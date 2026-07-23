@@ -128,6 +128,7 @@ function warnLegacyOverride(name: string): void {
 
 function configuredEnvironment(
   product: AutopilotConfig,
+  repositoryHome: string,
   stateDirectory: string,
   capabilityAttestation: string,
   configPath: string,
@@ -154,6 +155,7 @@ function configuredEnvironment(
     JINN_REVIEW_GH_TOKEN:
       env.AUTOPILOT_GITHUB_REVIEW_TOKEN ?? env.JINN_REVIEW_GH_TOKEN,
     AUTOPILOT_CONFIG_PATH: configPath,
+    AUTOPILOT_HERMES_HOMES_DIR: join(repositoryHome, 'hermes-homes'),
   };
 }
 
@@ -277,6 +279,7 @@ async function main(): Promise<void> {
   const loaded = await loadAutopilotConfig(repositoryPath, env);
   const runtimeEnvironment = configuredEnvironment(
     loaded.config,
+    loaded.paths.root,
     loaded.paths.state,
     loaded.paths.capabilityAttestation,
     loaded.configPath,

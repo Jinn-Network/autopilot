@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   buildCursorHeadlessPrompt,
   buildHeadlessPrompt,
@@ -18,9 +15,10 @@ import {
 } from './cursor-runtime.js';
 import { hermesChatArgs } from './hermes-runtime.js';
 import type { DispatcherConfig, Effort } from './types.js';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = join(HERE, '..', '..', '..', '..');
+import {
+  loadRuntimeCanon,
+  repositorySkillDirectories,
+} from '../config/runtime-assets.js';
 
 export interface SpawnResult {
   pid: number | undefined;
@@ -84,19 +82,11 @@ export interface CoordinatorSessionDeps {
 }
 
 /** Canon is explicit because neither headless runtime auto-loads it reliably. */
-export function loadCanon(): string {
-  const claudeMd = readFileSync(join(REPO_ROOT, 'CLAUDE.md'), 'utf8').trim();
-  const handbook = readFileSync(
-    join(REPO_ROOT, 'docs', 'engineering', 'handbook.md'),
-    'utf8',
-  ).trim();
-  return [
-    '# CLAUDE.md (canonical)\n',
-    claudeMd,
-    '',
-    '# Engineering handbook (canonical)\n',
-    handbook,
-  ].join('\n');
+export function loadCanon(
+  environment: NodeJS.ProcessEnv = process.env,
+  repositoryRoot?: string,
+): string {
+  return loadRuntimeCanon(environment, repositoryRoot);
 }
 
 /** Map board Effort to Claude's CLI flag; null keeps the runtime default. */
@@ -131,17 +121,14 @@ export function spawnCoordinatorSession(
     : cfg.runtime === 'cursor'
       ? buildCursorHeadlessPrompt(spec.skill, spec.scenario)
       : buildHeadlessPrompt(spec.skill, spec.scenario);
-  const prompt = [loadCanon(), '', runtimePrompt].join('\n');
+  const prompt = [
+    loadCanon(spec.env, spec.worktreePath),
+    '',
+    runtimePrompt,
+  ].join('\n');
   const env: NodeJS.ProcessEnv = {
     ...spec.env,
     JINN_AUTOPILOT_RUNTIME: cfg.runtime,
-    // Pin the session CLI to the package the DISPATCHER itself runs from.
-    // The skill's fallback is <repo-root>/packages/autopilot resolved from
-    // the session's cwd — the attempt worktree — whose checkout is the
-    // claim's base commit and can carry an older `autopilot session`
-    // implementation (proven live: a review verdict died on next's v1
-    // identity assertion). v1's dispatch.ts always pinned this; v2 must too.
-    JINN_AUTOPILOT_PACKAGE_DIR: join(REPO_ROOT, 'packages', 'autopilot'),
   };
   let result: SpawnResult;
 
@@ -151,6 +138,11 @@ export function spawnCoordinatorSession(
       worktreePath: spec.worktreePath,
       effort: spec.effort,
       cfg,
+      homesRoot: spec.env.AUTOPILOT_HERMES_HOMES_DIR,
+      repositorySkillDirectories: repositorySkillDirectories(
+        spec.env,
+        spec.worktreePath,
+      ),
     });
     result = deps.spawn(
       cfg.hermesPythonPath,

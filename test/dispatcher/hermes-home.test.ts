@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +18,7 @@ import {
 } from '../../src/dispatcher/hermes-home.js';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
 import type { Effort } from '../../src/dispatcher/types.js';
+import { packageEngineSkillsRoot } from '../../src/package-paths.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HERMES_ADAPTER_PATH = join(
@@ -59,6 +68,7 @@ describe('prepareHermesHome', () => {
     repoRoot = join(tmp, 'repo');
     mkdirSync(worktree, { recursive: true });
     mkdirSync(repoRoot, { recursive: true });
+    mkdirSync(join(repoRoot, '.claude', 'skills'), { recursive: true });
   });
   afterEach(() => {
     rmSync(tmp, { recursive: true, force: true });
@@ -74,7 +84,7 @@ describe('prepareHermesHome', () => {
       effort,
       cfg: DEFAULT_CONFIG,
       operatorHome,
-      repoRoot,
+      repositorySkillDirectories: [join(repoRoot, '.claude', 'skills')],
     });
     return { hermesHome, yaml: readFileSync(join(hermesHome, 'config.yaml'), 'utf8') };
   }
@@ -134,8 +144,24 @@ describe('prepareHermesHome', () => {
 
   it('points the skills loader at the repo skills dir and wires the app-test MCP', () => {
     const { yaml } = prep('Low');
+    expect(yaml).toContain(packageEngineSkillsRoot());
     expect(yaml).toContain(join(repoRoot, '.claude', 'skills'));
     expect(yaml).toContain('chrome-devtools');
+  });
+
+  it('reproduces an installed and enabled Jinn plugin without copying plugin state', () => {
+    const plugin = join(operatorHome, 'plugins', 'jinn');
+    mkdirSync(plugin, { recursive: true });
+    writeFileSync(join(plugin, 'plugin.yaml'), 'name: jinn\n');
+    writeFileSync(join(plugin, 'plugin-owned-state.db'), 'opaque\n');
+
+    const { hermesHome, yaml } = prep('Low');
+    const installed = join(hermesHome, 'plugins', 'jinn');
+
+    expect(lstatSync(installed).isSymbolicLink()).toBe(true);
+    expect(yaml).toContain('enabled:');
+    expect(yaml).toContain('"jinn"');
+    expect(existsSync(join(installed, 'plugin-owned-state.db'))).toBe(true);
   });
 
   it('pins the terminal to the session worktree', () => {

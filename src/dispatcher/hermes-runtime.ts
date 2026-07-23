@@ -1,15 +1,10 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { packageHermesLauncherPath } from '../package-paths.js';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = join(HERE, '..', '..', '..', '..');
-
-export const HERMES_STATELESS_LAUNCHER = join(
-  REPO_ROOT, 'packages', 'autopilot', 'bin', 'jinn-hermes-stateless.py',
-);
+export const HERMES_STATELESS_LAUNCHER = packageHermesLauncherPath();
 
 export const DEFAULT_HERMES_PYTHON = process.platform === 'win32'
   ? join(homedir(), '.hermes', 'hermes-agent', 'venv', 'Scripts', 'python.exe')

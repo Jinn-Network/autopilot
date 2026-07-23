@@ -65,7 +65,7 @@ export interface StageRunOpts {
    * The fully-curated stage prompt (stage task + issue body/ACs + prior-stage
    * outputs) that the coordinator writes to the `--prompt-file`. This helper
    * does NOT assemble those pieces — the coordinator owns curation (SKILL.md
-   * Step 4); the only things prepended here are canon (CLAUDE.md + handbook)
+   * Step 4); the only things prepended here are packaged/configured canon
    * and the headless-override block.
    */
   stageTask: string;
@@ -88,15 +88,15 @@ export interface StageRunOpts {
 const DEFAULT_TIMEOUT_MS = 600_000;
 
 /**
- * Compose the stage prompt: canon (CLAUDE.md + handbook), then the
+ * Compose the stage prompt: packaged lifecycle and configured repository
+ * canon, then the
  * headless-override block (so the root-session stage self-approves), then the
  * coordinator's curated stage prompt. Plain string join, mirroring
  * dispatch.ts's coordinator prompt (canon first, then the headless part).
  *
  * Canon is prepended because each stage runs as its own runtime root session.
- * In particular, Claude `-p` mode does not auto-load CLAUDE.md. We reuse
- * dispatch.ts's `loadCanon` so all runtimes and both call sites stay in
- * lockstep (and the repo-root derivation lives in one place).
+ * We reuse the coordinator's `loadCanon` so all runtimes and both call sites
+ * stay in lockstep.
  *
  * NOTE: this prepends BOTH canon and the runtime-specific headless override.
  * The `stageTask` passed in is already curated (the CLI shim reads it from the
@@ -104,13 +104,13 @@ const DEFAULT_TIMEOUT_MS = 600_000;
  * either would double-inject.
  */
 export function buildStagePrompt(
-  opts: Pick<StageRunOpts, 'stageTask' | 'worktreePath'>,
+  opts: Pick<StageRunOpts, 'stageTask' | 'worktreePath' | 'environment'>,
   runtime: AutopilotRuntime = parseAutopilotRuntime(
     process.env[AUTOPILOT_RUNTIME_ENV],
   ),
 ): string {
   return [
-    loadCanon(),
+    loadCanon(opts.environment ?? process.env, opts.worktreePath),
     '',
     headlessOverrideFor(runtime),
     '',

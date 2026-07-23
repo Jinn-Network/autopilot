@@ -119,7 +119,7 @@ describe('dispatchReview', () => {
     expect(prompt).toContain('#42');
     expect(prompt).toContain(EXPECTED_WT);
     expect(prompt).toContain('already exists');
-    expect(prompt).toContain('CLAUDE.md');
+    expect(prompt).toContain('Autopilot active-active lifecycle');
     expect(prompt).toContain('non-interactive');
     expect(calls[0].opts.cwd).toBe(EXPECTED_WT);
     expect(calls[0].opts.detached).toBe(true);

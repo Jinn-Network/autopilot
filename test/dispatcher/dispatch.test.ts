@@ -432,10 +432,10 @@ describe('dispatchIssue', () => {
     const prompt = promptOf(spawnCall);
 
     // (a) CLAUDE.md canon — check for a distinctive phrase from CLAUDE.md
-    expect(prompt).toContain('CLAUDE.md');
+    expect(prompt).toContain('Autopilot active-active lifecycle');
   });
 
-  it('spawns with a prompt containing the handbook canon', async () => {
+  it('spawns with a prompt containing the single-surface lifecycle canon', async () => {
     const { runner } = makeRunner();
     const { spawn, calls } = makeSpawn();
 
@@ -444,8 +444,7 @@ describe('dispatchIssue', () => {
     const [spawnCall] = calls;
     const prompt = promptOf(spawnCall);
 
-    // (a) handbook — check for a distinctive phrase from the engineering handbook
-    expect(prompt).toContain('handbook');
+    expect(prompt).toContain('Single-Surface Autopilot Lifecycle');
   });
 
   it('spawns with a prompt containing the implement-issue skill invocation on issue #418', async () => {
@@ -1038,7 +1037,7 @@ describe('dispatchIssue — global Hermes runtime', () => {
     expect(prompt).toContain('Use the implement-issue skill');
     expect(prompt).toContain('autopilot-runtime');
     expect(prompt).not.toContain('implement-issue-hermes');
-    expect(prompt).toContain('CLAUDE.md');            // canon still prepended
+    expect(prompt).toContain('Autopilot active-active lifecycle');
     expect(prompt).toContain(EXPECTED_WORKTREE_PATH); // pre-created worktree
     expect(prompt).toContain('do not create a new worktree');
     expect(calls[0].opts.cwd).toBe(EXPECTED_WORKTREE_PATH);

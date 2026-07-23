@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "repository": {
+    "slug": "Octo-Labs/widget",
+    "defaultBranch": "trunk",
+    "restDatabaseId": 987654,
+    "remote": {
+      "name": "publish",
+      "url": "https://github.com/Octo-Labs/widget.git"
+    },
+    "instructionFiles": [
+      "AGENTS.md",
+      "docs/MAINTAINING.md"
+    ]
+  },
+  "project": {
+    "owner": "Octo-Labs",
+    "number": 73,
+    "id": "PVT_external_fixture",
+    "fields": {
+      "status": {
+        "id": "PVTF_external_status",
+        "options": {
+          "todo": "external_status_todo",
+          "inProgress": "external_status_progress",
+          "human": "external_status_human",
+          "inReview": "external_status_review",
+          "done": "external_status_done"
+        }
+      },
+      "priority": {
+        "id": "PVTF_external_priority",
+        "options": {
+          "p0": "external_priority_0",
+          "p1": "external_priority_1",
+          "p2": "external_priority_2",
+          "p3": "external_priority_3",
+          "p4": "external_priority_4"
+        }
+      },
+      "effort": {
+        "id": "PVTF_external_effort",
+        "options": {
+          "low": "external_effort_low",
+          "medium": "external_effort_medium",
+          "high": "external_effort_high",
+          "xhigh": "external_effort_xhigh",
+          "max": "external_effort_max"
+        }
+      },
+      "blockedOn": {
+        "id": "PVTF_external_blocked",
+        "options": {
+          "nothing": "external_blocked_nothing",
+          "human": "external_blocked_human",
+          "anotherIssue": "external_blocked_issue"
+        }
+      },
+      "sprint": {
+        "id": "PVTF_external_sprint"
+      },
+      "type": {
+        "id": "PVTF_external_type",
+        "options": {
+          "feat": "external_type_feat",
+          "fix": "external_type_fix",
+          "refactor": "external_type_refactor",
+          "spike": "external_type_spike",
+          "chore": "external_type_chore",
+          "docs": "external_type_docs",
+          "test": "external_type_test",
+          "incident": "external_type_incident",
+          "design": "external_type_design"
+        }
+      }
+    }
+  },
+  "worker": {
+    "runtime": "hermes",
+    "model": "gpt-5.6-sol",
+    "provider": "openai-codex",
+    "repositorySkillDirectories": [
+      ".agents/skills"
+    ]
+  },
+  "scheduler": {
+    "pollSeconds": 600,
+    "fullReconcileSeconds": 3600,
+    "implementationConcurrency": 1,
+    "reviewConcurrency": 1,
+    "openPrBackpressure": 30
+  },
+  "triage": {
+    "allowedAuthors": [
+      "octocat"
+    ]
+  },
+  "safety": {
+    "staleAfterSeconds": 7200,
+    "diskFloorGb": 10,
+    "cleanup": true,
+    "children": true,
+    "carryover": true
+  },
+  "mergePolicy": "manual",
+  "maintainerSkills": {
+    "host": "codex",
+    "version": "0.1.0"
+  }
+}

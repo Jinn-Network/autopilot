@@ -27,7 +27,7 @@ describe('assertHermesRuntimeFiles', () => {
       .toThrow(/Hermes Python interpreter.*missing/);
   });
 
-  it('fails loudly when the Jinn stateless launcher is missing', () => {
+  it('fails loudly when the packaged stateless launcher is missing', () => {
     expect(() => assertHermesRuntimeFiles('/present/python', (path) => (
       path === '/present/python'
     ))).toThrow(/Hermes stateless launcher.*missing/);

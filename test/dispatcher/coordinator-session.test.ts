@@ -85,14 +85,10 @@ describe.each(['claude', 'hermes', 'cursor'] as const)(
           GH_TOKEN: `${session.kind}-token`,
           JINN_AUTOPILOT_RUNTIME: runtime,
         });
-        // The session CLI must run the DISPATCHER's own package, never the
-        // attempt worktree's checkout (whose base commit can carry an older
-        // `autopilot session` — a review verdict died live on next's v1
-        // identity assertion because this pin was missing in v2).
-        const packageDir = (call.opts.env as Record<string, string>)
-          .JINN_AUTOPILOT_PACKAGE_DIR;
-        expect(packageDir).toMatch(/packages\/autopilot$/);
-        expect(packageDir).not.toContain('/tmp/worktrees/');
+        // The installed `autopilot` executable owns session verbs. The target
+        // worktree must not select a repository-local engine checkout.
+        expect((call.opts.env as Record<string, string>)
+          .JINN_AUTOPILOT_PACKAGE_DIR).toBeUndefined();
 
         if (runtime === 'claude') {
           expect(call.cmd).toBe('claude');

@@ -1,8 +1,14 @@
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { mkdirSync, writeFileSync, existsSync, cpSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import type { DispatcherConfig, Effort } from './types.js';
+import { packageEngineSkillsRoot } from '../package-paths.js';
 
 /**
  * Per-session `$HERMES_HOME` for a Hermes coordinator session.
@@ -25,12 +31,8 @@ import type { DispatcherConfig, Effort } from './types.js';
  * supervisor (`sessionSpawnEnv` copies `process.env`).
  */
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-// src/dispatcher → src → packages/autopilot → packages → repo root
-const REPO_ROOT = join(HERE, '..', '..', '..', '..');
-
 /** Root for per-session hermes homes — sibling of SESSIONS_LOG_DIR. */
-export const HERMES_HOMES_DIR = join(homedir(), '.jinn-client', 'autopilot', 'hermes-homes');
+export const HERMES_HOMES_DIR = join(homedir(), '.autopilot', 'hermes-homes');
 
 /**
  * Operator hermes state seeded into each session home when present.
@@ -98,8 +100,10 @@ export interface HermesHomeOpts {
   cfg: DispatcherConfig;
   /** Override the operator home to seed from (tests). Default `~/.hermes`. */
   operatorHome?: string;
-  /** Override the repo root whose `.claude/skills` is exposed (tests). */
-  repoRoot?: string;
+  /** Explicit repository skill directories resolved inside this worktree. */
+  repositorySkillDirectories?: readonly string[];
+  /** Repository-scoped machine-local home root. */
+  homesRoot?: string;
 }
 
 /**
@@ -111,10 +115,9 @@ export interface HermesHomeOpts {
 export function prepareHermesHome(opts: HermesHomeOpts): { hermesHome: string } {
   const { sessionId, worktreePath, effort, cfg } = opts;
   const operatorHome = opts.operatorHome ?? join(homedir(), '.hermes');
-  const repoRoot = opts.repoRoot ?? REPO_ROOT;
-  const hermesHome = join(HERMES_HOMES_DIR, sessionId);
+  const hermesHome = join(opts.homesRoot ?? HERMES_HOMES_DIR, sessionId);
 
-  mkdirSync(hermesHome, { recursive: true });
+  mkdirSync(hermesHome, { recursive: true, mode: 0o700 });
 
   // Seed operator state (credentials + the tirith command scanner). Skip any
   // entry that is absent or already seeded — never overwrite.
@@ -124,6 +127,16 @@ export function prepareHermesHome(opts: HermesHomeOpts): { hermesHome: string } 
     if (existsSync(src) && !existsSync(dest)) {
       cpSync(src, dest, { recursive: true });
     }
+  }
+
+  // The plugin owns its corpus and runtime state. Autopilot only reproduces
+  // the already-installed plugin registration in the isolated worker home.
+  const operatorPlugin = join(operatorHome, 'plugins', 'jinn');
+  const workerPlugins = join(hermesHome, 'plugins');
+  const workerPlugin = join(workerPlugins, 'jinn');
+  if (existsSync(operatorPlugin) && !existsSync(workerPlugin)) {
+    mkdirSync(workerPlugins, { recursive: true });
+    symlinkSync(operatorPlugin, workerPlugin, 'dir');
   }
 
   const reasoning = hermesReasoningEffort(effort);
@@ -165,8 +178,12 @@ export function prepareHermesHome(opts: HermesHomeOpts): { hermesHome: string } 
       // Hermes scans SKILL.md trees natively — this is how the coordinator
       // loads canonical workflow skills, the shared runtime adapter, and
       // composed repository skills such as `testing-jinn-app`.
-      external_dirs: [join(repoRoot, '.claude', 'skills')],
+      external_dirs: [
+        packageEngineSkillsRoot(),
+        ...(opts.repositorySkillDirectories ?? []),
+      ],
     },
+    plugins: { enabled: ['jinn'], disabled: [], entries: {} },
     mcp_servers: {
       // Stage 7 (operator-visible surfaces) drives the browser through this.
       'chrome-devtools': { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest'] },

@@ -44,8 +44,8 @@ export function buildHeadlessPrompt(skill: string, scenario: string): string {
  * --print"); every rule in it (decide-don't-ask, always produce the artifact,
  * log decisions, escalate rather than stall) is agent-generic, so it is reused
  * verbatim under a reworded opener. Hermes loads the named skill through its
- * own SKILL.md scanner (`skills.external_dirs`, pointed at the repo's
- * `.claude/skills` by `prepareHermesHome`).
+ * own SKILL.md scanner (`skills.external_dirs`, pointed at the package engine
+ * skills and explicitly configured repository skill directories).
  */
 export function buildHermesHeadlessPrompt(skill: string, scenario: string): string {
   return [
