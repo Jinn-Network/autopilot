@@ -147,11 +147,18 @@ export function makeProductionReviewActionPort(
     if (options.codeownersText !== undefined) {
       return options.codeownersText(input);
     }
-    const contents = JSON.parse(await runner('gh', [
-      'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS`,
-      '--method', 'GET',
-      '-f', `ref=${input.baseOid}`,
-    ])) as {
+    let raw: string;
+    try {
+      raw = await runner('gh', [
+        'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS`,
+        '--method', 'GET',
+        '-f', `ref=${input.baseOid}`,
+      ]);
+    } catch (error) {
+      if (error instanceof Error && /HTTP 404/i.test(error.message)) return '';
+      throw error;
+    }
+    const contents = JSON.parse(raw) as {
       encoding?: unknown;
       content?: unknown;
     };

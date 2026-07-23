@@ -68,9 +68,21 @@ export function makeProductionMergeActionPort(
       repositorySlug,
     });
     const { baseOid, files } = changedFiles;
-    const codeownersRaw = JSON.parse(await runner('gh', [
-      'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS?ref=${baseOid}`,
-    ])) as { content?: unknown };
+    let codeownersResponse: string;
+    try {
+      codeownersResponse = await runner('gh', [
+        'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS?ref=${baseOid}`,
+      ]);
+    } catch (error) {
+      if (error instanceof Error && /HTTP 404/i.test(error.message)) {
+        codeownersResponse = JSON.stringify({
+          content: Buffer.from('').toString('base64'),
+        });
+      } else {
+        throw error;
+      }
+    }
+    const codeownersRaw = JSON.parse(codeownersResponse) as { content?: unknown };
     if (typeof codeownersRaw.content !== 'string') {
       throw new Error('Merge CODEOWNERS read was incomplete');
     }

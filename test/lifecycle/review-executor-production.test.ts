@@ -190,6 +190,34 @@ describe('production review acquisition port', () => {
     ]);
   });
 
+  it('treats an absent CODEOWNERS file as an empty policy', async () => {
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => snapshot(),
+      changedFiles: async () => ['GREETING.md'],
+      runner: async (command, args) => {
+        expect(command).toBe('gh');
+        if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+          return JSON.stringify({
+            changed_files: 1,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: '4'.repeat(40) },
+          });
+        }
+        if (args.some((arg) => arg.endsWith('/contents/.github/CODEOWNERS'))) {
+          throw new Error('gh: Not Found (HTTP 404)');
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      approvalPolicy: 'approve-eligible',
+    });
+  });
+
   it('re-reads exact GitHub lifecycle evidence and derives CODEOWNER policy', async () => {
     const port = makeProductionReviewActionPort({
       repositoryPath: '/repo',

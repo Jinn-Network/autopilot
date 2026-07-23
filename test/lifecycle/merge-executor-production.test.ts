@@ -191,4 +191,30 @@ describe('production head-pinned merge port', () => {
       codeownersComplete: true,
     });
   });
+
+  it('treats an absent CODEOWNERS file as a complete empty policy', async () => {
+    const runner = async (
+      command: string,
+      args: readonly string[],
+    ): Promise<string> => {
+      const endpoint = args.find((arg) => arg.startsWith('repos/'));
+      if (endpoint?.startsWith(
+        'repos/Jinn-Network/mono/contents/.github/CODEOWNERS',
+      )) {
+        throw new Error('gh: Not Found (HTTP 404)');
+      }
+      return candidateRunner(1, ['GREETING.md'])(command, args);
+    };
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      runner,
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      changedFilesComplete: true,
+      codeownersComplete: true,
+      codeownerSensitive: false,
+    });
+  });
 });
