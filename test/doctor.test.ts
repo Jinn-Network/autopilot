@@ -63,7 +63,6 @@ const liveFields = JSON.stringify({
     { name: 'Effort', id: fixture.project.fields.effort.id },
     { name: 'Blocked on', id: fixture.project.fields.blockedOn.id },
     { name: 'Sprint', id: fixture.project.fields.sprint.id },
-    { name: 'Type', id: fixture.project.fields.type.id },
   ],
 });
 
@@ -94,7 +93,15 @@ function healthyRunner(): DoctorRunner {
       return JSON.stringify({
         data: {
           organization: {
-            projectV2: { id: fixture.project.id, viewerCanUpdate: true },
+            projectV2: {
+              id: fixture.project.id,
+              viewerCanUpdate: true,
+              typeField: {
+                id: fixture.project.fields.type.id,
+                name: 'Type',
+                dataType: 'ISSUE_TYPE',
+              },
+            },
             issueTypes: {
               nodes: Object.entries(fixture.project.fields.type.options)
                 .map(([name, id]) => ({ name, id, isEnabled: true })),

@@ -16,6 +16,7 @@ import {
 } from '../src/config/config.js';
 import { runDoctor, type DoctorReport } from '../src/doctor.js';
 import { initializeAutopilot, type InitializationRunner } from '../src/init.js';
+import { createTerminalInitializationInteraction } from '../src/init-terminal.js';
 import {
   createMaintainerIssue,
   readTriageInventory,
@@ -257,21 +258,32 @@ async function main(): Promise<void> {
     return;
   }
   if (command.kind === 'init') {
-    const result = await initializeAutopilot({
-      cwd: process.cwd(),
-      nonInteractive: command.nonInteractive,
-      ...(command.project == null ? {} : { project: command.project }),
-      runner,
-      environment: process.env,
-    });
-    const loaded = await loadAutopilotConfig(result.repositoryRoot, process.env);
-    const skills = updateMaintainerSkills({
-      repositoryRoot: result.repositoryRoot,
-      config: loaded.config,
-      apply: true,
-      force: false,
-    });
-    process.stdout.write(`${JSON.stringify({ ...result, skills }, null, 2)}\n`);
+    const terminal = command.nonInteractive
+      ? undefined
+      : createTerminalInitializationInteraction({
+          input: process.stdin,
+          output: process.stdout,
+        });
+    try {
+      const result = await initializeAutopilot({
+        cwd: process.cwd(),
+        nonInteractive: command.nonInteractive,
+        ...(command.project == null ? {} : { project: command.project }),
+        runner,
+        ...(terminal == null ? {} : { interactor: terminal.interactor }),
+        environment: process.env,
+      });
+      const loaded = await loadAutopilotConfig(result.repositoryRoot, process.env);
+      const skills = updateMaintainerSkills({
+        repositoryRoot: result.repositoryRoot,
+        config: loaded.config,
+        apply: true,
+        force: false,
+      });
+      process.stdout.write(`${JSON.stringify({ ...result, skills }, null, 2)}\n`);
+    } finally {
+      terminal?.close();
+    }
     return;
   }
   if (command.kind === 'internal') {

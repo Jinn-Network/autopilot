@@ -46,7 +46,13 @@ interface CredentialProfile {
 const DOCTOR_DISCOVERY_QUERY = `
 query($owner: String!, $repository: String!, $projectNumber: Int!) {
   organization(login: $owner) {
-    projectV2(number: $projectNumber) { id viewerCanUpdate }
+    projectV2(number: $projectNumber) {
+      id
+      viewerCanUpdate
+      typeField: field(name: "Type") {
+        ... on ProjectV2Field { id name dataType }
+      }
+    }
     issueTypes(first: 100) { nodes { id name isEnabled } }
   }
   repository(owner: $owner, name: $repository) { viewerPermission }
@@ -153,7 +159,11 @@ async function resolveLogin(
   return login;
 }
 
-function validateFieldIds(raw: string, loaded: LoadedAutopilotConfig): void {
+function validateFieldIds(
+  raw: string,
+  loaded: LoadedAutopilotConfig,
+  liveTypeFieldId: unknown,
+): void {
   const parsed = safeJson(raw, 'Project fields') as {
     fields?: Array<{ id?: unknown; name?: unknown; options?: Array<{
       id?: unknown;
@@ -167,13 +177,15 @@ function validateFieldIds(raw: string, loaded: LoadedAutopilotConfig): void {
     ['Effort', loaded.config.project.fields.effort.id],
     ['Blocked on', loaded.config.project.fields.blockedOn.id],
     ['Sprint', loaded.config.project.fields.sprint.id],
-    ['Type', loaded.config.project.fields.type.id],
   ];
   for (const [name, id] of expected) {
     const matches = fields.filter((field) => field.name === name);
     if (matches.length !== 1 || matches[0]!.id !== id) {
       throw new Error(`Configured Project field ${name} does not match live schema`);
     }
+  }
+  if (liveTypeFieldId !== loaded.config.project.fields.type.id) {
+    throw new Error('Configured Project field Type does not match live schema');
   }
   const status = fields.find((field) => field.name === 'Status');
   const liveStatusIds = new Set((status?.options ?? []).map((option) => option.id));
@@ -373,7 +385,6 @@ export async function runDoctor(input: {
         '--format',
         'json',
       ], { cwd: loaded.repositoryRoot });
-      validateFieldIds(fieldRaw, loaded);
       const [owner, repository] = loaded.config.repository.slug.split('/') as [string, string];
       const raw = await input.runner('gh', [
         'api',
@@ -394,9 +405,13 @@ export async function runDoctor(input: {
       const organization = root.organization as Record<string, unknown> | undefined;
       const project = organization?.projectV2 as Record<string, unknown> | undefined;
       const repositoryNode = root.repository as Record<string, unknown> | undefined;
+      const typeField = project?.typeField as Record<string, unknown> | undefined;
+      validateFieldIds(fieldRaw, loaded, typeField?.id);
       if (
         project?.id !== loaded.config.project.id
         || project.viewerCanUpdate !== true
+        || typeField?.name !== 'Type'
+        || typeField.dataType !== 'ISSUE_TYPE'
         || repositoryNode?.viewerPermission !== 'ADMIN'
       ) {
         throw new Error('Project or repository permissions are insufficient');
