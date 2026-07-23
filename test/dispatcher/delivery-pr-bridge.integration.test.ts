@@ -23,6 +23,17 @@ import liveIssueFixture from '../fixtures/delivery-live-issue-solution.json';
 
 const execFileAsync = promisify(execFile);
 
+function configureTestIdentity(repository: string): void {
+  execFileSync('git', ['-C', repository, 'config', 'user.name', 'Autopilot Test']);
+  execFileSync('git', [
+    '-C',
+    repository,
+    'config',
+    'user.email',
+    'autopilot-test@example.invalid',
+  ]);
+}
+
 /** Real `git`, faked `gh` — dispatched by `cmd`. */
 function makeMixedRunner(ghCalls: { cmd: string; args: string[] }[]): CommandRunner {
   return async (cmd, args) => {
@@ -59,6 +70,7 @@ describe('delivery-pr-bridge — integration (local bare git repo as origin, scr
     // Local bare "origin" — never the real jinn-mono GitHub remote.
     execFileSync('git', ['init', '--bare', '--quiet', bareOrigin]);
     execFileSync('git', ['clone', '--quiet', bareOrigin, repoRoot]);
+    configureTestIdentity(repoRoot);
     execFileSync('git', ['-C', repoRoot, 'checkout', '-q', '-B', 'next']);
     // Baseline content the fixture's patch context matches exactly.
     writeFileSync(join(repoRoot, 'FIXTURE.md'), 'hello\n');
@@ -125,6 +137,7 @@ describe('delivery-pr-bridge — integration (local bare git repo as origin, scr
 
     execFileSync('git', ['init', '--bare', '--quiet', bareOrigin]);
     execFileSync('git', ['clone', '--quiet', bareOrigin, repoRoot]);
+    configureTestIdentity(repoRoot);
     execFileSync('git', ['-C', repoRoot, 'checkout', '-q', '-B', 'next']);
     writeFileSync(join(repoRoot, 'FIXTURE.md'), 'hello\n');
     execFileSync('git', ['-C', repoRoot, 'add', 'FIXTURE.md']);
