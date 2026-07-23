@@ -1,15 +1,31 @@
 {
   "name": "@jinn-network/autopilot",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "A self-hosted GitHub lifecycle engine for open-source maintainers",
+  "license": "MIT",
   "type": "module",
   "packageManager": "yarn@4.13.0",
-  "bin": {
-    "jinn-merge-batch": "./bin/jinn-merge-batch.ts",
-    "jinn-run-stage": "./bin/jinn-run-stage.ts",
-    "jinn-triage-check": "./bin/jinn-triage-check.ts"
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "bin": "./dist/autopilot.js",
+  "files": [
+    "dist/autopilot.js",
+    "assets",
+    "schemas",
+    "templates",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
+    "build": "node scripts/build-distribution.mjs",
+    "verify:dist": "node scripts/verify-distribution.mjs",
+    "prepack": "yarn build && yarn verify:dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "pressure": "tsx scripts/run-pressure-suite.ts",
@@ -27,6 +43,7 @@
   },
   "devDependencies": {
     "@types/node": "^22",
+    "esbuild": "^0.28.0",
     "tsx": "^4.23.1",
     "typescript": "^5.6.0",
     "vitest": "^2.1.9"

@@ -198,6 +198,12 @@ export function serviceCredentialEnvironment(
   };
   return {
     ...environment,
+    AUTOPILOT_REPOSITORY_SLUG: loaded.config.repository.slug,
+    AUTOPILOT_REPOSITORY_URL: loaded.config.repository.remote.url,
+    AUTOPILOT_REPOSITORY_REST_DATABASE_ID:
+      String(loaded.config.repository.restDatabaseId),
+    AUTOPILOT_PROJECT_OWNER: loaded.config.project.owner,
+    AUTOPILOT_PROJECT_NUMBER: String(loaded.config.project.number),
     ...(environment.AUTOPILOT_GITHUB_IMPLEMENT_TOKEN != null
       ? {}
       : typeof profile.implementation?.token === 'string'

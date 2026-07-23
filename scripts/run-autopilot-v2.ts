@@ -33,6 +33,8 @@ import {
 } from '../src/dispatcher/issue-source.js';
 import { DEFAULT_CONFIG, type DispatcherConfig } from '../src/dispatcher/types.js';
 import { DEFAULT_FLOOR } from '../src/dispatcher/rate-limit-guard.js';
+import { configureRepositoryConstants } from '../src/dispatcher/constants.js';
+import { configureCanonicalGitHubRemote } from '../src/lifecycle/implementation-executor.js';
 import { shouldRouteToSession } from '../src/cli/routing.js';
 import {
   ConditionalPullRequestEvidenceProbe,
@@ -285,6 +287,13 @@ export async function runAutopilotV2(
     'rev-parse', '--path-format=absolute', '--show-toplevel',
   ])).trim();
   const loaded = await loadAutopilotConfig(repositoryPath, env);
+  configureRepositoryConstants({
+    repositorySlug: loaded.config.repository.slug,
+    repositoryRestDatabaseId: loaded.config.repository.restDatabaseId,
+    projectOwner: loaded.config.project.owner,
+    projectNumber: loaded.config.project.number,
+  });
+  configureCanonicalGitHubRemote(loaded.config.repository.remote.url);
   const runtimeEnvironment = configuredEnvironment(
     loaded.config,
     loaded.paths.root,

@@ -24,8 +24,12 @@ import {
   type GitRefName,
 } from './types.js';
 
-export const CANONICAL_GITHUB_HTTPS_REMOTE =
-  'https://github.com/Jinn-Network/mono.git';
+export let CANONICAL_GITHUB_HTTPS_REMOTE =
+  process.env.AUTOPILOT_REPOSITORY_URL ?? '';
+
+export function configureCanonicalGitHubRemote(repositoryUrl: string): void {
+  CANONICAL_GITHUB_HTTPS_REMOTE = repositoryUrl;
+}
 
 export async function runCanonicalImplementationRealityCheck(
   issueNumber: number,

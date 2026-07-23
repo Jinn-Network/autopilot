@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jinn.network/autopilot/schemas/config-v1.json",
+  "title": "Autopilot configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "repository",
+    "project",
+    "worker",
+    "scheduler",
+    "triage",
+    "safety",
+    "mergePolicy",
+    "maintainerSkills"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slug",
+        "defaultBranch",
+        "restDatabaseId",
+        "remote",
+        "instructionFiles"
+      ],
+      "properties": {
+        "slug": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]+$"
+        },
+        "defaultBranch": { "type": "string", "minLength": 1 },
+        "restDatabaseId": { "type": "integer", "minimum": 1 },
+        "remote": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "url"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "url": { "type": "string", "format": "uri" }
+          }
+        },
+        "instructionFiles": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/repositoryRelativePath" }
+        }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "number", "id", "fields"],
+      "properties": {
+        "owner": { "type": "string", "minLength": 1 },
+        "number": { "type": "integer", "minimum": 1 },
+        "id": { "type": "string", "minLength": 1 },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "priority", "effort", "blockedOn", "sprint", "type"],
+          "properties": {
+            "status": {
+              "$ref": "#/$defs/statusField"
+            },
+            "priority": {
+              "$ref": "#/$defs/priorityField"
+            },
+            "effort": {
+              "$ref": "#/$defs/effortField"
+            },
+            "blockedOn": {
+              "$ref": "#/$defs/blockedField"
+            },
+            "sprint": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 }
+              }
+            },
+            "type": {
+              "$ref": "#/$defs/typeField"
+            }
+          }
+        }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime", "model", "provider", "repositorySkillDirectories"],
+      "properties": {
+        "runtime": { "const": "hermes" },
+        "model": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "repositorySkillDirectories": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/repositoryRelativePath" }
+        }
+      }
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pollSeconds",
+        "fullReconcileSeconds",
+        "implementationConcurrency",
+        "reviewConcurrency",
+        "openPrBackpressure"
+      ],
+      "properties": {
+        "pollSeconds": { "type": "integer", "minimum": 1 },
+        "fullReconcileSeconds": { "type": "integer", "minimum": 1 },
+        "implementationConcurrency": { "type": "integer", "minimum": 1 },
+        "reviewConcurrency": { "type": "integer", "minimum": 1 },
+        "openPrBackpressure": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "triage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowedAuthors"],
+      "properties": {
+        "allowedAuthors": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "staleAfterSeconds",
+        "diskFloorGb",
+        "cleanup",
+        "children",
+        "carryover"
+      ],
+      "properties": {
+        "staleAfterSeconds": { "type": "integer", "minimum": 1 },
+        "diskFloorGb": { "type": "integer", "minimum": 0 },
+        "cleanup": { "type": "boolean" },
+        "children": { "type": "boolean" },
+        "carryover": { "type": "boolean" }
+      }
+    },
+    "mergePolicy": { "enum": ["manual", "safe-auto"] },
+    "maintainerSkills": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "version"],
+      "properties": {
+        "host": { "enum": ["claude", "codex", "cursor"] },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "repositoryRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "pattern": "^/" },
+          { "pattern": "(^|/)\\.\\.(/|$)" },
+          { "pattern": "\\\\" }
+        ]
+      }
+    },
+    "id": { "type": "string", "minLength": 1 },
+    "statusField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "options"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["todo", "inProgress", "human", "inReview", "done"],
+          "properties": {
+            "todo": { "$ref": "#/$defs/id" },
+            "inProgress": { "$ref": "#/$defs/id" },
+            "human": { "$ref": "#/$defs/id" },
+            "inReview": { "$ref": "#/$defs/id" },
+            "done": { "$ref": "#/$defs/id" }
+          }
+        }
+      }
+    },
+    "priorityField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "options"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["p0", "p1", "p2", "p3", "p4"],
+          "properties": {
+            "p0": { "$ref": "#/$defs/id" },
+            "p1": { "$ref": "#/$defs/id" },
+            "p2": { "$ref": "#/$defs/id" },
+            "p3": { "$ref": "#/$defs/id" },
+            "p4": { "$ref": "#/$defs/id" }
+          }
+        }
+      }
+    },
+    "effortField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "options"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["low", "medium", "high", "xhigh", "max"],
+          "properties": {
+            "low": { "$ref": "#/$defs/id" },
+            "medium": { "$ref": "#/$defs/id" },
+            "high": { "$ref": "#/$defs/id" },
+            "xhigh": { "$ref": "#/$defs/id" },
+            "max": { "$ref": "#/$defs/id" }
+          }
+        }
+      }
+    },
+    "blockedField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "options"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["nothing", "human", "anotherIssue"],
+          "properties": {
+            "nothing": { "$ref": "#/$defs/id" },
+            "human": { "$ref": "#/$defs/id" },
+            "anotherIssue": { "$ref": "#/$defs/id" }
+          }
+        }
+      }
+    },
+    "typeField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "options"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "feat",
+            "fix",
+            "refactor",
+            "spike",
+            "chore",
+            "docs",
+            "test",
+            "incident",
+            "design"
+          ],
+          "properties": {
+            "feat": { "$ref": "#/$defs/id" },
+            "fix": { "$ref": "#/$defs/id" },
+            "refactor": { "$ref": "#/$defs/id" },
+            "spike": { "$ref": "#/$defs/id" },
+            "chore": { "$ref": "#/$defs/id" },
+            "docs": { "$ref": "#/$defs/id" },
+            "test": { "$ref": "#/$defs/id" },
+            "incident": { "$ref": "#/$defs/id" },
+            "design": { "$ref": "#/$defs/id" }
+          }
+        }
+      }
+    }
+  }
+}

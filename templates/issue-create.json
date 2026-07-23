@@ -1,0 +1,10 @@
+{
+  "title": "Describe the outcome",
+  "body": "Explain the problem and relevant context.",
+  "acceptanceCriteria": [
+    "A binary, externally verifiable result is true."
+  ],
+  "type": "feat",
+  "effort": "medium",
+  "priority": "p2"
+}
