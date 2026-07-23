@@ -77,6 +77,7 @@ function graphQlPr(input: {
   readonly labels?: readonly string[];
   readonly message?: string;
   readonly closingIssueNumber?: number;
+  readonly statusCheckRollup?: unknown;
 }) {
   return {
     number: input.number,
@@ -121,7 +122,7 @@ function graphQlPr(input: {
         createdAt: `2026-07-20T09:0${index}:00.000Z`,
       })),
     },
-    statusCheckRollup: null,
+    statusCheckRollup: input.statusCheckRollup ?? null,
   };
 }
 
@@ -628,6 +629,70 @@ describe('GhLifecycleReader', () => {
     const page = await new GhLifecycleReader(run).readPullRequests(null, [42]);
 
     expect(page.nodes[0]?.implementationCompletionSummary).toBe(summary);
+  });
+
+  it('uses the workflow run database id for GraphQL check reruns', async () => {
+    let openQuery = '';
+    const run: CommandRunner = async (command, args) => {
+      const stub = noReviewClaimRefs(command);
+      if (stub !== undefined) return stub;
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('closedByPullRequestsReferences')) {
+        return JSON.stringify({
+          data: {
+            rateLimit: rateLimit(),
+            repository: {
+              issue42: {
+                closedByPullRequestsReferences: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [],
+                },
+              },
+            },
+          },
+        });
+      }
+      openQuery = query;
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [graphQlPr({
+                number: 101,
+                state: 'OPEN',
+                head: OPEN_HEAD,
+                statusCheckRollup: {
+                  contexts: {
+                    pageInfo: { hasNextPage: false },
+                    nodes: [{
+                      __typename: 'CheckRun',
+                      name: 'test',
+                      status: 'COMPLETED',
+                      conclusion: 'FAILURE',
+                      databaseId: 999,
+                      checkSuite: { workflowRun: { databaseId: 123 } },
+                    }],
+                  },
+                },
+              })],
+            },
+          },
+        },
+      });
+    };
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null, [42]);
+
+    expect(openQuery).toContain('checkSuite { workflowRun { databaseId } }');
+    expect(page.nodes[0]?.checks).toEqual([{
+      name: 'test',
+      status: 'COMPLETED',
+      conclusion: 'FAILURE',
+      source: 'check-run',
+      runId: 123,
+    }]);
   });
 
   it('scopes open reads, batches merged outcomes, reads refs only for open PRs, and parses Human evidence', async () => {
