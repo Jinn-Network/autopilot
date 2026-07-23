@@ -91,9 +91,9 @@ const MERGED_PR_FIELDS = `
           nodes { commit { oid committedDate } }
         }`;
 
-const PR_QUERY = `query($cursor: String) {
+const PR_QUERY = `query($owner: String!, $name: String!, $cursor: String) {
   rateLimit { cost remaining resetAt }
-  repository(owner: "Jinn-Network", name: "mono") {
+  repository(owner: $owner, name: $name) {
     pullRequests(first: ${PR_PAGE_SIZE}, after: $cursor, states: [OPEN], labels: ["engine:review"], orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
@@ -103,9 +103,9 @@ const PR_QUERY = `query($cursor: String) {
   }
 }`;
 
-const PR_BY_NUMBER_QUERY = `query($number: Int!) {
+const PR_BY_NUMBER_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
-  repository(owner: "Jinn-Network", name: "mono") {
+  repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       ${PR_FIELDS}
     }
@@ -122,9 +122,9 @@ function closingPullRequestNumbersQuery(issueNumbers: readonly number[]): string
         nodes { number state }
       }
     }`).join('\n');
-  return `query IncrementalClosingPullRequests {
+  return `query IncrementalClosingPullRequests($owner: String!, $name: String!) {
   rateLimit { cost remaining resetAt }
-  repository(owner: "Jinn-Network", name: "mono") {
+  repository(owner: $owner, name: $name) {
 ${issues}
   }
 }`;
@@ -138,9 +138,9 @@ function mergedOutcomesQuery(issueNumbers: readonly number[]): string {
         nodes { ${MERGED_PR_FIELDS} }
       }
     }`).join('\n');
-  return `query {
+  return `query($owner: String!, $name: String!) {
   rateLimit { cost remaining resetAt }
-  repository(owner: "Jinn-Network", name: "mono") {
+  repository(owner: $owner, name: $name) {
 ${issues}
   }
 }`;
@@ -210,9 +210,10 @@ function parseSingleReviewClaimRef(raw: string, ref: GitRefName): GitOid | null 
  * item, scoped to one issue via `Issue.projectItems` instead of paginating
  * the whole board (~91 pages measured on the live board).
  */
-const PROJECT_ITEM_BY_ISSUE_QUERY = `query($number: Int!) {
+const PROJECT_ITEM_BY_ISSUE_QUERY =
+`query($owner: String!, $name: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
-  repository(owner: "Jinn-Network", name: "mono") {
+  repository(owner: $owner, name: $name) {
     issue(number: $number) {
       projectItems(first: 10) {
         pageInfo { hasNextPage }
@@ -230,9 +231,10 @@ const PROJECT_ITEM_BY_ISSUE_QUERY = `query($number: Int!) {
   }
 }`;
 
-const ISSUE_ACTION_CONTEXT_QUERY = `query($number: Int!) {
+const ISSUE_ACTION_CONTEXT_QUERY =
+`query($owner: String!, $name: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
-  repository(owner: "Jinn-Network", name: "mono") {
+  repository(owner: $owner, name: $name) {
     issue(number: $number) {
       projectItems(first: 10) {
         pageInfo { hasNextPage }
@@ -327,6 +329,7 @@ function parseSelected<Value extends string>(
 
 function decodeTargetedProjectItem(
   nodes: readonly ProjectItemByIssueNode[],
+  projectNumber = PROJECT_NUMBER,
 ): {
   readonly id: string;
   readonly status: ProjectStatus | null;
@@ -335,7 +338,7 @@ function decodeTargetedProjectItem(
   readonly blockedOn: BlockedOn | null;
   readonly issueType: IssueShape | null;
 } | null {
-  const node = nodes.find((candidate) => candidate.project.number === PROJECT_NUMBER);
+  const node = nodes.find((candidate) => candidate.project.number === projectNumber);
   if (node === undefined) return null;
   return {
     id: node.id,
@@ -656,6 +659,10 @@ export interface GhLifecycleReaderOptions {
    * run this before the runbook's "configure jinn-autopilot-v2" step).
    */
   readonly remoteName?: string;
+  /** GitHub owner/name and linked Project number supplied by repository config. */
+  readonly repositorySlug?: string;
+  readonly projectOwner?: string;
+  readonly projectNumber?: number;
   /** Share a cycle-scoped meter with future conditional REST readers. */
   readonly usageMeter?: GitHubUsageMeter;
   /** The supplied runner already records into `usageMeter`. */
@@ -668,6 +675,11 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   private readonly repositoryPath: string;
   private readonly remoteName: string;
   private readonly usageMeter: GitHubUsageMeter;
+  private readonly repositorySlug: string;
+  private readonly repositoryOwner: string;
+  private readonly repositoryName: string;
+  private readonly projectOwner: string;
+  private readonly projectNumber: number;
   // Review-claim metadata commits are content-addressed and append-only: an
   // OID's payload never changes, so this cache never needs invalidation for
   // the life of the reader (jinn-mono#1883-follow-up).
@@ -686,7 +698,25 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     this.run = options.runnerIsMetered === true
       ? run
       : makeGitHubUsageCommandRunner(run, this.usageMeter);
-    this.issues = new GhIssueSource(this.run);
+    this.repositorySlug = options.repositorySlug ?? REPO;
+    const [repositoryOwner, repositoryName, ...unexpected] =
+      this.repositorySlug.split('/');
+    if (
+      repositoryOwner === undefined
+      || repositoryOwner.length === 0
+      || repositoryName === undefined
+      || repositoryName.length === 0
+      || unexpected.length > 0
+    ) {
+      throw new Error('repositorySlug must be owner/name');
+    }
+    this.repositoryOwner = repositoryOwner;
+    this.repositoryName = repositoryName;
+    this.projectOwner = options.projectOwner ?? repositoryOwner;
+    this.projectNumber = options.projectNumber ?? PROJECT_NUMBER;
+    this.issues = new GhIssueSource(this.run, {
+      repositorySlug: this.repositorySlug,
+    });
     this.repositoryPath = options.repositoryPath ?? '.';
     this.remoteName = options.remoteName ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   }
@@ -700,7 +730,17 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   }
 
   readProjectSnapshot(): Promise<ProjectSnapshot> {
-    return fetchProjectSnapshot(this.run);
+    return fetchProjectSnapshot(this.run, {
+      projectOwner: this.projectOwner,
+      projectNumber: this.projectNumber,
+    });
+  }
+
+  private repositoryVariables(): string[] {
+    return [
+      '-F', `owner=${this.repositoryOwner}`,
+      '-F', `name=${this.repositoryName}`,
+    ];
   }
 
   async readIssues(board: IssueBoardState) {
@@ -831,6 +871,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     }
     const raw = await this.run('gh', [
       'api', 'graphql', '-f', `query=${closingPullRequestNumbersQuery(unique)}`,
+      ...this.repositoryVariables(),
     ]);
     const decoded = JSON.parse(raw) as unknown;
     if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
@@ -983,7 +1024,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   }> {
     let headCommittedAt: string | undefined;
     for (let page = 1; page <= MAX_COMMIT_HISTORY_PAGES; page += 1) {
-      const endpoint = `repos/${REPO}/commits?sha=${encodeURIComponent(headOid)}`
+      const endpoint = `repos/${this.repositorySlug}/commits?sha=${encodeURIComponent(headOid)}`
         + `&per_page=${COMMIT_HISTORY_PAGE_SIZE}&page=${page}`;
       const raw = await this.run('gh', ['api', endpoint]);
       const commits = JSON.parse(raw) as Array<{
@@ -1144,7 +1185,10 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     for (let offset = 0; offset < unique.length; offset += MERGED_ISSUE_BATCH_SIZE) {
       const batch = unique.slice(offset, offset + MERGED_ISSUE_BATCH_SIZE);
       const query = mergedOutcomesQuery(batch);
-      const raw = await this.run('gh', ['api', 'graphql', '-f', `query=${query}`]);
+      const raw = await this.run('gh', [
+        'api', 'graphql', '-f', `query=${query}`,
+        ...this.repositoryVariables(),
+      ]);
       const response = JSON.parse(raw) as MergedOutcomesResponse;
       for (const number of batch) {
         const connection = response.data.repository[`issue${number}`]
@@ -1197,6 +1241,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     const raw = await this.run('gh', [
       'api', 'graphql',
       '-f', `query=${PR_BY_NUMBER_QUERY}`,
+      ...this.repositoryVariables(),
       '-F', `number=${prNumber}`,
     ]);
     const response = JSON.parse(raw) as GraphQlPrResponse;
@@ -1241,6 +1286,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     const raw = await this.run('gh', [
       'api', 'graphql',
       '-f', `query=${PROJECT_ITEM_BY_ISSUE_QUERY}`,
+      ...this.repositoryVariables(),
       '-F', `number=${issueNumber}`,
     ]);
     const response = JSON.parse(raw) as ProjectItemByIssueResponse;
@@ -1249,7 +1295,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       throw new Error('Targeted Project-item pagination exceeded its fixed limit');
     }
     const nodes = projectItems?.nodes ?? [];
-    return decodeTargetedProjectItem(nodes);
+    return decodeTargetedProjectItem(nodes, this.projectNumber);
   }
 
   /**
@@ -1263,6 +1309,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     const raw = await this.run('gh', [
       'api', 'graphql',
       '-f', `query=${ISSUE_ACTION_CONTEXT_QUERY}`,
+      ...this.repositoryVariables(),
       '-F', `number=${issueNumber}`,
     ]);
     const response = JSON.parse(raw) as IssueActionContextResponse;
@@ -1293,7 +1340,10 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       if (node.state === 'OPEN') openPullRequestNumbers.add(node.number);
     }
     return {
-      projectItem: decodeTargetedProjectItem(issue.projectItems.nodes),
+      projectItem: decodeTargetedProjectItem(
+        issue.projectItems.nodes,
+        this.projectNumber,
+      ),
       openPullRequestNumbers,
     };
   }
@@ -1302,7 +1352,10 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     cursor: string | null,
     nonDoneIssueNumbers: readonly number[] = [],
   ): Promise<PullRequestPage> {
-    const args = ['api', 'graphql', '-f', `query=${PR_QUERY}`];
+    const args = [
+      'api', 'graphql', '-f', `query=${PR_QUERY}`,
+      ...this.repositoryVariables(),
+    ];
     if (cursor !== null) args.push('-F', `cursor=${cursor}`);
     const raw = await this.run('gh', args);
     const response = JSON.parse(raw) as GraphQlPage;
@@ -1401,7 +1454,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     const pageSize = 100;
     const maxPages = 100;
     for (let page = 1; page <= maxPages; page += 1) {
-      const endpoint = `repos/${REPO}/git/matching-refs/heads/autopilot/`
+      const endpoint = `repos/${this.repositorySlug}/git/matching-refs/heads/autopilot/`
         + `?per_page=${pageSize}&page=${page}`;
       const raw = await this.run('gh', ['api', endpoint]);
       const parsed = JSON.parse(raw) as unknown;

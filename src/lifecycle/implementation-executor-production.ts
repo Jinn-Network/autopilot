@@ -25,12 +25,17 @@ import {
 import { withSelectedCredential } from './production-auth.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
 import { gitOid, gitRefName } from './types.js';
+import type { ProjectMapping } from '../config/config.js';
 
 export interface ProductionImplementationActionPortOptions {
   readonly repositoryPath: string;
   readonly worktreeBase: string;
   readonly runnerId: string;
   readonly remoteName?: string;
+  readonly repositorySlug?: string;
+  readonly repositoryUrl?: string;
+  readonly defaultBranch?: string;
+  readonly projectMapping?: ProjectMapping;
   readonly credentials: CredentialPool;
   readonly authorAllowlist: ReadonlySet<string>;
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
@@ -153,6 +158,10 @@ export function makeProductionImplementationActionPort(
 ): ProductionImplementationActionPort {
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
+  const repositorySlug = options.repositorySlug ?? REPO;
+  const repositoryUrl =
+    options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
+  const defaultBranch = options.defaultBranch ?? 'next';
   const withCredential = <Value>(
     credential: SelectedCredential,
     operation: Parameters<typeof withSelectedCredential<Value>>[2],
@@ -161,7 +170,7 @@ export function makeProductionImplementationActionPort(
     branch: string,
     run: CommandRunner,
   ): Promise<ImplementationPullRequest> => run('gh', [
-    'pr', 'list', '--repo', REPO,
+    'pr', 'list', '--repo', repositorySlug,
     '--head', branch,
     '--state', 'open',
     '--json', 'number,headRefName,headRefOid,baseRefName,isDraft,labels,body',
@@ -237,7 +246,7 @@ export function makeProductionImplementationActionPort(
         targetBase: gitRefName(
           existing?.baseRefName
           ?? stackReady.get(issueNumber)?.baseBranch
-          ?? 'next',
+          ?? defaultBranch,
         ),
         effort: source.effort,
         ...(marker === null
@@ -247,7 +256,11 @@ export function makeProductionImplementationActionPort(
     },
 
     runRealityCheck: (issueNumber) =>
-      runCanonicalImplementationRealityCheck(issueNumber, runner),
+      runCanonicalImplementationRealityCheck(
+        issueNumber,
+        runner,
+        repositorySlug,
+      ),
 
     async listOpenPullRequests(issueNumber) {
       const snapshot = await options.readSnapshot();
@@ -289,7 +302,7 @@ export function makeProductionImplementationActionPort(
         const raw = await run('git', [
           ...gitPublicationArgs(askpass, []),
           '-C', options.repositoryPath,
-          'ls-remote', CANONICAL_GITHUB_HTTPS_REMOTE, ref,
+          'ls-remote', repositoryUrl, ref,
         ]);
         const lines = raw.trimEnd().split('\n').filter((line) =>
           line.endsWith(`\t${ref}`));
@@ -327,7 +340,7 @@ export function makeProductionImplementationActionPort(
           '-C', options.repositoryPath,
           ...args,
         ]),
-        { remote: CANONICAL_GITHUB_HTTPS_REMOTE },
+        { remote: repositoryUrl },
       ).claimBranch({
         branch,
         candidateParent,
@@ -347,7 +360,7 @@ export function makeProductionImplementationActionPort(
         if (before === null) {
           await mutateWithExactReadback(
             () => run('gh', [
-              'pr', 'create', '--repo', REPO,
+              'pr', 'create', '--repo', repositorySlug,
               '--head', input.branch,
               '--base', input.targetBase,
               '--title', input.title,
@@ -366,7 +379,7 @@ export function makeProductionImplementationActionPort(
         if (!before.draft) {
           await mutateWithExactReadback(
             () => run('gh', [
-              'pr', 'ready', String(before!.number), '--repo', REPO, '--undo',
+              'pr', 'ready', String(before!.number), '--repo', repositorySlug, '--undo',
             ]),
             async () => (await readPr(input.branch, secureRunner)).draft,
             'Implementation PR draft repair was ambiguous',
@@ -380,7 +393,7 @@ export function makeProductionImplementationActionPort(
         ) {
           await mutateWithExactReadback(
             () => run('gh', [
-              'pr', 'edit', String(before.number), '--repo', REPO,
+              'pr', 'edit', String(before.number), '--repo', repositorySlug,
               '--base', input.targetBase,
               '--title', input.title,
               '--body', input.body,
@@ -411,7 +424,19 @@ export function makeProductionImplementationActionPort(
           throw new Error('Implementation Project mutation lost exact-head authority');
         }
         const secureRunner: CommandRunner = (command, args) => run(command, args);
-        const fields = await ensureFieldIds(secureRunner);
+        const fields = options.projectMapping === undefined
+          ? await ensureFieldIds(secureRunner)
+          : {
+              projectId: options.projectMapping.id,
+              status: {
+                fieldId: options.projectMapping.fields.status.id,
+                options: {
+                  'In Progress':
+                    options.projectMapping.fields.status.options.inProgress,
+                  Human: options.projectMapping.fields.status.options.human,
+                },
+              },
+            };
         await mutateWithExactReadback(
           () => run('gh', [
             'project', 'item-edit',
@@ -456,7 +481,7 @@ export function makeProductionImplementationActionPort(
       await withCredential(credential, async ({ run }) => {
         await run('gh', [
           'issue', 'close', String(issueNumber),
-          '--repo', REPO,
+          '--repo', repositorySlug,
           '--comment', comment,
         ]);
       });
@@ -470,7 +495,19 @@ export function makeProductionImplementationActionPort(
           candidate.contentType === 'Issue' && candidate.number === issueNumber);
         if (item === undefined) throw new Error('Escalated issue is missing from Project');
         const secureRunner: CommandRunner = (command, args) => run(command, args);
-        const fields = await ensureFieldIds(secureRunner);
+        const fields = options.projectMapping === undefined
+          ? await ensureFieldIds(secureRunner)
+          : {
+              projectId: options.projectMapping.id,
+              status: {
+                fieldId: options.projectMapping.fields.status.id,
+                options: {
+                  'In Progress':
+                    options.projectMapping.fields.status.options.inProgress,
+                  Human: options.projectMapping.fields.status.options.human,
+                },
+              },
+            };
         if (item.status !== 'Human') {
           await mutateWithExactReadback(
             () => run('gh', [
@@ -489,13 +526,13 @@ export function makeProductionImplementationActionPort(
         const marker =
           `<!-- jinn-autopilot-human:v2 issue=${issueNumber} phase=${reason.phase} code=${reason.code} -->`;
         const comments = async () => run('gh', [
-          'api', `repos/${REPO}/issues/${issueNumber}/comments`,
+          'api', `repos/${repositorySlug}/issues/${issueNumber}/comments`,
           '--paginate', '--jq', '.[].body',
         ]);
         if (!(await comments()).includes(marker)) {
           await mutateWithExactReadback(
             () => run('gh', [
-              'issue', 'comment', String(issueNumber), '--repo', REPO,
+              'issue', 'comment', String(issueNumber), '--repo', repositorySlug,
               '--body', `${marker}\n\n${reason.detail}`,
             ]),
             async () => (await comments()).includes(marker),

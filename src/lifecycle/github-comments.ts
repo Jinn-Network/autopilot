@@ -8,10 +8,11 @@ const MAX_COMMENT_PAGES = 100;
 export async function readIssueCommentBodies(
   run: CommandRunner,
   issueNumber: number,
+  repositorySlug = REPO,
 ): Promise<readonly string[]> {
   const bodies: string[] = [];
   for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
-    const endpoint = `repos/${REPO}/issues/${issueNumber}/comments`
+    const endpoint = `repos/${repositorySlug}/issues/${issueNumber}/comments`
       + `?per_page=${COMMENT_PAGE_SIZE}&page=${page}`;
     const parsed = JSON.parse(await run('gh', ['api', endpoint])) as unknown;
     if (!Array.isArray(parsed)) throw new Error('Issue comment REST page is malformed');

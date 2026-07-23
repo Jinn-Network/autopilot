@@ -33,6 +33,7 @@ import {
   type PaintFacts,
 } from '../src/lifecycle/board-painter.js';
 import { parseChildMarker } from '../src/lifecycle/child-issues.js';
+import type { AutopilotConfig } from '../src/config/config.js';
 
 interface OpenPrRow {
   readonly number: number;
@@ -67,10 +68,69 @@ function withToken(
   });
 }
 
-async function listOpenPullRequests(run: CommandRunner): Promise<OpenPrRow[]> {
+interface PaintBoardRuntimeOptions {
+  readonly repositorySlug: string;
+  readonly repositoryOwner: string;
+  readonly repositoryName: string;
+  readonly projectOwner: string;
+  readonly projectNumber: number;
+  readonly projectId: string;
+  readonly statusFieldId: string;
+  readonly statusOptions: Readonly<Record<
+  'Todo' | 'In Progress' | 'Human' | 'In Review' | 'Done',
+  string
+  >>;
+}
+
+function legacyPaintBoardOptions(): PaintBoardRuntimeOptions {
+  return {
+    repositorySlug: REPO,
+    repositoryOwner: ORG,
+    repositoryName: 'mono',
+    projectOwner: ORG,
+    projectNumber: PROJECT_NUMBER,
+    projectId: PROJECT_ID,
+    statusFieldId: '',
+    statusOptions: {
+      Todo: '',
+      'In Progress': '',
+      Human: '',
+      'In Review': '',
+      Done: '',
+    },
+  };
+}
+
+export function paintBoardOptionsFromConfig(
+  config: AutopilotConfig,
+): PaintBoardRuntimeOptions {
+  const [repositoryOwner, repositoryName] =
+    config.repository.slug.split('/') as [string, string];
+  return {
+    repositorySlug: config.repository.slug,
+    repositoryOwner,
+    repositoryName,
+    projectOwner: config.project.owner,
+    projectNumber: config.project.number,
+    projectId: config.project.id,
+    statusFieldId: config.project.fields.status.id,
+    statusOptions: {
+      Todo: config.project.fields.status.options.todo,
+      'In Progress': config.project.fields.status.options.inProgress,
+      Human: config.project.fields.status.options.human,
+      'In Review': config.project.fields.status.options.inReview,
+      Done: config.project.fields.status.options.done,
+    },
+  };
+}
+
+async function listOpenPullRequests(
+  run: CommandRunner,
+  options: PaintBoardRuntimeOptions,
+): Promise<OpenPrRow[]> {
   const raw = await run('gh', [
     'pr', 'list',
-    '--repo', REPO,
+    '--repo', options.repositorySlug,
     '--state', 'open',
     '--limit', '500',
     '--json', 'number,isDraft,labels,closingIssuesReferences',
@@ -80,10 +140,11 @@ async function listOpenPullRequests(run: CommandRunner): Promise<OpenPrRow[]> {
 
 async function listClaimBranchIssueNumbers(
   run: CommandRunner,
+  options: PaintBoardRuntimeOptions,
 ): Promise<ReadonlySet<number>> {
   const raw = await run('gh', [
     'api',
-    `repos/${REPO}/git/matching-refs/heads/autopilot/`,
+    `repos/${options.repositorySlug}/git/matching-refs/heads/autopilot/`,
     '--paginate',
     '--slurp',
   ]);
@@ -103,10 +164,11 @@ async function listClaimBranchIssueNumbers(
 
 async function listOpenChildIssues(
   run: CommandRunner,
+  options: PaintBoardRuntimeOptions,
 ): Promise<readonly { number: number; body: string }[]> {
   const raw = await run('gh', [
     'issue', 'list',
-    '--repo', REPO,
+    '--repo', options.repositorySlug,
     '--state', 'open',
     '--limit', '500',
     '--search', 'jinn-autopilot:child in:body',
@@ -118,6 +180,7 @@ async function listOpenChildIssues(
 async function fetchIssueRows(
   run: CommandRunner,
   issueNumbers: readonly number[],
+  options: PaintBoardRuntimeOptions,
 ): Promise<Map<number, IssueRow>> {
   const out = new Map<number, IssueRow>();
   const unique = [...new Set(issueNumbers)].sort((a, b) => a - b);
@@ -133,7 +196,8 @@ async function fetchIssueRows(
     )).join('\n');
     const query = (
       `query {\n`
-      + `  repository(owner: "${ORG}", name: "mono") {\n`
+      + `  repository(owner: "${options.repositoryOwner}", `
+      + `name: "${options.repositoryName}") {\n`
       + `${fields}\n`
       + '  }\n'
       + '}'
@@ -162,12 +226,13 @@ async function fetchIssueRows(
 async function fetchParentPrStates(
   run: CommandRunner,
   prNumbers: readonly number[],
+  options: PaintBoardRuntimeOptions,
 ): Promise<Map<number, 'open' | 'closed' | 'merged'>> {
   const out = new Map<number, 'open' | 'closed' | 'merged'>();
   for (const n of [...new Set(prNumbers)]) {
     const raw = await run('gh', [
       'pr', 'view', String(n),
-      '--repo', REPO,
+      '--repo', options.repositorySlug,
       '--json', 'state,mergedAt',
     ]);
     const pr = JSON.parse(raw) as { state: string; mergedAt: string | null };
@@ -203,16 +268,20 @@ export interface PaintBoardRunResult {
 export async function runPaintBoard(
   run: CommandRunner = defaultRunner,
   now: Date = new Date(),
+  configured: PaintBoardRuntimeOptions = legacyPaintBoardOptions(),
 ): Promise<PaintBoardRunResult> {
-  const snapshot = await fetchProjectSnapshot(run);
+  const snapshot = await fetchProjectSnapshot(run, {
+    projectOwner: configured.projectOwner,
+    projectNumber: configured.projectNumber,
+  });
   const boardIssues = snapshot.items.filter((item) => item.contentType === 'Issue');
   const issueNumbers = boardIssues.map((item) => item.number);
 
   const [openPrs, claimIssues, childIssues, issueRows] = await Promise.all([
-    listOpenPullRequests(run),
-    listClaimBranchIssueNumbers(run),
-    listOpenChildIssues(run),
-    fetchIssueRows(run, issueNumbers),
+    listOpenPullRequests(run, configured),
+    listClaimBranchIssueNumbers(run, configured),
+    listOpenChildIssues(run, configured),
+    fetchIssueRows(run, issueNumbers, configured),
   ]);
 
   const openPrByIssue = new Map<number, OpenPrRow>();
@@ -264,7 +333,11 @@ export async function runPaintBoard(
     };
   });
 
-  const parentStates = await fetchParentPrStates(run, parentPrsFromChildren);
+  const parentStates = await fetchParentPrStates(
+    run,
+    parentPrsFromChildren,
+    configured,
+  );
   const orphanChildren: OrphanChildFact[] = parsedChildren.map((child) => ({
     childIssueNumber: child.childNumber,
     parentPrNumber: child.parentPr,
@@ -278,7 +351,15 @@ export async function runPaintBoard(
     now,
   );
 
-  const fields = await ensureFieldIds(run);
+  const fields = configured.statusFieldId.length === 0
+    ? await ensureFieldIds(run)
+    : {
+        projectId: configured.projectId,
+        status: {
+          fieldId: configured.statusFieldId,
+          options: configured.statusOptions,
+        },
+      };
   let paintsApplied = 0;
   for (const paint of plan.paints) {
     await run('gh', [
@@ -305,7 +386,8 @@ export async function runPaintBoard(
   for (let offset = 0; offset < toArchive.length; offset += BOARD_ARCHIVE_BATCH_SIZE) {
     const batch = toArchive.slice(offset, offset + BOARD_ARCHIVE_BATCH_SIZE);
     await run('gh', [
-      'api', 'graphql', '-f', `query=${archiveMutation(PROJECT_ID, batch)}`,
+      'api', 'graphql', '-f',
+      `query=${archiveMutation(configured.projectId, batch)}`,
     ]);
     archived += batch.length;
   }
@@ -319,7 +401,7 @@ export async function runPaintBoard(
   for (const close of plan.orphanCloses) {
     await run('gh', [
       'issue', 'close', String(close.childIssueNumber),
-      '--repo', REPO,
+      '--repo', configured.repositorySlug,
       '--comment', `Autopilot painter: ${close.reason}; closing orphan child.`,
     ]);
     console.log(
@@ -332,7 +414,7 @@ export async function runPaintBoard(
   }
 
   console.log(
-    `[paint-board] done project=${PROJECT_NUMBER} paints=${paintsApplied} `
+    `[paint-board] done project=${configured.projectNumber} paints=${paintsApplied} `
     + `archived=${archived} orphanClosed=${orphanClosed}`,
   );
   return { paintsApplied, paintsNoop, archived, orphanClosed };

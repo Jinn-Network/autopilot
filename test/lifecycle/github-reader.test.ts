@@ -338,6 +338,44 @@ describe('GhLifecycleReader', () => {
     expect(reader.githubUsage().restRequests).toBe(2);
   });
 
+  it('uses one injected non-Jinn identity across REST and GraphQL reads', async () => {
+    const calls: string[][] = [];
+    const reader = new GhLifecycleReader(async (command, args) => {
+      calls.push(args);
+      if (command === 'gh' && args[1]?.includes('/issues?')) return '[]';
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: { issue42: {
+            closedByPullRequestsReferences: {
+              pageInfo: { hasNextPage: false },
+              nodes: [],
+            },
+          } },
+        },
+      });
+    }, {
+      repositorySlug: 'Octo-Labs/widget',
+      projectOwner: 'Octo-Labs',
+      projectNumber: 7,
+      remoteName: 'https://github.com/Octo-Labs/widget.git',
+    });
+
+    await reader.readIssues({
+      currentSprintIterationId: null,
+      getIssue: () => null,
+    });
+    await reader.readPullRequestNumbersClosingIssues([42]);
+
+    expect(calls[0]).toEqual([
+      'api',
+      'repos/Octo-Labs/widget/issues?state=open&per_page=100&page=1',
+    ]);
+    expect(calls[1]).toContain('owner=Octo-Labs');
+    expect(calls[1]).toContain('name=widget');
+    expect(calls.flat().join(' ')).not.toContain('Jinn-Network/mono');
+  });
+
   it('counts each explicit REST page used to read matching branch refs', async () => {
     const calls: string[][] = [];
     const firstPage = Array.from({ length: 100 }, (_, index) => ({

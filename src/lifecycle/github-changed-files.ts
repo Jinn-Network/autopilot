@@ -16,6 +16,7 @@ export interface ReadExactChangedFilesOptions {
   readonly expectedHead: GitOid;
   readonly expectedBaseRefName: string;
   readonly context: string;
+  readonly repositorySlug?: string;
   readonly readFiles?: (prNumber: number) => Promise<readonly string[]>;
 }
 
@@ -42,8 +43,9 @@ function filenames(raw: unknown, context: string): string[] {
 export async function readExactChangedFiles(
   options: ReadExactChangedFilesOptions,
 ): Promise<ExactChangedFiles> {
+  const repositorySlug = options.repositorySlug ?? REPO;
   const metadata = JSON.parse(await options.run('gh', [
-    'api', `repos/${REPO}/pulls/${options.prNumber}`,
+    'api', `repos/${repositorySlug}/pulls/${options.prNumber}`,
   ])) as {
     changed_files?: unknown;
     head?: { sha?: unknown };
@@ -64,7 +66,7 @@ export async function readExactChangedFiles(
   const files = options.readFiles === undefined
     ? filenames(JSON.parse(await options.run('gh', [
       'api',
-      `repos/${REPO}/pulls/${options.prNumber}/files?per_page=100`,
+      `repos/${repositorySlug}/pulls/${options.prNumber}/files?per_page=100`,
       '--paginate',
       '--slurp',
     ])), options.context)

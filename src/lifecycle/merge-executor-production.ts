@@ -16,11 +16,16 @@ import { readExactChangedFiles } from './github-changed-files.js';
 import { withSelectedCredential } from './production-auth.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
 import { gitOid, gitRefName } from './types.js';
+import type { ProjectMapping } from '../config/config.js';
 
 export interface ProductionMergeActionPortOptions {
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
   readonly authorAllowlist: ReadonlySet<string>;
   readonly expectedBaseRefName?: string;
+  readonly repositorySlug?: string;
+  readonly projectOwner?: string;
+  readonly projectNumber?: number;
+  readonly projectMapping?: ProjectMapping;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
 }
@@ -40,6 +45,7 @@ export function makeProductionMergeActionPort(
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
   const expectedBase = gitRefName(options.expectedBaseRefName ?? 'next');
+  const repositorySlug = options.repositorySlug ?? REPO;
   const withCredential = <Value>(
     credential: SelectedCredential,
     operation: Parameters<typeof withSelectedCredential<Value>>[2],
@@ -59,17 +65,18 @@ export function makeProductionMergeActionPort(
       expectedHead: pr.headOid,
       expectedBaseRefName: pr.baseRefName,
       context: 'Merge',
+      repositorySlug,
     });
     const { baseOid, files } = changedFiles;
     const codeownersRaw = JSON.parse(await runner('gh', [
-      'api', `repos/${REPO}/contents/.github/CODEOWNERS?ref=${baseOid}`,
+      'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS?ref=${baseOid}`,
     ])) as { content?: unknown };
     if (typeof codeownersRaw.content !== 'string') {
       throw new Error('Merge CODEOWNERS read was incomplete');
     }
     const compare = JSON.parse(await runner('gh', [
       'api',
-      `repos/${REPO}/compare/${baseOid}...${pr.headOid}`,
+      `repos/${repositorySlug}/compare/${baseOid}...${pr.headOid}`,
     ])) as { status?: unknown };
     const compareStatus = typeof compare.status === 'string'
       && ['ahead', 'identical', 'behind', 'diverged'].includes(compare.status)
@@ -125,7 +132,7 @@ export function makeProductionMergeActionPort(
       withCredential(credential, async ({ run }) => {
         try {
           const response = JSON.parse(await run('gh', [
-            'api', '-X', 'PUT', `repos/${REPO}/pulls/${prNumber}/merge`,
+            'api', '-X', 'PUT', `repos/${repositorySlug}/pulls/${prNumber}/merge`,
             '-f', `sha=${head}`,
             '-f', 'merge_method=squash',
           ])) as { merged?: unknown; sha?: unknown; message?: unknown };
@@ -140,7 +147,7 @@ export function makeProductionMergeActionPort(
           // Exact PR readback below classifies accepted ambiguity versus rejection.
         }
         const readback = JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', REPO,
+          'pr', 'view', String(prNumber), '--repo', repositorySlug,
           '--json', 'state,headRefOid,mergeCommit',
         ])) as {
           state?: unknown;
@@ -167,18 +174,31 @@ export function makeProductionMergeActionPort(
     reconcileDone: ({ issueNumber, prNumber, expectedHead, credential }) =>
       withCredential(credential, async ({ run }) => {
         const pr = JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', REPO,
+          'pr', 'view', String(prNumber), '--repo', repositorySlug,
           '--json', 'state,headRefOid,mergeCommit',
         ])) as { state?: unknown; headRefOid?: unknown; mergeCommit?: unknown };
         if (pr.state !== 'MERGED' || pr.headRefOid !== expectedHead || pr.mergeCommit === null) {
           throw new Error('Merged readback is not exact');
         }
-        const snapshot = await fetchProjectSnapshot(run);
+        const snapshot = await fetchProjectSnapshot(run, {
+          projectOwner: options.projectOwner,
+          projectNumber: options.projectNumber,
+        });
         const item = snapshot.items.find((entry) =>
           entry.contentType === 'Issue' && entry.number === issueNumber);
         if (item === undefined) throw new Error('Merged issue is missing from Project');
         if (item.status !== 'Done') {
-          const fields = await ensureFieldIds(run);
+          const fields = options.projectMapping === undefined
+            ? await ensureFieldIds(run)
+            : {
+                projectId: options.projectMapping.id,
+                status: {
+                  fieldId: options.projectMapping.fields.status.id,
+                  options: {
+                    Done: options.projectMapping.fields.status.options.done,
+                  },
+                },
+              };
           let mutationError: unknown;
           try {
             await run('gh', [
@@ -191,7 +211,10 @@ export function makeProductionMergeActionPort(
           } catch (error) {
             mutationError = error;
           }
-          const after = await fetchProjectSnapshot(run);
+          const after = await fetchProjectSnapshot(run, {
+            projectOwner: options.projectOwner,
+            projectNumber: options.projectNumber,
+          });
           const current = after.items.find((entry) =>
             entry.contentType === 'Issue' && entry.number === issueNumber);
           if (current?.status !== 'Done') {
@@ -206,13 +229,13 @@ export function makeProductionMergeActionPort(
         try {
           await run('gh', [
             'pr', 'update-branch', String(prNumber),
-            '--repo', REPO,
+            '--repo', repositorySlug,
           ]);
         } catch {
           // Exact readback below classifies the outcome.
         }
         const readback = JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', REPO,
+          'pr', 'view', String(prNumber), '--repo', repositorySlug,
           '--json', 'headRefOid',
         ])) as { headRefOid?: unknown };
         if (typeof readback.headRefOid !== 'string') {
@@ -227,7 +250,14 @@ export function makeProductionMergeActionPort(
 
     fileReconcileChild: ({ prNumber, effort, credential }) =>
       withCredential(credential, async ({ run }) => {
-        const port = makeProductionChildIssuePort({ runner: run });
+        const port = makeProductionChildIssuePort({
+          runner: run,
+          repo: repositorySlug,
+          fixIssueTypeId: options.projectMapping?.fields.type.options.fix,
+          projectOwner: options.projectOwner,
+          projectNumber: options.projectNumber,
+          projectMapping: options.projectMapping,
+        });
         const filed = await fileChildIssue(port, {
           parentPr: prNumber,
           kind: 'reconcile',

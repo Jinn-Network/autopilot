@@ -23,6 +23,7 @@ const PROBE_ID = '12345678-1234-4234-8234-123456789abc';
 function fakeGit(options: {
   brokenAtomicRejection?: boolean;
   loseSecondSuccessfulAtomicResponse?: boolean;
+  remoteUrl?: string;
 } = {}) {
   const refs = new Map<string, string>();
   const pushes: string[][] = [];
@@ -33,7 +34,7 @@ function fakeGit(options: {
     expect(args.splice(0, 2)).toEqual(['-C', '/repo']);
     const command = args[0];
     if (command === 'remote') {
-      return 'https://github.com/Jinn-Network/mono.git\n';
+      return `${options.remoteUrl ?? 'https://github.com/Jinn-Network/mono.git'}\n`;
     }
     if (command === 'ls-remote') {
       const ref = args[2]!;
@@ -161,6 +162,40 @@ describe('live GitHub capability probe', () => {
     expect(fake.refs.size).toBe(0);
   });
 
+  it('binds an attestation to a configured non-Jinn repository', async () => {
+    const repositoryUrl = 'https://github.com/Octo-Labs/widget.git';
+    const fake = fakeGit({ remoteUrl: repositoryUrl });
+    const attestation = await runCapabilityProbe({
+      repositoryPath: '/repo',
+      repositoryUrl,
+      remoteName: REMOTE,
+      implementerLogin: 'implementation-bot',
+      runGit: fake.runGit,
+      nextId: () => PROBE_ID,
+      now: () => new Date('2026-07-20T12:00:00.000Z'),
+    });
+
+    expect(attestation.repositoryUrl).toBe(repositoryUrl);
+    expect(readCapabilityAttestation(
+      writeFreshAttestation(attestation),
+      {
+        repositoryUrl,
+        remoteName: REMOTE,
+        configuredLogins: ['implementation-bot'],
+        now: new Date('2026-07-21T12:00:00.000Z'),
+      },
+    )).toEqual(attestation);
+    expect(() => readCapabilityAttestation(
+      writeFreshAttestation(attestation),
+      {
+        repositoryUrl: 'https://github.com/Octo-Labs/other.git',
+        remoteName: REMOTE,
+        configuredLogins: ['implementation-bot'],
+        now: new Date('2026-07-21T12:00:00.000Z'),
+      },
+    )).toThrow(/repository/i);
+  });
+
   it('refuses to overwrite an existing output path', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'jinn-capability-old-'));
     const path = join(directory, 'attestation.json');
@@ -181,3 +216,12 @@ describe('live GitHub capability probe', () => {
     expect(readFileSync(path, 'utf8')).toBe(old);
   });
 });
+
+function writeFreshAttestation(
+  attestation: Awaited<ReturnType<typeof runCapabilityProbe>>,
+): string {
+  const directory = mkdtempSync(join(tmpdir(), 'autopilot-capability-attestation-'));
+  const path = join(directory, 'attestation.json');
+  writeCapabilityAttestation(path, attestation, () => PROBE_ID);
+  return path;
+}

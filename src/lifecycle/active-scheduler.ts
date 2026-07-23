@@ -1,5 +1,6 @@
 import type { NewWorkAction } from './types.js';
 import type { GitOid } from './types.js';
+import type { MergePolicy } from '../config/config.js';
 
 export type ActiveCandidate =
   | {
@@ -73,6 +74,15 @@ export interface ActiveSchedulingSkip {
 export interface ActiveSchedulingPlan {
   readonly actions: readonly NewWorkAction[];
   readonly skips: readonly ActiveSchedulingSkip[];
+}
+
+export function applyMergePolicy(
+  candidates: readonly ActiveCandidate[],
+  policy: MergePolicy,
+): readonly ActiveCandidate[] {
+  return policy === 'manual'
+    ? candidates.filter((candidate) => candidate.phase !== 'merge')
+    : candidates;
 }
 
 function subject(candidate: ActiveCandidate): string {

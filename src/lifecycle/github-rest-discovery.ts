@@ -103,6 +103,10 @@ export interface ActionPullRequestEntry {
 
 export interface GitHubRestDiscoveryReaderOptions {
   readonly maxPages?: number;
+  readonly repositorySlug?: string;
+  readonly repositoryRestDatabaseId?: number;
+  readonly projectOwner?: string;
+  readonly projectNumber?: number;
 }
 
 export interface RestProjectSnapshotOptions {
@@ -384,7 +388,11 @@ function parseLabels(value: unknown, subject: string): string[] {
   });
 }
 
-function parseIssueIndexRow(input: unknown, index: number): OpenIssueIndexEntry | null {
+function parseIssueIndexRow(
+  input: unknown,
+  index: number,
+  repositorySlug = REPO,
+): OpenIssueIndexEntry | null {
   const issue = record(input, `open issue ${index}`);
   const number = positiveInteger(issue.number, `open issue ${index}.number`);
   if (issue.state !== 'open') {
@@ -392,8 +400,8 @@ function parseIssueIndexRow(input: unknown, index: number): OpenIssueIndexEntry 
   }
   if (Object.hasOwn(issue, 'pull_request')) {
     const marker = record(issue.pull_request, `open issue ${index}.pull_request`);
-    const apiUrl = `https://api.github.com/repos/${REPO}/pulls/${number}`;
-    const htmlUrl = `https://github.com/${REPO}/pull/${number}`;
+    const apiUrl = `https://api.github.com/repos/${repositorySlug}/pulls/${number}`;
+    const htmlUrl = `https://github.com/${repositorySlug}/pull/${number}`;
     const expected = new Map<string, string>([
       ['url', apiUrl],
       ['html_url', htmlUrl],
@@ -529,18 +537,29 @@ function parseEndpoint(endpoint: string, subject: string): ParsedEndpoint {
   return { path, query };
 }
 
-function allowedPaginationPath(original: string, linked: string): boolean {
+interface RestRepositoryContext {
+  readonly repositorySlug: string;
+  readonly repositoryRestDatabaseId: number;
+  readonly projectOwner: string;
+}
+
+function allowedPaginationPath(
+  original: string,
+  linked: string,
+  context: RestRepositoryContext,
+): boolean {
   if (linked === original) return true;
   const named = /^orgs\/([^/]+)\/projectsV2\/([1-9][0-9]*)\/(fields|items)$/.exec(original);
   const numeric = /^organizations\/([1-9][0-9]*)\/projectsV2\/([1-9][0-9]*)\/(fields|items)$/
     .exec(linked);
-  if (named?.[1] === ORG
+  if (named?.[1] === context.projectOwner
     && named[2] === numeric?.[2]
     && named[3] === numeric?.[3]) {
     return true;
   }
-  const namedRepositoryPrefix = `repos/${REPO}/`;
-  const numericRepositoryPrefix = `repositories/${REPO_REST_DATABASE_ID}/`;
+  const namedRepositoryPrefix = `repos/${context.repositorySlug}/`;
+  const numericRepositoryPrefix =
+    `repositories/${context.repositoryRestDatabaseId}/`;
   if (
     !original.startsWith(namedRepositoryPrefix)
     || !linked.startsWith(numericRepositoryPrefix)
@@ -563,6 +582,11 @@ class ConfinedPaginator {
   constructor(
     originalEndpoint: string,
     private readonly mode: PaginationMode,
+    private readonly context: RestRepositoryContext = {
+      repositorySlug: REPO,
+      repositoryRestDatabaseId: REPO_REST_DATABASE_ID,
+      projectOwner: ORG,
+    },
   ) {
     this.original = parseEndpoint(originalEndpoint, 'original endpoint');
     this.immutable = this.original.query.filter((part) => (
@@ -585,7 +609,7 @@ class ConfinedPaginator {
   next(linkedEndpoint: string | null): string | null {
     if (linkedEndpoint === null) return null;
     const linked = parseEndpoint(linkedEndpoint, 'next Link');
-    if (!allowedPaginationPath(this.original.path, linked.path)) {
+    if (!allowedPaginationPath(this.original.path, linked.path, this.context)) {
       throw new GitHubRestPaginationError('next Link changed the resource path');
     }
     const linkedByKey = new Map(linked.query.map((part) => [part.key, part.value]));
@@ -659,15 +683,32 @@ class ConfinedPaginator {
 
 export class GitHubRestDiscoveryReader {
   private readonly maxPages: number;
+  private readonly repositorySlug: string;
+  private readonly repositoryRestDatabaseId: number;
+  private readonly projectOwner: string;
+  private readonly projectNumber: number;
 
   constructor(
     private readonly rest: ConditionalRestClient,
     options: GitHubRestDiscoveryReaderOptions = {},
   ) {
     this.maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+    this.repositorySlug = options.repositorySlug ?? REPO;
+    this.repositoryRestDatabaseId =
+      options.repositoryRestDatabaseId ?? REPO_REST_DATABASE_ID;
+    this.projectOwner = options.projectOwner ?? ORG;
+    this.projectNumber = options.projectNumber ?? PROJECT_NUMBER;
     if (!Number.isSafeInteger(this.maxPages) || this.maxPages <= 0) {
       throw new Error('GitHub REST maxPages must be a positive integer');
     }
+  }
+
+  private paginatorContext(): RestRepositoryContext {
+    return {
+      repositorySlug: this.repositorySlug,
+      repositoryRestDatabaseId: this.repositoryRestDatabaseId,
+      projectOwner: this.projectOwner,
+    };
   }
 
   private async readPages(
@@ -679,7 +720,11 @@ export class GitHubRestDiscoveryReader {
   }> {
     const allRows: unknown[] = [];
     const seen = new Set<string>();
-    const paginator = new ConfinedPaginator(startEndpoint, mode);
+    const paginator = new ConfinedPaginator(
+      startEndpoint,
+      mode,
+      this.paginatorContext(),
+    );
     let endpoint: string | null = startEndpoint;
     let last: ConditionalRestResponse | null = null;
     for (let page = 1; endpoint !== null; page += 1) {
@@ -700,7 +745,9 @@ export class GitHubRestDiscoveryReader {
 
   async readIssueForAction(issueNumber: number): Promise<ActionIssueEntry | null> {
     positiveInteger(issueNumber, 'target issue number');
-    const response = await this.rest.getJson(`repos/${REPO}/issues/${issueNumber}`);
+    const response = await this.rest.getJson(
+      `repos/${this.repositorySlug}/issues/${issueNumber}`,
+    );
     const issue = record(response.body, `target issue ${issueNumber}`);
     if (positiveInteger(issue.number, `target issue ${issueNumber}.number`) !== issueNumber) {
       throw new GitHubRestSchemaError('target issue response returned a different number');
@@ -724,7 +771,7 @@ export class GitHubRestDiscoveryReader {
   async readBlockedByIssueNumbersForAction(issueNumber: number): Promise<readonly number[]> {
     positiveInteger(issueNumber, 'target dependency issue number');
     const pages = await this.readPages(
-      `repos/${REPO}/issues/${issueNumber}/dependencies/blocked_by`
+      `repos/${this.repositorySlug}/issues/${issueNumber}/dependencies/blocked_by`
         + `?per_page=${PAGE_SIZE}&page=1`,
       'page',
     );
@@ -733,7 +780,9 @@ export class GitHubRestDiscoveryReader {
 
   async readPullRequestForAction(prNumber: number): Promise<ActionPullRequestEntry | null> {
     positiveInteger(prNumber, 'target pull request number');
-    const response = await this.rest.getJson(`repos/${REPO}/pulls/${prNumber}`);
+    const response = await this.rest.getJson(
+      `repos/${this.repositorySlug}/pulls/${prNumber}`,
+    );
     const pr = record(response.body, `target pull request ${prNumber}`);
     if (positiveInteger(pr.number, `target pull request ${prNumber}.number`) !== prNumber) {
       throw new GitHubRestSchemaError('target pull request response returned a different number');
@@ -762,13 +811,15 @@ export class GitHubRestDiscoveryReader {
     options: RestProjectSnapshotOptions = {},
   ): Promise<ProjectSnapshot> {
     const fieldPages = await this.readPages(
-      `orgs/${ORG}/projectsV2/${PROJECT_NUMBER}/fields?per_page=${PAGE_SIZE}`,
+      `orgs/${this.projectOwner}/projectsV2/${this.projectNumber}/fields`
+        + `?per_page=${PAGE_SIZE}`,
       'after',
     );
     const fields = discoverFields(fieldPages.rows);
     const fieldIds = PROJECT_FIELDS.map(([name]) => fields.get(name)!.id);
     const itemPages = await this.readPages(
-      `orgs/${ORG}/projectsV2/${PROJECT_NUMBER}/items?fields=${fieldIds.join(',')}`
+      `orgs/${this.projectOwner}/projectsV2/${this.projectNumber}`
+        + `/items?fields=${fieldIds.join(',')}`
         + `&per_page=${PAGE_SIZE}`,
       'after',
     );
@@ -796,7 +847,7 @@ export class GitHubRestDiscoveryReader {
         || item.blockedOn !== 'Another issue'
       ) continue;
       const dependencyPages = await this.readPages(
-        `repos/${REPO}/issues/${item.number}/dependencies/blocked_by`
+        `repos/${this.repositorySlug}/issues/${item.number}/dependencies/blocked_by`
           + `?per_page=${PAGE_SIZE}&page=1`,
         'page',
       );
@@ -820,18 +871,18 @@ export class GitHubRestDiscoveryReader {
 
   async readOpenIssueIndex(): Promise<readonly OpenIssueIndexEntry[]> {
     const pages = await this.readPages(
-      `repos/${REPO}/issues?state=open&sort=updated&direction=desc`
+      `repos/${this.repositorySlug}/issues?state=open&sort=updated&direction=desc`
         + `&per_page=${PAGE_SIZE}&page=1`,
       'page+after',
     );
     return pages.rows
-      .map(parseIssueIndexRow)
+      .map((row, index) => parseIssueIndexRow(row, index, this.repositorySlug))
       .filter((issue): issue is OpenIssueIndexEntry => issue !== null);
   }
 
   async readOpenPullRequestIndex(): Promise<readonly PullRequestIndexEntry[]> {
     const pages = await this.readPages(
-      `repos/${REPO}/pulls?state=open&sort=updated&direction=desc`
+      `repos/${this.repositorySlug}/pulls?state=open&sort=updated&direction=desc`
         + `&per_page=${PAGE_SIZE}&page=1`,
       'page',
     );
@@ -845,9 +896,13 @@ export class GitHubRestDiscoveryReader {
     const result: PullRequestIndexEntry[] = [];
     const seen = new Set<string>();
     let endpoint: string | null =
-      `repos/${REPO}/pulls?state=closed&sort=updated&direction=desc`
+      `repos/${this.repositorySlug}/pulls?state=closed&sort=updated&direction=desc`
       + `&per_page=${PAGE_SIZE}&page=1`;
-    const paginator = new ConfinedPaginator(endpoint, 'page');
+    const paginator = new ConfinedPaginator(
+      endpoint,
+      'page',
+      this.paginatorContext(),
+    );
     let previousUpdatedMs = Number.POSITIVE_INFINITY;
     for (let page = 1; endpoint !== null; page += 1) {
       if (page > this.maxPages) {

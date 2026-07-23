@@ -13,6 +13,7 @@ import {
   type ChildIssueRecord,
   type ChildKind,
 } from './child-issues.js';
+import type { ProjectMapping } from '../config/config.js';
 
 /** Org-level Issue Type node id for `fix` (see file-issue gh-taxonomy). */
 export const FIX_ISSUE_TYPE_ID = 'IT_kwDODh3-Ac4BvpyK';
@@ -29,6 +30,9 @@ export interface ProductionChildIssuePortOptions {
   readonly runner?: CommandRunner;
   readonly repo?: string;
   readonly fixIssueTypeId?: string;
+  readonly projectOwner?: string;
+  readonly projectNumber?: number;
+  readonly projectMapping?: ProjectMapping;
 }
 
 function parseIssueList(raw: string): readonly {
@@ -109,7 +113,12 @@ export function makeProductionChildIssuePort(
   const runner = options.runner ?? defaultRunner;
   const repo = options.repo ?? REPO;
   const fixTypeId = options.fixIssueTypeId ?? FIX_ISSUE_TYPE_ID;
-  const triageApplier = createProjectTriageApplier(runner, { repo });
+  const triageApplier = createProjectTriageApplier(runner, {
+    repo,
+    projectOwner: options.projectOwner,
+    projectNumber: options.projectNumber,
+    projectMapping: options.projectMapping,
+  });
 
   const listOpen = async (): Promise<readonly ChildIssueRecord[]> => {
     const raw = await runner('gh', [

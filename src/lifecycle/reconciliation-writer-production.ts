@@ -114,6 +114,9 @@ export interface ProductionReconciliationWriterOptions {
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
+  readonly repositorySlug?: string;
+  readonly repositoryUrl?: string;
+  readonly defaultBranch?: string;
 }
 
 interface ActionAuthorityScope {
@@ -294,6 +297,10 @@ function makeProductionReconciliationWriterWithScope(
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
   const now = options.now ?? (() => new Date());
+  const repositorySlug = options.repositorySlug ?? REPO;
+  const repositoryUrl =
+    options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
+  const defaultBranch = options.defaultBranch ?? 'next';
   if (options.cycleSnapshot.snapshotComplete !== true) {
     throw new Error('Reconciliation writer requires a complete cycle snapshot');
   }
@@ -519,7 +526,7 @@ function makeProductionReconciliationWriterWithScope(
           async () => {
             invalidateActionAuthority();
             const outcome = await makeGitProtocolPort(secureGit, {
-              remote: CANONICAL_GITHUB_HTTPS_REMOTE,
+              remote: repositoryUrl,
             }).publishReviewClaim({
               prNumber,
               recordParent: expectedReviewRefOid,
@@ -592,7 +599,7 @@ function makeProductionReconciliationWriterWithScope(
         () => {
           invalidateActionAuthority();
           return run('gh', [
-            'pr', 'ready', String(prNumber), '--repo', REPO,
+            'pr', 'ready', String(prNumber), '--repo', repositorySlug,
             ...(draft ? ['--undo'] : []),
           ]);
         },
@@ -628,7 +635,7 @@ function makeProductionReconciliationWriterWithScope(
         () => {
           invalidateActionAuthority();
           return run('gh', [
-            'pr', 'edit', String(prNumber), '--repo', REPO,
+            'pr', 'edit', String(prNumber), '--repo', repositorySlug,
             present ? '--add-label' : '--remove-label', label,
           ]);
         },
@@ -644,7 +651,11 @@ function makeProductionReconciliationWriterWithScope(
 
     async hasHumanComment(prNumber, marker) {
       return selected(async ({ run }) => {
-        const bodies = await readIssueCommentBodies(run, prNumber);
+        const bodies = await readIssueCommentBodies(
+          run,
+          prNumber,
+          repositorySlug,
+        );
         return bodies.some((body) => body.includes(marker));
       });
     },
@@ -660,13 +671,14 @@ function makeProductionReconciliationWriterWithScope(
       }
       await selected(async ({ run }) => {
         const hasMarker = async () => (
-          await readIssueCommentBodies(run, prNumber)
+          await readIssueCommentBodies(run, prNumber, repositorySlug)
         ).some((body) => body.includes(marker));
         await mutateWithExactReadback(
           () => {
             invalidateActionAuthority();
             return run('gh', [
-              'pr', 'comment', String(prNumber), '--repo', REPO, '--body', body,
+              'pr', 'comment', String(prNumber),
+              '--repo', repositorySlug, '--body', body,
             ]);
           },
           async () => {
@@ -693,7 +705,8 @@ function makeProductionReconciliationWriterWithScope(
         () => {
           invalidateActionAuthority();
           return run('gh', [
-            'pr', 'edit', String(prNumber), '--repo', REPO, '--body', desired,
+            'pr', 'edit', String(prNumber),
+            '--repo', repositorySlug, '--body', desired,
           ]);
         },
         async () => {
@@ -787,8 +800,13 @@ function makeProductionReconciliationWriterWithScope(
       }
       const cycleOpenBlocker = [...cycleOpenBlockers.values()][0];
       if (cycleOpenBlocker === undefined) {
-        if (expectedDependencies.length > 0 && input.baseRefName !== 'next') {
-          throw new Error('Draft PR reconciliation merged blockers require the next base');
+        if (
+          expectedDependencies.length > 0
+          && input.baseRefName !== defaultBranch
+        ) {
+          throw new Error(
+            'Draft PR reconciliation merged blockers require the configured default base',
+          );
         }
       } else {
         if (input.baseRefName !== cycleOpenBlocker.headRefName) {
@@ -847,7 +865,7 @@ function makeProductionReconciliationWriterWithScope(
         () => {
           invalidateActionAuthority();
           return run('gh', [
-            'pr', 'create', '--repo', REPO,
+            'pr', 'create', '--repo', repositorySlug,
             '--head', input.headRefName,
             '--base', input.baseRefName,
             '--title', nativeIssue.title,

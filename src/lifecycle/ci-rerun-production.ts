@@ -21,12 +21,17 @@ import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import { gitPublicationArgs } from './credentials.js';
 import { gitOid, type GitOid, type PublicationOutcome } from './types.js';
 import type { CheckSummary } from './types.js';
+import type { ProjectMapping } from '../config/config.js';
 
 export interface ProductionCiRerunPortOptions {
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
   readonly repositoryPath: string;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly repositorySlug?: string;
+  readonly repositoryUrl?: string;
+  readonly fixIssueTypeId?: string;
+  readonly projectMapping?: ProjectMapping;
 }
 
 function formatFailedChecksBody(
@@ -48,11 +53,12 @@ async function readRefCommitMessage(
   askpass: string,
   environment: Record<string, string>,
   ref: string,
+  repositoryUrl: string,
 ): Promise<string | null> {
   const raw = await run('git', [
     ...gitPublicationArgs(askpass, []),
     '-C', repositoryPath,
-    'ls-remote', CANONICAL_GITHUB_HTTPS_REMOTE, ref,
+    'ls-remote', repositoryUrl, ref,
   ], { env: environment });
   const line = raw.trimEnd().split('\n').find((entry) => entry.endsWith(`\t${ref}`));
   if (line === undefined) return null;
@@ -71,12 +77,13 @@ async function publishCiRerunRecord(
   askpass: string,
   environment: Record<string, string>,
   record: CiRerunRecord,
+  repositoryUrl: string,
 ): Promise<PublicationOutcome> {
   const ref = ciRerunRef(record.prNumber, record.head);
   const before = await run('git', [
     ...gitPublicationArgs(askpass, []),
     '-C', repositoryPath,
-    'ls-remote', CANONICAL_GITHUB_HTTPS_REMOTE, ref,
+    'ls-remote', repositoryUrl, ref,
   ], { env: environment }).catch(() => '');
   const beforeLine = before.trimEnd().split('\n').find((entry) => entry.endsWith(`\t${ref}`));
   const expectedRemoteOid = beforeLine === undefined
@@ -101,14 +108,14 @@ async function publishCiRerunRecord(
     await run('git', [
       ...gitPublicationArgs(askpass, []),
       '-C', repositoryPath,
-      'push', lease, CANONICAL_GITHUB_HTTPS_REMOTE, `${published}:${ref}`,
+      'push', lease, repositoryUrl, `${published}:${ref}`,
     ], { env: environment });
     return { status: 'won', expected: expectedRemoteOid, published, observed: published };
   } catch {
     const after = await run('git', [
       ...gitPublicationArgs(askpass, []),
       '-C', repositoryPath,
-      'ls-remote', CANONICAL_GITHUB_HTTPS_REMOTE, ref,
+      'ls-remote', repositoryUrl, ref,
     ], { env: environment }).catch(() => '');
     const afterLine = after.trimEnd().split('\n').find((entry) => entry.endsWith(`\t${ref}`));
     const observed = afterLine === undefined ? null : gitOid(afterLine.split('\t')[0]!);
@@ -128,6 +135,9 @@ export function makeProductionCiRerunDeps(
 ): CiRerunDeps {
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
+  const repositorySlug = options.repositorySlug ?? REPO;
+  const repositoryUrl =
+    options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   return {
     readChecks: async (prNumber) => {
       const snapshot = await options.readSnapshot();
@@ -144,6 +154,7 @@ export function makeProductionCiRerunDeps(
           askpass,
           environment,
           ciRerunRef(prNumber, head),
+          repositoryUrl,
         );
         return message === null ? null : decodeCiRerunRecord(message);
       },
@@ -155,7 +166,7 @@ export function makeProductionCiRerunDeps(
       async ({ run }) => {
         await run('gh', [
           'api',
-          `repos/${REPO}/actions/runs/${runId}/rerun-failed-jobs`,
+          `repos/${repositorySlug}/actions/runs/${runId}/rerun-failed-jobs`,
           '-X', 'POST',
         ]);
       },
@@ -170,12 +181,20 @@ export function makeProductionCiRerunDeps(
         askpass,
         environment,
         record,
+        repositoryUrl,
       ),
       runner,
     ),
     fileCiFailureChild: async ({ prNumber, head, classification, record }) =>
       withSelectedCredential(credential, ambient, async ({ run }) => {
-        const port = makeProductionChildIssuePort({ runner: run });
+        const port = makeProductionChildIssuePort({
+          runner: run,
+          repo: repositorySlug,
+          fixIssueTypeId: options.fixIssueTypeId,
+          projectOwner: options.projectMapping?.owner,
+          projectNumber: options.projectMapping?.number,
+          projectMapping: options.projectMapping,
+        });
         const filed = await fileChildIssue(port, {
           parentPr: prNumber,
           kind: 'ci-failure',

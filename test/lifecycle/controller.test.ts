@@ -715,6 +715,74 @@ describe('lifecycle controller', () => {
     );
   });
 
+  it('keeps merge-ready visible but never constructs a merge action under manual policy', async () => {
+    const mergeReady = implementation({
+      projectStatus: 'In Review',
+      approved: true,
+      needsReview: false,
+      mergeState: 'clean',
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{
+        source: 'check-run',
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+      }],
+    });
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+    const active = {
+      preflight: async () => ({ ok: true }),
+      readLocalState: () => ({
+        remaining: { implementation: 1, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      }),
+      implementationBackpressureThreshold: 10,
+      executeAction: async (action: unknown) => {
+        actions.push(action);
+        return { outcome: 'spawned' };
+      },
+    };
+
+    const manual = await runLifecycleCycle('active', {
+      ...deps(mergeReady, [], noOpWriter),
+      mergePolicy: 'manual',
+      active,
+    });
+    expect(manual.items[0]).toMatchObject({ phase: 'merge-ready' });
+    expect(actions).toEqual([]);
+
+    await runLifecycleCycle('active', {
+      ...deps(mergeReady, [], noOpWriter),
+      mergePolicy: 'safe-auto',
+      active,
+    });
+    expect(actions).toEqual([{
+      kind: 'merge',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+    }]);
+  });
+
   it.skip('reports legacy stale-looking items without reaping them', async () => {
     const calls: string[] = [];
     const legacy = implementation({

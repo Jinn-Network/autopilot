@@ -6,6 +6,7 @@
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { ORG, PROJECT_NUMBER, REPO } from '../dispatcher/constants.js';
 import { PROJECT_ID } from '../dispatcher/field-cache.js';
+import type { ProjectMapping } from '../config/config.js';
 
 export type MachineTriageEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type MachineTriagePriority = 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
@@ -50,7 +51,10 @@ export function parseItemAddId(raw: string): string {
   return id;
 }
 
-export function parseTriageFields(raw: string): TriageFields {
+export function parseTriageFields(
+  raw: string,
+  projectId = PROJECT_ID,
+): TriageFields {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw) as unknown;
@@ -128,7 +132,7 @@ export function parseTriageFields(raw: string): TriageFields {
   }
 
   return {
-    projectId: PROJECT_ID,
+    projectId,
     blockedOn: { fieldId: blockedOn.id, nothingOptionId },
     effort: { fieldId: effort.id, options: effortOptions },
     priority: { fieldId: priority.id, options: priorityOptions },
@@ -145,16 +149,54 @@ export interface ProjectTriageApplier {
 
 export function createProjectTriageApplier(
   runner: CommandRunner,
-  options: { readonly repo?: string } = {},
+  options: {
+    readonly repo?: string;
+    readonly projectOwner?: string;
+    readonly projectNumber?: number;
+    readonly projectMapping?: ProjectMapping;
+  } = {},
 ): ProjectTriageApplier {
   const repo = options.repo ?? REPO;
+  const projectOwner = options.projectOwner ?? ORG;
+  const projectNumber = options.projectNumber ?? PROJECT_NUMBER;
   let triageFields: TriageFields | undefined;
 
   const loadTriageFields = async (): Promise<TriageFields> => {
     if (triageFields !== undefined) return triageFields;
+    if (options.projectMapping !== undefined) {
+      const mapping = options.projectMapping;
+      triageFields = {
+        projectId: mapping.id,
+        blockedOn: {
+          fieldId: mapping.fields.blockedOn.id,
+          nothingOptionId: mapping.fields.blockedOn.options.nothing,
+        },
+        effort: {
+          fieldId: mapping.fields.effort.id,
+          options: {
+            Low: mapping.fields.effort.options.low,
+            Medium: mapping.fields.effort.options.medium,
+            High: mapping.fields.effort.options.high,
+            XHigh: mapping.fields.effort.options.xhigh,
+            Max: mapping.fields.effort.options.max,
+          },
+        },
+        priority: {
+          fieldId: mapping.fields.priority.id,
+          options: {
+            P0: mapping.fields.priority.options.p0,
+            P1: mapping.fields.priority.options.p1,
+            P2: mapping.fields.priority.options.p2,
+            P3: mapping.fields.priority.options.p3,
+            P4: mapping.fields.priority.options.p4,
+          },
+        },
+      };
+      return triageFields;
+    }
     const raw = await runner('gh', [
-      'project', 'field-list', String(PROJECT_NUMBER),
-      '--owner', ORG,
+      'project', 'field-list', String(projectNumber),
+      '--owner', projectOwner,
       '--format', 'json',
     ]);
     triageFields = parseTriageFields(raw);
@@ -168,9 +210,9 @@ export function createProjectTriageApplier(
       const itemRaw = await runner('gh', [
         'project',
         'item-add',
-        String(PROJECT_NUMBER),
+        String(projectNumber),
         '--owner',
-        ORG,
+        projectOwner,
         '--url',
         issueUrl,
         '--format',

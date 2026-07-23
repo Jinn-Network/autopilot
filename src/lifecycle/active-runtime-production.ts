@@ -62,6 +62,7 @@ import type {
   TargetedOpenPullRequest,
 } from './targeted-action-reader.js';
 import type { GitOid, HumanReason } from './types.js';
+import type { ProjectMapping } from '../config/config.js';
 
 export const AUTOPILOT_V2_REMOTE = 'jinn-autopilot-v2';
 
@@ -109,6 +110,10 @@ export interface ProductionActiveRuntimeOptions {
   readonly nextId?: () => string;
   readonly isPidAlive?: (pid: number) => boolean;
   readonly remoteName?: string;
+  readonly repositorySlug?: string;
+  readonly repositoryUrl?: string;
+  readonly defaultBranch?: string;
+  readonly projectMapping?: ProjectMapping;
   /**
    * Injectable delay for the bounded post-win confirmation retries in
    * review-claim acquisition (replication-lag tolerance;
@@ -167,6 +172,7 @@ export function makeProductionCapabilityPreflight(
   | 'environment'
   | 'now'
   | 'readCapabilityAttestation'
+  | 'repositoryUrl'
   >,
 ): () => Promise<{ readonly ok: boolean; readonly detail?: string }> {
   const runner = options.runner ?? defaultRunner;
@@ -175,6 +181,8 @@ export function makeProductionCapabilityPreflight(
   const now = options.now ?? (() => new Date());
   const readAttestation =
     options.readCapabilityAttestation ?? readCapabilityAttestation;
+  const repositoryUrl =
+    options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   return async () => {
     try {
       if (options.credentials.logins().length === 0) {
@@ -184,7 +192,7 @@ export function makeProductionCapabilityPreflight(
         '-C', options.repositoryPath,
         'remote', 'get-url', remoteName,
       ])).trim();
-      if (url !== CANONICAL_GITHUB_HTTPS_REMOTE) {
+      if (url !== repositoryUrl) {
         throw new Error(
           `${remoteName} must be the canonical HTTPS GitHub remote`,
         );
@@ -197,6 +205,7 @@ export function makeProductionCapabilityPreflight(
       }
       readAttestation(attestationPath, {
         remoteName,
+        repositoryUrl,
         configuredLogins: options.credentials.logins(),
         now: now(),
       });
@@ -292,6 +301,9 @@ export function makeProductionActiveRuntime(
       credential: selection.credential,
       runner,
       environment: ambient,
+      repositorySlug: options.repositorySlug,
+      repositoryUrl: options.repositoryUrl,
+      defaultBranch: options.defaultBranch,
       now,
     });
     const before = await writer.readPullRequest(input.candidate.number);
@@ -353,11 +365,16 @@ export function makeProductionActiveRuntime(
           readSnapshot: options.readSnapshot,
           runner,
           environment: ambient,
+          repositorySlug: options.repositorySlug,
+          repositoryUrl: options.repositoryUrl,
+          defaultBranch: options.defaultBranch,
+          projectMapping: options.projectMapping,
         });
         return executeImplementationAction(action, {
           ...port,
           credentials,
-          remoteUrl: CANONICAL_GITHUB_HTTPS_REMOTE,
+          remoteUrl:
+            options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE,
           ambientEnvironment: ambient,
           nextAttemptId: nextId,
           runnerId: options.runnerId,
@@ -376,6 +393,9 @@ export function makeProductionActiveRuntime(
           readSnapshot: options.readSnapshot,
           runner,
           environment: ambient,
+          repositorySlug: options.repositorySlug,
+          repositoryUrl: options.repositoryUrl,
+          projectMapping: options.projectMapping,
         });
         return executeReviewAction({
           prNumber: action.prNumber,
@@ -404,6 +424,11 @@ export function makeProductionActiveRuntime(
         ...makeProductionMergeActionPort({
           readSnapshot: options.readSnapshot,
           authorAllowlist: options.authorAllowlist,
+          expectedBaseRefName: options.defaultBranch,
+          repositorySlug: options.repositorySlug,
+          projectOwner: options.projectMapping?.owner,
+          projectNumber: options.projectMapping?.number,
+          projectMapping: options.projectMapping,
           runner,
           environment: ambient,
         }),
@@ -418,6 +443,11 @@ export function makeProductionActiveRuntime(
           ...makeProductionMergeActionPort({
             readSnapshot: options.readSnapshot,
             authorAllowlist: options.authorAllowlist,
+            expectedBaseRefName: options.defaultBranch,
+            repositorySlug: options.repositorySlug,
+            projectOwner: options.projectMapping?.owner,
+            projectNumber: options.projectMapping?.number,
+            projectMapping: options.projectMapping,
             runner,
             environment: ambient,
           }),
@@ -440,6 +470,11 @@ export function makeProductionActiveRuntime(
           ...makeProductionMergeActionPort({
             readSnapshot: options.readSnapshot,
             authorAllowlist: options.authorAllowlist,
+            expectedBaseRefName: options.defaultBranch,
+            repositorySlug: options.repositorySlug,
+            projectOwner: options.projectMapping?.owner,
+            projectNumber: options.projectMapping?.number,
+            projectMapping: options.projectMapping,
             runner,
             environment: ambient,
           }),
@@ -482,6 +517,10 @@ export function makeProductionActiveRuntime(
             repositoryPath: options.repositoryPath,
             runner,
             environment: ambient,
+            repositorySlug: options.repositorySlug,
+            repositoryUrl: options.repositoryUrl,
+            fixIssueTypeId: options.projectMapping?.fields.type.options.fix,
+            projectMapping: options.projectMapping,
           },
           selection.credential,
         );
@@ -499,6 +538,10 @@ export function makeProductionActiveRuntime(
             repositoryPath: options.repositoryPath,
             runner,
             environment: ambient,
+            repositorySlug: options.repositorySlug,
+            repositoryUrl: options.repositoryUrl,
+            fixIssueTypeId: options.projectMapping?.fields.type.options.fix,
+            projectMapping: options.projectMapping,
           },
           selection.credential,
         );

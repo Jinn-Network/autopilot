@@ -109,6 +109,21 @@ function makeFakeRunner(): CommandRunner {
 }
 
 describe('GhIssueSource', () => {
+  it('uses an injected non-Jinn repository slug for REST discovery', async () => {
+    const calls: string[][] = [];
+    const source = new GhIssueSource(async (_command, args) => {
+      calls.push(args);
+      return '[]';
+    }, { repositorySlug: 'Octo-Labs/widget' });
+
+    await source.poll(toIssueBoardState(SNAPSHOT));
+
+    expect(calls).toEqual([[
+      'api',
+      'repos/Octo-Labs/widget/issues?state=open&per_page=100&page=1',
+    ]]);
+  });
+
   it('maps an issue on the board with Issue Type to a fully-populated PolledIssue', async () => {
     const source = new GhIssueSource(makeFakeRunner());
     const issues = await source.poll(toIssueBoardState(SNAPSHOT));

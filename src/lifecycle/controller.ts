@@ -21,10 +21,12 @@ import {
   type SnapshotReadMode,
 } from './snapshot.js';
 import {
+  applyMergePolicy,
   scheduleActiveActions,
   type ActiveCandidate,
   type ActiveSchedulingSkip,
 } from './active-scheduler.js';
+import type { MergePolicy } from '../config/config.js';
 import { childrenPathEnabled, isMachineChildIssue } from './child-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
@@ -74,6 +76,12 @@ export interface LifecycleControllerDeps {
   readonly rateLimitFloor?: number;
   /** Persistent runners report pre-mutation snapshot failures and retry next cadence. */
   readonly snapshotFailureMode?: 'throw' | 'report';
+  /**
+   * The temporary internal default remains safe-auto until the Jinn consumer
+   * configuration lands. Every product entry point supplies this explicitly,
+   * and initialization writes manual.
+   */
+  readonly mergePolicy?: MergePolicy;
   readonly active?: {
     preflight(): Promise<{ readonly ok: boolean; readonly detail?: string }>;
     readLocalState(): {
@@ -1044,7 +1052,10 @@ export async function runLifecycleCycle(
     const openPipelineBacklog = snapshot.pullRequests.filter((pr) => (
       pr.state === 'OPEN' && pr.labels.includes('engine:review')
     )).length;
-    const candidates = activeCandidates(snapshot, view).filter((candidate) => (
+    const candidates = applyMergePolicy(
+      activeCandidates(snapshot, view),
+      deps.mergePolicy ?? 'manual',
+    ).filter((candidate) => (
       !blockedIssues.has(candidate.issueNumber)
       && matchesOnlyIssuesAllowlist(candidate.issueNumber, deps.active!.onlyIssues)
     ));

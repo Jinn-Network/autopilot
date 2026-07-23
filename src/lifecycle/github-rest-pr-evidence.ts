@@ -264,22 +264,27 @@ function canonicalChecks(checks: readonly CheckSummary[]): string {
 }
 
 export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceProbe {
-  constructor(private readonly rest: ConditionalRestClient) {}
+  constructor(
+    private readonly rest: ConditionalRestClient,
+    private readonly repositorySlug: string = REPO,
+  ) {}
 
   async changed(pr: PullRequestSnapshot): Promise<boolean> {
     if (pr.state !== 'OPEN') return false;
-    const detailResponse = await this.rest.getJson(`repos/${REPO}/pulls/${pr.number}`);
+    const detailResponse = await this.rest.getJson(
+      `repos/${this.repositorySlug}/pulls/${pr.number}`,
+    );
     const reviewResponse = await this.rest.getJson(
-      `repos/${REPO}/pulls/${pr.number}/reviews?per_page=100&page=1`,
+      `repos/${this.repositorySlug}/pulls/${pr.number}/reviews?per_page=100&page=1`,
     );
     const commentResponse = await this.rest.getJson(
-      `repos/${REPO}/issues/${pr.number}/comments?per_page=100&page=1`,
+      `repos/${this.repositorySlug}/issues/${pr.number}/comments?per_page=100&page=1`,
     );
     const checkResponse = await this.rest.getJson(
-      `repos/${REPO}/commits/${pr.headOid}/check-runs?per_page=100&page=1`,
+      `repos/${this.repositorySlug}/commits/${pr.headOid}/check-runs?per_page=100&page=1`,
     );
     const statusResponse = await this.rest.getJson(
-      `repos/${REPO}/commits/${pr.headOid}/status?per_page=100&page=1`,
+      `repos/${this.repositorySlug}/commits/${pr.headOid}/status?per_page=100&page=1`,
     );
     const detail = exactPullRequestDetail(
       completeBody(detailResponse, 'PR detail'),

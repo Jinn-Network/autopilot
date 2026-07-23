@@ -39,12 +39,16 @@ import {
   gitRefName,
   type GitOid,
 } from './types.js';
+import type { ProjectMapping } from '../config/config.js';
 
 export interface ProductionReviewActionPortOptions {
   readonly repositoryPath: string;
   readonly worktreeBase: string;
   readonly runnerId: string;
   readonly remoteName?: string;
+  readonly repositorySlug?: string;
+  readonly repositoryUrl?: string;
+  readonly projectMapping?: ProjectMapping;
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
   readonly changedFiles?: (prNumber: number) => Promise<readonly string[]>;
   readonly codeownersText?: (input: {
@@ -76,6 +80,9 @@ export function makeProductionReviewActionPort(
 ): ProductionReviewActionPort {
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
+  const repositorySlug = options.repositorySlug ?? REPO;
+  const repositoryUrl =
+    options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   const runRepositoryGit = (
     args: string[],
     env: Record<string, string> = {},
@@ -141,7 +148,7 @@ export function makeProductionReviewActionPort(
       return options.codeownersText(input);
     }
     const contents = JSON.parse(await runner('gh', [
-      'api', `repos/${REPO}/contents/.github/CODEOWNERS`,
+      'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS`,
       '--method', 'GET',
       '-f', `ref=${input.baseOid}`,
     ])) as {
@@ -176,6 +183,7 @@ export function makeProductionReviewActionPort(
       expectedHead: pr.headOid,
       expectedBaseRefName: pr.baseRefName,
       context: 'Review',
+      repositorySlug,
       ...(options.changedFiles === undefined
         ? {}
         : { readFiles: options.changedFiles }),
@@ -282,7 +290,7 @@ export function makeProductionReviewActionPort(
         ...args,
       ], { env: environment });
       return makeGitProtocolPort(secureRunner, {
-        remote: CANONICAL_GITHUB_HTTPS_REMOTE,
+        remote: repositoryUrl,
       }).publishReviewClaim({
         prNumber,
         recordParent,
@@ -323,13 +331,13 @@ export function makeProductionReviewActionPort(
           ...args,
         ], { env: environment });
         const ref = `refs/jinn-autopilot/review-claims/v1/${candidate.number}`;
-        const raw = await git(['ls-remote', CANONICAL_GITHUB_HTTPS_REMOTE, ref]);
+        const raw = await git(['ls-remote', repositoryUrl, ref]);
         if (!raw.includes(`${expectedReviewRefOid}\t${ref}`)) {
           throw new Error('Review projection lost exact review-ref authority');
         }
         const gh: CommandRunner = (cmd, args) => runner(cmd, args, { env: environment });
         const readPr = async () => JSON.parse(await gh('gh', [
-          'pr', 'view', String(candidate.number), '--repo', REPO,
+          'pr', 'view', String(candidate.number), '--repo', repositorySlug,
           '--json', 'headRefOid,labels,isDraft',
         ])) as {
           headRefOid?: string;
@@ -354,7 +362,7 @@ export function makeProductionReviewActionPort(
         if (!labels.includes('engine:review')) {
           await mutateWithExactReadback(
             () => gh('gh', [
-              'pr', 'edit', String(candidate.number), '--repo', REPO,
+              'pr', 'edit', String(candidate.number), '--repo', repositorySlug,
               '--add-label', 'engine:review',
             ]),
             async () => {
@@ -366,7 +374,10 @@ export function makeProductionReviewActionPort(
             'Review label projection was ambiguous',
           );
         }
-        const project = await fetchProjectSnapshot(gh);
+        const project = await fetchProjectSnapshot(gh, {
+          projectOwner: options.projectMapping?.owner,
+          projectNumber: options.projectMapping?.number,
+        });
         const item = project.items.find((entry) =>
           entry.contentType === 'Issue' && entry.number === candidate.issueNumber);
         if (item === undefined) throw new Error('Review issue is missing from Project');
@@ -374,7 +385,18 @@ export function makeProductionReviewActionPort(
           throw new Error('Review projection stopped because Human is dominant');
         }
         if (item.status !== 'In Review') {
-          const fields = await ensureFieldIds(gh);
+          const fields = options.projectMapping === undefined
+            ? await ensureFieldIds(gh)
+            : {
+                projectId: options.projectMapping.id,
+                status: {
+                  fieldId: options.projectMapping.fields.status.id,
+                  options: {
+                    'In Review':
+                      options.projectMapping.fields.status.options.inReview,
+                  },
+                },
+              };
           await mutateWithExactReadback(
             () => gh('gh', [
               'project', 'item-edit',
@@ -384,7 +406,10 @@ export function makeProductionReviewActionPort(
               '--single-select-option-id', fields.status.options['In Review'],
             ]),
             async () => {
-              const repaired = await fetchProjectSnapshot(gh);
+              const repaired = await fetchProjectSnapshot(gh, {
+                projectOwner: options.projectMapping?.owner,
+                projectNumber: options.projectMapping?.number,
+              });
               const repairedItem = repaired.items.find((entry) =>
                 entry.contentType === 'Issue' && entry.number === candidate.issueNumber);
               return repairedItem?.status === 'In Review'
@@ -393,7 +418,7 @@ export function makeProductionReviewActionPort(
             'Review Project projection was ambiguous',
           );
         }
-        const finalRef = await git(['ls-remote', CANONICAL_GITHUB_HTTPS_REMOTE, ref]);
+        const finalRef = await git(['ls-remote', repositoryUrl, ref]);
         if (!finalRef.includes(`${expectedReviewRefOid}\t${ref}`)) {
           throw new Error('Review projection lost exact review-ref authority');
         }
@@ -405,7 +430,10 @@ export function makeProductionReviewActionPort(
         ) {
           throw new Error('Review projection final PR authority changed');
         }
-        const finalProject = await fetchProjectSnapshot(gh);
+        const finalProject = await fetchProjectSnapshot(gh, {
+          projectOwner: options.projectMapping?.owner,
+          projectNumber: options.projectMapping?.number,
+        });
         const finalItem = finalProject.items.find((entry) =>
           entry.contentType === 'Issue' && entry.number === candidate.issueNumber);
         if (

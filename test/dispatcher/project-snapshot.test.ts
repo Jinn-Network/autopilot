@@ -716,6 +716,24 @@ describe('fetchProjectSnapshot — invocation shape', () => {
     // `query=…` form variable must be present
     expect(calls[0]!.args.some((a) => a.startsWith('query='))).toBe(true);
   });
+
+  it('binds an injected non-Jinn organization and Project number as variables', async () => {
+    const { runner, calls } = makePagedRunner([
+      buildPageResponse({
+        rateLimitRemaining: 4999,
+        nodes: [issueNode({ id: 'PVTI_a', number: 1, status: 'Todo' })],
+      }),
+    ]);
+
+    await fetchProjectSnapshot(runner, {
+      projectOwner: 'Octo-Labs',
+      projectNumber: 7,
+    });
+
+    expect(calls[0]!.args).toContain('owner=Octo-Labs');
+    expect(calls[0]!.args).toContain('projectNumber=7');
+    expect(calls[0]!.args.join(' ')).not.toContain('Jinn-Network');
+  });
 });
 
 describe('fetchProjectSnapshot — Sprint field (#609)', () => {

@@ -7,14 +7,21 @@ import {
   openSync,
   writeSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { argv, env, pid } from 'node:process';
 import {
   AUTOPILOT_RUNTIME_ENV,
   parseAutopilotRuntime,
 } from '../src/autopilot-runtime.js';
+import {
+  loadAutopilotConfig,
+  type AutopilotConfig,
+} from '../src/config/config.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
+import {
+  paintBoardOptionsFromConfig,
+  runPaintBoard,
+} from './paint-board.js';
 import {
   CURSOR_BIN_ENV,
   CURSOR_MODEL_ENV,
@@ -27,7 +34,6 @@ import { DEFAULT_CONFIG, type DispatcherConfig } from '../src/dispatcher/types.j
 import { DEFAULT_FLOOR } from '../src/dispatcher/rate-limit-guard.js';
 import { shouldRouteToSession } from '../src/cli/routing.js';
 import {
-  CANONICAL_GITHUB_HTTPS_REMOTE,
   ConditionalPullRequestEvidenceProbe,
   ConditionalRestClient,
   defaultRunnerId,
@@ -64,23 +70,6 @@ import {
   freeDiskBytes,
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
-
-const DEFAULT_INTERVAL_MS = 10 * 60_000;
-const DEFAULT_STALE_AFTER_MS = 2 * 60 * 60_000;
-// Staleness threshold for reaping unchanged claims. Overridable via
-// JINN_AUTOPILOT_STALE_AFTER_MS so the runbook's takeover canary (§8) can
-// exercise recovery without a two-hour wait; production leaves it at 2h.
-const STALE_AFTER_MS = positiveEnvironmentInteger(
-  env.JINN_AUTOPILOT_STALE_AFTER_MS,
-  DEFAULT_STALE_AFTER_MS,
-  'JINN_AUTOPILOT_STALE_AFTER_MS',
-);
-const DEFAULT_WORKTREE_BASE = join(
-  homedir(),
-  '.jinn-client',
-  'autopilot',
-  'attempts',
-);
 
 function authorAllowlist(raw: string | undefined): ReadonlySet<string> {
   return new Set(
@@ -130,29 +119,74 @@ function positiveEnvironmentInteger(
   return value;
 }
 
-function dispatcherConfig(allowlist: ReadonlySet<string>): DispatcherConfig {
+function warnLegacyOverride(name: string): void {
+  console.warn(
+    `[autopilot:v2] warning: ${name} is a temporary legacy override; `
+    + 'prefer .autopilot/config.json',
+  );
+}
+
+function configuredEnvironment(
+  product: AutopilotConfig,
+  stateDirectory: string,
+  capabilityAttestation: string,
+  configPath: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    JINN_AUTOPILOT_STATE_DIRECTORY:
+      env.JINN_AUTOPILOT_STATE_DIRECTORY ?? stateDirectory,
+    JINN_AUTOPILOT_CAPABILITY_ATTESTATION:
+      env.JINN_AUTOPILOT_CAPABILITY_ATTESTATION ?? capabilityAttestation,
+    JINN_AUTOPILOT_FULL_RECONCILE_MS:
+      env.JINN_AUTOPILOT_FULL_RECONCILE_MS
+      ?? String(product.scheduler.fullReconcileSeconds * 1_000),
+    JINN_AUTOPILOT_CHILDREN:
+      env.JINN_AUTOPILOT_CHILDREN ?? String(product.safety.children),
+    JINN_AUTOPILOT_CARRYOVER:
+      env.JINN_AUTOPILOT_CARRYOVER ?? String(product.safety.carryover),
+    JINN_AUTOPILOT_CLEANUP_ENABLED:
+      env.JINN_AUTOPILOT_CLEANUP_ENABLED ?? String(product.safety.cleanup),
+    JINN_AUTOPILOT_DISK_FLOOR_GB:
+      env.JINN_AUTOPILOT_DISK_FLOOR_GB ?? String(product.safety.diskFloorGb),
+    JINN_IMPL_GH_TOKEN:
+      env.AUTOPILOT_GITHUB_IMPLEMENT_TOKEN ?? env.JINN_IMPL_GH_TOKEN,
+    JINN_REVIEW_GH_TOKEN:
+      env.AUTOPILOT_GITHUB_REVIEW_TOKEN ?? env.JINN_REVIEW_GH_TOKEN,
+    AUTOPILOT_CONFIG_PATH: configPath,
+  };
+}
+
+function dispatcherConfig(
+  allowlist: ReadonlySet<string>,
+  product: AutopilotConfig,
+  environment: NodeJS.ProcessEnv,
+): DispatcherConfig {
   return {
     ...DEFAULT_CONFIG,
-    runtime: parseAutopilotRuntime(env[AUTOPILOT_RUNTIME_ENV]),
+    runtime: parseAutopilotRuntime(
+      environment[AUTOPILOT_RUNTIME_ENV] ?? product.worker.runtime,
+    ),
     authorAllowlist: [...allowlist],
-    reviewBotLogin: env.JINN_REVIEW_BOT_LOGIN ?? '',
-    implGhToken: env.JINN_IMPL_GH_TOKEN ?? '',
-    reviewGhToken: env.JINN_REVIEW_GH_TOKEN ?? '',
-    ...(env.JINN_DISPATCHER_HERMES_MODEL === undefined
+    concurrencyCap: product.scheduler.implementationConcurrency,
+    reviewCap: product.scheduler.reviewConcurrency,
+    openPrBackpressure: product.scheduler.openPrBackpressure,
+    reviewBotLogin: environment.JINN_REVIEW_BOT_LOGIN ?? '',
+    implGhToken: environment.JINN_IMPL_GH_TOKEN ?? '',
+    reviewGhToken: environment.JINN_REVIEW_GH_TOKEN ?? '',
+    hermesModel:
+      environment.JINN_DISPATCHER_HERMES_MODEL ?? product.worker.model,
+    hermesProvider:
+      environment.JINN_DISPATCHER_HERMES_PROVIDER ?? product.worker.provider,
+    ...(environment.JINN_DISPATCHER_HERMES_PYTHON === undefined
       ? {}
-      : { hermesModel: env.JINN_DISPATCHER_HERMES_MODEL }),
-    ...(env.JINN_DISPATCHER_HERMES_PROVIDER === undefined
+      : { hermesPythonPath: environment.JINN_DISPATCHER_HERMES_PYTHON }),
+    ...(environment[CURSOR_MODEL_ENV] === undefined
       ? {}
-      : { hermesProvider: env.JINN_DISPATCHER_HERMES_PROVIDER }),
-    ...(env.JINN_DISPATCHER_HERMES_PYTHON === undefined
+      : { cursorModel: environment[CURSOR_MODEL_ENV] }),
+    ...(environment[CURSOR_BIN_ENV] === undefined
       ? {}
-      : { hermesPythonPath: env.JINN_DISPATCHER_HERMES_PYTHON }),
-    ...(env[CURSOR_MODEL_ENV] === undefined
-      ? {}
-      : { cursorModel: env[CURSOR_MODEL_ENV] }),
-    ...(env[CURSOR_BIN_ENV] === undefined
-      ? {}
-      : { cursorBin: env[CURSOR_BIN_ENV] }),
+      : { cursorBin: environment[CURSOR_BIN_ENV] }),
   };
 }
 
@@ -237,11 +271,32 @@ async function main(): Promise<void> {
   }
 
   const options = parseLifecycleCli(argv.slice(2));
-  const snapshotRuntime = parseSnapshotRuntimeConfig(env);
-  const stateDirectory = parseAutopilotStateDirectory(env);
-  const allowlist = authorAllowlist(env.JINN_DISPATCHER_AUTHOR_ALLOWLIST);
+  const repositoryPath = (await defaultRunner('git', [
+    'rev-parse', '--path-format=absolute', '--show-toplevel',
+  ])).trim();
+  const loaded = await loadAutopilotConfig(repositoryPath, env);
+  const runtimeEnvironment = configuredEnvironment(
+    loaded.config,
+    loaded.paths.state,
+    loaded.paths.capabilityAttestation,
+    loaded.configPath,
+  );
+  const snapshotRuntime = parseSnapshotRuntimeConfig(runtimeEnvironment);
+  const stateDirectory = parseAutopilotStateDirectory(runtimeEnvironment);
+  const legacyAllowlist = env.JINN_DISPATCHER_AUTHOR_ALLOWLIST;
+  if (legacyAllowlist !== undefined && legacyAllowlist.trim().length > 0) {
+    warnLegacyOverride('JINN_DISPATCHER_AUTHOR_ALLOWLIST');
+  }
+  const allowlist = legacyAllowlist === undefined || legacyAllowlist.trim().length === 0
+    ? new Set(loaded.config.triage.allowedAuthors.map((login) => login.toLowerCase()))
+    : authorAllowlist(legacyAllowlist);
   const onlyIssues = parseOnlyIssuesAllowlist(env.JINN_AUTOPILOT_ONLY_ISSUES);
-  const config = dispatcherConfig(allowlist);
+  const config = dispatcherConfig(allowlist, loaded.config, runtimeEnvironment);
+  const staleAfterMs = positiveEnvironmentInteger(
+    env.JINN_AUTOPILOT_STALE_AFTER_MS,
+    loaded.config.safety.staleAfterSeconds * 1_000,
+    'JINN_AUTOPILOT_STALE_AFTER_MS',
+  );
   console.log(`[autopilot:v2] runtime=${config.runtime}`);
   if (config.runtime === 'cursor') {
     console.log(
@@ -258,18 +313,15 @@ async function main(): Promise<void> {
   let maintenanceCredential: SelectedCredential | undefined;
   if (options.mode !== 'observe') {
     credentials = await resolveCredentialPool({
-      JINN_IMPL_GH_TOKEN: env.JINN_IMPL_GH_TOKEN,
-      JINN_REVIEW_GH_TOKEN: env.JINN_REVIEW_GH_TOKEN,
-      JINN_REVIEW_BOT_LOGIN: env.JINN_REVIEW_BOT_LOGIN,
+      JINN_IMPL_GH_TOKEN: runtimeEnvironment.JINN_IMPL_GH_TOKEN,
+      JINN_REVIEW_GH_TOKEN: runtimeEnvironment.JINN_REVIEW_GH_TOKEN,
+      JINN_REVIEW_BOT_LOGIN: runtimeEnvironment.JINN_REVIEW_BOT_LOGIN,
     }, defaultRunner);
     const selected = selectCredential(credentials, { phase: 'implement' });
     if (selected.status !== 'selected') throw new Error(selected.detail);
     maintenanceCredential = selected.credential;
     runner = selectedReadRunner(selected.credential.secret(), env);
   }
-  const repositoryPath = (await runner('git', [
-    'rev-parse', '--path-format=absolute', '--show-toplevel',
-  ])).trim();
   // One cycle-scoped boundary owns usage for every GitHub command below —
   // reader queries, reconciliation, board archive, and active action ports.
   // Credential overlays are applied inside those ports and flow unchanged
@@ -288,7 +340,10 @@ async function main(): Promise<void> {
   // the cutover runbook deliberately runs an observe-mode smoke test before.
   const reader = new GhLifecycleReader(runner, {
     repositoryPath,
-    remoteName: CANONICAL_GITHUB_HTTPS_REMOTE,
+    remoteName: loaded.config.repository.remote.url,
+    repositorySlug: loaded.config.repository.slug,
+    projectOwner: loaded.config.project.owner,
+    projectNumber: loaded.config.project.number,
     usageMeter,
     runnerIsMetered: true,
   });
@@ -296,12 +351,20 @@ async function main(): Promise<void> {
     usageMeter,
     runnerIsMetered: true,
   });
-  const restDiscovery = new GitHubRestDiscoveryReader(conditionalRest);
+  const restDiscovery = new GitHubRestDiscoveryReader(conditionalRest, {
+    repositorySlug: loaded.config.repository.slug,
+    repositoryRestDatabaseId: loaded.config.repository.restDatabaseId,
+    projectOwner: loaded.config.project.owner,
+    projectNumber: loaded.config.project.number,
+  });
   const snapshotSource = createConfiguredIncrementalLifecycleSnapshotSource({
     fullReader: reader,
     restDiscovery,
     conditionalRest,
-    evidenceProbe: new ConditionalPullRequestEvidenceProbe(conditionalRest),
+    evidenceProbe: new ConditionalPullRequestEvidenceProbe(
+      conditionalRest,
+      loaded.config.repository.slug,
+    ),
     authorAllowlist: allowlist,
   }, stateDirectory);
   // A persistent observe loop is a runner and takes the same authoritative
@@ -377,7 +440,8 @@ async function main(): Promise<void> {
   };
   // Stage 3: board-archive + Status paint live in `yarn paint-board`
   // (scheduled workflow), not the autopilot cycle.
-  const worktreeBase = env.JINN_AUTOPILOT_WORKTREE_BASE ?? DEFAULT_WORKTREE_BASE;
+  const worktreeBase =
+    env.JINN_AUTOPILOT_WORKTREE_BASE ?? loaded.paths.attempts;
   const v2AttemptsBase = join(worktreeBase, 'v2');
   const cleanupEnabled = options.mode === 'active'
     && activeCleanupEnabled(
@@ -385,7 +449,9 @@ async function main(): Promise<void> {
       'JINN_AUTOPILOT_CLEANUP_ENABLED',
     );
   const attemptGracePeriodMs = attemptGraceMs(env.JINN_AUTOPILOT_ATTEMPT_GRACE_MS);
-  const diskFloorBytes = autopilotDiskFloorBytes(env.JINN_AUTOPILOT_DISK_FLOOR_GB);
+  const diskFloorBytes = autopilotDiskFloorBytes(
+    runtimeEnvironment.JINN_AUTOPILOT_DISK_FLOOR_GB,
+  );
   const diskBelowFloor = (): boolean =>
     diskFloorBytes > 0 && freeDiskBytes(v2AttemptsBase) < diskFloorBytes;
 
@@ -401,7 +467,10 @@ async function main(): Promise<void> {
             ...reconciliationTargets,
             credential: selection.credential,
             runner,
-            environment: env,
+            environment: runtimeEnvironment,
+            repositorySlug: loaded.config.repository.slug,
+            repositoryUrl: loaded.config.repository.remote.url,
+            defaultBranch: loaded.config.repository.defaultBranch,
           });
       })();
   const active = options.mode !== 'active'
@@ -434,9 +503,14 @@ async function main(): Promise<void> {
           'JINN_AUTOPILOT_BACKPRESSURE',
         ),
         onlyIssues,
-        staleAfterMs: STALE_AFTER_MS,
+        staleAfterMs,
         runner,
-        environment: env,
+        environment: runtimeEnvironment,
+        remoteName: loaded.config.repository.remote.name,
+        repositorySlug: loaded.config.repository.slug,
+        repositoryUrl: loaded.config.repository.remote.url,
+        defaultBranch: loaded.config.repository.defaultBranch,
+        projectMapping: loaded.config.project,
         newWorkPaused: diskBelowFloor,
       });
 
@@ -450,9 +524,10 @@ async function main(): Promise<void> {
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
         ...(active === undefined ? {} : { active }),
         now: () => new Date(),
-        staleAfterMs: STALE_AFTER_MS,
+        staleAfterMs,
         runnerId,
         cycleId: randomUUID,
+        mergePolicy: loaded.config.mergePolicy,
         snapshotFailureMode: options.once ? 'throw' : 'report',
       });
     } catch (error) {
@@ -494,6 +569,25 @@ async function main(): Promise<void> {
         }
       }
     }
+    if (
+      options.mode === 'active'
+      && report.status === 'ok'
+      && report.snapshotComplete
+    ) {
+      try {
+        await runPaintBoard(
+          runner,
+          new Date(),
+          paintBoardOptionsFromConfig(loaded.config),
+        );
+      } catch (error) {
+        console.warn(
+          `[autopilot:v2] status painter degraded: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
     if (options.json) {
       process.stdout.write(`${renderLifecycleJson(report)}\n`);
     } else if (options.command.kind === 'explain-issue') {
@@ -508,7 +602,7 @@ async function main(): Promise<void> {
 
   await runLifecycleCadence({
     once: options.once,
-    intervalMs: DEFAULT_INTERVAL_MS,
+    intervalMs: loaded.config.scheduler.pollSeconds * 1_000,
     runCycle: runOnce,
     shouldContinue: () => process.exitCode !== 2,
     wait: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),

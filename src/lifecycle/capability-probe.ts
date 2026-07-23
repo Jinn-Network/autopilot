@@ -28,6 +28,7 @@ export type CapabilityProbeGitRunner = (
 
 export interface CapabilityProbeOptions {
   readonly repositoryPath: string;
+  readonly repositoryUrl?: string;
   readonly remoteName: string;
   readonly implementerLogin: string;
   readonly runGit: CapabilityProbeGitRunner;
@@ -70,6 +71,7 @@ async function requireRejected(operation: () => Promise<unknown>): Promise<void>
 export async function runCapabilityProbe(
   options: CapabilityProbeOptions,
 ): Promise<CapabilityAttestation> {
+  const repositoryUrl = options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   const now = options.now ?? (() => new Date());
   const probeId = parseProbeId((options.nextId ?? randomUUID)());
   const branch = `refs/heads/autopilot/capability-${probeId}`;
@@ -96,7 +98,7 @@ export async function runCapabilityProbe(
     'get-url',
     options.remoteName,
   ])).trim();
-  if (remoteUrl !== CANONICAL_GITHUB_HTTPS_REMOTE) {
+  if (remoteUrl !== repositoryUrl) {
     throw new Error('Capability probe requires the canonical HTTPS remote');
   }
   if (await readRef(branch) !== null || await readRef(review) !== null) {
@@ -210,7 +212,7 @@ export async function runCapabilityProbe(
   const verifiedAt = now();
   return decodeCapabilityAttestation({
     version: 2,
-    repositoryUrl: CANONICAL_GITHUB_HTTPS_REMOTE,
+    repositoryUrl,
     remoteName: options.remoteName,
     probeId,
     implementerLogin: options.implementerLogin,
@@ -227,6 +229,7 @@ export async function runCapabilityProbe(
       readViaGitTransport: true,
     },
   }, {
+    repositoryUrl,
     remoteName: options.remoteName,
     configuredLogins: [options.implementerLogin],
     now: verifiedAt,

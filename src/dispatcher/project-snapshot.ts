@@ -258,10 +258,10 @@ export class ProjectFieldSchemaError extends Error {
  */
 const MAX_PAGES = 100;
 
-const SNAPSHOT_QUERY = `query($cursor: String) {
+const SNAPSHOT_QUERY = `query($owner: String!, $projectNumber: Int!, $cursor: String) {
   rateLimit { cost remaining used resetAt }
-  organization(login: "${ORG}") {
-    projectV2(number: ${PROJECT_NUMBER}) {
+  organization(login: $owner) {
+    projectV2(number: $projectNumber) {
       sprintField: field(name: "Sprint") {
         ... on ProjectV2IterationField {
           configuration {
@@ -483,6 +483,10 @@ export interface FetchOpts {
   /** Override "now" for the current-sprint resolver. Tests pass a fixed
    *  timestamp; production calls omit this and {@link Date.now} is used. */
   nowMs?: number;
+  /** Organization login and Project number. The legacy Jinn values remain
+   * only for internal callers that have not yet crossed the config port. */
+  projectOwner?: string;
+  projectNumber?: number;
 }
 
 export async function fetchProjectSnapshot(
@@ -491,6 +495,8 @@ export async function fetchProjectSnapshot(
 ): Promise<ProjectSnapshot> {
   const maxPages = opts.maxPages ?? MAX_PAGES;
   const nowMs = opts.nowMs ?? Date.now();
+  const projectOwner = opts.projectOwner ?? ORG;
+  const projectNumber = opts.projectNumber ?? PROJECT_NUMBER;
   const items: SnapshotItem[] = [];
   let rateLimit: RateLimitInfo | null = null;
   let sprintIterations: IterationConfig[] = [];
@@ -506,7 +512,12 @@ export async function fetchProjectSnapshot(
       throw new PaginationLimitError(maxPages);
     }
 
-    const args = ['api', 'graphql', '-f', `query=${SNAPSHOT_QUERY}`];
+    const args = [
+      'api', 'graphql',
+      '-f', `query=${SNAPSHOT_QUERY}`,
+      '-F', `owner=${projectOwner}`,
+      '-F', `projectNumber=${projectNumber}`,
+    ];
     if (cursor != null) {
       args.push('-f', `cursor=${cursor}`);
     }

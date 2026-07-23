@@ -113,9 +113,14 @@ export const defaultRunner: CommandRunner = async (cmd, args, opts) => {
 
 export class GhIssueSource implements IssueSource {
   private readonly run: CommandRunner;
+  private readonly repositorySlug: string;
 
-  constructor(runner: CommandRunner = defaultRunner) {
+  constructor(
+    runner: CommandRunner = defaultRunner,
+    options: { readonly repositorySlug?: string } = {},
+  ) {
     this.run = runner;
+    this.repositorySlug = options.repositorySlug ?? REPO;
   }
 
   async poll(board: IssueBoardState): Promise<PolledIssue[]> {
@@ -125,7 +130,8 @@ export class GhIssueSource implements IssueSource {
     // the meter exact. The endpoint also returns PRs, filtered below.
     const ghIssues: GhIssue[] = [];
     for (let page = 1; page <= MAX_ISSUE_PAGES; page += 1) {
-      const endpoint = `repos/${REPO}/issues?state=open&per_page=${ISSUE_PAGE_SIZE}&page=${page}`;
+      const endpoint =
+        `repos/${this.repositorySlug}/issues?state=open&per_page=${ISSUE_PAGE_SIZE}&page=${page}`;
       const raw = await this.run('gh', ['api', endpoint]);
       const rows = JSON.parse(raw) as unknown;
       if (!Array.isArray(rows)) throw new Error('Open issue REST page is malformed');

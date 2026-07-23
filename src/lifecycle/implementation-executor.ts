@@ -30,9 +30,10 @@ export const CANONICAL_GITHUB_HTTPS_REMOTE =
 export async function runCanonicalImplementationRealityCheck(
   issueNumber: number,
   runner: CommandRunner,
+  repositorySlug?: string,
 ): Promise<RealityCheckVerdict> {
   return classifyRealityCheck(
-    await gatherRealityCheckSignals(issueNumber, runner),
+    await gatherRealityCheckSignals(issueNumber, runner, repositorySlug),
   );
 }
 
@@ -200,14 +201,15 @@ export function validateCanonicalGitHubHttpsRemote(remoteUrl: string): string {
     throw new Error('Implementation publication requires the canonical HTTPS GitHub remote');
   }
   if (
-    parsed.href !== CANONICAL_GITHUB_HTTPS_REMOTE
-    || parsed.protocol !== 'https:'
+    parsed.protocol !== 'https:'
+    || parsed.hostname !== 'github.com'
     || parsed.username !== ''
     || parsed.password !== ''
     || parsed.search !== ''
     || parsed.hash !== ''
+    || !/^\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\.git$/.test(parsed.pathname)
   ) {
-    throw new Error('Implementation publication requires the canonical HTTPS GitHub remote');
+    throw new Error('Implementation publication requires a canonical HTTPS GitHub remote');
   }
   return parsed.href;
 }

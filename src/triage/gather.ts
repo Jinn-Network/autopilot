@@ -94,6 +94,7 @@ interface GhIssueViewClosedByRefs {
 export async function gatherRealityCheckSignals(
   issueNumber: number,
   runner: CommandRunner,
+  repositorySlug = REPO,
 ): Promise<RealityCheckInput> {
   // Defense-in-depth: the CLI shim already validates the issue number, but
   // any future programmatic caller that bypasses it would otherwise let a
@@ -115,7 +116,7 @@ export async function gatherRealityCheckSignals(
   const prsSearchRaw = await runner('gh', [
     'search', 'prs',
     `#${issueNumber} in:body`,
-    '--repo', REPO,
+    '--repo', repositorySlug,
     '--json', 'number,body',
     '--limit', '50',
   ]);
@@ -130,7 +131,7 @@ export async function gatherRealityCheckSignals(
     seenPrNums.add(lite.number);
     const viewRaw = await runner('gh', [
       'pr', 'view', String(lite.number),
-      '--repo', REPO,
+      '--repo', repositorySlug,
       '--json', 'number,state,title,headRefName,mergedAt,closedAt,body,mergeCommit',
     ]);
     prsDetail.push(safeJsonObject<GhPrView>(viewRaw));
@@ -139,7 +140,7 @@ export async function gatherRealityCheckSignals(
   // 4. closedByPullRequestsReferences via gh issue view.
   const issueViewRaw = await runner('gh', [
     'issue', 'view', String(issueNumber),
-    '--repo', REPO,
+    '--repo', repositorySlug,
     '--json', 'closedByPullRequestsReferences',
   ]);
   const issueView: GhIssueViewClosedByRefs = safeJsonObject(issueViewRaw);

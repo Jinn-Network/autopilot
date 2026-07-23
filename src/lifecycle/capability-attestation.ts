@@ -14,7 +14,7 @@ export const CAPABILITY_ATTESTATION_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 
 export interface CapabilityAttestation {
   readonly version: 2;
-  readonly repositoryUrl: typeof CANONICAL_GITHUB_HTTPS_REMOTE;
+  readonly repositoryUrl: string;
   readonly remoteName: string;
   readonly probeId: string;
   readonly implementerLogin: string;
@@ -70,18 +70,21 @@ function timestamp(value: unknown, label: string): string {
 export function decodeCapabilityAttestation(
   value: unknown,
   expected: {
+    readonly repositoryUrl?: string;
     readonly remoteName: string;
     readonly configuredLogins: readonly string[];
     readonly now: Date;
   },
 ): CapabilityAttestation {
   const root = record(value, 'document');
+  const expectedRepositoryUrl =
+    expected.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   const refs = record(root.refs, 'refs');
   const proofs = record(root.proofs, 'proofs');
   if (root.version !== CAPABILITY_ATTESTATION_VERSION) {
     throw new Error('Capability attestation version is unsupported');
   }
-  if (root.repositoryUrl !== CANONICAL_GITHUB_HTTPS_REMOTE) {
+  if (root.repositoryUrl !== expectedRepositoryUrl) {
     throw new Error('Capability attestation repository is not canonical');
   }
   const remoteName = string(root.remoteName, 'remoteName');
@@ -124,7 +127,7 @@ export function decodeCapabilityAttestation(
   }
   return {
     version: 2,
-    repositoryUrl: CANONICAL_GITHUB_HTTPS_REMOTE,
+    repositoryUrl: expectedRepositoryUrl,
     remoteName,
     probeId,
     implementerLogin,
