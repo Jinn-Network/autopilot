@@ -28,6 +28,7 @@ jobs:
       - run: corepack enable
       - run: yarn install --immutable
       - run: yarn test
+      - run: yarn verify:source
       - run: yarn build
       - run: yarn verify:dist
       - name: Prepare canary version

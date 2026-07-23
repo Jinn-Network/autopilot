@@ -5,9 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(here, '..', '..', '..');
 const skill = readFileSync(
-  join(repoRoot, '.claude', 'skills', 'review-pr', 'SKILL.md'),
+  join(here, '..', 'assets', 'engine-skills', 'review-pr', 'SKILL.md'),
   'utf8',
 );
 

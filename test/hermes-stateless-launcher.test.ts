@@ -13,7 +13,12 @@ import { expect, it } from 'vitest';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const AUTOPILOT_ROOT = join(HERE, '..');
-const LAUNCHER_PATH = join(AUTOPILOT_ROOT, 'bin', 'jinn-hermes-stateless.py');
+const LAUNCHER_PATH = join(
+  AUTOPILOT_ROOT,
+  'assets',
+  'runtime',
+  'autopilot-hermes-stateless.py',
+);
 
 it('runs Hermes with synchronous delivery and clears the session context on exit', () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'jinn-hermes-stateless-'));
@@ -81,7 +86,7 @@ def main():
     ).toEqual([
       {
         event: 'set',
-        source: 'jinn-autopilot',
+        source: 'autopilot',
         cwd: AUTOPILOT_ROOT,
         async_delivery: false,
       },

@@ -292,6 +292,31 @@ async function main(): Promise<void> {
       });
       return;
     }
+    if (operation === 'run-stage') {
+      const value = (name: string): string | undefined => {
+        const index = arguments_.indexOf(name);
+        return index < 0 ? undefined : arguments_[index + 1];
+      };
+      const promptFile = value('--prompt-file');
+      const worktree = value('--worktree');
+      if (promptFile == null || worktree == null) {
+        throw new Error(
+          'internal run-stage requires --prompt-file <path> --worktree <path>',
+        );
+      }
+      const timeout = value('--timeout-ms');
+      const { runStageHeadless } = await import('../src/dispatcher/run-stage.js');
+      const result = await runStageHeadless({
+        stageTask: readFileSync(promptFile, 'utf8'),
+        worktreePath: worktree,
+        ...(value('--model') == null ? {} : { model: value('--model') }),
+        ...(timeout == null ? {} : { timeoutMs: Number.parseInt(timeout, 10) }),
+      });
+      process.stdout.write(result.stdout);
+      if (result.stderr !== '') process.stderr.write(result.stderr);
+      process.exitCode = result.timedOut ? 1 : result.exitCode;
+      return;
+    }
     if (operation === 'migrate') return;
     throw new Error('Unknown internal command');
   }

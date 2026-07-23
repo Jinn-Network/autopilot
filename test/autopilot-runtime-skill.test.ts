@@ -1,11 +1,10 @@
-import { existsSync, readFileSync, readlinkSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(here, '..', '..', '..');
-const skillsRoot = join(repoRoot, '.claude', 'skills');
+const skillsRoot = join(here, '..', 'assets', 'engine-skills');
 const runtimeRoot = join(skillsRoot, 'autopilot-runtime');
 const runtimeSkillPath = join(runtimeRoot, 'SKILL.md');
 const claudeReferencePath = join(runtimeRoot, 'references', 'claude.md');
@@ -66,15 +65,6 @@ describe('shared Autopilot runtime skill contract', () => {
     }
   });
 
-  it('exposes the same canonical skills to Codex and Cursor harnesses', () => {
-    for (const harness of ['.codex', '.cursor']) {
-      for (const skill of ['autopilot-runtime', ...workflowNames]) {
-        const link = join(repoRoot, harness, 'skills', skill);
-        expect(readlinkSync(link)).toBe(`../../.claude/skills/${skill}`);
-      }
-    }
-  });
-
   it('makes review fan-out a synchronous batch of sanitized depth-0 roots', () => {
     const claude = read(claudeReferencePath);
     const hermes = read(hermesReferencePath);
@@ -84,7 +74,7 @@ describe('shared Autopilot runtime skill contract', () => {
       expect(reference).toMatch(
         /synchronous[\s\S]*parallel[\s\S]*separate `stage:run`/i,
       );
-      expect(reference).toContain('yarn stage:run');
+      expect(reference).toContain('autopilot internal run-stage');
       expect(reference).not.toContain('delegate_task');
     }
     expect(hermes).toMatch(/new\s+depth-0 Hermes process/);
@@ -98,7 +88,7 @@ describe('shared Autopilot runtime skill contract', () => {
     for (const path of [claudeReferencePath, hermesReferencePath, cursorReferencePath]) {
       const reference = read(path);
       expect(reference).toContain('JINN_AUTOPILOT_RUNTIME');
-      expect(reference).toContain('yarn stage:run');
+      expect(reference).toContain('autopilot internal run-stage');
       expect(reference).not.toContain('--runtime');
     }
   });
@@ -126,9 +116,9 @@ describe('shared Autopilot runtime skill contract', () => {
       /synchronous[\s\S]*parallel[\s\S]*separate `stage:run`/i,
     );
     expect(cursor).toMatch(/new depth-0 `agent -p` process/);
-    expect(cursor).toContain('yarn stage:run');
+    expect(cursor).toContain('autopilot internal run-stage');
     expect(cursor).not.toContain('--runtime');
-    expect(cursor).toContain('.cursor/skills');
-    expect(cursor).toContain('.claude/skills');
+    expect(cursor).toMatch(/repository\s+skill directories/);
+    expect(cursor).toContain('.autopilot/config.json');
   });
 });

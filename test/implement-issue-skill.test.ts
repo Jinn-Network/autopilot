@@ -4,27 +4,21 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(here, '..', '..', '..');
-const skillPath = join(repoRoot, '.claude', 'skills', 'implement-issue', 'SKILL.md');
+const skillsRoot = join(here, '..', 'assets', 'engine-skills');
+const skillPath = join(skillsRoot, 'implement-issue', 'SKILL.md');
 const runtimeSkillPath = join(
-  repoRoot,
-  '.claude',
-  'skills',
+  skillsRoot,
   'autopilot-runtime',
   'SKILL.md',
 );
 const claudeAdapterPath = join(
-  repoRoot,
-  '.claude',
-  'skills',
+  skillsRoot,
   'autopilot-runtime',
   'references',
   'claude.md',
 );
 const hermesAdapterPath = join(
-  repoRoot,
-  '.claude',
-  'skills',
+  skillsRoot,
   'autopilot-runtime',
   'references',
   'hermes.md',
@@ -88,7 +82,7 @@ describe('implement-issue inner workflow contract', () => {
       '| 4 — Code review | `/code-review` |',
       '| 5 — Independent review | `superpowers:requesting-code-review` |',
       '| 6 — Security review | `/security-review` |',
-      '| 7 — Jinn-app test | `testing-jinn-app` |',
+      '| 7 — Repository validation | repository-configured validation skills and instructions |',
       '| 8 — Verify + handoff | `superpowers:verification-before-completion` |',
     ];
 
