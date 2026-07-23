@@ -28,6 +28,7 @@ for (const asset of [
   'assets/engine-skills/reconcile/SKILL.md',
   'assets/engine-skills/autopilot-runtime/SKILL.md',
   'assets/canon/active-active-lifecycle.md',
+  'assets/canon/headless-override.md',
   'assets/runtime/autopilot-hermes-stateless.py',
   'assets/maintainer-skills/file-issue/SKILL.md',
   'schemas/config-v1.json',

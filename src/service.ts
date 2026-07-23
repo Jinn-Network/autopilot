@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { LoadedAutopilotConfig } from './config/config.js';
 import type { DoctorReport } from './doctor.js';
@@ -105,8 +106,54 @@ function metadataPath(loaded: LoadedAutopilotConfig): string {
   return join(loaded.paths.service, 'daemon.json');
 }
 
-function socketPath(loaded: LoadedAutopilotConfig): string {
-  return join(loaded.paths.service, 'control.sock');
+const SAFE_UNIX_SOCKET_PATH_BYTES = 100;
+
+export function serviceSocketPath(
+  loaded: Pick<LoadedAutopilotConfig, 'stateKey'>,
+  temporaryDirectory = tmpdir(),
+): string {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
+  const socketName = `${createHash('sha256')
+    .update(loaded.stateKey)
+    .digest('hex')
+    .slice(0, 24)}.sock`;
+  const candidate = join(temporaryDirectory, `ap-${uid}`, socketName);
+  if (Buffer.byteLength(candidate) <= SAFE_UNIX_SOCKET_PATH_BYTES) {
+    return candidate;
+  }
+  const fallback = join('/tmp', `ap-${uid}`, socketName);
+  if (Buffer.byteLength(fallback) > SAFE_UNIX_SOCKET_PATH_BYTES) {
+    throw new Error('unable to construct a safe Unix control socket path');
+  }
+  return fallback;
+}
+
+function ensureSocketDirectory(controlPath: string): void {
+  const directory = dirname(controlPath);
+  try {
+    mkdirSync(directory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`daemon socket parent must be a real directory: ${directory}`);
+  }
+  if (
+    typeof process.getuid === 'function'
+    && stat.uid !== process.getuid()
+  ) {
+    throw new Error(`daemon socket parent must be owned by the current user: ${directory}`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(`daemon socket parent must be owner-only: ${directory}`);
+  }
+}
+
+function removeControlSocket(loaded: LoadedAutopilotConfig): void {
+  const controlPath = serviceSocketPath(loaded);
+  ensureSocketDirectory(controlPath);
+  rmSync(controlPath, { force: true });
 }
 
 function atomicWriteJson(path: string, value: unknown): void {
@@ -241,7 +288,7 @@ export async function startService(input: {
   }
   if (inspected.classification === 'stale') {
     rmSync(metadataPath(input.loaded), { force: true });
-    rmSync(socketPath(input.loaded), { force: true });
+    removeControlSocket(input.loaded);
   }
   if (input.foreground) {
     await runDaemon({
@@ -312,7 +359,8 @@ export async function runDaemon(input: {
 }): Promise<void> {
   mkdirSync(input.loaded.paths.service, { recursive: true, mode: 0o700 });
   mkdirSync(input.loaded.paths.logs, { recursive: true, mode: 0o700 });
-  const controlPath = socketPath(input.loaded);
+  const controlPath = serviceSocketPath(input.loaded);
+  ensureSocketDirectory(controlPath);
   rmSync(controlPath, { force: true });
   const startupConfigHash = configurationHash(input.loaded.configPath);
   let stopping = false;
@@ -346,21 +394,23 @@ export async function runDaemon(input: {
       if (message.trim() !== 'stop') connection.end('unknown command\n');
     });
   });
-  await new Promise<void>((resolvePromise, reject) => {
-    server.once('error', reject);
-    server.listen(controlPath, () => resolvePromise());
-  });
-  chmodSync(controlPath, 0o600);
-  metadata = updateMetadata(input.loaded, metadata, { state: 'running' });
-
   const requestStop = (): void => {
     stopping = true;
     metadata = updateMetadata(input.loaded, metadata, { state: 'stopping' });
     wake?.();
   };
-  process.once('SIGTERM', requestStop);
-  process.once('SIGINT', requestStop);
+  let signalHandlersInstalled = false;
   try {
+    await new Promise<void>((resolvePromise, reject) => {
+      server.once('error', reject);
+      server.listen(controlPath, () => resolvePromise());
+    });
+    chmodSync(controlPath, 0o600);
+    metadata = updateMetadata(input.loaded, metadata, { state: 'running' });
+    process.once('SIGTERM', requestStop);
+    process.once('SIGINT', requestStop);
+    signalHandlersInstalled = true;
+
     while (true) {
       const decision = shouldRunDaemonCycle({
         stopping,
@@ -414,9 +464,18 @@ export async function runDaemon(input: {
       wake = undefined;
     }
   } finally {
-    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    if (signalHandlersInstalled) {
+      process.off('SIGTERM', requestStop);
+      process.off('SIGINT', requestStop);
+    }
+    if (server.listening) {
+      await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+    }
     rmSync(controlPath, { force: true });
-    rmSync(metadataPath(input.loaded), { force: true });
+    const currentMetadata = readDaemonMetadata(input.loaded);
+    if (currentMetadata?.pid === process.pid) {
+      rmSync(metadataPath(input.loaded), { force: true });
+    }
   }
 }
 
@@ -441,7 +500,7 @@ export async function stopService(input: {
   if (inspected.classification === 'not-running' || inspected.classification === 'stale') {
     if (inspected.classification === 'stale') {
       rmSync(metadataPath(input.loaded), { force: true });
-      rmSync(socketPath(input.loaded), { force: true });
+      removeControlSocket(input.loaded);
     }
     return { status: 'not-running' };
   }

@@ -44,6 +44,28 @@ const TYPE_OPTIONS = {
   incident: 'incident',
   design: 'design',
 } as const;
+const REQUIRED_LABELS = {
+  'engine:review': {
+    color: '1D76DB',
+    description: 'Autopilot independent review lifecycle',
+  },
+  'autopilot:human': {
+    color: 'D93F0B',
+    description: 'Autopilot requires human attention',
+  },
+  'review-finding': {
+    color: 'FBCA04',
+    description: 'Autopilot review-finding child issue',
+  },
+  reconcile: {
+    color: '5319E7',
+    description: 'Autopilot branch-reconciliation child issue',
+  },
+  'ci-failure': {
+    color: 'B60205',
+    description: 'Autopilot CI-failure child issue',
+  },
+} as const;
 
 const DISCOVERY_QUERY = `
 query($owner: String!, $repository: String!, $projectNumber: Int!) {
@@ -56,18 +78,17 @@ query($owner: String!, $repository: String!, $projectNumber: Int!) {
     projectV2(number: $projectNumber) {
       id
       viewerCanUpdate
-      typeField: field(name: "Type") {
-        ... on ProjectV2Field {
-          id
-          name
-          dataType
-        }
-      }
-      sprintField: field(name: "Sprint") {
-        ... on ProjectV2IterationField {
-          id
-          configuration {
-            iterations { id title startDate duration }
+      fields(first: 100) {
+        nodes {
+          ... on ProjectV2Field { id name dataType }
+          ... on ProjectV2IterationField {
+            id
+            name
+            dataType
+            configuration {
+              duration
+              iterations { id title startDate duration }
+            }
           }
         }
       }
@@ -75,6 +96,9 @@ query($owner: String!, $repository: String!, $projectNumber: Int!) {
   }
   repository(owner: $owner, name: $repository) {
     viewerPermission
+    labels(first: 100) {
+      nodes { name }
+    }
   }
 }`;
 
@@ -131,7 +155,8 @@ mutation(
   $projectId: ID!,
   $name: String!,
   $startDate: Date!,
-  $duration: Int!
+  $duration: Int!,
+  $iterations: [ProjectV2Iteration!]!
 ) {
   createProjectV2Field(input: {
     projectId: $projectId,
@@ -140,7 +165,26 @@ mutation(
     iterationConfiguration: {
       startDate: $startDate,
       duration: $duration,
-      iterations: []
+      iterations: $iterations
+    }
+  }) {
+    projectV2Field { ... on ProjectV2IterationField { id } }
+  }
+}`;
+
+const CONFIGURE_SPRINT_QUERY = `
+mutation(
+  $fieldId: ID!,
+  $startDate: Date!,
+  $duration: Int!,
+  $iterations: [ProjectV2Iteration!]!
+) {
+  updateProjectV2Field(input: {
+    fieldId: $fieldId,
+    iterationConfiguration: {
+      startDate: $startDate,
+      duration: $duration,
+      iterations: $iterations
     }
   }) {
     projectV2Field { ... on ProjectV2IterationField { id } }
@@ -226,8 +270,20 @@ type ProvisioningAction =
       readonly description: string;
     }
   | {
+      readonly kind: 'configure-empty-sprint';
+      readonly fieldId: string;
+      readonly description: string;
+    }
+  | {
       readonly kind: 'create-issue-type';
       readonly name: string;
+      readonly description: string;
+    }
+  | {
+      readonly kind: 'create-label';
+      readonly name: keyof typeof REQUIRED_LABELS;
+      readonly color: string;
+      readonly labelDescription: string;
       readonly description: string;
     };
 
@@ -245,15 +301,59 @@ interface Discovery {
     readonly projectV2?: {
       readonly id?: unknown;
       readonly viewerCanUpdate?: unknown;
-      readonly typeField?: {
-        readonly id?: unknown;
-        readonly name?: unknown;
-        readonly dataType?: unknown;
+      readonly fields?: {
+        readonly nodes?: readonly {
+          readonly id?: unknown;
+          readonly name?: unknown;
+          readonly dataType?: unknown;
+          readonly configuration?: {
+            readonly duration?: unknown;
+            readonly iterations?: readonly {
+              readonly id?: unknown;
+              readonly title?: unknown;
+              readonly startDate?: unknown;
+              readonly duration?: unknown;
+            }[];
+          };
+        }[];
       };
-      readonly sprintField?: { readonly id?: unknown };
     };
   };
-  readonly repository?: { readonly viewerPermission?: unknown };
+  readonly repository?: {
+    readonly viewerPermission?: unknown;
+    readonly labels?: {
+      readonly nodes?: readonly { readonly name?: unknown }[];
+    };
+  };
+}
+
+function nativeProjectField(
+  project: NonNullable<NonNullable<Discovery['organization']>['projectV2']>,
+  name: string,
+  dataType: string,
+): {
+  readonly id?: unknown;
+  readonly name?: unknown;
+  readonly dataType?: unknown;
+  readonly configuration?: {
+    readonly duration?: unknown;
+    readonly iterations?: readonly {
+      readonly id?: unknown;
+      readonly title?: unknown;
+      readonly startDate?: unknown;
+      readonly duration?: unknown;
+    }[];
+  };
+} | undefined {
+  const matches = (project.fields?.nodes ?? []).filter((field) => field.name === name);
+  if (matches.length > 1) {
+    throw new Error(`Project has contradictory duplicate native fields named ${name}`);
+  }
+  const field = matches[0];
+  if (field != null && field.dataType !== dataType) {
+    throw new Error(`Project native field ${name} has contradictory type`);
+  }
+  return field;
 }
 
 export interface InitializationResult {
@@ -289,6 +389,12 @@ function integer(value: unknown, label: string): number {
     throw new Error(`${label} is missing`);
   }
   return value;
+}
+
+function integerText(value: string, label: string): number {
+  const trimmed = value.trim();
+  if (!/^[1-9][0-9]*$/.test(trimmed)) throw new Error(`${label} is missing`);
+  return integer(Number(trimmed), label);
 }
 
 function parseProjectReference(raw: string): { owner: string; number: number } {
@@ -508,6 +614,41 @@ function sprintProvisioningAction(fields: readonly GitHubField[]): ProvisioningA
   return [];
 }
 
+function sprintIterationProvisioningActions(
+  project: NonNullable<NonNullable<Discovery['organization']>['projectV2']>,
+  now: Date,
+): ProvisioningAction[] {
+  const sprint = nativeProjectField(project, 'Sprint', 'ITERATION');
+  if (sprint == null) return [];
+  const iterations = sprint.configuration?.iterations;
+  if (iterations == null) {
+    throw new Error('Project Sprint iteration configuration is malformed');
+  }
+  const nowMs = now.getTime();
+  const hasCurrent = iterations.some((iteration) => {
+    if (
+      typeof iteration.startDate !== 'string'
+      || typeof iteration.duration !== 'number'
+    ) return false;
+    const start = Date.parse(`${iteration.startDate}T00:00:00Z`);
+    return Number.isFinite(start)
+      && nowMs >= start
+      && nowMs < start + iteration.duration * 86_400_000;
+  });
+  if (hasCurrent) return [];
+  if (iterations.length > 0) {
+    throw new Error(
+      'Project Sprint has iterations but none is current; select or create the '
+      + 'active iteration manually',
+    );
+  }
+  return [{
+    kind: 'configure-empty-sprint',
+    fieldId: text(sprint.id, 'Sprint field ID'),
+    description: 'Create the first active two-week Sprint iteration',
+  }];
+}
+
 function issueTypeProvisioningActions(
   nodes: NonNullable<NonNullable<Discovery['organization']>['issueTypes']>['nodes'],
 ): ProvisioningAction[] {
@@ -528,10 +669,41 @@ function issueTypeProvisioningActions(
   return actions;
 }
 
-function nextMonday(): string {
-  const date = new Date();
+function labelProvisioningActions(
+  nodes: NonNullable<NonNullable<Discovery['repository']>['labels']>['nodes'],
+): ProvisioningAction[] {
+  const actions: ProvisioningAction[] = [];
+  for (const [name, metadata] of Object.entries(REQUIRED_LABELS) as [
+    keyof typeof REQUIRED_LABELS,
+    (typeof REQUIRED_LABELS)[keyof typeof REQUIRED_LABELS],
+  ][]) {
+    const named = (nodes ?? []).filter((node) => (
+      typeof node.name === 'string'
+      && node.name.toLowerCase() === name.toLowerCase()
+    ));
+    if (
+      named.length > 1
+      || (named.length === 1 && named[0]!.name !== name)
+    ) {
+      throw new Error(`Repository has contradictory lifecycle label ${name}`);
+    }
+    if (named.length === 0) {
+      actions.push({
+        kind: 'create-label',
+        name,
+        color: metadata.color,
+        labelDescription: metadata.description,
+        description: `Create repository lifecycle label ${name}`,
+      });
+    }
+  }
+  return actions;
+}
+
+function currentMonday(now: Date): string {
+  const date = new Date(now);
   const day = date.getUTCDay();
-  const distance = day === 1 ? 0 : (8 - day) % 7;
+  const distance = day === 0 ? -6 : 1 - day;
   date.setUTCDate(date.getUTCDate() + distance);
   return date.toISOString().slice(0, 10);
 }
@@ -597,6 +769,8 @@ async function applyProvisioningActions(input: {
   readonly projectOwner: string;
   readonly projectNumber: number;
   readonly projectId: string;
+  readonly repositorySlug: string;
+  readonly now: Date;
 }): Promise<void> {
   const optionActions = new Map<string, {
     fieldName: string;
@@ -631,12 +805,38 @@ async function applyProvisioningActions(input: {
       continue;
     }
     if (action.kind === 'create-sprint') {
+      const startDate = currentMonday(input.now);
       await graphqlInput(input.runner, input.repositoryRoot, CREATE_SPRINT_QUERY, {
         projectId: input.projectId,
         name: 'Sprint',
-        startDate: nextMonday(),
+        startDate,
         duration: 14,
+        iterations: [{ title: 'Sprint 1', startDate, duration: 14 }],
       });
+      continue;
+    }
+    if (action.kind === 'configure-empty-sprint') {
+      const startDate = currentMonday(input.now);
+      await graphqlInput(input.runner, input.repositoryRoot, CONFIGURE_SPRINT_QUERY, {
+        fieldId: action.fieldId,
+        startDate,
+        duration: 14,
+        iterations: [{ title: 'Sprint 1', startDate, duration: 14 }],
+      });
+      continue;
+    }
+    if (action.kind === 'create-label') {
+      await input.runner('gh', [
+        'label',
+        'create',
+        action.name,
+        '--repo',
+        input.repositorySlug,
+        '--color',
+        action.color,
+        '--description',
+        action.labelDescription,
+      ], { cwd: input.repositoryRoot });
       continue;
     }
     await input.runner('gh', [
@@ -831,11 +1031,13 @@ export async function initializeAutopilot(input: {
   readonly runner: InitializationRunner;
   readonly interactor?: InitializationInteractor;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly now?: Date;
 }): Promise<InitializationResult> {
   if (input.nonInteractive && input.project == null) {
     throw new Error('Non-interactive initialization requires --project owner/number');
   }
   const environment = input.environment ?? process.env;
+  const now = input.now ?? new Date();
   const repositoryRoot = resolve((await input.runner(
     'git',
     ['rev-parse', '--show-toplevel'],
@@ -848,10 +1050,16 @@ export async function initializeAutopilot(input: {
     'repo',
     'view',
     '--json',
-    'nameWithOwner,defaultBranchRef,databaseId,url',
+    'nameWithOwner,defaultBranchRef,url',
   ], { cwd: repositoryRoot }), 'GitHub repository discovery');
   const slug = text(repo.nameWithOwner, 'repository nameWithOwner');
   const [owner, repositoryName] = slug.split('/') as [string, string];
+  const restDatabaseId = integerText(await input.runner('gh', [
+    'api',
+    `repos/${slug}`,
+    '--jq',
+    '.id',
+  ], { cwd: repositoryRoot }), 'repository REST database ID');
   const selectedProject = input.project == null
     ? await chooseProject({
         owner,
@@ -869,7 +1077,6 @@ export async function initializeAutopilot(input: {
     record(repo.defaultBranchRef, 'default branch').name,
     'default branch name',
   );
-  const restDatabaseId = integer(repo.databaseId, 'repository REST database ID');
   const remoteName = 'origin';
   const discoveredRemote = normalizedRemote(await input.runner(
     'git',
@@ -1032,17 +1239,12 @@ export async function initializeAutopilot(input: {
     );
   }
 
-  const typeFieldBeforeProvisioning = discovery.organization.projectV2.typeField;
-  if (
-    typeFieldBeforeProvisioning?.name !== 'Type'
-    || typeFieldBeforeProvisioning.dataType !== 'ISSUE_TYPE'
-  ) {
-    throw new Error('Project is missing its native Type field');
-  }
   const actions = [
     ...singleSelectProvisioningActions(fields),
     ...sprintProvisioningAction(fields),
+    ...sprintIterationProvisioningActions(discovery.organization.projectV2, now),
     ...issueTypeProvisioningActions(discovery.organization.issueTypes?.nodes),
+    ...labelProvisioningActions(discovery.repository?.labels?.nodes),
   ];
   if (actions.length > 0) {
     const plan: InitializationMutationPlan = {
@@ -1069,6 +1271,8 @@ export async function initializeAutopilot(input: {
       projectOwner: projectRef.owner,
       projectNumber: projectRef.number,
       projectId,
+      repositorySlug: slug,
+      now,
     });
     fieldDocument = parseJson(await input.runner('gh', [
       'project',
@@ -1101,10 +1305,16 @@ export async function initializeAutopilot(input: {
       discoveryDocument.data,
       'GitHub schema data after provisioning',
     ) as Discovery;
+    const reloadedProject = discovery.organization?.projectV2;
+    if (reloadedProject == null) {
+      throw new Error('GitHub Project schema disappeared during provisioning');
+    }
     if (
       singleSelectProvisioningActions(fields).length > 0
       || sprintProvisioningAction(fields).length > 0
+      || sprintIterationProvisioningActions(reloadedProject, now).length > 0
       || issueTypeProvisioningActions(discovery.organization?.issueTypes?.nodes).length > 0
+      || labelProvisioningActions(discovery.repository?.labels?.nodes).length > 0
     ) {
       throw new Error('GitHub Project provisioning did not converge; no configuration was written');
     }
@@ -1133,18 +1343,12 @@ export async function initializeAutopilot(input: {
   }
   const sprintField = findField(fields, 'Sprint');
   const liveSprintId = text(
-    projectSchema.sprintField?.id,
+    nativeProjectField(projectSchema, 'Sprint', 'ITERATION')?.id,
     'live Sprint field ID',
   );
   if (text(sprintField.id, 'Sprint field ID') !== liveSprintId) {
     throw new Error('Project has contradictory Sprint field identity');
   }
-  const typeField = projectSchema.typeField;
-  if (typeField?.name !== 'Type' || typeField.dataType !== 'ISSUE_TYPE') {
-    throw new Error('Project is missing its native Type field');
-  }
-  const typeFieldId = text(typeField.id, 'Type field ID');
-
   const config = decodeAutopilotConfig({
     schemaVersion: 1,
     repository: {
@@ -1165,7 +1369,6 @@ export async function initializeAutopilot(input: {
         blockedOn: mapOptions(findField(fields, 'Blocked on'), 'Blocked on', BLOCKED_OPTIONS),
         sprint: { id: liveSprintId },
         type: {
-          id: typeFieldId,
           options: typeOptions,
         },
       },

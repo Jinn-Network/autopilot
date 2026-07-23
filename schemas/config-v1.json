@@ -256,9 +256,8 @@
     "typeField": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "options"],
+      "required": ["options"],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
         "options": {
           "type": "object",
           "additionalProperties": false,

@@ -67,7 +67,6 @@ function validConfig(): unknown {
         },
         sprint: { id: 'PVTF_sprint' },
         type: {
-          id: 'PVTF_type',
           options: {
             feat: 'type_feat',
             fix: 'type_fix',

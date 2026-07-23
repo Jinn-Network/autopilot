@@ -49,8 +49,11 @@ query($owner: String!, $repository: String!, $projectNumber: Int!) {
     projectV2(number: $projectNumber) {
       id
       viewerCanUpdate
-      typeField: field(name: "Type") {
-        ... on ProjectV2Field { id name dataType }
+      fields(first: 100) {
+        nodes {
+          ... on ProjectV2Field { id name dataType }
+          ... on ProjectV2IterationField { id name dataType }
+        }
       }
     }
     issueTypes(first: 100) { nodes { id name isEnabled } }
@@ -159,11 +162,7 @@ async function resolveLogin(
   return login;
 }
 
-function validateFieldIds(
-  raw: string,
-  loaded: LoadedAutopilotConfig,
-  liveTypeFieldId: unknown,
-): void {
+function validateFieldIds(raw: string, loaded: LoadedAutopilotConfig): void {
   const parsed = safeJson(raw, 'Project fields') as {
     fields?: Array<{ id?: unknown; name?: unknown; options?: Array<{
       id?: unknown;
@@ -183,9 +182,6 @@ function validateFieldIds(
     if (matches.length !== 1 || matches[0]!.id !== id) {
       throw new Error(`Configured Project field ${name} does not match live schema`);
     }
-  }
-  if (liveTypeFieldId !== loaded.config.project.fields.type.id) {
-    throw new Error('Configured Project field Type does not match live schema');
   }
   const status = fields.find((field) => field.name === 'Status');
   const liveStatusIds = new Set((status?.options ?? []).map((option) => option.id));
@@ -299,16 +295,26 @@ export async function runDoctor(input: {
         'repo',
         'view',
         '--json',
-        'nameWithOwner,defaultBranchRef,databaseId',
+        'nameWithOwner,defaultBranchRef',
       ], { cwd: loaded.repositoryRoot });
       const repository = safeJson(raw, 'GitHub repository');
       const branch = safeJson(
         JSON.stringify(repository.defaultBranchRef),
         'default branch',
       );
+      const restDatabaseIdRaw = (await input.runner('gh', [
+        'api',
+        `repos/${loaded.config.repository.slug}`,
+        '--jq',
+        '.id',
+      ], { cwd: loaded.repositoryRoot })).trim();
+      const restDatabaseId = /^[1-9][0-9]*$/.test(restDatabaseIdRaw)
+        ? Number(restDatabaseIdRaw)
+        : Number.NaN;
       if (
         repository.nameWithOwner !== loaded.config.repository.slug
-        || repository.databaseId !== loaded.config.repository.restDatabaseId
+        || !Number.isSafeInteger(restDatabaseId)
+        || restDatabaseId !== loaded.config.repository.restDatabaseId
         || branch.name !== loaded.config.repository.defaultBranch
       ) {
         throw new Error('live repository identity differs from configuration');
@@ -405,13 +411,10 @@ export async function runDoctor(input: {
       const organization = root.organization as Record<string, unknown> | undefined;
       const project = organization?.projectV2 as Record<string, unknown> | undefined;
       const repositoryNode = root.repository as Record<string, unknown> | undefined;
-      const typeField = project?.typeField as Record<string, unknown> | undefined;
-      validateFieldIds(fieldRaw, loaded, typeField?.id);
+      validateFieldIds(fieldRaw, loaded);
       if (
         project?.id !== loaded.config.project.id
         || project.viewerCanUpdate !== true
-        || typeField?.name !== 'Type'
-        || typeField.dataType !== 'ISSUE_TYPE'
         || repositoryNode?.viewerPermission !== 'ADMIN'
       ) {
         throw new Error('Project or repository permissions are insufficient');
@@ -449,7 +452,7 @@ export async function runDoctor(input: {
   checks.push(await attempt(
     'plugin-diagnostics',
     async () => {
-      const raw = await input.runner('hermes', ['doctor', '--json'], {
+      const raw = await input.runner('hermes', ['doctor'], {
         cwd: loaded.repositoryRoot,
         env: { HERMES_HOME: hermesHome },
       });
@@ -468,6 +471,7 @@ export async function runDoctor(input: {
         join(packageRoot(), 'assets', 'engine-skills', 'implement-issue', 'SKILL.md'),
         join(packageRoot(), 'assets', 'engine-skills', 'review-pr', 'SKILL.md'),
         join(packageRoot(), 'assets', 'canon', 'active-active-lifecycle.md'),
+        join(packageRoot(), 'assets', 'canon', 'headless-override.md'),
       ];
       for (const path of required) {
         if (!existsSync(path)) throw new Error(`packaged worker asset is missing: ${path}`);

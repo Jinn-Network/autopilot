@@ -22,6 +22,10 @@ export function packageCanonPaths(): readonly string[] {
   ];
 }
 
+export function packageHeadlessOverridePath(): string {
+  return join(packageRoot(), 'assets', 'canon', 'headless-override.md');
+}
+
 export function packageHermesLauncherPath(): string {
   return join(packageRoot(), 'assets', 'runtime', 'autopilot-hermes-stateless.py');
 }

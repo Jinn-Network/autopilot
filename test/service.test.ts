@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   classifyDaemonRecord,
+  serviceSocketPath,
   type DaemonMetadata,
 } from '../src/service.js';
 
@@ -57,5 +58,25 @@ describe('repository-scoped daemon safety', () => {
       repository: 'Octo-Labs/other',
       executableFingerprint: metadata.executableFingerprint,
     })).toBe('unsafe-live-mismatch');
+  });
+
+  it('uses a deterministic, collision-safe control socket below macOS limits', () => {
+    const first = serviceSocketPath(
+      { stateKey: 'octo-labs-widget-123456789abc' },
+      '/an/intentionally/very/long/temporary/directory/that/would/exceed/the/unix/socket/path/limit',
+    );
+    const repeated = serviceSocketPath(
+      { stateKey: 'octo-labs-widget-123456789abc' },
+      '/an/intentionally/very/long/temporary/directory/that/would/exceed/the/unix/socket/path/limit',
+    );
+    const second = serviceSocketPath(
+      { stateKey: 'octo-labs-other-123456789abc' },
+      '/an/intentionally/very/long/temporary/directory/that/would/exceed/the/unix/socket/path/limit',
+    );
+
+    expect(first).toBe(repeated);
+    expect(first).not.toBe(second);
+    expect(Buffer.byteLength(first)).toBeLessThanOrEqual(100);
+    expect(first).toMatch(/^\/tmp\/ap-\d+\/[0-9a-f]{24}\.sock$/);
   });
 });

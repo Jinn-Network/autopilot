@@ -1204,6 +1204,61 @@ describe('production reconciliation writer', () => {
     expect(mutations).toBe(0);
   });
 
+  it('recovers an exact orphan claim while its Project status is still Todo', async () => {
+    const base = worldSnapshotFixture();
+    const cycle: GitHubLifecycleSnapshot = {
+      ...base,
+      project: {
+        ...base.project,
+        items: base.project.items.map((item) => (
+          item.number === 50 ? { ...item, status: 'Todo' } : item
+        )),
+      },
+      issues: base.issues.map((issue) => (
+        issue.number === 50 ? { ...issue, status: 'Todo' } : issue
+      )),
+    };
+    let created = false;
+    const relation = {
+      number: 99,
+      headRefName: 'autopilot/50',
+      headOid: DRAFT_BRANCH_HEAD,
+      baseRefName: 'next',
+      draft: true,
+      labels: ['engine:review'],
+      body: 'Closes #50\n\n<!-- jinn-autopilot:v2 issue=50 branch=autopilot/50 -->',
+    };
+    const targeted = targetedWriterOptions(() => cycle, cycle);
+    const writer = makeProductionReconciliationWriter({
+      repositoryPath: '/repo',
+      ...targeted,
+      readIssueActionContext: async () => ({
+        projectItem: {
+          id: 'PVTI_issue_50',
+          status: 'Todo',
+          blockedOn: 'Nothing',
+        },
+        openPullRequests: created ? [relation] : [],
+      }),
+      credential: selectedCredential(),
+      runner: async (_command, args) => {
+        if (args[0] === 'pr' && args[1] === 'create') {
+          created = true;
+          return 'https://github.com/Jinn-Network/mono/pull/99\n';
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(writer.ensureDraftPullRequest({
+      issueNumber: 50,
+      expectedHead: DRAFT_BRANCH_HEAD,
+      headRefName: 'autopilot/50',
+      baseRefName: 'next',
+    })).resolves.toBeUndefined();
+    expect(created).toBe(true);
+  });
+
   it('rejects an inexact issue-level draft relation in the post-mutation readback', async () => {
     const cycle = worldSnapshotFixture();
     let created = false;

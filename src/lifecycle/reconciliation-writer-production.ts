@@ -769,8 +769,13 @@ function makeProductionReconciliationWriterWithScope(
       if (projectItem.status === 'Human' || projectItem.blockedOn === 'Human') {
         throw new Error('Human is dominant over draft PR reconciliation');
       }
-      if (projectItem.status !== 'In Progress') {
-        throw new Error('Draft PR reconciliation Project status is not In Progress');
+      if (
+        projectItem.status !== 'Todo'
+        && projectItem.status !== 'In Progress'
+      ) {
+        throw new Error(
+          'Draft PR reconciliation Project status is not Todo or In Progress',
+        );
       }
       const dependencies = await options.readBlockedByIssueNumbers(input.issueNumber);
       const expectedDependencies = [...issue.blockedByIssues].sort((left, right) => left - right);

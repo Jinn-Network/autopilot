@@ -1086,5 +1086,7 @@ describe('safe attempt cleanup', () => {
   it('reports free disk bytes for a path', () => {
     const fixture = repositoryFixture();
     expect(freeDiskBytes(fixture.repo)).toBeGreaterThan(0);
+    expect(freeDiskBytes(join(fixture.repo, 'not-created-yet', 'v2')))
+      .toBeGreaterThan(0);
   });
 });

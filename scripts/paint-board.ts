@@ -23,7 +23,6 @@ import {
 } from '../src/dispatcher/field-cache.js';
 import { fetchProjectSnapshot } from '../src/dispatcher/project-snapshot.js';
 import {
-  BOARD_ARCHIVE_BATCH_SIZE,
   BOARD_ARCHIVE_MAX_PER_SWEEP,
 } from '../src/lifecycle/board-archive-executor-production.js';
 import {
@@ -46,6 +45,41 @@ interface IssueRow {
   readonly number: number;
   readonly state: 'OPEN' | 'CLOSED';
   readonly labels: readonly { readonly name: string }[];
+}
+
+export function buildIssueRowsQuery(
+  repositoryOwner: string,
+  repositoryName: string,
+  issueNumbers: readonly number[],
+): string {
+  const fields = issueNumbers.map((n, i) => (
+    `  i${i}: issue(number: ${n}) {\n`
+    + '    number\n'
+    + '    state\n'
+    + '    labels(first: 40) { nodes { name } }\n'
+    + '  }'
+  )).join('\n');
+  return (
+    'query {\n'
+    + `  repository(owner: "${repositoryOwner}", name: "${repositoryName}") {\n`
+    + `${fields}\n`
+    + '  }\n'
+    + '  rateLimit { cost remaining resetAt used limit }\n'
+    + '}'
+  );
+}
+
+export function archiveProjectItemArgs(
+  projectNumber: number,
+  projectOwner: string,
+  itemId: string,
+): readonly string[] {
+  return [
+    'project', 'item-archive',
+    String(projectNumber),
+    '--owner', projectOwner,
+    '--id', itemId,
+  ];
 }
 
 function painterToken(env: NodeJS.ProcessEnv): string | undefined {
@@ -187,20 +221,10 @@ async function fetchIssueRows(
   const chunkSize = 40;
   for (let offset = 0; offset < unique.length; offset += chunkSize) {
     const chunk = unique.slice(offset, offset + chunkSize);
-    const fields = chunk.map((n, i) => (
-      `  i${i}: issue(number: ${n}) {\n`
-      + '    number\n'
-      + '    state\n'
-      + '    labels(first: 40) { nodes { name } }\n'
-      + '  }'
-    )).join('\n');
-    const query = (
-      `query {\n`
-      + `  repository(owner: "${options.repositoryOwner}", `
-      + `name: "${options.repositoryName}") {\n`
-      + `${fields}\n`
-      + '  }\n'
-      + '}'
+    const query = buildIssueRowsQuery(
+      options.repositoryOwner,
+      options.repositoryName,
+      chunk,
     );
     const raw = await run('gh', ['api', 'graphql', '-f', `query=${query}`]);
     const response = JSON.parse(raw) as {
@@ -245,17 +269,6 @@ async function fetchParentPrStates(
     }
   }
   return out;
-}
-
-function archiveMutation(projectId: string, itemIds: readonly string[]): string {
-  const fields = itemIds
-    .map((itemId, index) => (
-      `  a${index}: archiveProjectV2Item(input: { projectId: "${projectId}", itemId: "${itemId}" }) {\n`
-      + '    item { id }\n'
-      + '  }'
-    ))
-    .join('\n');
-  return `mutation {\n${fields}\n}`;
 }
 
 export interface PaintBoardRunResult {
@@ -383,13 +396,13 @@ export async function runPaintBoard(
 
   const toArchive = plan.archiveItemIds.slice(0, BOARD_ARCHIVE_MAX_PER_SWEEP);
   let archived = 0;
-  for (let offset = 0; offset < toArchive.length; offset += BOARD_ARCHIVE_BATCH_SIZE) {
-    const batch = toArchive.slice(offset, offset + BOARD_ARCHIVE_BATCH_SIZE);
-    await run('gh', [
-      'api', 'graphql', '-f',
-      `query=${archiveMutation(configured.projectId, batch)}`,
-    ]);
-    archived += batch.length;
+  for (const itemId of toArchive) {
+    await run('gh', [...archiveProjectItemArgs(
+      configured.projectNumber,
+      configured.projectOwner,
+      itemId,
+    )]);
+    archived += 1;
   }
   if (archived > 0) {
     console.log(`[paint-board] archived ${archived} Done item(s)`);

@@ -184,25 +184,43 @@ describe('deterministic maintainer issue helpers', () => {
   });
 
   it('reports missing triage facts and disallowed authors read-only', async () => {
-    const runner: CommandRunner = async () => JSON.stringify({
-      items: [{
-        content: {
-          number: 7,
-          title: 'External issue',
-          type: '',
-          author: { login: 'someone-else' },
+    const runner: CommandRunner = async (_command, args) => {
+      if (args[0] === 'project') {
+        return JSON.stringify({
+          items: [{
+            content: {
+              number: 7,
+              title: 'External issue',
+              type: 'Issue',
+            },
+            effort: '',
+            priority: 'P2',
+            blockedOn: 'Nothing',
+            sprint: {
+              duration: 14,
+              iterationId: 'iteration-current',
+              startDate: '2026-07-20',
+              title: 'Sprint 1',
+            },
+          }],
+        });
+      }
+      return JSON.stringify({
+        data: {
+          repository: {
+            issue: {
+              author: { login: 'someone-else' },
+              issueType: null,
+            },
+          },
         },
-        effort: '',
-        priority: 'P2',
-        blockedOn: 'Nothing',
-        sprint: '',
-      }],
-    });
+      });
+    };
     const inventory = await readTriageInventory(config, runner);
     expect(inventory.items).toEqual([{
       number: 7,
       title: 'External issue',
-      missing: ['type', 'effort', 'sprint'],
+      missing: ['type', 'effort'],
       blocked: ['author-not-allowed'],
     }]);
   });

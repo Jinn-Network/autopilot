@@ -1,9 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
 import type { AutopilotRuntime } from './autopilot-runtime.js';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
+import { packageHeadlessOverridePath } from './package-paths.js';
 
 /** The CLI reference in headless-override.md's opening framing line. Swapped
  *  out for non-claude coordinators (see buildHermesHeadlessPrompt). */
@@ -12,7 +9,7 @@ const CURSOR_CLI_TOKEN = '`agent -p`';
 
 /** The canonical headless-override block, injected into every headless session. */
 export function headlessOverride(): string {
-  return readFileSync(join(HERE, '..', 'headless-override.md'), 'utf8').trim();
+  return readFileSync(packageHeadlessOverridePath(), 'utf8').trim();
 }
 
 /** Render the shared override with runtime-specific CLI framing. */

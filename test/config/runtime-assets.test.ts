@@ -18,6 +18,7 @@ import {
 import {
   packageCanonPaths,
   packageEngineSkillsRoot,
+  packageHeadlessOverridePath,
   packageHermesLauncherPath,
   packageRoot,
 } from '../../src/package-paths.js';
@@ -55,12 +56,15 @@ describe('installed package runtime assets', () => {
     for (const path of [
       ...packageCanonPaths(),
       packageEngineSkillsRoot(),
+      packageHeadlessOverridePath(),
       packageHermesLauncherPath(),
     ]) {
       expect(path.startsWith(`${root}/`)).toBe(true);
     }
     expect(readFileSync(packageHermesLauncherPath(), 'utf8'))
       .toContain('source="autopilot"');
+    expect(readFileSync(packageHeadlessOverridePath(), 'utf8'))
+      .toContain('There is no human present');
   });
 
   it('loads package canon and only explicitly configured repository instructions', () => {

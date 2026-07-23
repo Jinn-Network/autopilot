@@ -190,6 +190,61 @@ describe('production implementation action port', () => {
     expect(calls.every((call) => call.env?.GITHUB_TOKEN === '')).toBe(true);
   });
 
+  it('retries a temporarily missing PR after creation until exact readback', async () => {
+    const pool = new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }]);
+    const selection = selectCredential(pool, { phase: 'implement' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    let listReads = 0;
+    let creates = 0;
+    const port = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: pool,
+      authorAllowlist: new Set(['trusted-author']),
+      readSnapshot: async () => snapshot(),
+      runner: async (command, args) => {
+        if (command !== 'gh') throw new Error(`unexpected ${command}`);
+        if (args.includes('create')) {
+          creates += 1;
+          return 'https://github.com/Jinn-Network/mono/pull/84\n';
+        }
+        if (args.includes('list')) {
+          listReads += 1;
+          if (listReads <= 2) return '[]';
+          return JSON.stringify([{
+            number: 84,
+            headRefName: 'autopilot/42',
+            headRefOid: HEAD,
+            baseRefName: 'next',
+            isDraft: true,
+            labels: [{ name: 'engine:review' }],
+            body: 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+          }]);
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.ensureDraftPullRequest({
+      issueNumber: 42,
+      branch: gitRefName('autopilot/42'),
+      claimOid: HEAD,
+      targetBase: gitRefName('next'),
+      title: 'Implement active lifecycle',
+      body: 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      draft: true,
+      label: 'engine:review',
+      credential: selection.credential,
+    })).resolves.toMatchObject({ number: 84, head: HEAD, draft: true });
+    expect(creates).toBe(1);
+    expect(listReads).toBeGreaterThanOrEqual(3);
+  });
+
   it('does not reclaim Project authority after a Human hold arrives', async () => {
     const baseline = snapshot();
     const current: GitHubLifecycleSnapshot = {

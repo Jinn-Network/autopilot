@@ -115,13 +115,18 @@ async function mutateWithExactReadback(
   detail: string,
 ): Promise<void> {
   let mutationError: unknown;
+  let confirmationError: unknown;
   try {
     await mutate();
   } catch (error) {
     mutationError = error;
   }
   for (let attempt = 0; attempt < READBACK_CONFIRMATION_ATTEMPTS; attempt += 1) {
-    if (await confirmed()) return;
+    try {
+      if (await confirmed()) return;
+    } catch (error) {
+      confirmationError = error;
+    }
     if (attempt < READBACK_CONFIRMATION_ATTEMPTS - 1) {
       await new Promise((resolve) => {
         setTimeout(resolve, READBACK_CONFIRMATION_DELAY_MS);
@@ -129,7 +134,9 @@ async function mutateWithExactReadback(
     }
   }
   if (mutationError !== undefined) throw mutationError;
-  throw new Error(detail);
+  throw new Error(detail, {
+    ...(confirmationError === undefined ? {} : { cause: confirmationError }),
+  });
 }
 
 function prLinks(snapshot: GitHubLifecycleSnapshot): Map<number, PrLink[]> {

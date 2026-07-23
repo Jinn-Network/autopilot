@@ -60,7 +60,6 @@
         "id": "PVTF_external_sprint"
       },
       "type": {
-        "id": "PVTF_external_type",
         "options": {
           "feat": "external_type_feat",
           "fix": "external_type_fix",

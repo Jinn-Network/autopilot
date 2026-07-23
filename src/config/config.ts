@@ -65,19 +65,23 @@ const projectFieldsSchema = z.object({
   effort: mappedField(optionsSchema(['low', 'medium', 'high', 'xhigh', 'max'])),
   blockedOn: mappedField(optionsSchema(['nothing', 'human', 'anotherIssue'])),
   sprint: z.object({ id: nonEmpty }).strict(),
-  type: mappedField(optionsSchema([
-    'feat',
-    'fix',
-    'refactor',
-    'spike',
-    'chore',
-    'docs',
-    'test',
-    'incident',
-    'design',
-  ])),
+  type: z.object({
+    options: optionsSchema([
+      'feat',
+      'fix',
+      'refactor',
+      'spike',
+      'chore',
+      'docs',
+      'test',
+      'incident',
+      'design',
+    ]),
+  }).strict(),
 }).strict().superRefine((fields, context) => {
-  const ids = Object.values(fields).map((field) => field.id);
+  const ids = Object.values(fields).flatMap((field) => (
+    'id' in field ? [field.id] : []
+  ));
   if (new Set(ids).size !== ids.length) {
     context.addIssue({ code: 'custom', message: 'Project field IDs must be unique' });
   }

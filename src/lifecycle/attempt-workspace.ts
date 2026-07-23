@@ -1022,7 +1022,13 @@ export interface CleanupAttemptOptions {
 }
 
 export function freeDiskBytes(path: string): number {
-  const stats = statfsSync(path);
+  let existingPath = resolve(path);
+  while (!existsSync(existingPath)) {
+    const parent = dirname(existingPath);
+    if (parent === existingPath) break;
+    existingPath = parent;
+  }
+  const stats = statfsSync(existingPath);
   return Number(stats.bavail) * Number(stats.bsize);
 }
 

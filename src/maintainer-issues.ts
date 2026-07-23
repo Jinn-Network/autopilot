@@ -131,6 +131,16 @@ query($owner: String!, $projectNumber: Int!) {
   }
 }`;
 
+const ISSUE_FACTS_QUERY = `
+query($owner: String!, $repository: String!, $number: Int!) {
+  repository(owner: $owner, name: $repository) {
+    issue(number: $number) {
+      author { login }
+      issueType { name }
+    }
+  }
+}`;
+
 function currentSprintId(raw: string, sprintFieldId: string, now: Date): string {
   const parsed = JSON.parse(raw) as {
     data?: {
@@ -372,6 +382,15 @@ export interface TriageInventory {
   }[];
 }
 
+function projectFieldIsPresent(value: unknown): boolean {
+  if (typeof value === 'string') return value.trim() !== '';
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const iterationId = (value as { iterationId?: unknown }).iterationId;
+  return typeof iterationId === 'string' && iterationId.trim() !== '';
+}
+
 export async function readTriageInventory(
   config: AutopilotConfig,
   runner: CommandRunner,
@@ -400,30 +419,55 @@ export async function readTriageInventory(
   const allowed = new Set(
     config.triage.allowedAuthors.map((author) => author.toLowerCase()),
   );
-  const items = (parsed.items ?? []).flatMap((item) => {
+  const [owner, repository] = config.repository.slug.split('/') as [string, string];
+  const items: TriageInventory['items'][number][] = [];
+  for (const item of parsed.items ?? []) {
     const number = item.content?.number;
-    if (typeof number !== 'number' || !Number.isSafeInteger(number)) return [];
+    if (typeof number !== 'number' || !Number.isSafeInteger(number)) continue;
+    const factsRaw = await runner('gh', [
+      'api',
+      'graphql',
+      '-f',
+      `query=${ISSUE_FACTS_QUERY}`,
+      '-f',
+      `owner=${owner}`,
+      '-f',
+      `repository=${repository}`,
+      '-F',
+      `number=${number}`,
+    ]);
+    const facts = JSON.parse(factsRaw) as {
+      data?: {
+        repository?: {
+          issue?: {
+            author?: { login?: unknown } | null;
+            issueType?: { name?: unknown } | null;
+          } | null;
+        } | null;
+      };
+    };
+    const issue = facts.data?.repository?.issue;
     const missing = [
-      ['type', item.content?.type],
+      ['type', issue?.issueType?.name],
       ['effort', item.effort],
       ['priority', item.priority],
       ['blockedOn', item['blocked on'] ?? item.blockedOn],
       ['sprint', item.sprint],
-    ].filter(([, value]) => typeof value !== 'string' || value === '')
+    ].filter(([, value]) => !projectFieldIsPresent(value))
       .map(([name]) => name as string);
-    const author = item.content?.author?.login;
+    const author = issue?.author?.login;
     const blocked = typeof author === 'string' && allowed.has(author.toLowerCase())
       ? []
       : ['author-not-allowed'];
-    return [{
+    items.push({
       number,
       title: typeof item.content?.title === 'string'
         ? item.content.title
         : `Issue #${number}`,
       missing,
       blocked,
-    }];
-  });
+    });
+  }
   return {
     schemaVersion: 1,
     repository: config.repository.slug,

@@ -34,10 +34,16 @@ function compatibleRunner(calls: string[][]): InitializationRunner {
     if (command === 'gh' && args[0] === 'repo') {
       return JSON.stringify({
         nameWithOwner: 'Octo-Labs/widget',
-        databaseId: 987654,
         url: 'https://github.com/Octo-Labs/widget',
         defaultBranchRef: { name: 'trunk' },
       });
+    }
+    if (
+      command === 'gh'
+      && args[0] === 'api'
+      && args[1] === 'repos/Octo-Labs/widget'
+    ) {
+      return '987654\n';
     }
     if (command === 'gh' && args[0] === 'api' && args[1] === 'user') {
       return 'octocat\n';
@@ -95,25 +101,38 @@ function compatibleRunner(calls: string[][]): InitializationRunner {
             projectV2: {
               id: 'PVT_external_fixture',
               viewerCanUpdate: true,
-              typeField: {
-                id: 'PVTF_type',
-                name: 'Type',
-                dataType: 'ISSUE_TYPE',
-              },
-              sprintField: {
-                id: 'PVTF_sprint',
-                configuration: {
-                  iterations: [{
-                    id: 'iteration-current',
-                    title: 'Sprint 1',
-                    startDate: '2026-07-20',
-                    duration: 14,
-                  }],
-                },
+              fields: {
+                nodes: [
+                  {
+                    id: 'PVTF_sprint',
+                    name: 'Sprint',
+                    dataType: 'ITERATION',
+                    configuration: {
+                      duration: 14,
+                      iterations: [{
+                        id: 'iteration-current',
+                        title: 'Sprint 1',
+                        startDate: '2026-07-20',
+                        duration: 14,
+                      }],
+                    },
+                  },
+                ],
               },
             },
           },
-          repository: { viewerPermission: 'ADMIN' },
+          repository: {
+            viewerPermission: 'ADMIN',
+            labels: {
+              nodes: [
+                { name: 'engine:review' },
+                { name: 'autopilot:human' },
+                { name: 'review-finding' },
+                { name: 'reconcile' },
+                { name: 'ci-failure' },
+              ],
+            },
+          },
         },
       });
     }
@@ -493,7 +512,10 @@ describe('autopilot init', () => {
         const value = JSON.parse(raw);
         value.data.organization.issueTypes.nodes = value.data.organization
           .issueTypes.nodes.filter((entry: { name: string }) => entry.name !== 'docs');
-        delete value.data.organization.projectV2.sprintField;
+        value.data.organization.projectV2.fields.nodes = value.data.organization
+          .projectV2.fields.nodes.filter(
+            (entry: { name: string }) => entry.name !== 'Sprint',
+          );
         return JSON.stringify(value);
       }
       return raw;
@@ -528,6 +550,60 @@ describe('autopilot init', () => {
       sprintCreated: true,
       typeCreated: true,
     });
+  });
+
+  it('previews and creates missing repository lifecycle labels', async () => {
+    const root = repository();
+    const calls: string[][] = [];
+    const base = compatibleRunner(calls);
+    let labelCreated = false;
+    const runner: InitializationRunner = async (command, args, options) => {
+      if (command === 'gh' && args[0] === 'label' && args[1] === 'create') {
+        calls.push([command, ...args]);
+        labelCreated = true;
+        return '';
+      }
+      const raw = await base(command, args, options);
+      if (
+        !labelCreated
+        && command === 'gh'
+        && args[0] === 'api'
+        && args[1] === 'graphql'
+      ) {
+        const value = JSON.parse(raw);
+        value.data.repository.labels.nodes = value.data.repository.labels.nodes
+          .filter((entry: { name: string }) => entry.name !== 'engine:review');
+        return JSON.stringify(value);
+      }
+      return raw;
+    };
+    const plans: string[][] = [];
+    const interactor: InitializationInteractor = {
+      chooseProject: async () => {
+        throw new Error('unexpected Project selection');
+      },
+      confirm: async (plan) => {
+        plans.push([...plan.changes]);
+        return true;
+      },
+    };
+
+    await initializeAutopilot({
+      cwd: root,
+      nonInteractive: false,
+      project: 'Octo-Labs/73',
+      runner,
+      interactor,
+      environment: {},
+    });
+
+    expect(plans).toEqual([[
+      'Create repository lifecycle label engine:review',
+    ]]);
+    expect(labelCreated).toBe(true);
+    expect(calls.some((call) => call.join(' ').includes(
+      'gh label create engine:review --repo Octo-Labs/widget',
+    ))).toBe(true);
   });
 
   it('stores environment credentials only in an owner-only local profile', async () => {

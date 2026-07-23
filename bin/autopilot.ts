@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { parseAutopilotArguments, AUTOPILOT_USAGE } from '../src/cli/arguments.js';
+import { parseTrailingJson } from '../src/cli/json-output.js';
+import { ensureCapabilityAttestation } from '../src/capability-setup.js';
 import {
   loadAutopilotConfig,
   type LoadedAutopilotConfig,
@@ -108,18 +110,6 @@ async function runEngine(arguments_: readonly string[]): Promise<void> {
   const result = await captureEngine(arguments_);
   process.stdout.write(result.text);
   if (result.exitCode != null) process.exitCode = result.exitCode;
-}
-
-function parseLastJson(output: string): unknown {
-  const lines = output.trim().split('\n');
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    try {
-      return JSON.parse(lines[index]!) as unknown;
-    } catch {
-      // Runtime diagnostics may precede the final JSON lifecycle report.
-    }
-  }
-  throw new Error('Lifecycle engine did not return a JSON report');
 }
 
 function logPath(
@@ -274,6 +264,11 @@ async function main(): Promise<void> {
         environment: process.env,
       });
       const loaded = await loadAutopilotConfig(result.repositoryRoot, process.env);
+      await ensureCapabilityAttestation({
+        loaded,
+        environment: process.env,
+        runner: defaultRunner,
+      });
       const skills = updateMaintainerSkills({
         repositoryRoot: result.repositoryRoot,
         config: loaded.config,
@@ -375,7 +370,7 @@ async function main(): Promise<void> {
       process.stdout.write(`${JSON.stringify({
         schemaVersion: 1,
         daemon,
-        lifecycle: parseLastJson(lifecycle.text),
+        lifecycle: parseTrailingJson(lifecycle.text),
       }, null, 2)}\n`);
     } else {
       process.stdout.write(`Daemon: ${daemon.status}\n${lifecycle.text}`);

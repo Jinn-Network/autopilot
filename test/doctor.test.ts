@@ -78,8 +78,14 @@ function healthyRunner(): DoctorRunner {
       return JSON.stringify({
         nameWithOwner: fixture.repository.slug,
         defaultBranchRef: { name: fixture.repository.defaultBranch },
-        databaseId: fixture.repository.restDatabaseId,
       });
+    }
+    if (
+      command === 'gh'
+      && args[0] === 'api'
+      && args[1] === `repos/${fixture.repository.slug}`
+    ) {
+      return `${fixture.repository.restDatabaseId}\n`;
     }
     if (command === 'gh' && args[0] === 'project' && args[1] === 'field-list') {
       return liveFields;
@@ -96,10 +102,14 @@ function healthyRunner(): DoctorRunner {
             projectV2: {
               id: fixture.project.id,
               viewerCanUpdate: true,
-              typeField: {
-                id: fixture.project.fields.type.id,
-                name: 'Type',
-                dataType: 'ISSUE_TYPE',
+              fields: {
+                nodes: [
+                  {
+                    id: fixture.project.fields.sprint.id,
+                    name: 'Sprint',
+                    dataType: 'ITERATION',
+                  },
+                ],
               },
             },
             issueTypes: {

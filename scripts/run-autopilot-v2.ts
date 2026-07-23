@@ -7,7 +7,7 @@ import {
   openSync,
   writeSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { argv, env, pid } from 'node:process';
 import {
@@ -629,7 +629,16 @@ export async function runAutopilotV2(
   });
 }
 
-if (argv[1] != null && import.meta.url === pathToFileURL(argv[1]).href) {
+export function isDirectLifecycleEntrypoint(
+  entryPath: string | undefined,
+  moduleUrl = import.meta.url,
+): boolean {
+  return entryPath != null
+    && /^run-autopilot-v2\.(?:[cm]?[jt]s)$/.test(basename(entryPath))
+    && moduleUrl === pathToFileURL(entryPath).href;
+}
+
+if (isDirectLifecycleEntrypoint(argv[1])) {
   runAutopilotV2().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[autopilot:v2] ${message}`);
