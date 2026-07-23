@@ -4,6 +4,7 @@ import { ConditionalRestClient } from '../../src/lifecycle/github-rest.js';
 import {
   ConditionalPullRequestEvidenceProbe,
 } from '../../src/lifecycle/github-rest-pr-evidence.js';
+import * as restEvidence from '../../src/lifecycle/github-rest-pr-evidence.js';
 import type { PullRequestSnapshot } from '../../src/lifecycle/snapshot.js';
 import { gitOid } from '../../src/lifecycle/types.js';
 import { GitHubUsageMeter } from '../../src/lifecycle/github-usage.js';
@@ -123,6 +124,19 @@ function probeWith(
 }
 
 describe('ConditionalPullRequestEvidenceProbe', () => {
+  it('parses workflow run ids rather than check-run ids', () => {
+    const parser = (
+      restEvidence as unknown as {
+        workflowRunIdFromDetailsUrl?: (url: unknown) => number | undefined;
+      }
+    ).workflowRunIdFromDetailsUrl;
+    expect(parser).toBeTypeOf('function');
+    expect(parser?.(
+      'https://github.com/Jinn-Network/mono/actions/runs/123/jobs/456',
+    )).toBe(123);
+    expect(parser?.('https://github.com/Jinn-Network/mono/runs/999')).toBeUndefined();
+  });
+
   it('normalizes a cold 200 against full evidence, then reuses all four ETags on 304', async () => {
     const context = probeWith(equalBodies(), true);
 
@@ -135,6 +149,58 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
       restNotModified: 5,
       cacheHits: 5,
     });
+  });
+
+  it('uses the workflow run id from a check-run details URL', async () => {
+    const bodies = equalBodies();
+    bodies.checks = {
+      total_count: 1,
+      check_runs: [{
+        id: 999,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'success',
+        details_url: 'https://github.com/Jinn-Network/mono/actions/runs/123/jobs/456',
+        check_suite: { id: 77 },
+      }],
+    };
+
+    await expect(probeWith(bodies).probe.changed(pr({
+      checks: [{
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+        source: 'check-run',
+        runId: 123,
+        checkSuiteId: 77,
+      }],
+    }))).resolves.toBe(false);
+  });
+
+  it('detects a changed workflow run id even when the visible check state is unchanged', async () => {
+    const bodies = equalBodies();
+    bodies.checks = {
+      total_count: 1,
+      check_runs: [{
+        id: 999,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'success',
+        details_url: 'https://github.com/Jinn-Network/mono/actions/runs/123/jobs/456',
+        check_suite: { id: 77 },
+      }],
+    };
+
+    await expect(probeWith(bodies).probe.changed(pr({
+      checks: [{
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+        source: 'check-run',
+        runId: 999,
+        checkSuiteId: 77,
+      }],
+    }))).resolves.toBe(true);
   });
 
   it('normalizes documented null PR body and user values to empty strings', async () => {

@@ -57,6 +57,67 @@ describe('ci-rerun', () => {
     expect(publishRecord).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    'gh: Not Found (HTTP 404)',
+    'gh: Gone (HTTP 410)',
+  ])('skips stale workflow-run ids on %s and still publishes a rerun record', async (failure) => {
+    const rerunFailedJobs = vi.fn(async () => {
+      throw new Error(`Command failed: gh api ... -X POST\n${failure}`);
+    });
+    const publishRecord = vi.fn(async () => ({
+      status: 'won' as const,
+      expected: null,
+      published: HEAD,
+      observed: HEAD,
+    }));
+    const result = await executeRerunFailedChecksAction(
+      { prNumber: 101, head: HEAD },
+      {
+        readChecks: async () => [
+          check({ name: 'test', source: 'check-run', runId: 55 }),
+        ],
+        readRecord: async () => null,
+        rerunFailedJobs,
+        publishRecord,
+        fileCiFailureChild: async () => ({
+          status: 'filed',
+          childNumber: 1,
+        }),
+      },
+    );
+    expect(result).toMatchObject({ status: 'rerun-requested', prNumber: 101, head: HEAD });
+    expect(rerunFailedJobs).toHaveBeenCalledWith(55);
+    expect(publishRecord).toHaveBeenCalledOnce();
+  });
+
+  it('does not treat unrelated not-found failures as stale workflow runs', async () => {
+    const publishRecord = vi.fn(async () => ({
+      status: 'won' as const,
+      expected: null,
+      published: HEAD,
+      observed: HEAD,
+    }));
+
+    await expect(executeRerunFailedChecksAction(
+      { prNumber: 101, head: HEAD },
+      {
+        readChecks: async () => [
+          check({ name: 'test', source: 'check-run', runId: 55 }),
+        ],
+        readRecord: async () => null,
+        rerunFailedJobs: async () => {
+          throw new Error('GitHub credential not found');
+        },
+        publishRecord,
+        fileCiFailureChild: async () => ({
+          status: 'filed',
+          childNumber: 1,
+        }),
+      },
+    )).rejects.toThrow(/credential not found/i);
+    expect(publishRecord).not.toHaveBeenCalled();
+  });
+
   it('does not spend a retry when a record already exists', async () => {
     const rerunFailedJobs = vi.fn(async () => {});
     const result = await executeRerunFailedChecksAction(
