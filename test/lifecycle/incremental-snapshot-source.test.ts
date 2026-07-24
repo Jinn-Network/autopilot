@@ -358,6 +358,7 @@ describe('IncrementalLifecycleSnapshotSource', () => {
                 content: {
                   __typename: 'Issue',
                   number: 42,
+                  repository: { nameWithOwner: 'Jinn-Network/mono' },
                   issueType: { name: 'feat' },
                   blockedBy: { nodes: [] },
                 },
