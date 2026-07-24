@@ -69,6 +69,15 @@ export interface ProductionChildIssuePortOptions {
   readonly projectOwner?: string;
   readonly projectNumber?: number;
   readonly projectMapping?: ProjectMapping;
+  /** Injectable only for bounded, eventually-consistent Project readbacks. */
+  readonly wait?: (milliseconds: number) => Promise<void>;
+}
+
+const PROJECT_MEMBERSHIP_READBACK_ATTEMPTS = 5;
+const PROJECT_MEMBERSHIP_READBACK_DELAY_MS = 250;
+
+function productionWait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, milliseconds); });
 }
 
 function createFixIssueTypeIdResolver(
@@ -409,6 +418,7 @@ export async function repairProductionMachineChild(
   const repo = options.repo ?? REPO;
   const projectOwner = options.projectOwner ?? ORG;
   const projectNumber = options.projectNumber ?? PROJECT_NUMBER;
+  const wait = options.wait ?? productionWait;
   const resolveFixTypeId = createFixIssueTypeIdResolver(options, runner, repo);
   let current = await readMachineChildRepairState(
     runner,
@@ -501,8 +511,19 @@ export async function repairProductionMachineChild(
       '--format',
       'json',
     ]));
-    current = await refresh();
-    if (current.item === null || current.item.id !== added) {
+    for (let attempt = 0; attempt < PROJECT_MEMBERSHIP_READBACK_ATTEMPTS; attempt += 1) {
+      current = await refresh();
+      if (current.item !== null) {
+        if (current.item.id !== added) {
+          throw new Error('Machine-child repair Project membership readback is ambiguous');
+        }
+        break;
+      }
+      if (attempt + 1 < PROJECT_MEMBERSHIP_READBACK_ATTEMPTS) {
+        await wait(PROJECT_MEMBERSHIP_READBACK_DELAY_MS);
+      }
+    }
+    if (current.item === null) {
       throw new Error('Machine-child repair Project membership readback is ambiguous');
     }
   }
