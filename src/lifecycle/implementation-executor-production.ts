@@ -219,11 +219,6 @@ export function makeProductionImplementationActionPort(
       prLinks(snapshot),
       options.authorAllowlist,
     );
-    const existing = snapshot.pullRequests.find((pr) =>
-      pr.state === 'OPEN' && (
-        pr.closingIssueNumbers.includes(issueNumber)
-        || pr.body.includes(`<!-- jinn-autopilot:v2 issue=${issueNumber} `)
-      ));
     const marker = parseChildMarker(source.body ?? '');
     const childKindLabel = hasChildKindLabel(source.labels);
     let eligible = lifecycle.kind === 'issue'
@@ -244,9 +239,10 @@ export function makeProductionImplementationActionPort(
       open: true,
       eligible,
       ...(eligibilityDetail === undefined ? {} : { eligibilityDetail }),
+      // The executor compares the implementation PR against this authority.
+      // Keep it independent of that PR to make a PR-only retarget fail closed.
       targetBase: gitRefName(
-        existing?.baseRefName
-        ?? stackReady.get(issueNumber)?.baseBranch
+        stackReady.get(issueNumber)?.baseBranch
         ?? defaultBranch,
       ),
       effort: source.effort,
