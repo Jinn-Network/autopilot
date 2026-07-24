@@ -74,6 +74,18 @@ export interface BranchClaimSnapshot {
   readonly implementationCompletionSummary?: string;
 }
 
+export interface TerminalClaimEvidence {
+  readonly issueNumber: number;
+  readonly prNumber: number;
+  readonly headRefName: string;
+  readonly headOid: GitOid;
+  readonly claimAttempt: string;
+  readonly targetBase: string;
+  readonly claimFingerprint: string;
+  readonly mergedAt: string;
+  readonly mergeCommitOid: GitOid;
+}
+
 export interface RawBranchClaim {
   readonly issueNumber: number;
   readonly headRefName: string;
@@ -188,6 +200,8 @@ export interface GitHubLifecycleSnapshot {
   readonly issues: readonly PolledIssue[];
   readonly pullRequests: readonly PullRequestSnapshot[];
   readonly branches: readonly BranchClaimSnapshot[];
+  /** Narrow terminal proof for suppressing orphan recovery on retained implementation refs. */
+  readonly terminalClaims?: readonly TerminalClaimEvidence[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
   readonly lifecycle: LifecycleSnapshot;
   readonly capturedAt: string;
@@ -815,6 +829,7 @@ export function composeGitHubLifecycleSnapshot(
     readonly issues: readonly PolledIssue[];
     readonly pullRequests: readonly PullRequestSnapshot[];
     readonly branches: readonly BranchClaimSnapshot[];
+    readonly terminalClaims?: readonly TerminalClaimEvidence[];
   },
   options: {
     readonly authorAllowlist: ReadonlySet<string>;
@@ -840,6 +855,7 @@ export function composeGitHubLifecycleSnapshot(
     issues: [...evidence.issues],
     pullRequests: [...evidence.pullRequests],
     branches: [...evidence.branches],
+    terminalClaims: [...(evidence.terminalClaims ?? [])],
     diagnostics: lifecycle.diagnostics,
     lifecycle: { items: lifecycle.items },
     capturedAt: options.capturedAt,

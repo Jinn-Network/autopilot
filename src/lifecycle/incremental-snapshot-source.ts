@@ -32,8 +32,11 @@ import {
   type GitHubLifecycleSnapshot,
   type LifecycleParityDifference,
   type LifecycleSnapshotSource,
+  type BranchClaimSnapshot,
   type PullRequestSnapshot,
+  type TerminalClaimEvidence,
 } from './snapshot.js';
+import { implementationClaimFingerprint } from './terminal-claim.js';
 
 /** Closed-index overlap selected at a full reconciliation and held fixed until the next one. */
 export const RECENTLY_CLOSED_OVERLAP_MS = 5 * 60 * 1_000;
@@ -215,6 +218,80 @@ function retainMerged(pr: PullRequestSnapshot, project: ProjectSnapshot): boolea
     const status = statuses.get(number);
     return status !== undefined && status !== 'Done';
   });
+}
+
+function terminalMatchesBranch(
+  terminal: TerminalClaimEvidence,
+  branch: BranchClaimSnapshot,
+): boolean {
+  return branch.issueNumber === terminal.issueNumber
+    && branch.headRefName === terminal.headRefName
+    && branch.headOid === terminal.headOid
+    && branch.claim.phase === 'implement'
+    && branch.claim.prNumber === terminal.prNumber
+    && branch.claim.attempt === terminal.claimAttempt
+    && branch.claim.targetBase === terminal.targetBase
+    && implementationClaimFingerprint(branch.claim) === terminal.claimFingerprint;
+}
+
+function retainTerminalClaims(
+  prior: readonly TerminalClaimEvidence[],
+  branches: readonly BranchClaimSnapshot[],
+): TerminalClaimEvidence[] {
+  return prior
+    .filter((terminal) => branches.some((branch) => terminalMatchesBranch(terminal, branch)))
+    .sort((left, right) => left.issueNumber - right.issueNumber);
+}
+
+function implementationClaimsMatch(
+  left: Extract<BranchClaimSnapshot['claim'], { readonly phase: 'implement' }>,
+  right: Extract<BranchClaimSnapshot['claim'], { readonly phase: 'implement' }>,
+): boolean {
+  return left.issueNumber === right.issueNumber
+    && left.prNumber === right.prNumber
+    && left.attempt === right.attempt
+    && left.runner === right.runner
+    && left.login === right.login
+    && left.expectedHead === right.expectedHead
+    && left.targetBase === right.targetBase
+    && left.claimedAt === right.claimedAt
+    && left.phaseComplete === right.phaseComplete
+    && implementationClaimFingerprint(left) === implementationClaimFingerprint(right);
+}
+
+function terminalClaimFromExactMergedPr(
+  branch: BranchClaimSnapshot,
+  pr: PullRequestSnapshot,
+): TerminalClaimEvidence | null {
+  const claim = branch.claim;
+  const prClaim = pr.branchClaim;
+  if (
+    claim.phase !== 'implement'
+    || claim.prNumber === undefined
+    || prClaim?.phase !== 'implement'
+    || pr.state !== 'MERGED'
+    || pr.mergedAt === undefined
+    || pr.mergeCommitOid === undefined
+    || pr.number !== claim.prNumber
+    || pr.headRefName !== branch.headRefName
+    || pr.headOid !== branch.headOid
+    || pr.baseRefName !== claim.targetBase
+    || !pr.closingIssueNumbers.includes(branch.issueNumber)
+    || !implementationClaimsMatch(claim, prClaim)
+  ) {
+    return null;
+  }
+  return {
+    issueNumber: branch.issueNumber,
+    prNumber: pr.number,
+    headRefName: branch.headRefName,
+    headOid: branch.headOid,
+    claimAttempt: claim.attempt,
+    targetBase: claim.targetBase,
+    claimFingerprint: implementationClaimFingerprint(claim),
+    mergedAt: pr.mergedAt,
+    mergeCommitOid: pr.mergeCommitOid,
+  };
 }
 
 function assertTargetedReserve(remaining: number, floor: number): void {
@@ -499,8 +576,17 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         }`;
       }
     }
+    const cacheBaseline = parityCandidate?.next ?? prior;
+    const terminalClaims = await this.backfillTerminalClaims(
+      cacheBaseline?.terminalClaims ?? [],
+      provisional,
+      rateLimitFloor,
+    );
     const capturedAt = exactNow(this.now);
-    const full = composeGitHubLifecycleSnapshot(provisional, {
+    const full = composeGitHubLifecycleSnapshot({
+      ...provisional,
+      terminalClaims,
+    }, {
       authorAllowlist: this.authorAllowlist,
       capturedAt,
       snapshotMode: 'full',
@@ -544,7 +630,6 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
             ? {}
             : { parityUnavailableReason }),
         });
-    const cacheBaseline = parityCandidate?.next ?? prior;
     const exactOpen = new Map<number, PullRequestSnapshot>();
     const previousOpen = cacheBaseline === null
       || cacheBaseline === undefined
@@ -575,6 +660,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     const next: LifecycleDiscoveryState = {
       version: 1,
       evidence: evidence(reconciled),
+      terminalClaims: [...(reconciled.terminalClaims ?? [])],
       openPullRequestEvidence: [...exactOpen.values()]
         .sort((left, right) => left.number - right.number),
       openPullRequests: [...openAfter],
@@ -688,6 +774,10 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
 
     const branches = (await this.requireIncrementalBranchClaims())
       .map(decodeBranchClaimSnapshot);
+    const terminalClaims = new Map(retainTerminalClaims(
+      prior.terminalClaims,
+      branches,
+    ).map((terminal) => [terminal.issueNumber, terminal]));
     const activatedIssues = newlyActiveProjectIssues(prior.evidence.project, project);
     const hasUntrackedOpen = openIndex.some((entry) => !openEvidence.has(entry.number));
     const needsRelationRead = activatedIssues.length > 0 && hasUntrackedOpen;
@@ -769,6 +859,14 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         mergedEvidence.delete(number);
       } else {
         openEvidence.delete(number);
+        const branch = branches.find((candidate) => (
+          candidate.claim.phase === 'implement'
+          && candidate.claim.prNumber === decoded.number
+        ));
+        if (branch !== undefined) {
+          const terminal = terminalClaimFromExactMergedPr(branch, decoded);
+          if (terminal !== null) terminalClaims.set(terminal.issueNumber, terminal);
+        }
         if (relevantToLifecycle(decoded, project)) mergedEvidence.set(number, decoded);
         else mergedEvidence.delete(number);
       }
@@ -788,6 +886,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         ...mergedEvidence.values(),
       ].sort((left, right) => left.number - right.number),
       branches,
+      terminalClaims: [...terminalClaims.values()]
+        .sort((left, right) => left.issueNumber - right.issueNumber),
     }, {
       authorAllowlist: this.authorAllowlist,
       capturedAt,
@@ -798,6 +898,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     const next: LifecycleDiscoveryState = {
       version: 1,
       evidence: evidence(snapshot),
+      terminalClaims: [...(snapshot.terminalClaims ?? [])],
       openPullRequestEvidence: [...openEvidence.values()]
         .sort((left, right) => left.number - right.number),
       openPullRequests: [...openIndex],
@@ -806,6 +907,50 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       restCache: this.conditionalRest.exportCache(),
     };
     return { snapshot, next, openIssues: issueIndex, reviewClaimRefs };
+  }
+
+  private async backfillTerminalClaims(
+    prior: readonly TerminalClaimEvidence[],
+    snapshot: GitHubLifecycleSnapshot,
+    rateLimitFloor: number,
+  ): Promise<readonly TerminalClaimEvidence[]> {
+    const retained = retainTerminalClaims(prior, snapshot.branches);
+    const byIssue = new Map(retained.map((terminal) => [terminal.issueNumber, terminal]));
+    const openBranches = new Set(snapshot.pullRequests
+      .filter((pr) => pr.state === 'OPEN')
+      .map((pr) => pr.headRefName));
+    for (const branch of snapshot.branches) {
+      if (
+        byIssue.has(branch.issueNumber)
+        || branch.claim.phase !== 'implement'
+        || branch.claim.prNumber === undefined
+        || openBranches.has(branch.headRefName)
+      ) {
+        continue;
+      }
+      const remaining = this.fullReader.githubUsage().graphqlRemaining;
+      if (remaining === null) {
+        throw new IncrementalSnapshotUnavailableError(
+          'full branch backfill has no GraphQL quota evidence',
+        );
+      }
+      assertTargetedReserve(remaining, rateLimitFloor);
+      const raw = await this.requireHydrator(branch.claim.prNumber);
+      const usage = this.fullReader.githubUsage();
+      if (usage.graphqlRemaining === null) {
+        throw new IncrementalSnapshotUnavailableError(
+          `full branch backfill for PR #${branch.claim.prNumber} returned no GraphQL quota evidence`,
+        );
+      }
+      assertCompletedFloor(usage.graphqlRemaining, rateLimitFloor);
+      if (raw === null) continue;
+      const terminal = terminalClaimFromExactMergedPr(
+        branch,
+        decodePullRequestSnapshot(raw),
+      );
+      if (terminal !== null) byIssue.set(terminal.issueNumber, terminal);
+    }
+    return [...byIssue.values()].sort((left, right) => left.issueNumber - right.issueNumber);
   }
 
   private async parityBoundaryChange(

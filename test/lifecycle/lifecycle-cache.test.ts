@@ -86,6 +86,7 @@ function state(): LifecycleDiscoveryState {
         accountingComplete: true,
       },
     },
+    terminalClaims: [],
     openPullRequestEvidence: [pullRequest],
     openPullRequests: null,
     recentlyClosedPullRequests: [],
@@ -144,6 +145,7 @@ function branch(): BranchClaimSnapshot {
       protocolVersion: 2,
       phase: 'implement',
       issueNumber: 42,
+      prNumber: 202,
       attempt: '11111111-1111-4111-8111-111111111111',
       runner: 'runner-a',
       login: 'oaksprout',
@@ -151,6 +153,28 @@ function branch(): BranchClaimSnapshot {
       targetBase: gitRefName('next'),
       claimedAt: '2026-07-22T09:30:00.000Z',
     },
+  };
+}
+
+function stateWithTerminalClaim(): LifecycleDiscoveryState {
+  const claimedBranch = branch();
+  return {
+    ...state(),
+    evidence: {
+      ...state().evidence,
+      branches: [claimedBranch],
+    },
+    terminalClaims: [{
+      issueNumber: 42,
+      prNumber: 202,
+      headRefName: 'autopilot/42',
+      headOid: gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+      claimAttempt: '11111111-1111-4111-8111-111111111111',
+      targetBase: gitRefName('next'),
+      claimFingerprint: '78a9c342d92eba807e79dcf2f595877f01f4bec051e8ba8db553b2f640c63b8b',
+      mergedAt: '2026-07-22T09:45:00.000Z',
+      mergeCommitOid: gitOid('dddddddddddddddddddddddddddddddddddddddd'),
+    }],
   };
 }
 
@@ -166,6 +190,150 @@ describe('LifecycleDiscoveryCacheStore', () => {
     expect((await stat(join(directory, 'lifecycle-cache.json'))).mode & 0o777).toBe(0o600);
     expect(await readFile(join(directory, 'lifecycle-cache.json'), 'utf8'))
       .not.toMatch(/GH_TOKEN|credential|authorization/i);
+  });
+
+  it('round-trips terminal claim evidence after merged PR evidence is no longer retained', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const terminal = stateWithTerminalClaim();
+
+    await store.save(terminal);
+
+    await expect(store.load()).resolves.toEqual(terminal);
+  });
+
+  it('loads a legacy cache without terminal claim evidence as an empty fail-closed ledger', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    await chmod(directory, 0o700);
+    const { terminalClaims: _terminalClaims, ...legacy } = state();
+    await writeFile(
+      join(directory, 'lifecycle-cache.json'),
+      JSON.stringify(legacy),
+      { mode: 0o600 },
+    );
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+
+    await expect(store.load()).resolves.toEqual(state());
+  });
+
+  it.each([
+    ['missing branch', () => ({
+      ...stateWithTerminalClaim(),
+      evidence: { ...stateWithTerminalClaim().evidence, branches: [] },
+    })],
+    ['changed issue', () => ({
+      ...stateWithTerminalClaim(),
+      terminalClaims: [{
+        ...stateWithTerminalClaim().terminalClaims[0]!,
+        issueNumber: 43,
+      }],
+    })],
+    ['changed PR', () => ({
+      ...stateWithTerminalClaim(),
+      terminalClaims: [{
+        ...stateWithTerminalClaim().terminalClaims[0]!,
+        prNumber: 203,
+      }],
+    })],
+    ['changed branch', () => ({
+      ...stateWithTerminalClaim(),
+      terminalClaims: [{
+        ...stateWithTerminalClaim().terminalClaims[0]!,
+        headRefName: 'autopilot/42-r2',
+      }],
+    })],
+    ['changed head', () => ({
+      ...stateWithTerminalClaim(),
+      terminalClaims: [{
+        ...stateWithTerminalClaim().terminalClaims[0]!,
+        headOid: gitOid('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'),
+      }],
+    })],
+    ['changed attempt', () => ({
+      ...stateWithTerminalClaim(),
+      terminalClaims: [{
+        ...stateWithTerminalClaim().terminalClaims[0]!,
+        claimAttempt: '22222222-2222-4222-8222-222222222222',
+      }],
+    })],
+    ['changed target base', () => ({
+      ...stateWithTerminalClaim(),
+      terminalClaims: [{
+        ...stateWithTerminalClaim().terminalClaims[0]!,
+        targetBase: gitRefName('release/next'),
+      }],
+    })],
+    ['changed runner', () => ({
+      ...stateWithTerminalClaim(),
+      evidence: {
+        ...stateWithTerminalClaim().evidence,
+        branches: [{
+          ...stateWithTerminalClaim().evidence.branches[0]!,
+          claim: {
+            ...stateWithTerminalClaim().evidence.branches[0]!.claim,
+            runner: 'runner-b',
+          },
+        }],
+      },
+    })],
+    ['changed login', () => ({
+      ...stateWithTerminalClaim(),
+      evidence: {
+        ...stateWithTerminalClaim().evidence,
+        branches: [{
+          ...stateWithTerminalClaim().evidence.branches[0]!,
+          claim: {
+            ...stateWithTerminalClaim().evidence.branches[0]!.claim,
+            login: 'different-login',
+          },
+        }],
+      },
+    })],
+    ['changed expected head', () => ({
+      ...stateWithTerminalClaim(),
+      evidence: {
+        ...stateWithTerminalClaim().evidence,
+        branches: [{
+          ...stateWithTerminalClaim().evidence.branches[0]!,
+          claim: {
+            ...stateWithTerminalClaim().evidence.branches[0]!.claim,
+            expectedHead: gitOid('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'),
+          },
+        }],
+      },
+    })],
+    ['changed claimed time', () => ({
+      ...stateWithTerminalClaim(),
+      evidence: {
+        ...stateWithTerminalClaim().evidence,
+        branches: [{
+          ...stateWithTerminalClaim().evidence.branches[0]!,
+          claim: {
+            ...stateWithTerminalClaim().evidence.branches[0]!.claim,
+            claimedAt: '2026-07-22T09:31:00.000Z',
+          },
+        }],
+      },
+    })],
+    ['changed phase completion', () => ({
+      ...stateWithTerminalClaim(),
+      evidence: {
+        ...stateWithTerminalClaim().evidence,
+        branches: [{
+          ...stateWithTerminalClaim().evidence.branches[0]!,
+          claim: {
+            ...stateWithTerminalClaim().evidence.branches[0]!.claim,
+            phaseComplete: true as const,
+          },
+        }],
+      },
+    })],
+  ] as const)('rejects terminal evidence with a %s identity', async (_label, makeState) => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+
+    await expect(store.save(makeState())).rejects
+      .toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
   });
 
   it('round-trips ci rerun evidence in snapshot and open-PR cache state', async () => {

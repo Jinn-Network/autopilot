@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import type { ProjectSnapshot } from '../../src/dispatcher/project-snapshot.js';
 import { fetchProjectSnapshot } from '../../src/dispatcher/project-snapshot.js';
 import type { PolledIssue } from '../../src/dispatcher/types.js';
+import { runLifecycleCycle } from '../../src/lifecycle/controller.js';
 import { ConditionalRestClient } from '../../src/lifecycle/github-rest.js';
+import { encodeBranchClaimTrailers } from '../../src/lifecycle/codecs.js';
 import type {
   GitHubRestDiscoveryReader,
   OpenIssueIndexEntry,
@@ -22,11 +24,19 @@ import type {
   LifecycleDiscoveryStateStore,
 } from '../../src/lifecycle/lifecycle-cache.js';
 import { LifecycleDiscoveryCacheStore } from '../../src/lifecycle/lifecycle-cache.js';
+import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
 import type {
+  GitHubLifecycleSnapshot,
   GitHubLifecycleReader,
+  RawBranchClaim,
   RawPullRequest,
 } from '../../src/lifecycle/snapshot.js';
-import { gitOid, type GitOid } from '../../src/lifecycle/types.js';
+import {
+  gitOid,
+  gitRefName,
+  type BranchClaim,
+  type GitOid,
+} from '../../src/lifecycle/types.js';
 
 const HEAD_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -34,6 +44,7 @@ const MERGE = 'cccccccccccccccccccccccccccccccccccccccc';
 const HEAD_C = 'dddddddddddddddddddddddddddddddddddddddd';
 const HEAD_D = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 const FULL_AT = '2026-07-22T10:00:00.000Z';
+const ATTEMPT_A = '11111111-1111-4111-8111-111111111111';
 
 function project(status: 'Todo' | 'In Review' | 'Done' = 'In Review'): ProjectSnapshot {
   return {
@@ -103,6 +114,54 @@ function rawPr(overrides: Partial<RawPullRequest> = {}): RawPullRequest {
   };
 }
 
+function implementationClaim(overrides: Partial<BranchClaim> = {}): BranchClaim {
+  return {
+    kind: 'branch-claim',
+    protocolVersion: 2,
+    phase: 'implement',
+    issueNumber: 42,
+    prNumber: 101,
+    attempt: ATTEMPT_A,
+    runner: 'runner-a',
+    login: 'oaksprout',
+    expectedHead: gitOid(HEAD_A),
+    targetBase: gitRefName('next'),
+    claimedAt: '2026-07-22T09:00:00.000Z',
+    ...overrides,
+  } as BranchClaim;
+}
+
+function rawBranchClaim(options: {
+  issueNumber?: number;
+  headRefName?: string;
+  headOid?: string;
+  claim?: Partial<BranchClaim>;
+} = {}): RawBranchClaim {
+  const issueNumber = options.issueNumber ?? 42;
+  const headOid = options.headOid ?? HEAD_A;
+  const claim = implementationClaim({
+    issueNumber,
+    ...options.claim,
+  });
+  return {
+    issueNumber,
+    headRefName: options.headRefName ?? `autopilot/${issueNumber}`,
+    headOid,
+    headCommittedAt: '2026-07-22T09:00:00.000Z',
+    claimTrailers: encodeBranchClaimTrailers(claim),
+  };
+}
+
+function mergedImplementation(overrides: Partial<RawPullRequest> = {}): RawPullRequest {
+  return rawPr({
+    state: 'MERGED',
+    branchClaimTrailers: encodeBranchClaimTrailers(implementationClaim()),
+    mergedAt: '2026-07-22T09:45:00.000Z',
+    mergeCommitOid: MERGE,
+    ...overrides,
+  });
+}
+
 function openIndex(overrides: Partial<PullRequestIndexEntry> = {}): PullRequestIndexEntry {
   return {
     number: 101,
@@ -154,6 +213,7 @@ class FakeLifecycleReader implements GitHubLifecycleReader {
   quotaProbeCalls = 0;
   closingPullRequestNumbers = new Map<number, readonly number[]>();
   closingRelationCalls: number[][] = [];
+  branchClaims: RawBranchClaim[] = [];
   quotaResponses: number[] = [];
   projectGraphQlCost = 2;
   events: string[] = [];
@@ -187,13 +247,13 @@ class FakeLifecycleReader implements GitHubLifecycleReader {
 
   readBranchClaims = async () => {
     this.branchReads += 1;
-    return [];
+    return this.branchClaims;
   };
 
   readIncrementalBranchClaims = async () => {
     this.branchReads += 1;
     this.events.push('git:branches');
-    return [];
+    return this.branchClaims;
   };
 
   readReviewClaimRefs = async () => {
@@ -331,6 +391,22 @@ function harness(options: {
     conditionalRest,
     setNow(value: string) { now = new Date(value); },
   };
+}
+
+async function expectNoOrphanDraftRecovery(
+  snapshot: GitHubLifecycleSnapshot,
+): Promise<void> {
+  const report = await runLifecycleCycle('observe', {
+    readSnapshot: async () => snapshot,
+    writer: {} as ReconciliationWriter,
+    now: () => new Date(snapshot.capturedAt),
+    staleAfterMs: 2 * 60 * 60 * 1_000,
+    runnerId: 'runner-a',
+    cycleId: () => 'historical-branch-proof',
+  });
+
+  expect(report.orphanBranchClaims).toEqual([]);
+  expect(JSON.stringify(report)).not.toContain('ensure-draft-pr');
 }
 
 describe('IncrementalLifecycleSnapshotSource', () => {
@@ -572,6 +648,360 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     expect(probes).toEqual([101]);
     expect(reader.branchReads).toBe(2);
     expect(reader.reviewRefReads).toBe(1);
+  });
+
+  it('backfills an unresolved retained branch from one exact merged PR and carries it across incremental restart', async () => {
+    const context = harness();
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-terminal-claim-restart-'));
+    const durableStore = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    let now = new Date(FULL_AT);
+    const source = new IncrementalLifecycleSnapshotSource({
+      fullReader: context.reader,
+      restDiscovery: context.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: context.conditionalRest,
+      evidenceProbe: context.probe,
+      cacheStore: durableStore,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => now,
+    });
+    context.reader.project = project('Done');
+    context.reader.issues = [];
+    context.reader.fullPrs = [];
+    context.reader.branchClaims = [rawBranchClaim()];
+    context.reader.targeted.set(101, mergedImplementation());
+    context.rest.project = project('Done');
+    context.rest.issues = [];
+    context.rest.openPrs = [];
+
+    const full = await source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(context.reader.hydrationCalls).toEqual([101]);
+    expect(full.pullRequests).toEqual([]);
+    expect(full.terminalClaims).toEqual([{
+      issueNumber: 42,
+      prNumber: 101,
+      headRefName: 'autopilot/42',
+      headOid: HEAD_A,
+      claimAttempt: ATTEMPT_A,
+      targetBase: 'next',
+      claimFingerprint: 'afdb35fdcaa31feb3a6a3f310bb47293b47e436b2d072ed32f26b16b33eef3f8',
+      mergedAt: '2026-07-22T09:45:00.000Z',
+      mergeCommitOid: MERGE,
+    }]);
+    await expect(durableStore.load()).resolves.toMatchObject({
+      terminalClaims: full.terminalClaims,
+    });
+
+    context.reader.hydrationCalls = [];
+    now = new Date('2026-07-22T11:00:00.000Z');
+    const nextFull = await source.read({ mode: 'full', rateLimitFloor: 500 });
+    expect(nextFull.terminalClaims).toEqual(full.terminalClaims);
+    expect(context.reader.hydrationCalls).toEqual([]);
+
+    now = new Date('2026-07-22T11:10:00.000Z');
+    const incremental = await source.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+    expect(incremental.terminalClaims).toEqual(full.terminalClaims);
+    expect(context.reader.hydrationCalls).toEqual([]);
+
+    const restartedReader = new FakeLifecycleReader();
+    restartedReader.branchClaims = [rawBranchClaim()];
+    restartedReader.targeted.set(101, null);
+    const restarted = new IncrementalLifecycleSnapshotSource({
+      fullReader: restartedReader,
+      restDiscovery: context.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: new ConditionalRestClient(async () => {
+        throw new Error('no direct calls expected');
+      }),
+      evidenceProbe: context.probe,
+      cacheStore: durableStore,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => new Date('2026-07-22T11:20:00.000Z'),
+    });
+
+    const afterRestart = await restarted.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+    expect(afterRestart.terminalClaims).toEqual(full.terminalClaims);
+    expect(restartedReader.hydrationCalls).toEqual([]);
+  });
+
+  it('keeps an archived historical update-merge branch terminal after overlap aging and restart', async () => {
+    const context = harness();
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-historical-terminal-branch-'));
+    const durableStore = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    let now = new Date(FULL_AT);
+    const archivedProject: ProjectSnapshot = {
+      ...project('Done'),
+      items: [],
+      currentSprintIterationId: null,
+    };
+    // Historical update-branch shape: the stable ref advanced to a merge
+    // commit while its surviving claim trailers still name the first parent.
+    const ancestralFirstParent = gitOid(HEAD_A);
+    const updateBranchMergeHead = gitOid(HEAD_B);
+    const historicalClaim = implementationClaim({
+      expectedHead: ancestralFirstParent,
+    });
+    const historicalBranch = rawBranchClaim({
+      headOid: updateBranchMergeHead,
+      claim: { expectedHead: ancestralFirstParent },
+    });
+    const exactMergedPr = mergedImplementation({
+      headOid: updateBranchMergeHead,
+      branchClaimTrailers: encodeBranchClaimTrailers(historicalClaim),
+    });
+    const source = new IncrementalLifecycleSnapshotSource({
+      fullReader: context.reader,
+      restDiscovery: context.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: context.conditionalRest,
+      evidenceProbe: context.probe,
+      cacheStore: durableStore,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => now,
+    });
+    context.reader.project = archivedProject;
+    context.reader.issues = [];
+    context.reader.fullPrs = [];
+    context.reader.branchClaims = [historicalBranch];
+    context.reader.targeted.set(101, exactMergedPr);
+    context.rest.project = archivedProject;
+    context.rest.issues = [];
+    context.rest.openPrs = [];
+    context.rest.closedPrs = [openIndex({
+      state: 'CLOSED',
+      updatedAt: '2026-07-22T09:58:00.000Z',
+      headOid: updateBranchMergeHead,
+      closedAt: '2026-07-22T09:45:00.000Z',
+      mergedAt: '2026-07-22T09:45:00.000Z',
+    })];
+    expect(historicalBranch.headOid).toBe(updateBranchMergeHead);
+    expect(historicalClaim.expectedHead).toBe(ancestralFirstParent);
+    expect(historicalBranch.headOid).not.toBe(historicalClaim.expectedHead);
+    expect(exactMergedPr).toMatchObject({
+      number: 101,
+      state: 'MERGED',
+      headRefName: historicalBranch.headRefName,
+      headOid: historicalBranch.headOid,
+      baseRefName: historicalClaim.targetBase,
+      closingIssueNumbers: [historicalClaim.issueNumber],
+      mergedAt: '2026-07-22T09:45:00.000Z',
+      mergeCommitOid: MERGE,
+    });
+    expect(exactMergedPr.branchClaimTrailers).toBe(historicalBranch.claimTrailers);
+
+    const full = await source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(context.reader.hydrationCalls).toEqual([101]);
+    expect(full.project.items).toEqual([]);
+    expect(full.issues).toEqual([]);
+    expect(full.pullRequests).toEqual([]);
+    expect(full.branches).toEqual([
+      expect.objectContaining({
+        headOid: updateBranchMergeHead,
+        claim: expect.objectContaining({
+          expectedHead: ancestralFirstParent,
+          prNumber: 101,
+        }),
+      }),
+    ]);
+    expect(full.terminalClaims).toEqual([
+      expect.objectContaining({
+        issueNumber: 42,
+        prNumber: 101,
+        headOid: updateBranchMergeHead,
+        mergeCommitOid: MERGE,
+      }),
+    ]);
+    await expect(durableStore.load()).resolves.toMatchObject({
+      recentlyClosedPullRequests: [expect.objectContaining({ number: 101 })],
+      terminalClaims: full.terminalClaims,
+    });
+    await expectNoOrphanDraftRecovery(full);
+
+    context.reader.hydrationCalls = [];
+    context.rest.closedPrs = [];
+    now = new Date('2026-07-22T11:00:00.000Z');
+    const agedFull = await source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(agedFull.pullRequests).toEqual([]);
+    expect(agedFull.terminalClaims).toEqual(full.terminalClaims);
+    expect(context.reader.hydrationCalls).toEqual([]);
+    await expect(durableStore.load()).resolves.toMatchObject({
+      recentlyClosedPullRequests: [],
+      terminalClaims: full.terminalClaims,
+    });
+    await expectNoOrphanDraftRecovery(agedFull);
+
+    now = new Date('2026-07-22T11:10:00.000Z');
+    const incremental = await source.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+
+    expect(incremental.terminalClaims).toEqual(full.terminalClaims);
+    expect(context.reader.hydrationCalls).toEqual([]);
+    await expectNoOrphanDraftRecovery(incremental);
+
+    const restartedReader = new FakeLifecycleReader();
+    restartedReader.project = archivedProject;
+    restartedReader.issues = [];
+    restartedReader.fullPrs = [];
+    restartedReader.branchClaims = [historicalBranch];
+    restartedReader.targeted.set(101, null);
+    const restarted = new IncrementalLifecycleSnapshotSource({
+      fullReader: restartedReader,
+      restDiscovery: context.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: new ConditionalRestClient(async () => {
+        throw new Error('no direct calls expected');
+      }),
+      evidenceProbe: context.probe,
+      cacheStore: durableStore,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => new Date('2026-07-22T11:20:00.000Z'),
+    });
+
+    const afterRestart = await restarted.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+
+    expect(afterRestart.project.items).toEqual([]);
+    expect(afterRestart.issues).toEqual([]);
+    expect(afterRestart.pullRequests).toEqual([]);
+    expect(afterRestart.terminalClaims).toEqual(full.terminalClaims);
+    expect(restartedReader.hydrationCalls).toEqual([]);
+    await expectNoOrphanDraftRecovery(afterRestart);
+  });
+
+  it.each([
+    ['absent proof', null],
+    ['open PR', rawPr({
+      branchClaimTrailers: encodeBranchClaimTrailers(implementationClaim()),
+    })],
+    ['missing merged timestamp', mergedImplementation({ mergedAt: null })],
+    ['missing merge commit', mergedImplementation({ mergeCommitOid: null })],
+    ['missing PR claim', mergedImplementation({ branchClaimTrailers: null })],
+    ['changed PR head', mergedImplementation({ headOid: HEAD_B })],
+    ['changed PR attempt', mergedImplementation({
+      branchClaimTrailers: encodeBranchClaimTrailers(implementationClaim({
+        attempt: '22222222-2222-4222-8222-222222222222',
+      })),
+    })],
+  ] as const)('fails closed when full branch backfill returns %s', async (
+    _label,
+    proof,
+  ) => {
+    const context = harness();
+    context.reader.project = project('Done');
+    context.reader.issues = [];
+    context.reader.fullPrs = [];
+    context.reader.branchClaims = [rawBranchClaim()];
+    context.reader.targeted.set(101, proof);
+    context.rest.project = project('Done');
+    context.rest.issues = [];
+    context.rest.openPrs = [];
+
+    const full = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(context.reader.hydrationCalls).toEqual([101]);
+    expect(full.terminalClaims).toEqual([]);
+    expect(context.store.state?.terminalClaims).toEqual([]);
+  });
+
+  it.each([
+    ['branch disappearance', []],
+    ['issue', [rawBranchClaim({ issueNumber: 43 })]],
+    ['PR', [rawBranchClaim({ claim: { prNumber: 202 } })]],
+    ['branch', [rawBranchClaim({ headRefName: 'autopilot/42-r2' })]],
+    ['head', [rawBranchClaim({ headOid: HEAD_B })]],
+    ['attempt', [rawBranchClaim({
+      claim: { attempt: '22222222-2222-4222-8222-222222222222' },
+    })]],
+    ['target base', [rawBranchClaim({
+      claim: { targetBase: gitRefName('release/next') },
+    })]],
+    ['runner', [rawBranchClaim({ claim: { runner: 'runner-b' } })]],
+    ['login', [rawBranchClaim({ claim: { login: 'different-login' } })]],
+    ['expected head', [rawBranchClaim({
+      claim: { expectedHead: gitOid(HEAD_B) },
+    })]],
+    ['claimed time', [rawBranchClaim({
+      claim: { claimedAt: '2026-07-22T09:01:00.000Z' },
+    })]],
+    ['phase completion', [rawBranchClaim({
+      claim: { phaseComplete: true },
+    })]],
+  ] as const)('prunes terminal evidence after a current %s identity change', async (
+    _label,
+    branchClaims,
+  ) => {
+    const context = harness();
+    context.reader.project = project('Done');
+    context.reader.issues = [];
+    context.reader.fullPrs = [];
+    context.reader.branchClaims = [rawBranchClaim()];
+    context.reader.targeted.set(101, mergedImplementation());
+    context.rest.project = project('Done');
+    context.rest.issues = [];
+    context.rest.openPrs = [];
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    context.reader.branchClaims = [...branchClaims];
+    context.reader.hydrationCalls = [];
+    context.setNow('2026-07-22T10:10:00.000Z');
+    const incremental = await context.source.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+
+    expect(incremental.terminalClaims).toEqual([]);
+    expect(context.store.state?.terminalClaims).toEqual([]);
+    expect(context.reader.hydrationCalls).toEqual([]);
+  });
+
+  it('seeds terminal evidence from an exact incremental merge before merged PR eviction', async () => {
+    const context = harness();
+    context.reader.branchClaims = [rawBranchClaim()];
+    context.reader.fullPrs = [rawPr({
+      branchClaimTrailers: encodeBranchClaimTrailers(implementationClaim()),
+    })];
+    context.reader.targeted.set(101, context.reader.fullPrs[0]!);
+    const full = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    expect(full.terminalClaims).toEqual([]);
+
+    context.setNow('2026-07-22T10:10:00.000Z');
+    context.rest.openPrs = [];
+    context.rest.closedPrs = [openIndex({
+      state: 'CLOSED',
+      updatedAt: '2026-07-22T10:05:00.000Z',
+      closedAt: '2026-07-22T10:05:00.000Z',
+      mergedAt: '2026-07-22T10:05:00.000Z',
+    })];
+    context.reader.targeted.set(101, mergedImplementation({
+      mergedAt: '2026-07-22T10:05:00.000Z',
+    }));
+
+    const merged = await context.source.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+    expect(merged.terminalClaims).toEqual([
+      expect.objectContaining({ issueNumber: 42, prNumber: 101, mergeCommitOid: MERGE }),
+    ]);
+
+    context.rest.project = project('Done');
+    context.rest.issues = [];
+    context.setNow('2026-07-22T10:20:00.000Z');
+    const evicted = await context.source.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+    expect(evicted.pullRequests).toEqual([]);
+    expect(evicted.terminalClaims).toEqual(merged.terminalClaims);
   });
 
   it('establishes complete REST baselines at startup without hydrating unrelated open or closed PRs', async () => {
