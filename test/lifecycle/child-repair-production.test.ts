@@ -56,12 +56,28 @@ function state(input: {
   issueType: string | null;
   body?: string;
   repository?: string;
+  itemId?: string;
+  duplicateItem?: boolean;
   item?: {
     blockedOn: string | null;
     effort: string | null;
     priority: string | null;
   };
 }): string {
+  const item = input.item;
+  const nodes = item === undefined
+    ? []
+    : Array.from({ length: input.duplicateItem ? 2 : 1 }, (_, index) => ({
+        id: index === 0 ? (input.itemId ?? 'PVTI_2141') : 'PVTI_duplicate',
+        content: {
+          __typename: 'Issue',
+          number: 2141,
+          repository: { nameWithOwner: input.repository ?? 'Jinn-Network/mono' },
+        },
+        blockedOn: item.blockedOn === null ? null : { name: item.blockedOn },
+        effort: item.effort === null ? null : { name: item.effort },
+        priority: item.priority === null ? null : { name: item.priority },
+      }));
   return JSON.stringify({
     data: {
       repository: {
@@ -77,21 +93,7 @@ function state(input: {
           id: 'PVT_project',
           items: {
             pageInfo: { hasNextPage: false, endCursor: null },
-            nodes: input.item === undefined
-              ? []
-              : [{
-                  id: 'PVTI_2141',
-                  content: {
-                    __typename: 'Issue',
-                    number: 2141,
-                    repository: { nameWithOwner: input.repository ?? 'Jinn-Network/mono' },
-                  },
-                  blockedOn: input.item.blockedOn === null
-                    ? null
-                    : { name: input.item.blockedOn },
-                  effort: input.item.effort === null ? null : { name: input.item.effort },
-                  priority: input.item.priority === null ? null : { name: input.item.priority },
-                }],
+            nodes,
           },
         },
       },
@@ -202,6 +204,189 @@ describe('production machine-child repair', () => {
     expect(result).toEqual({ status: 'repaired' });
     expect(waits).toHaveLength(1);
     expect(mutations).toEqual(['item-add', 'opt_nothing', 'opt_medium', 'opt_p1']);
+  });
+
+  it('fails closed after exactly five absent post-add membership readbacks', async () => {
+    const waits: number[] = [];
+    let added = false;
+    let postAddReads = 0;
+    const fieldEdits: string[][] = [];
+
+    await expect(repairProductionMachineChild({
+      ...options(async (_cmd, args) => {
+        if (args[0] === 'api' && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+          if (added) postAddReads += 1;
+          return state({ issueType: 'fix' });
+        }
+        if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+        if (args[0] === 'project' && args[1] === 'item-add') {
+          added = true;
+          return JSON.stringify({ id: 'PVTI_2141' });
+        }
+        if (args[0] === 'project' && args[1] === 'item-edit') fieldEdits.push(args);
+        return '';
+      }),
+      wait: async (milliseconds: number) => { waits.push(milliseconds); },
+    }, ACTION)).rejects.toThrow(/Project membership readback is ambiguous/i);
+
+    expect(postAddReads).toBe(5);
+    expect(waits).toEqual([250, 250, 250, 250]);
+    expect(fieldEdits).toEqual([]);
+  });
+
+  it('fails immediately when the first visible membership has a different item ID', async () => {
+    const waits: number[] = [];
+    const fieldEdits: string[][] = [];
+    let added = false;
+
+    await expect(repairProductionMachineChild({
+      ...options(async (_cmd, args) => {
+        if (args[0] === 'api' && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+          return state({
+            issueType: 'fix',
+            ...(added ? {
+              itemId: 'PVTI_unexpected',
+              item: { blockedOn: null, effort: null, priority: null },
+            } : {}),
+          });
+        }
+        if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+        if (args[0] === 'project' && args[1] === 'item-add') {
+          added = true;
+          return JSON.stringify({ id: 'PVTI_2141' });
+        }
+        if (args[0] === 'project' && args[1] === 'item-edit') fieldEdits.push(args);
+        return '';
+      }),
+      wait: async (milliseconds: number) => { waits.push(milliseconds); },
+    }, ACTION)).rejects.toThrow(/Project membership readback is ambiguous/i);
+
+    expect(waits).toEqual([]);
+    expect(fieldEdits).toEqual([]);
+  });
+
+  it('fails immediately when the first visible membership is duplicated', async () => {
+    const fieldEdits: string[][] = [];
+    let added = false;
+
+    await expect(repairProductionMachineChild(options(async (_cmd, args) => {
+      if (args[0] === 'api' && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+        return state({
+          issueType: 'fix',
+          ...(added ? {
+            duplicateItem: true,
+            item: { blockedOn: null, effort: null, priority: null },
+          } : {}),
+        });
+      }
+      if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+      if (args[0] === 'project' && args[1] === 'item-add') {
+        added = true;
+        return JSON.stringify({ id: 'PVTI_2141' });
+      }
+      if (args[0] === 'project' && args[1] === 'item-edit') fieldEdits.push(args);
+      return '';
+    }), ACTION)).rejects.toThrow(/Project item is ambiguous/i);
+
+    expect(fieldEdits).toEqual([]);
+  });
+
+  it.each([
+    {
+      label: 'authoritative marker',
+      body: formatChildMarker(9999, 'reconcile'),
+      error: /authoritative child marker/i,
+    },
+    {
+      label: 'durable triage intent',
+      body: [
+        formatChildMarker(2140, 'reconcile'),
+        formatChildTriageIntent({ issueType: 'fix', effort: 'low', priority: 'p2' }),
+      ].join('\n\n'),
+      error: /live child triage intent contradicts/i,
+    },
+  ])('fails closed when $label drifts during an absent membership retry', async ({ body, error }) => {
+    const waits: number[] = [];
+    const fieldEdits: string[][] = [];
+    let added = false;
+    let liveBody = formatChildMarker(2140, 'reconcile');
+
+    await expect(repairProductionMachineChild({
+      ...options(async (_cmd, args) => {
+        if (args[0] === 'api' && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+          return state({ issueType: 'fix', body: liveBody });
+        }
+        if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+        if (args[0] === 'project' && args[1] === 'item-add') {
+          added = true;
+          return JSON.stringify({ id: 'PVTI_2141' });
+        }
+        if (args[0] === 'project' && args[1] === 'item-edit') fieldEdits.push(args);
+        return '';
+      }),
+      wait: async (milliseconds: number) => {
+        expect(added).toBe(true);
+        waits.push(milliseconds);
+        liveBody = body;
+      },
+    }, ACTION)).rejects.toThrow(error);
+
+    expect(waits).toEqual([250]);
+    expect(fieldEdits).toEqual([]);
+  });
+
+  it('resumes a partial repair once, then makes the later cycle a no-op', async () => {
+    const mutations: string[] = [];
+    let failFirstEdit = true;
+    let item: {
+      blockedOn: string | null;
+      effort: string | null;
+      priority: string | null;
+    } | undefined;
+
+    const runner: NonNullable<ProductionChildIssuePortOptions['runner']> = async (_cmd, args) => {
+      if (args[0] === 'api' && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+        return state({ issueType: 'fix', ...(item === undefined ? {} : { item: { ...item } }) });
+      }
+      if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+      if (args[0] === 'project' && args[1] === 'item-add') {
+        mutations.push('item-add');
+        item = { blockedOn: null, effort: null, priority: null };
+        return JSON.stringify({ id: 'PVTI_2141' });
+      }
+      if (args[0] === 'project' && args[1] === 'item-edit') {
+        const option = String(args[args.indexOf('--single-select-option-id') + 1]);
+        mutations.push(option);
+        if (item !== undefined && option === 'opt_nothing') item.blockedOn = 'Nothing';
+        if (item !== undefined && option === 'opt_medium') item.effort = 'Medium';
+        if (item !== undefined && option === 'opt_p1') item.priority = 'P1';
+        if (failFirstEdit) {
+          failFirstEdit = false;
+          throw new Error('ambiguous field-edit response');
+        }
+        return '';
+      }
+      if (args[0] === 'issue' && args[1] === 'create') mutations.push('issue-create');
+      return '';
+    };
+
+    await expect(repairProductionMachineChild(options(runner), ACTION))
+      .rejects.toThrow(/ambiguous field-edit response/i);
+    await expect(repairProductionMachineChild(options(runner), ACTION))
+      .resolves.toEqual({ status: 'repaired' });
+    const mutationsAfterRepair = [...mutations];
+    await expect(repairProductionMachineChild(options(runner), ACTION))
+      .resolves.toEqual({ status: 'already-complete' });
+
+    expect(mutations).toEqual(['item-add', 'opt_nothing', 'opt_medium', 'opt_p1']);
+    expect(mutations).toEqual(mutationsAfterRepair);
+    expect(mutations.filter((mutation) => mutation === 'item-add')).toHaveLength(1);
+    expect(mutations).not.toContain('issue-create');
   });
 
   it('leaves matching fields untouched and fills only the missing priority', async () => {

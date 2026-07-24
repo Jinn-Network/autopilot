@@ -34,11 +34,25 @@ expected field mutations.
 Fresh Node 22 verification passed:
 
 - `yarn typecheck`
-- `yarn test` — 135 files passed, 1,816 tests passed, 40 skipped
+- `yarn test` — 135 files passed, 1,822 tests passed, 40 skipped
 - `yarn verify:source`
 - `yarn build`
 - `yarn verify:dist`
 - `git diff --check`
+
+## Review follow-up
+
+Added explicit safety-property regressions without changing production code:
+
+- non-convergence performs exactly five post-add reads, four 250 ms waits,
+  and no field edits;
+- a first visible item with a different ID fails immediately without waiting
+  or editing;
+- duplicate matching membership fails before an edit;
+- marker and durable-intent drift on an absent-item retry each fail on the
+  next authoritative reread before an edit; and
+- a partial repair resumes without another item-add, then a later complete
+  cycle is an `already-complete` no-op.
 
 ## Self-review
 
