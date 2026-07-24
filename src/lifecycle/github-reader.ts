@@ -869,6 +869,19 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   async readPullRequestNumbersClosingIssues(
     issueNumbers: readonly number[],
   ): Promise<ReadonlySet<number>> {
+    return this.readPullRequestNumbersClosingIssuesByState(issueNumbers, false);
+  }
+
+  async readPullRequestOutcomeNumbersClosingIssues(
+    issueNumbers: readonly number[],
+  ): Promise<ReadonlySet<number>> {
+    return this.readPullRequestNumbersClosingIssuesByState(issueNumbers, true);
+  }
+
+  private async readPullRequestNumbersClosingIssuesByState(
+    issueNumbers: readonly number[],
+    includeMerged: boolean,
+  ): Promise<ReadonlySet<number>> {
     const unique = [...new Set(issueNumbers)].sort((left, right) => left - right);
     for (const number of unique) {
       if (!Number.isSafeInteger(number) || number <= 0) {
@@ -901,6 +914,16 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     const data = (decoded as { data?: unknown }).data;
     if (typeof data !== 'object' || data === null) {
       throw new Error('Targeted closing-PR response data is missing');
+    }
+    const rateLimit = (data as { rateLimit?: unknown }).rateLimit;
+    const cost = typeof rateLimit === 'object' && rateLimit !== null
+      ? (rateLimit as { cost?: unknown }).cost
+      : undefined;
+    if (typeof cost === 'number' && cost > TARGETED_RELATION_RESERVE) {
+      throw new Error(
+        `Targeted closing-PR context cost ${cost} exceeded `
+        + `${TARGETED_RELATION_RESERVE}-point reserve`,
+      );
     }
     const repository = (data as { repository?: unknown }).repository;
     if (typeof repository !== 'object' || repository === null) {
@@ -947,7 +970,9 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         if (state !== 'OPEN' && state !== 'CLOSED' && state !== 'MERGED') {
           throw new Error(`Targeted closing-PR issue #${issueNumber} PR state is unknown`);
         }
-        if (state === 'OPEN') result.add(number as number);
+        if (state === 'OPEN' || (includeMerged && state === 'MERGED')) {
+          result.add(number as number);
+        }
       }
     }
     return result;

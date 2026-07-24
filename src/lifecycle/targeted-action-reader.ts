@@ -62,6 +62,9 @@ export interface TargetedActionReaderOptions {
   readonly readOpenPullRequestNumbersClosingIssue?: (
     issueNumber: number,
   ) => Promise<ReadonlySet<number>>;
+  readonly readPullRequestOutcomeNumbersClosingIssues?: (
+    issueNumbers: readonly number[],
+  ) => Promise<ReadonlySet<number>>;
   readonly readPullRequestDetails?: (
     prNumber: number,
   ) => Promise<TargetedOpenPullRequest | null>;
@@ -323,9 +326,60 @@ export function makeTargetedActionReader(
     ));
     const project = projectWithTarget(cycleSnapshot, issueNumber, item);
     const decoded = decodePullRequestSnapshot(raw);
-    const pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
+    let pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
       ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
       : [...cycleSnapshot.pullRequests, decoded];
+    const dependencySet = new Set(dependencies);
+    const blockerPullRequestNumbers = new Set(cycleSnapshot.pullRequests
+      .filter((pr) => (
+        pr.number !== prNumber
+        && pr.closingIssueNumbers.some((number) => dependencySet.has(number))
+      ))
+      .map((pr) => pr.number));
+    if (dependencies.length > 0) {
+      if (options.readPullRequestOutcomeNumbersClosingIssues === undefined) return null;
+      await reserve(TARGETED_RELATION_RESERVE);
+      for (const number of await options.readPullRequestOutcomeNumbersClosingIssues(
+        dependencies,
+      )) {
+        positiveNumber(number, 'Targeted blocker PR number');
+        if (number !== prNumber) blockerPullRequestNumbers.add(number);
+      }
+    }
+    for (const blockerNumber of [...blockerPullRequestNumbers].sort((left, right) => left - right)) {
+      await reserve(TARGETED_PR_RESERVE);
+      const liveBlocker = await options.readPullRequest(blockerNumber);
+      if (liveBlocker === null) {
+        pullRequests = pullRequests.filter((pr) => pr.number !== blockerNumber);
+        continue;
+      }
+      if (liveBlocker.number !== blockerNumber) {
+        throw new Error('Targeted blocker PR reader returned a different PR');
+      }
+      const mappedBlockers = issueNumbers(liveBlocker);
+      if (
+        mappedBlockers.length !== 1
+        || !dependencySet.has(mappedBlockers[0]!)
+      ) {
+        return null;
+      }
+      const hydratedBlocker = decodePullRequestSnapshot(liveBlocker);
+      pullRequests = pullRequests.some((pr) => pr.number === blockerNumber)
+        ? pullRequests.map((pr) => pr.number === blockerNumber ? hydratedBlocker : pr)
+        : [...pullRequests, hydratedBlocker];
+    }
+    for (const dependency of dependencySet) {
+      const blockerEvidence = pullRequests.filter((pr) => (
+        pr.closingIssueNumbers.includes(dependency)
+      ));
+      if (blockerEvidence.some((pr) => pr.state === 'MERGED')) continue;
+      const openPullRequestNumbers = new Set(
+        blockerEvidence
+          .filter((pr) => pr.state === 'OPEN')
+          .map((pr) => pr.number),
+      );
+      if (openPullRequestNumbers.size > 1) return null;
+    }
     return composeTargeted(
       cycleSnapshot,
       { project, issues, pullRequests },

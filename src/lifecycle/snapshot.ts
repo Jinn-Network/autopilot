@@ -185,6 +185,10 @@ export interface GitHubLifecycleReader {
   readPullRequestNumbersClosingIssues?(
     issueNumbers: readonly number[],
   ): Promise<ReadonlySet<number>>;
+  /** Targeted recovery discovery including exact merged blocker outcomes. */
+  readPullRequestOutcomeNumbersClosingIssues?(
+    issueNumbers: readonly number[],
+  ): Promise<ReadonlySet<number>>;
   resetGitHubUsage?(): void;
   githubUsage(): GitHubUsage;
 }

@@ -230,6 +230,48 @@ describe('GhLifecycleReader', () => {
       .resolves.toEqual(new Set([101]));
   });
 
+  it('discovers open and merged blocker outcomes for targeted recovery', async () => {
+    const reader = new GhLifecycleReader(async () => JSON.stringify({
+      data: {
+        rateLimit: { cost: 2, remaining: 518, resetAt: '2026-07-22T13:00:00.000Z' },
+        repository: {
+          issue42: {
+            closedByPullRequestsReferences: {
+              pageInfo: { hasNextPage: false },
+              nodes: [
+                { number: 101, state: 'OPEN' },
+                { number: 99, state: 'MERGED' },
+                { number: 98, state: 'CLOSED' },
+              ],
+            },
+          },
+        },
+      },
+    }));
+
+    await expect(reader.readPullRequestOutcomeNumbersClosingIssues([42, 42]))
+      .resolves.toEqual(new Set([99, 101]));
+  });
+
+  it('rejects blocker-outcome discovery above its exact two-point reserve', async () => {
+    const reader = new GhLifecycleReader(async () => JSON.stringify({
+      data: {
+        rateLimit: { cost: 3, remaining: 517, resetAt: '2026-07-22T13:00:00.000Z' },
+        repository: {
+          issue42: {
+            closedByPullRequestsReferences: {
+              pageInfo: { hasNextPage: false },
+              nodes: [{ number: 99, state: 'MERGED' }],
+            },
+          },
+        },
+      },
+    }));
+
+    await expect(reader.readPullRequestOutcomeNumbersClosingIssues([42]))
+      .rejects.toThrow(/cost 3 exceeded.*2-point reserve/i);
+  });
+
   it.each([
     ['partial data with GraphQL errors', [{ message: 'issue lookup failed' }]],
     ['a malformed GraphQL errors member', { message: 'not an array' }],
