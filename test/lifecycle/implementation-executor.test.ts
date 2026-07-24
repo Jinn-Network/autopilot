@@ -176,6 +176,7 @@ function staleRecoveryState(overrides: Record<string, unknown> = {}) {
     targetBase: gitRefName('next'),
     claimedAt: '2026-07-20T08:00:00.000Z',
   };
+  const pullRequest = { ...pr(), state: 'OPEN' as const };
   return {
     issue: issue({
       eligible: false,
@@ -183,7 +184,8 @@ function staleRecoveryState(overrides: Record<string, unknown> = {}) {
     }),
     projectStatus: 'In Progress',
     humanHold: false,
-    pullRequest: { ...pr(), state: 'OPEN' },
+    pullRequest,
+    openPullRequests: [pullRequest],
     claim,
     ...overrides,
   };
@@ -471,6 +473,53 @@ describe('implementation action executor', () => {
       }),
     ]);
     expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
+  });
+
+  it('escalates duplicate open implementation PRs without publishing a recovery claim', async () => {
+    const pinned = { ...pr(), state: 'OPEN' as const };
+    const duplicate = {
+      ...pr({
+        number: 85,
+        headRefName: gitRefName('other/issue-42'),
+      }),
+      state: 'OPEN' as const,
+    };
+    const state = staleRecoveryState({
+      pullRequest: pinned,
+      openPullRequests: [pinned, duplicate],
+    });
+    const { deps, claims, events, human } = harness({
+      readStaleRecovery: async () => state,
+      runRealityCheck: async () => ({
+        classification: 'pr-open',
+        evidence: { prNumber: 84 },
+        suggestedBlockedOn: 'Another issue',
+        suggestedComment: 'Open PR exists.',
+      }),
+    });
+
+    await expect(executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: ADOPTED_HEAD,
+      branch: gitRefName('existing/issue-42'),
+      claimAttempt: ATTEMPT_A,
+    }, deps)).resolves.toEqual({
+      status: 'human',
+      issueNumber: 42,
+      code: 'branch-mapping-ambiguous',
+    });
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+    expect(human).toEqual([expect.objectContaining({
+      issueNumber: 42,
+      reason: expect.objectContaining({
+        code: 'branch-mapping-ambiguous',
+        detail: expect.stringMatching(/PR #84.*PR #85/),
+      }),
+    })]);
   });
 
   it.each([

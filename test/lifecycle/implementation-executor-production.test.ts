@@ -163,6 +163,23 @@ describe('production implementation action port', () => {
         mergeStateStatus: 'BLOCKED',
         checks: [],
         reviews: [],
+      }, {
+        number: 85,
+        title: 'Duplicate implementation',
+        body: 'Closes #42',
+        author: 'implementation-bot',
+        baseRefName: 'stack/base',
+        headRefName: 'other/42',
+        headOid: PARENT,
+        headCommittedAt: '2026-07-20T09:00:00.000Z',
+        isDraft: true,
+        state: 'OPEN',
+        labels: ['engine:review'],
+        closingIssueNumbers: [42],
+        mergeability: 'UNKNOWN',
+        mergeStateStatus: 'BLOCKED',
+        checks: [],
+        reviews: [],
       }],
       lifecycle: {
         items: [{
@@ -224,6 +241,18 @@ describe('production implementation action port', () => {
           headRefName: 'existing/42',
           head: HEAD,
         }),
+        openPullRequests: [
+          expect.objectContaining({
+            number: 84,
+            headRefName: 'existing/42',
+            head: HEAD,
+          }),
+          expect.objectContaining({
+            number: 85,
+            headRefName: 'other/42',
+            head: PARENT,
+          }),
+        ],
       }),
     );
   });

@@ -63,6 +63,7 @@ export interface StaleImplementationRecoveryState {
   readonly pullRequest: (ImplementationPullRequest & {
     readonly state: 'OPEN' | 'CLOSED' | 'MERGED';
   }) | null;
+  readonly openPullRequests: readonly ImplementationPullRequest[];
   readonly claim: BranchClaim | null;
 }
 
@@ -413,6 +414,9 @@ function staleRecoveryRejection(
   if (pullRequest.baseRefName !== state.issue.targetBase) {
     return `Stale recovery PR #${action.prNumber} target base changed.`;
   }
+  if (!state.openPullRequests.some((candidate) => candidate.number === action.prNumber)) {
+    return `Stale recovery PR #${action.prNumber} is no longer the bounded open mapping.`;
+  }
   const claim = state.claim;
   if (
     claim === null
@@ -485,7 +489,7 @@ export async function executeImplementationAction(
 
   const reality = await deps.runRealityCheck(issueNumber);
   const openPullRequests = isStaleRecovery
-    ? [recovery!.pullRequest!]
+    ? recovery!.openPullRequests
     : await deps.listOpenPullRequests(issueNumber);
   const realityPrNumber = reality.classification === 'pr-open'
     ? reality.evidence.prNumber

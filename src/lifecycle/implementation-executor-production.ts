@@ -255,6 +255,23 @@ export function makeProductionImplementationActionPort(
         : { child: { parentPr: marker.parentPr, kind: marker.kind } }),
     };
   };
+  const openImplementationPullRequests = (
+    snapshot: GitHubLifecycleSnapshot,
+    issueNumber: number,
+  ): ImplementationPullRequest[] => snapshot.pullRequests
+    .filter((pr) => pr.state === 'OPEN' && (
+      pr.closingIssueNumbers.includes(issueNumber)
+      || pr.body.includes(`<!-- jinn-autopilot:v2 issue=${issueNumber} `)
+    ))
+    .map((pr) => ({
+      number: pr.number,
+      headRefName: gitRefName(pr.headRefName),
+      head: pr.headOid,
+      baseRefName: gitRefName(pr.baseRefName),
+      draft: pr.isDraft,
+      labels: [...pr.labels],
+      body: pr.body,
+    }));
 
   return {
     async readIssue(issueNumber) {
@@ -293,6 +310,7 @@ export function makeProductionImplementationActionPort(
               body: pullRequest.body,
               state: pullRequest.state,
             },
+        openPullRequests: openImplementationPullRequests(snapshot, issueNumber),
         claim: lifecycle?.kind === 'pull-request'
           ? lifecycle.branchClaim ?? null
           : null,
@@ -308,20 +326,7 @@ export function makeProductionImplementationActionPort(
 
     async listOpenPullRequests(issueNumber) {
       const snapshot = await options.readSnapshot();
-      return snapshot.pullRequests
-        .filter((pr) => pr.state === 'OPEN' && (
-          pr.closingIssueNumbers.includes(issueNumber)
-          || pr.body.includes(`<!-- jinn-autopilot:v2 issue=${issueNumber} `)
-        ))
-        .map((pr) => ({
-          number: pr.number,
-          headRefName: gitRefName(pr.headRefName),
-          head: pr.headOid,
-          baseRefName: gitRefName(pr.baseRefName),
-          draft: pr.isDraft,
-          labels: [...pr.labels],
-          body: pr.body,
-        }));
+      return openImplementationPullRequests(snapshot, issueNumber);
     },
 
     async readParentPullRequest(prNumber) {
