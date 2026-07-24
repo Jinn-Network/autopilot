@@ -418,12 +418,13 @@ function staleRecoveryRejection(
     return `Stale recovery PR #${action.prNumber} is no longer the bounded open mapping.`;
   }
   const claim = state.claim;
+  // The pinned claim records its historical base; the exact live head and
+  // attempt bind it while the PR-to-issue check above binds the current base.
   if (
     claim === null
     || claim.phase !== 'implement'
     || claim.issueNumber !== action.issueNumber
     || (claim.prNumber !== undefined && claim.prNumber !== action.prNumber)
-    || claim.targetBase !== state.issue.targetBase
   ) {
     return `Stale recovery PR #${action.prNumber} no longer has a matching implementation claim.`;
   }

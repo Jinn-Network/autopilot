@@ -475,6 +475,61 @@ describe('implementation action executor', () => {
     expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
   });
 
+  it('resumes pinned stale work after the live draft and issue are retargeted together', async () => {
+    const historicalBase = gitRefName('stacked/original-base');
+    const state = staleRecoveryState({
+      claim: {
+        ...staleRecoveryState().claim,
+        targetBase: historicalBase,
+      },
+    });
+    const createdClaims: BranchClaim[] = [];
+    const { deps, claims, events } = harness({
+      readStaleRecovery: async () => state,
+      runRealityCheck: async () => ({
+        classification: 'pr-open',
+        evidence: { prNumber: 84 },
+        suggestedBlockedOn: 'Another issue',
+        suggestedComment: 'Open PR exists.',
+      }),
+      createClaimCommit: async ({ claim }) => {
+        createdClaims.push(claim);
+        return CLAIM_A;
+      },
+    });
+
+    await expect(executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: ADOPTED_HEAD,
+      branch: gitRefName('existing/issue-42'),
+      claimAttempt: ATTEMPT_A,
+    }, deps)).resolves.toMatchObject({
+      status: 'spawned',
+      issueNumber: 42,
+      prNumber: 84,
+      branch: 'existing/issue-42',
+    });
+    expect(createdClaims).toEqual([
+      expect.objectContaining({
+        issueNumber: 42,
+        prNumber: 84,
+        expectedHead: ADOPTED_HEAD,
+        targetBase: 'next',
+      }),
+    ]);
+    expect(claims).toEqual([
+      expect.objectContaining({
+        branch: 'existing/issue-42',
+        candidateParent: ADOPTED_HEAD,
+        expectedRemoteHead: ADOPTED_HEAD,
+      }),
+    ]);
+    expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
+  });
+
   it('escalates duplicate open implementation PRs without publishing a recovery claim', async () => {
     const pinned = { ...pr(), state: 'OPEN' as const };
     const duplicate = {
@@ -523,7 +578,10 @@ describe('implementation action executor', () => {
   });
 
   it.each([
+    ['missing issue', { issue: null }, 'missing or closed'],
     ['closed issue', { issue: issue({ open: false }) }, 'missing or closed'],
+    ['changed issue', { issue: issue({ number: 43 }) }, 'missing or closed'],
+    ['missing PR', { pullRequest: null }, 'is missing'],
     ['changed PR', { pullRequest: { ...pr(), number: 85, state: 'OPEN' } }, 'PR #84'],
     ['closed PR', { pullRequest: { ...pr(), state: 'CLOSED' } }, 'not open'],
     ['non-draft PR', { pullRequest: { ...pr(), state: 'OPEN', draft: false } }, 'not a draft'],
@@ -537,6 +595,36 @@ describe('implementation action executor', () => {
         headRefName: gitRefName('other/issue-42'),
       },
     }, 'branch changed'],
+    ['changed issue target base', {
+      issue: issue({ targetBase: gitRefName('release/next') }),
+    }, 'target base changed'],
+    ['changed PR target base', {
+      pullRequest: {
+        ...pr(),
+        state: 'OPEN',
+        baseRefName: gitRefName('release/next'),
+      },
+    }, 'target base changed'],
+    ['changed bounded PR mapping', { openPullRequests: [] }, 'bounded open mapping'],
+    ['missing claim', { claim: null }, 'matching implementation claim'],
+    ['changed claim phase', {
+      claim: {
+        ...staleRecoveryState().claim,
+        phase: 'review',
+      },
+    }, 'matching implementation claim'],
+    ['changed claim issue', {
+      claim: {
+        ...staleRecoveryState().claim,
+        issueNumber: 43,
+      },
+    }, 'matching implementation claim'],
+    ['changed claim PR', {
+      claim: {
+        ...staleRecoveryState().claim,
+        prNumber: 85,
+      },
+    }, 'matching implementation claim'],
     ['changed claim', {
       claim: {
         ...staleRecoveryState().claim,
@@ -557,10 +645,15 @@ describe('implementation action executor', () => {
     detail,
   ) => {
     const state = staleRecoveryState(changed);
-    const { deps, claims, events } = harness({
+    const mutations: string[] = [];
+    const { deps, claims, events, human } = harness({
       readIssue: async () => state.issue,
       readStaleRecovery: async () => state,
       listOpenPullRequests: async () => [state.pullRequest],
+      createClaimCommit: async () => {
+        mutations.push('claim-commit');
+        return CLAIM_A;
+      },
     });
 
     await expect(executeImplementationAction({
@@ -577,6 +670,8 @@ describe('implementation action executor', () => {
     }));
     expect(claims).toEqual([]);
     expect(events).toEqual([]);
+    expect(human).toEqual([]);
+    expect(mutations).toEqual([]);
   });
 
   it('rejects ordinary In Progress work with its specific eligibility evidence', async () => {
@@ -638,6 +733,35 @@ describe('implementation action executor', () => {
       reason: expect.objectContaining({
         phase: 'eligible',
         code: 'branch-mapping-ambiguous',
+      }),
+    })]);
+  });
+
+  it('preserves the fresh-work target-base gate for a sole retargeted PR', async () => {
+    const retargeted = pr({ baseRefName: gitRefName('release/next') });
+    const { deps, claims, events, human } = harness({
+      listOpenPullRequests: async () => [retargeted],
+      runRealityCheck: async () => ({
+        classification: 'pr-open',
+        evidence: { prNumber: retargeted.number },
+        suggestedBlockedOn: 'Another issue',
+        suggestedComment: 'Open PR exists.',
+      }),
+    });
+
+    await expect(executeImplementationAction(freshAction(), deps))
+      .resolves.toEqual({
+        status: 'human',
+        issueNumber: 42,
+        code: 'branch-mapping-ambiguous',
+      });
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+    expect(human).toEqual([expect.objectContaining({
+      issueNumber: 42,
+      reason: expect.objectContaining({
+        code: 'branch-mapping-ambiguous',
+        detail: expect.stringMatching(/release\/next/),
       }),
     })]);
   });
