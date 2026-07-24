@@ -287,6 +287,21 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
     const detailResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/pulls/${pr.number}`,
     );
+    const detailRaw = completeBody(detailResponse, 'PR detail');
+    const detailRecord = record(detailRaw, 'PR detail');
+    if (detailRecord.number !== pr.number) {
+      throw new GitHubRestSchemaError(
+        `PR detail identity #${String(detailRecord.number)} does not match #${pr.number}`,
+      );
+    }
+    const head = record(detailRecord.head, 'PR detail.head');
+    const liveHeadOid = nonEmptyString(head.sha, 'PR detail.head.sha');
+    gitOid(liveHeadOid);
+    if (liveHeadOid !== pr.headOid) {
+      // Index/cache head can lag a push. Mark it changed so the incremental
+      // refresh continues rather than aborting the entire lifecycle cycle.
+      return true;
+    }
     const reviewResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/pulls/${pr.number}/reviews?per_page=100&page=1`,
     );
@@ -299,10 +314,7 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
     const statusResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/commits/${pr.headOid}/status?per_page=100&page=1`,
     );
-    const detail = exactPullRequestDetail(
-      completeBody(detailResponse, 'PR detail'),
-      pr,
-    );
+    const detail = exactPullRequestDetail(detailRaw, pr);
     const currentReviews = reviews(completeBody(reviewResponse, 'PR reviews'));
     const currentHuman = latestHuman(
       completeBody(commentResponse, 'PR comments'),
