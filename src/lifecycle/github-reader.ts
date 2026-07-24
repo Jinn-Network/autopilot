@@ -694,6 +694,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   // OID's payload never changes, so this cache never needs invalidation for
   // the life of the reader (jinn-mono#1883-follow-up).
   private readonly reviewClaimPayloadByOid = new Map<GitOid, string>();
+  private reviewClaimFetchTail: Promise<void> = Promise.resolve();
   private readonly ancestryByCandidate = new Map<string, Promise<{
     readonly headCommittedAt: string;
     readonly claimTrailers: string | null;
@@ -966,6 +967,14 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     }
   }
 
+  private async fetchReviewClaimRef(ref: GitRefName): Promise<void> {
+    const pending = this.reviewClaimFetchTail.then(async () => {
+      await this.gitRun(['fetch', '--no-tags', '--depth=1', this.remoteName, ref]);
+    });
+    this.reviewClaimFetchTail = pending.catch(() => undefined);
+    await pending;
+  }
+
   /**
    * Reads the `jinn-autopilot-review.json` payload for a review-claim
    * commit OID, fetching it over git only on a local cache miss (an OID
@@ -977,7 +986,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     const cached = this.reviewClaimPayloadByOid.get(oid);
     if (cached !== undefined) return cached;
     if (!(await this.objectExistsLocally(oid))) {
-      await this.gitRun(['fetch', '--no-tags', '--depth=1', this.remoteName, ref]);
+      await this.fetchReviewClaimRef(ref);
     }
     let payload: string;
     try {

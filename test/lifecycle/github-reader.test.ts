@@ -1529,6 +1529,66 @@ describe('GhLifecycleReader', () => {
       expect(third.nodes[0]?.reviewClaim?.oid).toBe(oidY);
     });
 
+    it('serializes review-claim cache-miss fetches into one Git checkout', async () => {
+      const oid101 = 'd'.repeat(40);
+      const oid102 = 'e'.repeat(40);
+      const ref101 = 'refs/jinn-autopilot/review-claims/v1/101';
+      const ref102 = 'refs/jinn-autopilot/review-claims/v1/102';
+      const oidByRef = new Map([
+        [ref101, oid101],
+        [ref102, oid102],
+      ]);
+      const localObjects = new Set<string>();
+      let inFlightFetches = 0;
+      let maximumInFlightFetches = 0;
+      const run: CommandRunner = async (command, args) => {
+        if (command !== 'git') {
+          return openPrPage(
+            graphQlPr({
+              number: 101,
+              state: 'OPEN',
+              head: '1'.repeat(40),
+              headRefName: 'feature/101',
+            }),
+            graphQlPr({
+              number: 102,
+              state: 'OPEN',
+              head: '2'.repeat(40),
+              headRefName: 'feature/102',
+            }),
+          );
+        }
+        const rest = args.slice(2);
+        if (rest[0] === 'ls-remote' && rest[2] === REVIEW_CLAIM_GLOB) {
+          return `${oid101}\t${ref101}\n${oid102}\t${ref102}\n`;
+        }
+        if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
+        if (rest[0] === 'cat-file' && rest[1] === '-e') {
+          if (localObjects.has(rest[2] ?? '')) return '';
+          throw new Error('object not found locally');
+        }
+        if (rest[0] === 'fetch') {
+          inFlightFetches += 1;
+          maximumInFlightFetches = Math.max(maximumInFlightFetches, inFlightFetches);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          const oid = oidByRef.get(rest.at(-1) ?? '');
+          if (oid === undefined) throw new Error('unexpected review-claim ref');
+          localObjects.add(oid);
+          inFlightFetches -= 1;
+          return '';
+        }
+        if (rest[0] === 'cat-file' && rest[1] === '-p') {
+          return '{"protocolVersion":2}';
+        }
+        throw new Error(`unexpected git call: ${rest.join(' ')}`);
+      };
+
+      const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+      expect(page.nodes).toHaveLength(2);
+      expect(maximumInFlightFetches).toBe(1);
+    });
+
     it('resolves an absent review claim to null from empty ls-remote output', async () => {
       const run: CommandRunner = async (command) => {
         if (command === 'git') return '';
