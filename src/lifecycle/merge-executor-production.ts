@@ -4,6 +4,7 @@ import { parseOwnedPrefixes, touchesCodeOwnedPath } from '../dispatcher/code-own
 import { REPO } from '../dispatcher/constants.js';
 import { ensureFieldIds } from '../dispatcher/field-cache.js';
 import { fetchProjectSnapshot } from '../dispatcher/project-snapshot.js';
+import { formatAutomatedReviewMarker } from './codecs.js';
 import type { SelectedCredential } from './credentials.js';
 import { fileChildIssue } from './child-issues.js';
 import { makeProductionChildIssuePort } from './child-issues-production.js';
@@ -14,7 +15,11 @@ import type {
 } from './merge-executor.js';
 import { readExactChangedFiles } from './github-changed-files.js';
 import { withSelectedCredential } from './production-auth.js';
-import type { GitHubLifecycleSnapshot } from './snapshot.js';
+import type {
+  GitHubLifecycleSnapshot,
+  NativeReviewSnapshot,
+  PullRequestSnapshot,
+} from './snapshot.js';
 import { gitOid, gitRefName } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 
@@ -37,6 +42,18 @@ MergeExecutorDeps,
 
 function decodeBase64(value: string): string {
   return Buffer.from(value.replace(/\n/g, ''), 'base64').toString('utf8');
+}
+
+function effectiveCurrentHeadReviews(
+  pr: PullRequestSnapshot,
+): readonly NativeReviewSnapshot[] {
+  const latest = new Map<string, NativeReviewSnapshot>();
+  for (const review of pr.reviews
+    .filter((candidate) => candidate.commitId === pr.headOid)
+    .sort((left, right) => left.submittedAt.localeCompare(right.submittedAt))) {
+    latest.set(review.reviewer.toLowerCase(), review);
+  }
+  return [...latest.values()];
 }
 
 export function makeProductionMergeActionPort(
@@ -94,10 +111,30 @@ export function makeProductionMergeActionPort(
       && ['ahead', 'identical', 'behind', 'diverged'].includes(compare.status)
       ? compare.status as 'ahead' | 'identical' | 'behind' | 'diverged'
       : 'unknown';
-    const terminalApprovalMatches = lifecycle.reviewClaim?.state === 'terminal-approved'
-      && lifecycle.reviewClaim.head === pr.headOid
+    const effectiveReviews = effectiveCurrentHeadReviews(pr);
+    const reviewClaim = lifecycle.reviewClaim;
+    const terminalReview = reviewClaim === undefined
+      ? undefined
+      : effectiveReviews.find((review) =>
+        review.reviewer.toLowerCase() === reviewClaim.reviewer.toLowerCase());
+    const signedMarker = reviewClaim?.state === 'terminal-approved'
+      ? formatAutomatedReviewMarker({
+          generation: reviewClaim.generation,
+          attempt: reviewClaim.attempt,
+          intent: reviewClaim.verdict.marker,
+          reviewer: reviewClaim.reviewer,
+          head: reviewClaim.head,
+          verdict: reviewClaim.verdict.state,
+        })
+      : undefined;
+    const terminalApprovalMatches = reviewClaim?.state === 'terminal-approved'
+      && reviewClaim.head === pr.headOid
       && lifecycle.terminalVerdict?.head === pr.headOid
-      && lifecycle.terminalVerdict.state === 'APPROVE';
+      && lifecycle.terminalVerdict.state === 'APPROVE'
+      && lifecycle.terminalVerdict.marker === reviewClaim.verdict.marker
+      && signedMarker !== undefined
+      && terminalReview?.state === 'APPROVED'
+      && terminalReview.body.includes(signedMarker);
     return {
       issueNumber: lifecycle.issueNumber,
       prNumber: pr.number,
@@ -118,9 +155,7 @@ export function makeProductionMergeActionPort(
       ...(lifecycle.reviewClaim?.reviewer === undefined
         ? {}
         : { terminalApprovalReviewer: lifecycle.reviewClaim.reviewer }),
-      effectiveReviews: pr.reviews
-        .filter((review) => review.commitId === pr.headOid)
-        .map((review) => ({
+      effectiveReviews: effectiveReviews.map((review) => ({
           reviewer: review.reviewer,
           state: review.state,
           commitId: review.commitId,
