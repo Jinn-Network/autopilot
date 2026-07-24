@@ -2,15 +2,45 @@ import { describe, expect, it } from 'vitest';
 import {
   makeProductionMergeActionPort,
 } from '../../src/lifecycle/merge-executor-production.js';
+import { executeMergeAction } from '../../src/lifecycle/merge-executor.js';
 import { CredentialPool, selectCredential } from '../../src/lifecycle/credentials.js';
-import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
+import type {
+  GitHubLifecycleSnapshot,
+  NativeReviewSnapshot,
+} from '../../src/lifecycle/snapshot.js';
 import { gitOid, isoTimestamp } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
+const OTHER_HEAD = gitOid('2'.repeat(40));
 const BASE = gitOid('3'.repeat(40));
+const GENERATION = '22222222-2222-4222-8222-222222222222';
+const ATTEMPT = '33333333-3333-4333-8333-333333333333';
+const INTENT = '44444444-4444-4444-8444-444444444444';
+const REVIEWER = 'review-bot';
+const MARKER = '<!-- jinn-autopilot-review:v2 '
+  + 'generation=22222222-2222-4222-8222-222222222222 '
+  + 'attempt=33333333-3333-4333-8333-333333333333 '
+  + 'intent=44444444-4444-4444-8444-444444444444 '
+  + 'reviewer=review-bot '
+  + 'head=1111111111111111111111111111111111111111 '
+  + 'verdict=APPROVE -->';
 
-function snapshot(): GitHubLifecycleSnapshot {
-  const marker = 'review-marker';
+function approvedReview(
+  overrides: Partial<NativeReviewSnapshot> = {},
+): NativeReviewSnapshot {
+  return {
+    reviewer: REVIEWER,
+    state: 'APPROVED',
+    commitId: HEAD,
+    body: `${MARKER}\n\nApproved.`,
+    submittedAt: '2026-07-20T00:01:00.000Z',
+    ...overrides,
+  };
+}
+
+function snapshot(
+  reviews: readonly NativeReviewSnapshot[] = [approvedReview()],
+): GitHubLifecycleSnapshot {
   return {
     pullRequests: [{
       number: 84,
@@ -28,7 +58,7 @@ function snapshot(): GitHubLifecycleSnapshot {
       mergeability: 'MERGEABLE',
       mergeStateStatus: 'CLEAN',
       checks: [{ name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS' }],
-      reviews: [],
+      reviews,
       branchClaim: {
         version: 2,
         phase: 'implement',
@@ -60,28 +90,25 @@ function snapshot(): GitHubLifecycleSnapshot {
         approved: true,
         mergeState: 'clean',
         reviewClaim: {
-          version: 1,
+          kind: 'review-claim',
+          protocolVersion: 2,
           prNumber: 84,
-          issueNumber: 84,
           head: HEAD,
-          generation: '22222222-2222-4222-8222-222222222222',
-          reviewer: 'review-bot',
-          runner: 'runner-b',
-          startedAt: isoTimestamp('2026-07-20T00:00:00.000Z'),
+          generation: GENERATION,
+          attempt: ATTEMPT,
+          reviewer: REVIEWER,
+          recordedAt: isoTimestamp('2026-07-20T00:00:00.000Z'),
           state: 'terminal-approved',
           verdict: {
             state: 'APPROVE',
-            head: HEAD,
-            marker,
-            submittedAt: isoTimestamp('2026-07-20T00:01:00.000Z'),
+            marker: INTENT,
           },
         },
         terminalVerdict: {
-          reviewer: 'review-bot',
           state: 'APPROVE',
           head: HEAD,
-          marker,
-          submittedAt: isoTimestamp('2026-07-20T00:01:00.000Z'),
+          marker: INTENT,
+          recordedAt: isoTimestamp('2026-07-20T00:01:00.000Z'),
         },
       }],
     },
@@ -118,6 +145,115 @@ function candidateRunner(changedFiles: number, filenames: readonly string[]) {
 }
 
 describe('production head-pinned merge port', () => {
+  it.each([
+    {
+      name: 'the terminal approval is dismissed',
+      finalReviews: [
+        approvedReview(),
+        approvedReview({
+          state: 'DISMISSED',
+          body: '',
+          submittedAt: '2026-07-20T00:02:00.000Z',
+        }),
+      ],
+    },
+    {
+      name: 'the signed approval belongs to the wrong reviewer',
+      finalReviews: [approvedReview({ reviewer: 'marker-copying-bot' })],
+    },
+    {
+      name: 'the signed approval belongs to the wrong head',
+      finalReviews: [approvedReview({ commitId: OTHER_HEAD })],
+    },
+    {
+      name: 'the terminal reviewer removes approval',
+      finalReviews: [
+        approvedReview(),
+        approvedReview({
+          state: 'COMMENTED',
+          body: 'Approval removed.',
+          submittedAt: '2026-07-20T00:02:00.000Z',
+        }),
+      ],
+    },
+  ])('does not merge when $name before the final reread', async ({ finalReviews }) => {
+    let candidateReads = 0;
+    let mergeCalls = 0;
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot(candidateReads++ === 0 ? undefined : finalReviews),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: candidateRunner(1, ['GREETING.md']),
+    });
+
+    const result = await executeMergeAction({
+      prNumber: 84,
+      expectedHead: HEAD,
+    }, {
+      ...port,
+      credentials: new CredentialPool([{
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'selected-secret',
+      }]),
+      mergeExactHead: async ({ head }) => {
+        mergeCalls += 1;
+        return { status: 'merged', head, mergeCommitOid: OTHER_HEAD };
+      },
+      reconcileDone: async () => {},
+    });
+
+    expect(result).toMatchObject({
+      status: 'ineligible',
+      reasons: ['terminal-approval'],
+    });
+    expect(candidateReads).toBe(2);
+    expect(mergeCalls).toBe(0);
+  });
+
+  it('uses each reviewer latest exact-head state when checking native blockers', async () => {
+    let mergeCalls = 0;
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot([
+        approvedReview(),
+        approvedReview({
+          reviewer: 'human-reviewer',
+          state: 'CHANGES_REQUESTED',
+          body: 'Old blocker.',
+          submittedAt: '2026-07-20T00:01:30.000Z',
+        }),
+        approvedReview({
+          reviewer: 'human-reviewer',
+          body: 'Resolved.',
+          submittedAt: '2026-07-20T00:02:00.000Z',
+        }),
+      ]),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: candidateRunner(1, ['GREETING.md']),
+    });
+
+    const result = await executeMergeAction({
+      prNumber: 84,
+      expectedHead: HEAD,
+    }, {
+      ...port,
+      credentials: new CredentialPool([{
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'selected-secret',
+      }]),
+      mergeExactHead: async ({ head }) => {
+        mergeCalls += 1;
+        return { status: 'merged', head, mergeCommitOid: OTHER_HEAD };
+      },
+      reconcileDone: async () => {},
+    });
+
+    expect(result).toMatchObject({ status: 'merged', head: HEAD });
+    expect(mergeCalls).toBe(1);
+  });
+
   it('uses the selected identity, exact SHA, and no admin or bypass flag', async () => {
     const calls: Array<{ command: string; args: readonly string[]; env?: NodeJS.ProcessEnv }> = [];
     const runner = async (
