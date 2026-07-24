@@ -177,6 +177,30 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await expect(store.load()).resolves.toEqual(incremental);
   });
 
+  it('round-trips a closed PR whose close timestamp follows its update timestamp', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const withDelayedClose: LifecycleDiscoveryState = {
+      ...base,
+      recentlyClosedPullRequests: [{
+        number: 1951,
+        title: 'Feed intermediate failure diffs',
+        state: 'CLOSED',
+        updatedAt: '2026-07-23T23:24:45.000Z',
+        headOid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        headRefName: 'feature/1951',
+        baseRefName: 'next',
+        isDraft: false,
+        closedAt: '2026-07-23T23:24:47.000Z',
+        mergedAt: null,
+      }],
+    };
+
+    await expect(store.save(withDelayedClose)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(withDelayedClose);
+  });
+
   it.each([
     ['no live REST request', { restRequests: 0 }],
     ['nonzero GraphQL cost without a GraphQL request', { graphqlCost: 1 }],
