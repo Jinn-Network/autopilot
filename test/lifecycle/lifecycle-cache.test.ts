@@ -168,6 +168,29 @@ describe('LifecycleDiscoveryCacheStore', () => {
       .not.toMatch(/GH_TOKEN|credential|authorization/i);
   });
 
+  it('round-trips ci rerun evidence in snapshot and open-PR cache state', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const withCiRerunRecorded: LifecycleDiscoveryState = {
+      ...base,
+      evidence: {
+        ...base.evidence,
+        pullRequests: [{
+          ...base.evidence.pullRequests[0]!,
+          ciRerunRecorded: true,
+        }],
+      },
+      openPullRequestEvidence: [{
+        ...base.openPullRequestEvidence[0]!,
+        ciRerunRecorded: true,
+      }],
+    };
+
+    await expect(store.save(withCiRerunRecorded)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(withCiRerunRecorded);
+  });
+
   it('persists complete incremental quota evidence supplied by zero-point REST authority', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
