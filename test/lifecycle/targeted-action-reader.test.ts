@@ -217,6 +217,102 @@ function staleRecoveryTarget(
   return port.readStaleRecovery(42, 101);
 }
 
+function executeTargetedRecovery(
+  snapshot: GitHubLifecycleSnapshot,
+  events: string[],
+) {
+  return executeImplementationAction({
+    kind: 'claim-implementation',
+    intent: 'stale-recovery',
+    issueNumber: 42,
+    prNumber: 101,
+    expectedHead: gitOid(HEAD),
+    branch: gitRefName('autopilot/42'),
+    claimAttempt: '11111111-1111-4111-8111-111111111111',
+  }, {
+    ...makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: new CredentialPool([]),
+      authorAllowlist: new Set(['oaksprout']),
+      defaultBranch: 'next',
+      readSnapshot: async () => snapshot,
+    }),
+    runRealityCheck: async () => {
+      events.push('reality');
+      return {
+        classification: 'clear',
+        evidence: {},
+        suggestedBlockedOn: null,
+        suggestedComment: null,
+      };
+    },
+    credentials: new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }]),
+    remoteUrl: 'https://github.com/Jinn-Network/mono.git',
+    readTargetBaseHead: async () => {
+      events.push('target-head');
+      return gitOid(BLOCKER_HEAD);
+    },
+    createClaimCommit: async () => {
+      events.push('claim-commit');
+      return gitOid('c'.repeat(40));
+    },
+    claimBranch: async (input) => {
+      events.push('claim');
+      return {
+        status: 'won',
+        expected: input.expectedRemoteHead,
+        published: input.claimOid,
+        observed: input.claimOid,
+      };
+    },
+    ensureDraftPullRequest: async (input) => {
+      events.push('pull-request');
+      return {
+        number: 101,
+        headRefName: input.branch,
+        head: input.claimOid,
+        baseRefName: input.targetBase,
+        draft: true,
+        labels: [input.label],
+        body: input.body,
+      };
+    },
+    setProjectInProgress: async () => {
+      events.push('project');
+    },
+    createAttempt: async (input) => {
+      events.push('attempt');
+      return {
+        attemptId: input.attemptId,
+        paths: {
+          worktree: '/attempt/worktree',
+          manifest: '/attempt/manifest.json',
+          log: '/attempt/session.log',
+          ghConfigDir: '/attempt/gh',
+          askpass: '/attempt/askpass',
+        },
+      };
+    },
+    spawnCoordinator: () => {
+      events.push('worker');
+      return { pid: 42 };
+    },
+    trackChild: () => {
+      events.push('track');
+    },
+    ambientEnvironment: {},
+    nextAttemptId: () => '22222222-2222-4222-8222-222222222222',
+    runnerId: 'runner-a',
+    now: () => new Date('2026-07-22T10:00:00.000Z'),
+  } satisfies ImplementationExecutorDeps);
+}
+
 describe('targeted action reader', () => {
   it('hydrates only the requested PR and its mapped Project item', async () => {
     const calls: string[] = [];
@@ -278,96 +374,7 @@ describe('targeted action reader', () => {
     const targeted = await reader.readPullRequest(fixture.cycle, 101);
     const result = targeted === null
       ? 'withheld'
-      : await executeImplementationAction({
-          kind: 'claim-implementation',
-          intent: 'stale-recovery',
-          issueNumber: 42,
-          prNumber: 101,
-          expectedHead: gitOid(HEAD),
-          branch: gitRefName('autopilot/42'),
-          claimAttempt: '11111111-1111-4111-8111-111111111111',
-        }, {
-          ...makeProductionImplementationActionPort({
-            repositoryPath: '/repo',
-            worktreeBase: '/attempts',
-            runnerId: 'runner-a',
-            credentials: new CredentialPool([]),
-            authorAllowlist: new Set(['oaksprout']),
-            defaultBranch: 'next',
-            readSnapshot: async () => targeted,
-          }),
-          runRealityCheck: async () => {
-            events.push('reality');
-            return {
-              classification: 'clear',
-              evidence: {},
-              suggestedBlockedOn: null,
-              suggestedComment: null,
-            };
-          },
-          credentials: new CredentialPool([{
-            login: 'implementation-bot',
-            normalizedLogin: 'implementation-bot',
-            implementationToken: 'selected-secret',
-          }]),
-          remoteUrl: 'https://github.com/Jinn-Network/mono.git',
-          readTargetBaseHead: async () => {
-            events.push('target-head');
-            return gitOid(BLOCKER_HEAD);
-          },
-          createClaimCommit: async () => {
-            events.push('claim-commit');
-            return gitOid('c'.repeat(40));
-          },
-          claimBranch: async (input) => {
-            events.push('claim');
-            return {
-              status: 'won',
-              expected: input.expectedRemoteHead,
-              published: input.claimOid,
-              observed: input.claimOid,
-            };
-          },
-          ensureDraftPullRequest: async (input) => {
-            events.push('pull-request');
-            return {
-              number: 101,
-              headRefName: input.branch,
-              head: input.claimOid,
-              baseRefName: input.targetBase,
-              draft: true,
-              labels: [input.label],
-              body: input.body,
-            };
-          },
-          setProjectInProgress: async () => {
-            events.push('project');
-          },
-          createAttempt: async (input) => {
-            events.push('attempt');
-            return {
-              attemptId: input.attemptId,
-              paths: {
-                worktree: '/attempt/worktree',
-                manifest: '/attempt/manifest.json',
-                log: '/attempt/session.log',
-                ghConfigDir: '/attempt/gh',
-                askpass: '/attempt/askpass',
-              },
-            };
-          },
-          spawnCoordinator: () => {
-            events.push('worker');
-            return { pid: 42 };
-          },
-          trackChild: () => {
-            events.push('track');
-          },
-          ambientEnvironment: {},
-          nextAttemptId: () => '22222222-2222-4222-8222-222222222222',
-          runnerId: 'runner-a',
-          now: () => new Date('2026-07-22T10:00:00.000Z'),
-        } satisfies ImplementationExecutorDeps);
+      : await executeTargetedRecovery(targeted, events);
 
     expect(result).toMatchObject({
       status: 'ineligible',
@@ -538,6 +545,108 @@ describe('targeted action reader', () => {
     });
 
     await expect(reader.readPullRequest(fixture.cycle, 101)).resolves.toBeNull();
+  });
+
+  it('withholds two trusted OPEN outcomes for one blocker before reality or mutation', async () => {
+    const fixture = staleRecoveryCycle();
+    const secondBlocker = {
+      ...fixture.blocker,
+      number: 202,
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/second -->',
+      headRefName: 'stack/second',
+      headOid: 'd'.repeat(40),
+    };
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => 510,
+      readPullRequest: async (number) => {
+        if (number === 101) return fixture.implementation;
+        if (number === 201) return fixture.blocker;
+        if (number === 202) return secondBlocker;
+        return null;
+      },
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Progress',
+        priority: 'P1',
+        effort: 'Medium',
+        blockedOn: 'Another issue',
+        issueType: 'fix',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [7],
+      // PR #201 is present in both sources; identity deduplication must leave
+      // exactly two distinct OPEN outcomes, not three.
+      readPullRequestOutcomeNumbersClosingIssues: async () => new Set([201, 202]),
+    });
+    const events: string[] = [];
+
+    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const result = targeted === null
+      ? 'withheld'
+      : await executeTargetedRecovery(targeted, events);
+
+    expect(result).toBe('withheld');
+    expect(events).toEqual([]);
+  });
+
+  it('keeps one MERGED and one OPEN outcome for the same blocker satisfied', async () => {
+    const fixture = staleRecoveryCycle('next');
+    const mergedBlocker = {
+      ...fixture.blocker,
+      state: 'MERGED' as const,
+      mergedAt: '2026-07-22T09:30:00.000Z',
+      mergeCommitOid: 'c'.repeat(40),
+    };
+    const historicalOpen = {
+      ...fixture.blocker,
+      number: 202,
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/historical-open -->',
+      headRefName: 'stack/historical-open',
+      headOid: 'd'.repeat(40),
+    };
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => 510,
+      readPullRequest: async (number) => {
+        if (number === 101) return fixture.implementation;
+        if (number === 201) return mergedBlocker;
+        if (number === 202) return historicalOpen;
+        return null;
+      },
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Progress',
+        priority: 'P1',
+        effort: 'Medium',
+        blockedOn: 'Another issue',
+        issueType: 'fix',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [7],
+      readPullRequestOutcomeNumbersClosingIssues: async () => new Set([201, 202]),
+    });
+
+    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+
+    expect(targeted).not.toBeNull();
+    await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
+      issue: { targetBase: 'next' },
+    });
   });
 
   it('withholds stale-recovery authority when a fresh blocker edge has no PR evidence', async () => {

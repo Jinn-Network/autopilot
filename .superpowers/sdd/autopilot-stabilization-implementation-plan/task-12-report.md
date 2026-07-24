@@ -31,7 +31,14 @@ cycle could not recover that authoritative merged evidence.
   before every exact PR hydration.
 - Exact-hydrated every discovered or cycle-referenced blocker PR by number.
   Closed-unmerged/disappeared PRs are removed from the composed evidence;
-  mismatched or multi-issue blocker mappings fail closed.
+  mismatched or multi-issue blocker mappings fail closed. Two distinct trusted
+  OPEN PRs mapped to the same blocker now also fail closed before recovery can
+  reach reality check or mutation; a MERGED outcome remains authoritative when
+  historical OPEN evidence is also present.
+- Enforced the relation reader's exact two-point quota contract against the
+  GraphQL response cost. Responses reporting a higher cost now fail closed,
+  while the exact two-point boundary and responses without cost evidence retain
+  their prior behavior.
 - Kept target derivation in the existing stack resolver. All-merged blockers
   now use the configured default branch rather than a hard-coded `next`;
   still-open trusted blockers retain their exact live head branch.
@@ -59,14 +66,22 @@ still-open trusted, merged-after-snapshot, multiple blocker hydration, exact
 quota reserves, zero reality/mutation events, and #2039 resolving through
 merged PR #1728 to a configured non-`next` default.
 
+Review round 1 added two focused RED/GREEN regressions. The first demonstrated
+that two distinct trusted OPEN PRs closing one blocker previously selected the
+first branch and spawned recovery; it now withholds with a zero-event mutation
+ledger, with PR identity deduplication and a MERGED-plus-OPEN control. The
+second demonstrated that relation discovery previously accepted a response
+cost of three despite reserving exactly two points; it now rejects cost three
+and retains the cost-two boundary.
+
 ## Verification
 
 Fresh Node 22.23.1 verification passed:
 
 - focused targeted-reader, GitHub-reader, implementation executor/production
-  port, and stack-readiness tests — 149 passed, 1 skipped;
+  port, and stack-readiness tests — 152 passed, 1 skipped;
 - `yarn typecheck`;
-- `yarn test` — 135 files passed, 1,848 tests passed, 40 skipped;
+- `yarn test` — 135 files passed, 1,851 tests passed, 40 skipped;
 - `yarn verify:source`;
 - `yarn build`;
 - `yarn verify:dist`; and
@@ -81,3 +96,9 @@ claim identity/attempt before the first mutation. Fresh implementation and
 review paths retain their existing gates. The new reader surface is internal
 and optional at the snapshot interface, but production stale-recovery wiring
 provides it and fails closed when blocker discovery is unavailable.
+
+The follow-up ambiguity check is scoped to distinct OPEN PR identities per
+fresh blocker edge, so duplicate sightings of one PR do not create false
+ambiguity and a present MERGED outcome continues to satisfy that blocker. The
+quota-cost guard is confined to the shared targeted closing-relation read and
+does not broaden its reserve or change public configuration.

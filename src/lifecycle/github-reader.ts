@@ -915,6 +915,16 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     if (typeof data !== 'object' || data === null) {
       throw new Error('Targeted closing-PR response data is missing');
     }
+    const rateLimit = (data as { rateLimit?: unknown }).rateLimit;
+    const cost = typeof rateLimit === 'object' && rateLimit !== null
+      ? (rateLimit as { cost?: unknown }).cost
+      : undefined;
+    if (typeof cost === 'number' && cost > TARGETED_RELATION_RESERVE) {
+      throw new Error(
+        `Targeted closing-PR context cost ${cost} exceeded `
+        + `${TARGETED_RELATION_RESERVE}-point reserve`,
+      );
+    }
     const repository = (data as { repository?: unknown }).repository;
     if (typeof repository !== 'object' || repository === null) {
       throw new Error('Targeted closing-PR repository is missing');

@@ -368,6 +368,18 @@ export function makeTargetedActionReader(
         ? pullRequests.map((pr) => pr.number === blockerNumber ? hydratedBlocker : pr)
         : [...pullRequests, hydratedBlocker];
     }
+    for (const dependency of dependencySet) {
+      const blockerEvidence = pullRequests.filter((pr) => (
+        pr.closingIssueNumbers.includes(dependency)
+      ));
+      if (blockerEvidence.some((pr) => pr.state === 'MERGED')) continue;
+      const openPullRequestNumbers = new Set(
+        blockerEvidence
+          .filter((pr) => pr.state === 'OPEN')
+          .map((pr) => pr.number),
+      );
+      if (openPullRequestNumbers.size > 1) return null;
+    }
     return composeTargeted(
       cycleSnapshot,
       { project, issues, pullRequests },
