@@ -47,11 +47,17 @@ export function formatChildTriageIntent(input: ChildTriageExpectation): string {
     + `effort=${input.effort} priority=${input.priority} -->`;
 }
 
+function hasChildTriageIntentPrefix(body: string): boolean {
+  return /<!--\s*jinn-autopilot:child-triage\b/.test(body);
+}
+
 export function parseChildTriageIntent(body: string): ChildTriageExpectation | null {
-  const match = body.match(
-    /<!--\s*jinn-autopilot:child-triage\s+type=(fix)\s+effort=(low|medium|high)\s+priority=(p1|p2)\s*-->/,
-  );
-  if (match === null) return null;
+  const prefixes = [...body.matchAll(/<!--\s*jinn-autopilot:child-triage\b/g)];
+  const matches = [...body.matchAll(
+    /<!--\s*jinn-autopilot:child-triage\s+type=(fix)\s+effort=(low|medium|high)\s+priority=(p1|p2)\s*-->/g,
+  )];
+  if (prefixes.length !== 1 || matches.length !== 1) return null;
+  const match = matches[0]!;
   return {
     issueType: match[1] as ChildTriageExpectation['issueType'],
     effort: match[2] as ChildTriageExpectation['effort'],
@@ -65,6 +71,7 @@ export function resolveChildTriageExpectation(
 ): ChildTriageExpectation | null {
   const explicit = parseChildTriageIntent(body);
   if (explicit !== null) return explicit;
+  if (hasChildTriageIntentPrefix(body)) return null;
   return kind === 'reconcile'
     ? { issueType: 'fix', effort: 'medium', priority: 'p1' }
     : null;
@@ -167,7 +174,18 @@ export async function fileChildIssue(
   const bodyWithMarker = input.body.includes(marker)
     ? input.body
     : `${marker}\n\n${input.body.trim()}`;
-  const body = parseChildTriageIntent(bodyWithMarker) === null
+  const existingTriageIntent = parseChildTriageIntent(bodyWithMarker);
+  if (hasChildTriageIntentPrefix(bodyWithMarker)) {
+    if (
+      existingTriageIntent === null
+      || existingTriageIntent.issueType !== 'fix'
+      || existingTriageIntent.effort !== input.effort
+      || existingTriageIntent.priority !== input.priority
+    ) {
+      throw new Error('Child body contains invalid or contradictory triage intent');
+    }
+  }
+  const body = existingTriageIntent === null
     ? bodyWithMarker.replace(marker, `${marker}\n\n${triageIntent}`)
     : bodyWithMarker;
   const created = await port.createIssue({

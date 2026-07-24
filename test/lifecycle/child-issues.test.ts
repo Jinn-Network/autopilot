@@ -142,6 +142,29 @@ describe('child marker parse/format', () => {
     )).toBeNull();
   });
 
+  it.each([
+    {
+      label: 'malformed',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=max priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'duplicate',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
+  ])('does not apply the reconcile legacy fallback to $label durable intent', ({
+    body,
+  }) => {
+    expect(parseChildTriageIntent(body)).toBeNull();
+    expect(resolveChildTriageExpectation(body, 'reconcile')).toBeNull();
+  });
+
   it('rejects malformed markers', () => {
     expect(parseChildMarker('<!-- jinn-autopilot:child pr=0 kind=reconcile -->')).toBeNull();
     expect(parseChildMarker('<!-- jinn-autopilot:child pr=1 kind=finding -->')).toBeNull();
@@ -242,6 +265,47 @@ describe('fileChildIssue', () => {
         priority: 'p1',
       }),
     );
+  });
+
+  it.each([
+    {
+      label: 'malformed',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=max priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'duplicate',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'mismatched',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=low priority=p2 -->',
+      ].join('\n\n'),
+    },
+  ])('rejects $label durable triage intent before creating a child', async ({
+    body,
+  }) => {
+    const port = fakePort();
+
+    await expect(fileChildIssue(port, {
+      parentPr: 7,
+      kind: 'reconcile',
+      title: 'Reconcile #7',
+      body,
+      effort: 'medium',
+      priority: 'p1',
+    })).rejects.toThrow(/triage intent/i);
+    expect(port.created).toEqual([]);
+    expect(port.typed).toEqual([]);
+    expect(port.triaged).toEqual([]);
   });
 
   it('returns runawayHold when prior children of the kind already hit the limit', async () => {

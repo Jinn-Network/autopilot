@@ -71,6 +71,67 @@ export interface ProductionChildIssuePortOptions {
   readonly projectMapping?: ProjectMapping;
 }
 
+function createFixIssueTypeIdResolver(
+  options: ProductionChildIssuePortOptions,
+  runner: CommandRunner,
+  repo: string,
+): () => Promise<string> {
+  let fixTypeIdPromise: Promise<string> | undefined;
+  return () => {
+    fixTypeIdPromise ??= (async () => {
+      if (options.fixIssueTypeId !== undefined) {
+        if (options.fixIssueTypeId.trim().length === 0) {
+          throw new Error('Configured fix Issue Type ID must not be empty');
+        }
+        return options.fixIssueTypeId;
+      }
+      const owner = repo.split('/')[0];
+      if (owner === undefined || owner.length === 0) {
+        throw new Error(`Cannot resolve repository owner from '${repo}'`);
+      }
+      const raw = await runner('gh', [
+        'api',
+        'graphql',
+        '-f',
+        `query=${FIX_ISSUE_TYPE_QUERY}`,
+        '-f',
+        `owner=${owner}`,
+      ]);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        throw new Error(`Malformed Issue Type discovery for ${owner}`);
+      }
+      const organization = (
+        parsed as {
+          data?: {
+            organization?: {
+              issueTypes?: {
+                nodes?: Array<{ id?: unknown; name?: unknown; isEnabled?: unknown }>;
+              };
+            } | null;
+          };
+        }
+      ).data?.organization;
+      const matches = organization?.issueTypes?.nodes?.filter((entry) => (
+        entry.name === 'fix' && entry.isEnabled === true
+      )) ?? [];
+      if (
+        matches.length !== 1
+        || typeof matches[0]?.id !== 'string'
+        || matches[0].id.length === 0
+      ) {
+        throw new Error(
+          `Organization ${owner} must have exactly one enabled fix Issue Type`,
+        );
+      }
+      return matches[0].id;
+    })();
+    return fixTypeIdPromise;
+  };
+}
+
 export interface ProductionMachineChildRepairInput {
   readonly issueNumber: number;
   readonly parentPr: number;
@@ -348,6 +409,7 @@ export async function repairProductionMachineChild(
   const repo = options.repo ?? REPO;
   const projectOwner = options.projectOwner ?? ORG;
   const projectNumber = options.projectNumber ?? PROJECT_NUMBER;
+  const resolveFixTypeId = createFixIssueTypeIdResolver(options, runner, repo);
   let current = await readMachineChildRepairState(
     runner,
     input,
@@ -372,12 +434,8 @@ export async function repairProductionMachineChild(
   };
 
   if (current.issueType === null) {
+    const typeId = await resolveFixTypeId();
     current = await refresh();
-    const typeId = options.fixIssueTypeId
-      ?? options.projectMapping?.fields.type.options.fix;
-    if (typeId === undefined || typeId.length === 0) {
-      throw new Error('Machine-child repair requires the configured fix Issue Type ID');
-    }
     if (current.issueType === null) {
       await runner('gh', [
         'api',
@@ -430,6 +488,7 @@ export async function repairProductionMachineChild(
         },
       };
 
+  current = await refresh();
   if (current.item === null) {
     const added = parseItemAddId(await runner('gh', [
       'project',
@@ -578,57 +637,7 @@ export function makeProductionChildIssuePort(
 ): ChildIssuePort {
   const runner = options.runner ?? defaultRunner;
   const repo = options.repo ?? REPO;
-  let fixTypeIdPromise: Promise<string> | undefined;
-  const resolveFixTypeId = (): Promise<string> => {
-    fixTypeIdPromise ??= (async () => {
-      if (options.fixIssueTypeId !== undefined) {
-        if (options.fixIssueTypeId.trim().length === 0) {
-          throw new Error('Configured fix Issue Type ID must not be empty');
-        }
-        return options.fixIssueTypeId;
-      }
-      const owner = repo.split('/')[0];
-      if (owner === undefined || owner.length === 0) {
-        throw new Error(`Cannot resolve repository owner from '${repo}'`);
-      }
-      const raw = await runner('gh', [
-        'api',
-        'graphql',
-        '-f',
-        `query=${FIX_ISSUE_TYPE_QUERY}`,
-        '-f',
-        `owner=${owner}`,
-      ]);
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw) as unknown;
-      } catch {
-        throw new Error(`Malformed Issue Type discovery for ${owner}`);
-      }
-      const organization = (
-        parsed as {
-          data?: {
-            organization?: {
-              issueTypes?: {
-                nodes?: Array<{ id?: unknown; name?: unknown; isEnabled?: unknown }>;
-              };
-            } | null;
-          };
-        }
-      ).data?.organization;
-      const matches = organization?.issueTypes?.nodes?.filter((entry) => (
-        entry.name === 'fix' && entry.isEnabled === true
-      )) ?? [];
-      if (matches.length !== 1 || typeof matches[0]?.id !== 'string'
-        || matches[0].id.length === 0) {
-        throw new Error(
-          `Organization ${owner} must have exactly one enabled fix Issue Type`,
-        );
-      }
-      return matches[0].id;
-    })();
-    return fixTypeIdPromise;
-  };
+  const resolveFixTypeId = createFixIssueTypeIdResolver(options, runner, repo);
   const triageApplier = createProjectTriageApplier(runner, {
     repo,
     projectOwner: options.projectOwner,

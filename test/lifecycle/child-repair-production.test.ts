@@ -226,6 +226,109 @@ describe('production machine-child repair', () => {
     expect(mutations).toEqual([]);
   });
 
+  it.each([
+    {
+      label: 'malformed',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=max priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'duplicate',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
+  ])('fails closed on $label durable triage intent before repair mutation', async ({
+    body,
+  }) => {
+    const mutations: string[][] = [];
+
+    await expect(repairProductionMachineChild(options(async (_cmd, args) => {
+      if (args[0] === 'api' && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+        return state({
+          issueType: 'fix',
+          body,
+          item: { blockedOn: 'Nothing', effort: 'Medium', priority: 'P1' },
+        });
+      }
+      mutations.push(args);
+      return '';
+    }), ACTION)).rejects.toThrow(/live child triage intent contradicts.*action/i);
+
+    expect(mutations).toEqual([]);
+  });
+
+  it('dynamically resolves the enabled Fix Issue Type when no mapping is configured', async () => {
+    let issueType: string | null = null;
+    const mutations: string[] = [];
+
+    const result = await repairProductionMachineChild({
+      runner: async (_cmd, args) => {
+        if (args[0] === 'api' && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+          return state({
+            issueType,
+            item: { blockedOn: 'Nothing', effort: 'Medium', priority: 'P1' },
+          });
+        }
+        if (args[0] === 'api' && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('issueTypes(first: 100)'))) {
+          return JSON.stringify({
+            data: {
+              organization: {
+                issueTypes: {
+                  nodes: [{ id: 'IT_dynamic_fix', name: 'fix', isEnabled: true }],
+                },
+              },
+            },
+          });
+        }
+        if (args[0] === 'api' && args[1] === 'graphql') {
+          const typeId = String(args.find((arg) => arg.startsWith('typeId=')));
+          mutations.push(typeId);
+          issueType = 'fix';
+          return '{"data":{}}';
+        }
+        if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      },
+      repo: 'Jinn-Network/mono',
+      projectOwner: 'Jinn-Network',
+      projectNumber: 1,
+    }, ACTION);
+
+    expect(result).toEqual({ status: 'repaired' });
+    expect(mutations).toEqual(['typeId=IT_dynamic_fix']);
+  });
+
+  it('refreshes authority and membership immediately before adding a Project item', async () => {
+    let body = formatChildMarker(2140, 'reconcile');
+    const mutations: string[] = [];
+
+    await expect(repairProductionMachineChild(options(async (_cmd, args) => {
+      if (args[0] === 'api' && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+        return state({ issueType: 'fix', body });
+      }
+      if (args[0] === 'project' && args[1] === 'field-list') {
+        body = formatChildMarker(9999, 'reconcile');
+        return FIELD_LIST;
+      }
+      if (args[0] === 'project' && args[1] === 'item-add') {
+        mutations.push('item-add');
+        return JSON.stringify({ id: 'PVTI_2141' });
+      }
+      throw new Error(`unexpected command: ${args.join(' ')}`);
+    }), ACTION)).rejects.toThrow(/authoritative child marker/i);
+
+    expect(mutations).toEqual([]);
+  });
+
   it('keeps repository and Project owners distinct in the fresh-state query', async () => {
     const queryArgs: string[][] = [];
     await expect(repairProductionMachineChild({
