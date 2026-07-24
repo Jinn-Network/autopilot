@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { ProjectSnapshot } from '../../src/dispatcher/project-snapshot.js';
 import { fetchProjectSnapshot } from '../../src/dispatcher/project-snapshot.js';
 import type { PolledIssue } from '../../src/dispatcher/types.js';
+import { runLifecycleCycle } from '../../src/lifecycle/controller.js';
 import { ConditionalRestClient } from '../../src/lifecycle/github-rest.js';
 import { encodeBranchClaimTrailers } from '../../src/lifecycle/codecs.js';
 import type {
@@ -23,7 +24,9 @@ import type {
   LifecycleDiscoveryStateStore,
 } from '../../src/lifecycle/lifecycle-cache.js';
 import { LifecycleDiscoveryCacheStore } from '../../src/lifecycle/lifecycle-cache.js';
+import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
 import type {
+  GitHubLifecycleSnapshot,
   GitHubLifecycleReader,
   RawBranchClaim,
   RawPullRequest,
@@ -390,6 +393,22 @@ function harness(options: {
   };
 }
 
+async function expectNoOrphanDraftRecovery(
+  snapshot: GitHubLifecycleSnapshot,
+): Promise<void> {
+  const report = await runLifecycleCycle('observe', {
+    readSnapshot: async () => snapshot,
+    writer: {} as ReconciliationWriter,
+    now: () => new Date(snapshot.capturedAt),
+    staleAfterMs: 2 * 60 * 60 * 1_000,
+    runnerId: 'runner-a',
+    cycleId: () => 'historical-branch-proof',
+  });
+
+  expect(report.orphanBranchClaims).toEqual([]);
+  expect(JSON.stringify(report)).not.toContain('ensure-draft-pr');
+}
+
 describe('IncrementalLifecycleSnapshotSource', () => {
   it('persists and reloads a full source seeded from a live-shaped Project rate limit', async () => {
     const context = harness();
@@ -708,6 +727,154 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     });
     expect(afterRestart.terminalClaims).toEqual(full.terminalClaims);
     expect(restartedReader.hydrationCalls).toEqual([]);
+  });
+
+  it('keeps an archived historical update-merge branch terminal after overlap aging and restart', async () => {
+    const context = harness();
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-historical-terminal-branch-'));
+    const durableStore = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    let now = new Date(FULL_AT);
+    const archivedProject: ProjectSnapshot = {
+      ...project('Done'),
+      items: [],
+      currentSprintIterationId: null,
+    };
+    // Historical update-branch shape: the stable ref advanced to a merge
+    // commit while its surviving claim trailers still name the first parent.
+    const ancestralFirstParent = gitOid(HEAD_A);
+    const updateBranchMergeHead = gitOid(HEAD_B);
+    const historicalClaim = implementationClaim({
+      expectedHead: ancestralFirstParent,
+    });
+    const historicalBranch = rawBranchClaim({
+      headOid: updateBranchMergeHead,
+      claim: { expectedHead: ancestralFirstParent },
+    });
+    const exactMergedPr = mergedImplementation({
+      headOid: updateBranchMergeHead,
+      branchClaimTrailers: encodeBranchClaimTrailers(historicalClaim),
+    });
+    const source = new IncrementalLifecycleSnapshotSource({
+      fullReader: context.reader,
+      restDiscovery: context.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: context.conditionalRest,
+      evidenceProbe: context.probe,
+      cacheStore: durableStore,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => now,
+    });
+    context.reader.project = archivedProject;
+    context.reader.issues = [];
+    context.reader.fullPrs = [];
+    context.reader.branchClaims = [historicalBranch];
+    context.reader.targeted.set(101, exactMergedPr);
+    context.rest.project = archivedProject;
+    context.rest.issues = [];
+    context.rest.openPrs = [];
+    context.rest.closedPrs = [openIndex({
+      state: 'CLOSED',
+      updatedAt: '2026-07-22T09:58:00.000Z',
+      headOid: updateBranchMergeHead,
+      closedAt: '2026-07-22T09:45:00.000Z',
+      mergedAt: '2026-07-22T09:45:00.000Z',
+    })];
+    expect(historicalBranch.headOid).toBe(updateBranchMergeHead);
+    expect(historicalClaim.expectedHead).toBe(ancestralFirstParent);
+    expect(historicalBranch.headOid).not.toBe(historicalClaim.expectedHead);
+    expect(exactMergedPr).toMatchObject({
+      number: 101,
+      state: 'MERGED',
+      headRefName: historicalBranch.headRefName,
+      headOid: historicalBranch.headOid,
+      baseRefName: historicalClaim.targetBase,
+      closingIssueNumbers: [historicalClaim.issueNumber],
+      mergedAt: '2026-07-22T09:45:00.000Z',
+      mergeCommitOid: MERGE,
+    });
+    expect(exactMergedPr.branchClaimTrailers).toBe(historicalBranch.claimTrailers);
+
+    const full = await source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(context.reader.hydrationCalls).toEqual([101]);
+    expect(full.project.items).toEqual([]);
+    expect(full.issues).toEqual([]);
+    expect(full.pullRequests).toEqual([]);
+    expect(full.branches).toEqual([
+      expect.objectContaining({
+        headOid: updateBranchMergeHead,
+        claim: expect.objectContaining({
+          expectedHead: ancestralFirstParent,
+          prNumber: 101,
+        }),
+      }),
+    ]);
+    expect(full.terminalClaims).toEqual([
+      expect.objectContaining({
+        issueNumber: 42,
+        prNumber: 101,
+        headOid: updateBranchMergeHead,
+        mergeCommitOid: MERGE,
+      }),
+    ]);
+    await expect(durableStore.load()).resolves.toMatchObject({
+      recentlyClosedPullRequests: [expect.objectContaining({ number: 101 })],
+      terminalClaims: full.terminalClaims,
+    });
+    await expectNoOrphanDraftRecovery(full);
+
+    context.reader.hydrationCalls = [];
+    context.rest.closedPrs = [];
+    now = new Date('2026-07-22T11:00:00.000Z');
+    const agedFull = await source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(agedFull.pullRequests).toEqual([]);
+    expect(agedFull.terminalClaims).toEqual(full.terminalClaims);
+    expect(context.reader.hydrationCalls).toEqual([]);
+    await expect(durableStore.load()).resolves.toMatchObject({
+      recentlyClosedPullRequests: [],
+      terminalClaims: full.terminalClaims,
+    });
+    await expectNoOrphanDraftRecovery(agedFull);
+
+    now = new Date('2026-07-22T11:10:00.000Z');
+    const incremental = await source.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+
+    expect(incremental.terminalClaims).toEqual(full.terminalClaims);
+    expect(context.reader.hydrationCalls).toEqual([]);
+    await expectNoOrphanDraftRecovery(incremental);
+
+    const restartedReader = new FakeLifecycleReader();
+    restartedReader.project = archivedProject;
+    restartedReader.issues = [];
+    restartedReader.fullPrs = [];
+    restartedReader.branchClaims = [historicalBranch];
+    restartedReader.targeted.set(101, null);
+    const restarted = new IncrementalLifecycleSnapshotSource({
+      fullReader: restartedReader,
+      restDiscovery: context.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: new ConditionalRestClient(async () => {
+        throw new Error('no direct calls expected');
+      }),
+      evidenceProbe: context.probe,
+      cacheStore: durableStore,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => new Date('2026-07-22T11:20:00.000Z'),
+    });
+
+    const afterRestart = await restarted.read({
+      mode: 'incremental',
+      rateLimitFloor: 500,
+    });
+
+    expect(afterRestart.project.items).toEqual([]);
+    expect(afterRestart.issues).toEqual([]);
+    expect(afterRestart.pullRequests).toEqual([]);
+    expect(afterRestart.terminalClaims).toEqual(full.terminalClaims);
+    expect(restartedReader.hydrationCalls).toEqual([]);
+    await expectNoOrphanDraftRecovery(afterRestart);
   });
 
   it.each([
