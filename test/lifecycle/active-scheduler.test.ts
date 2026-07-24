@@ -39,6 +39,43 @@ describe('active local scheduler', () => {
     ]);
   });
 
+  it('schedules machine-child repair first without consuming an implementation slot', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [
+        {
+          phase: 'repair-machine-child',
+          issueNumber: 2141,
+          parentPr: 2140,
+          childKind: 'reconcile',
+          expectedType: 'fix',
+          expectedEffort: 'medium',
+          expectedPriority: 'p1',
+        },
+        { phase: 'implementation', issueNumber: 42 },
+        { phase: 'implementation', issueNumber: 43 },
+      ],
+      remaining: { implementation: 1, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([
+      {
+        kind: 'repair-machine-child',
+        issueNumber: 2141,
+        parentPr: 2140,
+        childKind: 'reconcile',
+        expectedType: 'fix',
+        expectedEffort: 'medium',
+        expectedPriority: 'p1',
+      },
+      { kind: 'claim-implementation', issueNumber: 42 },
+    ]);
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:43',
+      reason: 'capacity',
+    });
+  });
+
   it('suppresses only fresh implementation at the GitHub backlog threshold', () => {
     const plan = scheduleActiveActions(input({ openPipelineBacklog: 10 }));
     expect(plan.actions.map((action) => action.kind)).toEqual([

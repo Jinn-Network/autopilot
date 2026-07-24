@@ -110,4 +110,39 @@ describe('active runtime boundary', () => {
     })).resolves.toEqual({ outcome: 'spawned' });
     expect(selected).toEqual([['implementation-bot', 'review-bot']]);
   });
+
+  it('dispatches machine-child repair through the maintenance handler at zero implementation capacity', async () => {
+    const received: unknown[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 0, review: 0 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        repairMachineChild: async (action) => {
+          received.push(action);
+          return { status: 'repaired' };
+        },
+        merge: async () => ({ status: 'merged' }),
+      },
+    });
+    const action = {
+      kind: 'repair-machine-child' as const,
+      issueNumber: 2141,
+      parentPr: 2140,
+      childKind: 'reconcile' as const,
+      expectedType: 'fix' as const,
+      expectedEffort: 'medium' as const,
+      expectedPriority: 'p1' as const,
+    };
+
+    await expect(runtime.executeAction(action, {} as never)).resolves.toEqual({
+      outcome: 'repaired',
+    });
+    expect(received).toEqual([action]);
+  });
 });
