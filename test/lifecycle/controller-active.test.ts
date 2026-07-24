@@ -224,7 +224,7 @@ describe('active lifecycle controller', () => {
         expectedEffort: 'medium',
         expectedPriority: 'p1',
       },
-      { kind: 'claim-implementation', issueNumber: 42 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 42 },
     ]);
   });
 
@@ -241,7 +241,7 @@ describe('active lifecycle controller', () => {
     await runLifecycleCycle('active', controller);
 
     expect(actions).toEqual([
-      { kind: 'claim-implementation', issueNumber: 2141 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2141 },
     ]);
   });
 
@@ -297,9 +297,9 @@ describe('active lifecycle controller', () => {
     })]);
   });
 
-  it('treats a reaped stale draft as an ordinary implementation claim on its existing branch', async () => {
+  function implementationPrSnapshot(headChangedAt: string): GitHubLifecycleSnapshot {
     const head = gitOid('1'.repeat(40));
-    const reaped: GitHubLifecycleSnapshot = {
+    return {
       project: {
         items: [],
         rateLimit: {
@@ -320,7 +320,7 @@ describe('active lifecycle controller', () => {
         baseRefName: 'next',
         headRefName: 'autopilot/42',
         headOid: head,
-        headCommittedAt: '2026-07-20T08:00:00.000Z',
+        headCommittedAt: headChangedAt,
         isDraft: true,
         state: 'OPEN',
         labels: ['engine:review'],
@@ -336,10 +336,10 @@ describe('active lifecycle controller', () => {
           issueNumber: 42,
           prNumber: 84,
           v2Marked: true,
-          projectStatus: 'Todo',
+          projectStatus: 'In Progress',
           labels: ['engine:review'],
           head,
-          headChangedAt: '2026-07-20T08:00:00.000Z',
+          headChangedAt,
           isDraft: true,
           merged: false,
           needsReview: true,
@@ -362,8 +362,14 @@ describe('active lifecycle controller', () => {
       },
       capturedAt: NOW.toISOString(),
     };
+  }
+
+  it('pins stale implementation recovery to the observed PR, head, branch, and claim', async () => {
+    const head = gitOid('1'.repeat(40));
     const actions: unknown[] = [];
-    const controller = deps({ readSnapshot: async () => reaped });
+    const controller = deps({
+      readSnapshot: async () => implementationPrSnapshot('2026-07-20T08:00:00.000Z'),
+    });
     controller.active!.executeAction = async (action) => {
       actions.push(action);
       return { outcome: 'spawned' };
@@ -372,8 +378,28 @@ describe('active lifecycle controller', () => {
     await runLifecycleCycle('active', controller);
     expect(actions).toEqual([{
       kind: 'claim-implementation',
+      intent: 'stale-recovery',
       issueNumber: 42,
+      prNumber: 84,
+      expectedHead: head,
+      branch: gitRefName('autopilot/42'),
+      claimAttempt: '11111111-1111-4111-8111-111111111111',
     }]);
+  });
+
+  it('does not schedule a non-stale In Progress implementation as fresh work', async () => {
+    const actions: unknown[] = [];
+    const controller = deps({
+      readSnapshot: async () => implementationPrSnapshot('2026-07-20T11:00:00.000Z'),
+    });
+    controller.active!.executeAction = async (action) => {
+      actions.push(action);
+      return { outcome: 'unexpected' };
+    };
+
+    await runLifecycleCycle('active', controller);
+
+    expect(actions).toEqual([]);
   });
 
   it.skip('does not let a permanently-failing reconciliation action for one issue block claim scheduling for an unrelated issue', async () => {
@@ -439,7 +465,9 @@ describe('active lifecycle controller', () => {
     };
 
     const first = await runLifecycleCycle('active', controller);
-    expect(actions).toEqual([{ kind: 'claim-implementation', issueNumber: 42 }]);
+    expect(actions).toEqual([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 42 },
+    ]);
     if (first.status !== 'ok') throw new Error('expected active report');
     expect(first.reconciliation?.results).toEqual([
       expect.objectContaining({
@@ -452,7 +480,9 @@ describe('active lifecycle controller', () => {
     // being claimable in later cycles too, not just the first.
     actions.length = 0;
     const second = await runLifecycleCycle('active', controller);
-    expect(actions).toEqual([{ kind: 'claim-implementation', issueNumber: 42 }]);
+    expect(actions).toEqual([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 42 },
+    ]);
     expect(second.status).toBe('ok');
   });
 
@@ -670,7 +700,9 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       return { outcome: 'spawned' };
     };
     const report = await runLifecycleCycle('active', controller);
-    expect(actions).toEqual([{ kind: 'claim-implementation', issueNumber: 42 }]);
+    expect(actions).toEqual([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 42 },
+    ]);
     expect(report.status).toBe('ok');
   });
 
@@ -686,8 +718,8 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
     };
     await runLifecycleCycle('active', controller);
     expect(actions).toEqual([
-      { kind: 'claim-implementation', issueNumber: 42 },
-      { kind: 'claim-implementation', issueNumber: 99 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 42 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 99 },
     ]);
   });
 

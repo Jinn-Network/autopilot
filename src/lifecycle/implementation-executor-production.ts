@@ -2,7 +2,6 @@ import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
 import { ensureFieldIds } from '../dispatcher/field-cache.js';
-import { selectReady } from '../dispatcher/ready-filter.js';
 import { resolveStackReady } from '../dispatcher/stack-readiness.js';
 import type { PrLink } from '../dispatcher/pr-links.js';
 import type { CreateAttemptOptions } from './attempt-workspace.js';
@@ -50,6 +49,7 @@ export interface ProductionImplementationActionPortOptions {
 export type ProductionImplementationActionPort = Pick<
 ImplementationExecutorDeps,
 | 'readIssue'
+| 'readStaleRecovery'
 | 'runRealityCheck'
 | 'listOpenPullRequests'
 | 'readTargetBaseHead'
@@ -206,59 +206,96 @@ export function makeProductionImplementationActionPort(
     if (selection.status !== 'selected') throw new Error(selection.detail);
     return selection.credential;
   };
+  const issueFromSnapshot = (
+    snapshot: GitHubLifecycleSnapshot,
+    issueNumber: number,
+  ) => {
+    const source = snapshot.issues.find((issue) => issue.number === issueNumber);
+    const lifecycle = snapshot.lifecycle.items.find((item) =>
+      item.issueNumber === issueNumber);
+    if (source === undefined || lifecycle === undefined) return null;
+    const stackReady = resolveStackReady(
+      [...snapshot.issues],
+      prLinks(snapshot),
+      options.authorAllowlist,
+    );
+    const existing = snapshot.pullRequests.find((pr) =>
+      pr.state === 'OPEN' && (
+        pr.closingIssueNumbers.includes(issueNumber)
+        || pr.body.includes(`<!-- jinn-autopilot:v2 issue=${issueNumber} `)
+      ));
+    const marker = parseChildMarker(source.body ?? '');
+    const childKindLabel = hasChildKindLabel(source.labels);
+    let eligible = lifecycle.kind === 'issue'
+      && lifecycle.eligible
+      && lifecycle.humanHold !== true;
+    // Machine children must route through fix-child on the parent branch.
+    // A kind label without a body marker means the incremental index omitted
+    // the marker — fail closed instead of ordinary implement-issue.
+    if (childKindLabel && marker === null) {
+      eligible = false;
+    }
+    const eligibilityDetail = lifecycle.kind === 'issue'
+      ? lifecycle.eligibilityDetail
+      : `Project status is ${lifecycle.projectStatus ?? 'missing'}`;
+    return {
+      number: source.number,
+      title: source.title,
+      open: true,
+      eligible,
+      ...(eligibilityDetail === undefined ? {} : { eligibilityDetail }),
+      targetBase: gitRefName(
+        existing?.baseRefName
+        ?? stackReady.get(issueNumber)?.baseBranch
+        ?? defaultBranch,
+      ),
+      effort: source.effort,
+      ...(marker === null
+        ? {}
+        : { child: { parentPr: marker.parentPr, kind: marker.kind } }),
+    };
+  };
 
   return {
     async readIssue(issueNumber) {
       const snapshot = await options.readSnapshot();
-      const source = snapshot.issues.find((issue) => issue.number === issueNumber);
+      return issueFromSnapshot(snapshot, issueNumber);
+    },
+
+    async readStaleRecovery(issueNumber, prNumber) {
+      const snapshot = await options.readSnapshot();
+      const project = snapshot.project.items.find((item) =>
+        item.contentType === 'Issue' && item.number === issueNumber);
       const lifecycle = snapshot.lifecycle.items.find((item) =>
-        item.issueNumber === issueNumber);
-      if (source === undefined || lifecycle === undefined) return null;
-      const stackReady = resolveStackReady(
-        [...snapshot.issues],
-        prLinks(snapshot),
-        options.authorAllowlist,
-      );
-      const selected = selectReady(
-        [...snapshot.issues],
-        new Set(),
-        options.authorAllowlist,
-        stackReady,
-      ).ready.some((issue) => issue.number === issueNumber);
-      const existing = snapshot.pullRequests.find((pr) =>
-        pr.state === 'OPEN' && (
-          pr.closingIssueNumbers.includes(issueNumber)
-          || pr.body.includes(`<!-- jinn-autopilot:v2 issue=${issueNumber} `)
-        ));
-      const marker = parseChildMarker(source.body ?? '');
-      const childKindLabel = hasChildKindLabel(source.labels);
-      let eligible = lifecycle.kind === 'issue'
-        ? lifecycle.eligible && lifecycle.humanHold !== true
-        : selected
-          && lifecycle.humanHold !== true
-          && lifecycle.branchClaim?.phase === 'implement'
-          && lifecycle.branchClaim.phaseComplete !== true
-          && lifecycle.isDraft;
-      // Machine children must route through fix-child on the parent branch.
-      // A kind label without a body marker means the incremental index omitted
-      // the marker — fail closed instead of ordinary implement-issue.
-      if (childKindLabel && marker === null) {
-        eligible = false;
-      }
+        item.kind === 'pull-request'
+        && item.issueNumber === issueNumber
+        && item.prNumber === prNumber);
+      const pullRequest = snapshot.pullRequests.find((pr) =>
+        pr.number === prNumber);
       return {
-        number: source.number,
-        title: source.title,
-        open: true,
-        eligible,
-        targetBase: gitRefName(
-          existing?.baseRefName
-          ?? stackReady.get(issueNumber)?.baseBranch
-          ?? defaultBranch,
-        ),
-        effort: source.effort,
-        ...(marker === null
-          ? {}
-          : { child: { parentPr: marker.parentPr, kind: marker.kind } }),
+        issue: issueFromSnapshot(snapshot, issueNumber),
+        projectStatus: project?.status ?? null,
+        humanHold: project?.status === 'Human'
+          || project?.blockedOn === 'Human'
+          || lifecycle?.humanHold === true
+          || lifecycle?.humanReason !== undefined
+          || lifecycle?.labels.includes('review:needs-human') === true
+          || lifecycle?.labels.includes('autopilot:human') === true,
+        pullRequest: pullRequest === undefined
+          ? null
+          : {
+              number: pullRequest.number,
+              headRefName: gitRefName(pullRequest.headRefName),
+              head: pullRequest.headOid,
+              baseRefName: gitRefName(pullRequest.baseRefName),
+              draft: pullRequest.isDraft,
+              labels: [...pullRequest.labels],
+              body: pullRequest.body,
+              state: pullRequest.state,
+            },
+        claim: lifecycle?.kind === 'pull-request'
+          ? lifecycle.branchClaim ?? null
+          : null,
       };
     },
 

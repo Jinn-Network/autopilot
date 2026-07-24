@@ -256,8 +256,24 @@ export interface LocalCapacity {
   readonly usableCredentialLanes: number;
 }
 
+export type ImplementationClaimAction =
+  | {
+      readonly kind: 'claim-implementation';
+      readonly intent: 'fresh';
+      readonly issueNumber: number;
+    }
+  | {
+      readonly kind: 'claim-implementation';
+      readonly intent: 'stale-recovery';
+      readonly issueNumber: number;
+      readonly prNumber: number;
+      readonly expectedHead: GitOid;
+      readonly branch: GitRefName;
+      readonly claimAttempt: string;
+    };
+
 export type NewWorkAction =
-  | { readonly kind: 'claim-implementation'; readonly issueNumber: number }
+  | ImplementationClaimAction
   | {
       readonly kind: 'repair-machine-child';
       readonly issueNumber: number;

@@ -91,6 +91,7 @@ function harness(overrides: Partial<ImplementationExecutorDeps> = {}) {
   const attemptIds = [ATTEMPT_A, ATTEMPT_B];
   const deps: ImplementationExecutorDeps = {
     readIssue: async () => issue(),
+    readStaleRecovery: async () => staleRecoveryState(),
     runRealityCheck: async () => ({
       classification: 'clear',
       evidence: {},
@@ -161,7 +162,56 @@ function harness(overrides: Partial<ImplementationExecutorDeps> = {}) {
   return { deps, events, claims, human };
 }
 
+function staleRecoveryState(overrides: Record<string, unknown> = {}) {
+  const claim: BranchClaim = {
+    kind: 'branch-claim',
+    protocolVersion: 2,
+    phase: 'implement',
+    issueNumber: 42,
+    prNumber: 84,
+    attempt: ATTEMPT_A,
+    runner: 'runner-old',
+    login: 'implementation-bot',
+    expectedHead: BASE,
+    targetBase: gitRefName('next'),
+    claimedAt: '2026-07-20T08:00:00.000Z',
+  };
+  return {
+    issue: issue({
+      eligible: false,
+      eligibilityDetail: 'Project status is In Progress',
+    }),
+    projectStatus: 'In Progress',
+    humanHold: false,
+    pullRequest: { ...pr(), state: 'OPEN' },
+    claim,
+    ...overrides,
+  };
+}
+
+function freshAction(issueNumber = 42) {
+  return {
+    kind: 'claim-implementation' as const,
+    intent: 'fresh' as const,
+    issueNumber,
+  };
+}
+
 describe('implementation action executor', () => {
+  it('rejects an implementation action without an explicit intent before any read', async () => {
+    let reads = 0;
+    const { deps } = harness({
+      readIssue: async () => {
+        reads += 1;
+        return issue();
+      },
+    });
+
+    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+      .rejects.toThrow('explicit fresh or stale-recovery intent');
+    expect(reads).toBe(0);
+  });
+
   it('exposes the canonical gather-and-classify reality check for production injection', async () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const verdict = await runCanonicalImplementationRealityCheck(
@@ -206,8 +256,8 @@ describe('implementation action executor', () => {
     };
 
     const [first, second] = await Promise.all([
-      executeImplementationAction({ issueNumber: 42 }, shared.deps),
-      executeImplementationAction({ issueNumber: 42 }, shared.deps),
+      executeImplementationAction(freshAction(), shared.deps),
+      executeImplementationAction(freshAction(), shared.deps),
     ]);
 
     expect([first.status, second.status].sort()).toEqual(['lost', 'spawned']);
@@ -221,7 +271,7 @@ describe('implementation action executor', () => {
   it('uses the stable branch and exact claim metadata for brand-new work', async () => {
     const { deps, claims, events } = harness();
 
-    const result = await executeImplementationAction({ issueNumber: 42 }, deps);
+    const result = await executeImplementationAction(freshAction(), deps);
 
     expect(result).toMatchObject({
       status: 'spawned',
@@ -265,7 +315,7 @@ describe('implementation action executor', () => {
       },
       spawnCoordinator: () => ({ pid: 4242 }),
     });
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'spawned', prNumber: 84 });
     expect(initialClaim).not.toHaveProperty('prNumber');
 
@@ -369,7 +419,7 @@ describe('implementation action executor', () => {
       }),
     });
 
-    const result = await executeImplementationAction({ issueNumber: 42 }, deps);
+    const result = await executeImplementationAction(freshAction(), deps);
 
     expect(result).toMatchObject({
       status: 'spawned',
@@ -381,6 +431,123 @@ describe('implementation action executor', () => {
       candidateParent: adopted.head,
       expectedRemoteHead: adopted.head,
     });
+  });
+
+  it('resumes stale work only from the pinned durable claim state', async () => {
+    const state = staleRecoveryState();
+    const { deps, claims, events } = harness({
+      readIssue: async () => state.issue,
+      readStaleRecovery: async () => state,
+      listOpenPullRequests: async () => [state.pullRequest],
+      runRealityCheck: async () => ({
+        classification: 'pr-open',
+        evidence: { prNumber: 84 },
+        suggestedBlockedOn: 'Another issue',
+        suggestedComment: 'Open PR exists.',
+      }),
+    });
+
+    const result = await executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: ADOPTED_HEAD,
+      branch: gitRefName('existing/issue-42'),
+      claimAttempt: ATTEMPT_A,
+    }, deps);
+
+    expect(result).toMatchObject({
+      status: 'spawned',
+      issueNumber: 42,
+      prNumber: 84,
+      branch: 'existing/issue-42',
+    });
+    expect(claims).toEqual([
+      expect.objectContaining({
+        branch: 'existing/issue-42',
+        candidateParent: ADOPTED_HEAD,
+        expectedRemoteHead: ADOPTED_HEAD,
+      }),
+    ]);
+    expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
+  });
+
+  it.each([
+    ['closed issue', { issue: issue({ open: false }) }, 'missing or closed'],
+    ['changed PR', { pullRequest: { ...pr(), number: 85, state: 'OPEN' } }, 'PR #84'],
+    ['closed PR', { pullRequest: { ...pr(), state: 'CLOSED' } }, 'not open'],
+    ['non-draft PR', { pullRequest: { ...pr(), state: 'OPEN', draft: false } }, 'not a draft'],
+    ['changed head', {
+      pullRequest: { ...pr(), state: 'OPEN', head: WORK },
+    }, 'head changed'],
+    ['changed branch', {
+      pullRequest: {
+        ...pr(),
+        state: 'OPEN',
+        headRefName: gitRefName('other/issue-42'),
+      },
+    }, 'branch changed'],
+    ['changed claim', {
+      claim: {
+        ...staleRecoveryState().claim,
+        attempt: ATTEMPT_B,
+      },
+    }, 'claim attempt changed'],
+    ['finished claim', {
+      claim: {
+        ...staleRecoveryState().claim,
+        phaseComplete: true,
+      },
+    }, 'claim is finished'],
+    ['Human state', { humanHold: true }, 'Human'],
+    ['changed Project status', { projectStatus: 'Todo' }, 'Project status changed'],
+  ])('rejects stale recovery with specific evidence for %s and never falls back', async (
+    _name,
+    changed,
+    detail,
+  ) => {
+    const state = staleRecoveryState(changed);
+    const { deps, claims, events } = harness({
+      readIssue: async () => state.issue,
+      readStaleRecovery: async () => state,
+      listOpenPullRequests: async () => [state.pullRequest],
+    });
+
+    await expect(executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: ADOPTED_HEAD,
+      branch: gitRefName('existing/issue-42'),
+      claimAttempt: ATTEMPT_A,
+    }, deps)).resolves.toEqual(expect.objectContaining({
+      status: 'ineligible',
+      detail: expect.stringContaining(detail),
+    }));
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it('rejects ordinary In Progress work with its specific eligibility evidence', async () => {
+    const { deps, claims } = harness({
+      readIssue: async () => issue({
+        eligible: false,
+        eligibilityDetail: 'Project status is In Progress',
+      }),
+    });
+
+    await expect(executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'fresh',
+      issueNumber: 42,
+    }, deps)).resolves.toEqual({
+      status: 'ineligible',
+      issueNumber: 42,
+      detail: 'Project status is In Progress',
+    });
+    expect(claims).toEqual([]);
   });
 
   it('does not claim missing, ineligible, or resolved work', async () => {
@@ -399,7 +566,7 @@ describe('implementation action executor', () => {
 
     for (const override of cases) {
       const { deps, claims, events } = harness(override);
-      await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+      await expect(executeImplementationAction(freshAction(), deps))
         .resolves.toMatchObject({ status: 'ineligible' });
       expect(claims).toEqual([]);
       expect(events).toEqual([]);
@@ -414,7 +581,7 @@ describe('implementation action executor', () => {
       ],
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'human', code: 'branch-mapping-ambiguous' });
     expect(claims).toEqual([]);
     expect(human).toEqual([expect.objectContaining({
@@ -441,7 +608,7 @@ describe('implementation action executor', () => {
       }),
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'human', code: 'branch-mapping-ambiguous' });
     expect(claims).toEqual([]);
     expect(human).toHaveLength(1);
@@ -459,7 +626,7 @@ describe('implementation action executor', () => {
       }),
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'human', code: 'branch-mapping-ambiguous' });
     expect(claims).toEqual([]);
     expect(human).toEqual([expect.objectContaining({
@@ -483,7 +650,7 @@ describe('implementation action executor', () => {
       }),
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'human', code: 'branch-mapping-ambiguous' });
     expect(claims).toEqual([]);
     expect(events).toEqual([]);
@@ -516,7 +683,7 @@ describe('implementation action executor', () => {
       ],
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'human', code: 'branch-mapping-ambiguous' });
     expect(realityChecks).toBe(1);
     expect(claims).toEqual([]);
@@ -531,7 +698,7 @@ describe('implementation action executor', () => {
         : issue({ targetBase: gitRefName('release/next') }),
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({
         status: 'partial',
         code: 'target-base-changed',
@@ -548,7 +715,7 @@ describe('implementation action executor', () => {
         : issue({ eligible: false }),
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'spawned', issueNumber: 42 });
     expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
   });
@@ -580,7 +747,7 @@ describe('implementation action executor', () => {
       },
     });
 
-    const result = await executeImplementationAction({ issueNumber: 2069 }, deps);
+    const result = await executeImplementationAction(freshAction(2069), deps);
 
     expect(result).toMatchObject({
       status: 'spawned',
@@ -621,7 +788,7 @@ describe('implementation action executor', () => {
       }),
     });
 
-    await expect(executeImplementationAction({ issueNumber: 42 }, deps))
+    await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'ambiguous' });
     expect(events).toEqual([]);
   });

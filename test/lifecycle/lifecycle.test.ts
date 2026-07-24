@@ -750,6 +750,7 @@ describe('planCycle', () => {
 
     expect(planCycle(view, capacity, 'active')).toEqual([{
       kind: 'claim-implementation',
+      intent: 'fresh',
       issueNumber: 7,
     }]);
   });

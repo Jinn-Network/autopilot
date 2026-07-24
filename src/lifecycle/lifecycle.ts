@@ -444,7 +444,11 @@ export function planCycle(
     ) {
       continue;
     }
-    planned.push({ kind: 'claim-implementation', issueNumber: candidate.item.issueNumber });
+    planned.push({
+      kind: 'claim-implementation',
+      intent: 'fresh',
+      issueNumber: candidate.item.issueNumber,
+    });
     lanes -= 1;
     implementationSlots -= 1;
   }
