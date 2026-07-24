@@ -406,6 +406,169 @@ describe('production implementation action port', () => {
     });
   });
 
+  it('withholds stale recovery target authority for missing, untrusted, or unresolved blockers', async () => {
+    const base = snapshot();
+    const current: GitHubLifecycleSnapshot = {
+      ...base,
+      project: {
+        ...base.project,
+        items: [{
+          ...base.project.items[0]!,
+          status: 'In Progress',
+          blockedOn: 'Another issue',
+          blockedByIssues: [50],
+        }],
+      },
+      issues: [{
+        ...base.issues[0]!,
+        status: 'In Progress',
+        blockedOn: 'Another issue',
+        blockedByIssues: [50],
+      }],
+      pullRequests: [{
+        number: 84,
+        title: 'Implement active lifecycle',
+        body: 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=42 branch=existing/42 -->',
+        author: 'implementation-bot',
+        baseRefName: 'next',
+        headRefName: 'existing/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T08:00:00.000Z',
+        isDraft: true,
+        state: 'OPEN',
+        labels: ['engine:review'],
+        closingIssueNumbers: [42],
+        mergeability: 'UNKNOWN',
+        mergeStateStatus: 'BLOCKED',
+        checks: [],
+        reviews: [],
+      }],
+      lifecycle: {
+        items: [{
+          kind: 'pull-request',
+          issueNumber: 42,
+          prNumber: 84,
+          v2Marked: true,
+          projectStatus: 'In Progress',
+          labels: ['engine:review'],
+          head: HEAD,
+          headChangedAt: '2026-07-20T08:00:00.000Z',
+          isDraft: true,
+          merged: false,
+          needsReview: true,
+          approved: false,
+          mergeState: 'blocked',
+          branchClaim: {
+            kind: 'branch-claim',
+            protocolVersion: 2,
+            phase: 'implement',
+            issueNumber: 42,
+            prNumber: 84,
+            attempt: '11111111-1111-4111-8111-111111111111',
+            runner: 'old-runner',
+            login: 'implementation-bot',
+            expectedHead: HEAD,
+            targetBase: gitRefName('stacked/original-base'),
+            claimedAt: '2026-07-20T08:00:00.000Z',
+          },
+        }],
+      },
+    };
+    const port = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: new CredentialPool([]),
+      authorAllowlist: new Set(['trusted-author']),
+      readSnapshot: async () => current,
+    });
+
+    await expect(port.readIssue(42)).resolves.toMatchObject({
+      eligible: false,
+      targetBase: 'next',
+    });
+    await expect(port.readStaleRecovery(42, 84)).resolves.toMatchObject({
+      issue: null,
+      pullRequest: {
+        baseRefName: 'next',
+      },
+      claim: {
+        targetBase: 'stacked/original-base',
+      },
+    });
+
+    const blockerPr = (
+      number: number,
+      issueNumber: number,
+      headRefName: string,
+      author = 'trusted-author',
+    ): GitHubLifecycleSnapshot['pullRequests'][number] => ({
+      number,
+      title: `Implement blocker #${issueNumber}`,
+      body: `Closes #${issueNumber}`,
+      author,
+      baseRefName: 'next',
+      headRefName,
+      headOid: PARENT,
+      headCommittedAt: '2026-07-20T07:00:00.000Z',
+      isDraft: true,
+      state: 'OPEN',
+      labels: ['engine:review'],
+      closingIssueNumbers: [issueNumber],
+      mergeability: 'UNKNOWN',
+      mergeStateStatus: 'BLOCKED',
+      checks: [],
+      reviews: [],
+    });
+    const untrustedPort = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: new CredentialPool([]),
+      authorAllowlist: new Set(['trusted-author']),
+      readSnapshot: async () => ({
+        ...current,
+        pullRequests: [
+          blockerPr(83, 50, 'stack/untrusted', 'outsider'),
+          ...current.pullRequests,
+        ],
+      }),
+    });
+    await expect(untrustedPort.readStaleRecovery(42, 84)).resolves.toMatchObject({
+      issue: null,
+    });
+
+    const unresolvedPort = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: new CredentialPool([]),
+      authorAllowlist: new Set(['trusted-author']),
+      readSnapshot: async () => ({
+        ...current,
+        project: {
+          ...current.project,
+          items: [{
+            ...current.project.items[0]!,
+            blockedByIssues: [50, 60],
+          }],
+        },
+        issues: [{
+          ...current.issues[0]!,
+          blockedByIssues: [50, 60],
+        }],
+        pullRequests: [
+          blockerPr(82, 50, 'stack/first'),
+          blockerPr(83, 60, 'stack/second'),
+          ...current.pullRequests,
+        ],
+      }),
+    });
+    await expect(unresolvedPort.readStaleRecovery(42, 84)).resolves.toMatchObject({
+      issue: null,
+    });
+  });
+
   it('uses the selected credential and accepts a lost PR-create response only after exact readback', async () => {
     const calls: Array<{ args: string[]; env?: Record<string, string> }> = [];
     const pool = new CredentialPool([{

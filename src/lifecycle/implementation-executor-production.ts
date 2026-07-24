@@ -209,6 +209,7 @@ export function makeProductionImplementationActionPort(
   const issueFromSnapshot = (
     snapshot: GitHubLifecycleSnapshot,
     issueNumber: number,
+    requireAuthorizedTarget = false,
   ) => {
     const source = snapshot.issues.find((issue) => issue.number === issueNumber);
     const lifecycle = snapshot.lifecycle.items.find((item) =>
@@ -219,6 +220,14 @@ export function makeProductionImplementationActionPort(
       prLinks(snapshot),
       options.authorAllowlist,
     );
+    const authorizedStack = stackReady.get(issueNumber);
+    if (
+      requireAuthorizedTarget
+      && source.blockedByIssues.length > 0
+      && authorizedStack === undefined
+    ) {
+      return null;
+    }
     const marker = parseChildMarker(source.body ?? '');
     const childKindLabel = hasChildKindLabel(source.labels);
     let eligible = lifecycle.kind === 'issue'
@@ -242,7 +251,7 @@ export function makeProductionImplementationActionPort(
       // The executor compares the implementation PR against this authority.
       // Keep it independent of that PR to make a PR-only retarget fail closed.
       targetBase: gitRefName(
-        stackReady.get(issueNumber)?.baseBranch
+        authorizedStack?.baseBranch
         ?? defaultBranch,
       ),
       effort: source.effort,
@@ -286,7 +295,7 @@ export function makeProductionImplementationActionPort(
       const pullRequest = snapshot.pullRequests.find((pr) =>
         pr.number === prNumber);
       return {
-        issue: issueFromSnapshot(snapshot, issueNumber),
+        issue: issueFromSnapshot(snapshot, issueNumber, true),
         projectStatus: project?.status ?? null,
         humanHold: project?.status === 'Human'
           || project?.blockedOn === 'Human'

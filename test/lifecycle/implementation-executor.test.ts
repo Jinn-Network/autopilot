@@ -530,6 +530,35 @@ describe('implementation action executor', () => {
     expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
   });
 
+  it('rejects stale recovery without authorized current target evidence before every mutation', async () => {
+    const state = staleRecoveryState({ issue: null });
+    const mutations: string[] = [];
+    const { deps, claims, events, human } = harness({
+      readStaleRecovery: async () => state,
+      createClaimCommit: async () => {
+        mutations.push('claim-commit');
+        return CLAIM_A;
+      },
+    });
+
+    await expect(executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: ADOPTED_HEAD,
+      branch: gitRefName('existing/issue-42'),
+      claimAttempt: ATTEMPT_A,
+    }, deps)).resolves.toEqual(expect.objectContaining({
+      status: 'ineligible',
+      detail: expect.stringContaining('missing or closed'),
+    }));
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+    expect(human).toEqual([]);
+    expect(mutations).toEqual([]);
+  });
+
   it('escalates duplicate open implementation PRs without publishing a recovery claim', async () => {
     const pinned = { ...pr(), state: 'OPEN' as const };
     const duplicate = {
