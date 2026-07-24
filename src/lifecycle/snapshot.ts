@@ -217,6 +217,14 @@ export interface GitHubLifecycleSnapshot {
   readonly partialReason?: string;
   /** A complete cached/incremental view returned after a due full read failed. */
   readonly snapshotWarning?: string;
+  /**
+   * Present only on a deliberately non-global pre-dispatch view. Scoped
+   * evidence may drive reconciliation and exact action checks, but must never
+   * replace the durable global discovery cache.
+   */
+  readonly snapshotAuthority?: 'scoped';
+  /** Original operator-selected issue numbers for a scoped authority view. */
+  readonly scopedIssueNumbers?: readonly number[];
 }
 
 export function decodeBranchClaimSnapshot(raw: RawBranchClaim): BranchClaimSnapshot {
@@ -839,6 +847,8 @@ export function composeGitHubLifecycleSnapshot(
     readonly githubUsage: GitHubUsage;
     readonly parityDifferences?: readonly LifecycleParityDifference[];
     readonly parityUnavailableReason?: string;
+    readonly snapshotAuthority?: 'scoped';
+    readonly scopedIssueNumbers?: readonly number[];
   },
 ): GitHubLifecycleSnapshot {
   isoTimestamp(options.capturedAt);
@@ -869,6 +879,12 @@ export function composeGitHubLifecycleSnapshot(
     ...(options.parityUnavailableReason === undefined
       ? {}
       : { parityUnavailableReason: options.parityUnavailableReason }),
+    ...(options.snapshotAuthority === undefined
+      ? {}
+      : {
+          snapshotAuthority: options.snapshotAuthority,
+          scopedIssueNumbers: [...(options.scopedIssueNumbers ?? [])],
+        }),
   });
 }
 

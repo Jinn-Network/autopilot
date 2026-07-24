@@ -14,6 +14,12 @@ export const TARGETED_PROJECT_ITEM_RESERVE = 1;
 /** GraphQL points reserved for one targeted issue-to-closing-PR relation read. */
 export const TARGETED_RELATION_RESERVE = 2;
 
+/**
+ * One enrollment may need one candidate read plus all three bounded
+ * post-publication confirmation reads.
+ */
+export const REVIEW_CLAIM_ACTION_RESERVE = TARGETED_PR_RESERVE * 4;
+
 /** Conservative modeled span for an opaque higher-level `gh` command. */
 export const OPAQUE_GH_COMMAND_RESERVE = 10;
 

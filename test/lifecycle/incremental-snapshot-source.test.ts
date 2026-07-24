@@ -23,13 +23,18 @@ import type {
   LifecycleDiscoveryState,
   LifecycleDiscoveryStateStore,
 } from '../../src/lifecycle/lifecycle-cache.js';
-import { LifecycleDiscoveryCacheStore } from '../../src/lifecycle/lifecycle-cache.js';
+import {
+  LifecycleDiscoveryCacheCorruptError,
+  LifecycleDiscoveryCacheStore,
+} from '../../src/lifecycle/lifecycle-cache.js';
 import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
+import { encodeReviewClaimPayload } from '../../src/lifecycle/codecs.js';
 import type {
   GitHubLifecycleSnapshot,
   GitHubLifecycleReader,
   RawBranchClaim,
   RawPullRequest,
+  TerminalClaimEvidence,
 } from '../../src/lifecycle/snapshot.js';
 import {
   gitOid,
@@ -410,6 +415,331 @@ async function expectNoOrphanDraftRecovery(
 }
 
 describe('IncrementalLifecycleSnapshotSource', () => {
+  it('declines scoped pre-dispatch without a durable global authority seed', async () => {
+    const context = harness();
+
+    await expect(context.source.readScoped({
+      issueNumbers: new Set([42]),
+      rateLimitFloor: 500,
+      maxGlobalAgeMs: 2 * 60 * 60_000,
+    })).resolves.toBeNull();
+
+    expect(context.reader.quotaProbeCalls).toBe(0);
+    expect(context.reader.hydrationCalls).toEqual([]);
+    expect(context.store.saves).toBe(0);
+  });
+
+  it('builds a non-persisted explicitly scoped snapshot from recent global authority', async () => {
+    const context = harness();
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    const savesAfterGlobalSeed = context.store.saves;
+    context.reader.hydrationCalls = [];
+    context.reader.closingRelationCalls = [];
+    context.reader.quotaProbeCalls = 0;
+
+    const scoped = await context.source.readScoped({
+      issueNumbers: new Set([42]),
+      rateLimitFloor: 500,
+      maxGlobalAgeMs: 2 * 60 * 60_000,
+    });
+
+    expect(scoped).toMatchObject({
+      snapshotComplete: true,
+      snapshotAuthority: 'scoped',
+      scopedIssueNumbers: [42],
+    });
+    expect(scoped?.issues.map((entry) => entry.number)).toEqual([42]);
+    expect(scoped?.pullRequests.map((entry) => entry.number)).toEqual([101]);
+    expect(context.reader.closingRelationCalls).toEqual([[42]]);
+    expect(context.reader.hydrationCalls).toEqual([101]);
+    expect(context.store.saves).toBe(savesAfterGlobalSeed);
+  });
+
+  it('keeps terminal-claim PR evidence in the selected issue closure', async () => {
+    const context = harness();
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    const terminal: TerminalClaimEvidence = {
+      issueNumber: 42,
+      prNumber: 150,
+      headRefName: 'autopilot/42',
+      headOid: gitOid(HEAD_B),
+      claimAttempt: ATTEMPT_A,
+      targetBase: gitRefName('next'),
+      claimFingerprint: 'terminal-claim-fingerprint',
+      mergedAt: '2026-07-22T09:45:00.000Z',
+      mergeCommitOid: gitOid(MERGE),
+    };
+    (context.store.state!.terminalClaims as TerminalClaimEvidence[]).push(terminal);
+    context.reader.targeted.set(150, rawPr({
+      number: 150,
+      state: 'MERGED',
+      headRefName: 'autopilot/42',
+      headOid: HEAD_B,
+      mergedAt: '2026-07-22T09:45:00.000Z',
+      mergeCommitOid: MERGE,
+    }));
+    context.reader.hydrationCalls = [];
+
+    const scoped = await context.source.readScoped({
+      issueNumbers: new Set([42]),
+      rateLimitFloor: 500,
+      maxGlobalAgeMs: 2 * 60 * 60_000,
+    });
+
+    expect(scoped?.pullRequests.map((entry) => entry.number)).toEqual([101, 150]);
+    expect(scoped?.terminalClaims?.map((entry) => entry.prNumber)).toEqual([150]);
+    expect(context.reader.hydrationCalls).toEqual([101, 150]);
+  });
+
+  it('declines scoped pre-dispatch when global authority is stale', async () => {
+    const context = harness();
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    context.setNow('2026-07-22T12:00:00.001Z');
+    context.reader.hydrationCalls = [];
+    context.reader.quotaProbeCalls = 0;
+
+    await expect(context.source.readScoped({
+      issueNumbers: new Set([42]),
+      rateLimitFloor: 500,
+      maxGlobalAgeMs: 2 * 60 * 60_000,
+    })).resolves.toBeNull();
+
+    expect(context.reader.quotaProbeCalls).toBe(0);
+    expect(context.reader.hydrationCalls).toEqual([]);
+  });
+
+  it('declines corrupt scoped authority and preserves unrestricted full recovery', async () => {
+    const context = harness();
+    let corrupt = true;
+    let quarantines = 0;
+    let saved: LifecycleDiscoveryState | null = null;
+    const store: LifecycleDiscoveryStateStore = {
+      load: async () => {
+        if (corrupt) throw new LifecycleDiscoveryCacheCorruptError('invalid fixture');
+        return saved;
+      },
+      quarantineCorrupt: async () => {
+        quarantines += 1;
+        corrupt = false;
+      },
+      save: async (state) => {
+        saved = state;
+      },
+    };
+    const source = new IncrementalLifecycleSnapshotSource({
+      fullReader: context.reader,
+      restDiscovery: context.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: context.conditionalRest,
+      evidenceProbe: context.probe,
+      cacheStore: store,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => new Date(FULL_AT),
+    });
+
+    await expect(source.readScoped({
+      issueNumbers: new Set([42]),
+      rateLimitFloor: 500,
+      maxGlobalAgeMs: 2 * 60 * 60_000,
+    })).resolves.toBeNull();
+    expect(context.reader.quotaProbeCalls).toBe(0);
+
+    await expect(source.read({ mode: 'full', rateLimitFloor: 500 }))
+      .resolves.toMatchObject({ snapshotMode: 'full', snapshotComplete: true });
+    expect(quarantines).toBe(1);
+    expect(saved).not.toBeNull();
+  });
+
+  it('computes blocker, child, PR, branch, and review-claim closure to a fixed point', async () => {
+    const context = harness();
+    const issue43: PolledIssue = {
+      ...issue(),
+      number: 43,
+      title: 'Blocker',
+      blockedByIssues: [],
+      projectItemId: 'PVTI_43',
+    };
+    const issue44: PolledIssue = {
+      ...issue(),
+      number: 44,
+      title: 'Review finding',
+      body: '<!-- jinn-autopilot:child pr=101 kind=review-finding -->',
+      shape: 'fix',
+      projectItemId: 'PVTI_44',
+    };
+    const issue999: PolledIssue = {
+      ...issue(),
+      number: 999,
+      title: 'Unrelated',
+      projectItemId: 'PVTI_999',
+    };
+    context.reader.issues = [{
+      ...issue(),
+      blockedOn: 'Another issue',
+      blockedByIssues: [43],
+    }, issue43, issue44, issue999];
+    context.reader.project = {
+      ...project(),
+      items: context.reader.issues.map((entry) => ({
+        id: entry.projectItemId!,
+        number: entry.number,
+        contentType: 'Issue' as const,
+        status: entry.status,
+        priority: entry.priority,
+        effort: entry.effort,
+        blockedOn: entry.blockedOn,
+        issueType: entry.shape,
+        blockedByIssues: [...entry.blockedByIssues],
+        sprintIterationId: 'sprint',
+      })),
+    };
+    const reviewClaim = {
+      kind: 'review-claim' as const,
+      protocolVersion: 2 as const,
+      prNumber: 101,
+      generation: '22222222-2222-4222-8222-222222222222',
+      attempt: '33333333-3333-4333-8333-333333333333',
+      reviewer: 'reviewer',
+      head: gitOid(HEAD_A),
+      state: 'active' as const,
+      recordedAt: '2026-07-22T09:30:00.000Z',
+    };
+    const parent = rawPr({
+      reviewClaim: {
+        oid: HEAD_B,
+        payload: encodeReviewClaimPayload(reviewClaim),
+      },
+    });
+    const childPr = rawPr({
+      number: 102,
+      title: 'fix: finding',
+      body: 'Closes #44',
+      headRefName: 'autopilot/44',
+      headOid: HEAD_C,
+      closingIssueNumbers: [44],
+      branchClaimTrailers: encodeBranchClaimTrailers(implementationClaim({
+        issueNumber: 44,
+        prNumber: 102,
+        expectedHead: gitOid(HEAD_C),
+      })),
+    });
+    const unrelated = rawPr({
+      number: 199,
+      title: 'unrelated',
+      body: 'Closes #999',
+      headRefName: 'autopilot/999',
+      headOid: HEAD_D,
+      closingIssueNumbers: [999],
+    });
+    context.reader.fullPrs = [parent, childPr, unrelated];
+    context.reader.targeted = new Map([
+      [101, parent],
+      [102, childPr],
+      [199, unrelated],
+    ]);
+    context.reader.branchClaims = [rawBranchClaim({
+      issueNumber: 44,
+      headRefName: 'autopilot/44',
+      headOid: HEAD_C,
+      claim: {
+        issueNumber: 44,
+        prNumber: 102,
+        expectedHead: gitOid(HEAD_C),
+      },
+    })];
+    context.rest.openPrs = [
+      openIndex(),
+      openIndex({
+        number: 102,
+        title: childPr.title,
+        headRefName: childPr.headRefName,
+        headOid: childPr.headOid,
+      }),
+      openIndex({
+        number: 199,
+        title: unrelated.title,
+        headRefName: unrelated.headRefName,
+        headOid: unrelated.headOid,
+      }),
+    ];
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    context.reader.hydrationCalls = [];
+    context.reader.closingRelationCalls = [];
+
+    const scoped = await context.source.readScoped({
+      issueNumbers: new Set([42]),
+      rateLimitFloor: 500,
+      maxGlobalAgeMs: 2 * 60 * 60_000,
+    });
+
+    expect(scoped?.issues.map((entry) => entry.number)).toEqual([42, 43, 44]);
+    expect(scoped?.pullRequests.map((entry) => entry.number)).toEqual([101, 102]);
+    expect(scoped?.branches.map((entry) => entry.issueNumber)).toEqual([44]);
+    expect(scoped?.pullRequests.find((entry) => entry.number === 101)?.reviewClaim?.record)
+      .toMatchObject({ prNumber: 101, state: 'active' });
+    expect(context.reader.hydrationCalls).toEqual([101, 102]);
+    expect(context.reader.hydrationCalls).not.toContain(199);
+
+    context.reader.hydrationCalls = [];
+    context.reader.closingRelationCalls = [];
+    const childScoped = await context.source.readScoped({
+      issueNumbers: new Set([44]),
+      rateLimitFloor: 500,
+      maxGlobalAgeMs: 2 * 60 * 60_000,
+    });
+
+    expect(childScoped?.issues.map((entry) => entry.number)).toEqual([42, 43, 44]);
+    expect(childScoped?.pullRequests.map((entry) => entry.number)).toEqual([101, 102]);
+    expect(context.reader.hydrationCalls).toEqual([101, 102]);
+  });
+
+  it('keeps scoped targeted reads proportional to the selected closure', async () => {
+    const run = async (unrelatedCount: number) => {
+      const context = harness();
+      context.reader.fullPrs = [
+        rawPr(),
+        ...Array.from({ length: unrelatedCount }, (_, offset) => rawPr({
+          number: 200 + offset,
+          title: `unrelated ${offset}`,
+          body: `Closes #${300 + offset}`,
+          headRefName: `unrelated/${offset}`,
+          headOid: offset % 2 === 0 ? HEAD_C : HEAD_D,
+          closingIssueNumbers: [300 + offset],
+          labels: [],
+        })),
+      ];
+      context.rest.openPrs = context.reader.fullPrs.map((pr) => openIndex({
+        number: pr.number,
+        title: pr.title,
+        headOid: pr.headOid,
+        headRefName: pr.headRefName,
+      }));
+      await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+      context.reader.hydrationCalls = [];
+      context.reader.closingRelationCalls = [];
+      context.reader.quotaProbeCalls = 0;
+
+      const scoped = await context.source.readScoped({
+        issueNumbers: new Set([42]),
+        rateLimitFloor: 500,
+        maxGlobalAgeMs: 2 * 60 * 60_000,
+      });
+      return {
+        scoped,
+        hydrationCalls: [...context.reader.hydrationCalls],
+        relationCalls: context.reader.closingRelationCalls.map((entry) => [...entry]),
+        quotaProbeCalls: context.reader.quotaProbeCalls,
+      };
+    };
+
+    const baseline = await run(0);
+    const withUnrelatedBacklog = await run(40);
+
+    expect(withUnrelatedBacklog.hydrationCalls).toEqual(baseline.hydrationCalls);
+    expect(withUnrelatedBacklog.relationCalls).toEqual(baseline.relationCalls);
+    expect(withUnrelatedBacklog.quotaProbeCalls).toBe(baseline.quotaProbeCalls);
+    expect(withUnrelatedBacklog.scoped?.pullRequests.map((pr) => pr.number)).toEqual([101]);
+  });
+
   it('persists and reloads a full source seeded from a live-shaped Project rate limit', async () => {
     const context = harness();
     const fetched = await fetchProjectSnapshot(async () => JSON.stringify({

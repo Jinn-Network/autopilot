@@ -10,7 +10,10 @@ import {
   runLifecycleCycle,
   type LifecycleControllerDeps,
 } from '../../src/lifecycle/controller.js';
-import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
+import {
+  LifecycleRateLimitError,
+  type GitHubLifecycleSnapshot,
+} from '../../src/lifecycle/snapshot.js';
 import {
   gitOid,
   gitRefName,
@@ -209,8 +212,13 @@ describe('lifecycle controller', () => {
 
   it('reports a persistent snapshot failure as mutation-free but keeps one-shot behavior fail-closed', async () => {
     const calls: string[] = [];
+    let cycleIds = 0;
     const persistent = await runLifecycleCycle('recover', {
       ...deps(implementation(), calls),
+      cycleId: () => {
+        cycleIds += 1;
+        return 'unused-cycle';
+      },
       snapshotFailureMode: 'report',
       readGitHubUsage: () => ({
         graphqlRequests: 2,
@@ -236,6 +244,7 @@ describe('lifecycle controller', () => {
       events: [],
     });
     expect(calls).toEqual([]);
+    expect(cycleIds).toBe(0);
     await expect(runLifecycleCycle('recover', {
       ...deps(implementation(), calls),
       readSnapshot: async () => { throw new Error('one-shot failed'); },
@@ -713,6 +722,387 @@ describe('lifecycle controller', () => {
     expect(scheduled).toContainEqual(
       expect.objectContaining({ kind: 'claim-review', prNumber: 101 }),
     );
+  });
+
+  it('dispatches from scoped authority before reading and maintaining the global snapshot', async () => {
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      projectStatus: 'In Review',
+    });
+    const reviewing = implementation({
+      ...delivered,
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'reviewer-bot',
+        head: HEAD,
+        state: 'active',
+        recordedAt: NOW.toISOString(),
+      },
+    });
+    const order: string[] = [];
+    let claimed = false;
+    let resets = 0;
+    const base = deps(delivered, [], new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    }));
+    const report = await runLifecycleCycle('active', {
+      ...base,
+      resetGitHubUsage: () => { resets += 1; },
+      readScopedSnapshot: async (issueNumbers) => {
+        order.push(`scoped:${[...issueNumbers].join(',')}`);
+        return {
+          ...snapshot(delivered),
+          snapshotMode: 'incremental',
+          snapshotAuthority: 'scoped',
+          scopedIssueNumbers: [42],
+        };
+      },
+      readSnapshot: async () => {
+        order.push('global');
+        expect(claimed).toBe(true);
+        return snapshot(reviewing);
+      },
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 1, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        onlyIssues: new Set([42]),
+        executeAction: async (action) => {
+          order.push(action.kind);
+          claimed = true;
+          return { outcome: 'spawned' };
+        },
+      },
+    });
+
+    expect(order).toEqual(['scoped:42', 'claim-review', 'global']);
+    expect(resets).toBe(1);
+    expect(report.events.filter((event) => event.action === 'claim-review')).toHaveLength(1);
+    expect(report.items).toContainEqual(expect.objectContaining({
+      issueNumber: 42,
+      prNumber: 101,
+      phase: 'reviewing',
+    }));
+  });
+
+  it('reports scoped mutations and combined usage when the mandatory global read fails', async () => {
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      projectStatus: 'In Review',
+    });
+    let actionCalls = 0;
+    const combinedUsage: GitHubUsage = {
+      graphqlRequests: 4,
+      graphqlCost: 32,
+      graphqlRemaining: 3_968,
+      graphqlResetAt: '2026-07-20T13:00:00.000Z',
+      restRequests: 7,
+      restNotModified: 0,
+      cacheHits: 1,
+      accountingComplete: true,
+    };
+    const report = await runLifecycleCycle('active', {
+      ...deps(delivered, [], new Proxy({} as ReconciliationWriter, {
+        get() {
+          return async () => null;
+        },
+      })),
+      snapshotFailureMode: 'report',
+      readGitHubUsage: () => combinedUsage,
+      readScopedSnapshot: async () => ({
+        ...snapshot(delivered),
+        snapshotMode: 'incremental',
+        snapshotAuthority: 'scoped',
+        scopedIssueNumbers: [42],
+      }),
+      readSnapshot: async () => {
+        throw new Error('global incremental unavailable');
+      },
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 0, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        onlyIssues: new Set([42]),
+        executeAction: async () => {
+          actionCalls += 1;
+          return { outcome: 'spawned' };
+        },
+      },
+    });
+
+    expect(actionCalls).toBe(1);
+    expect(report).toMatchObject({
+      status: 'failed',
+      mutationFree: false,
+      githubUsage: combinedUsage,
+    });
+    expect(report.events).toContainEqual(expect.objectContaining({
+      action: 'claim-review',
+      outcome: 'spawned',
+    }));
+    expect(report.message).toMatch(/global.*failed after scoped pre-dispatch/i);
+  });
+
+  it('does not hide scoped mutations behind an incomplete global snapshot gate', async () => {
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      projectStatus: 'In Review',
+    });
+    const report = await runLifecycleCycle('active', {
+      ...deps(delivered, [], new Proxy({} as ReconciliationWriter, {
+        get() {
+          return async () => null;
+        },
+      })),
+      readGitHubUsage: () => ({
+        ...snapshot(delivered).githubUsage!,
+        restRequests: 9,
+        accountingComplete: true,
+      }),
+      readScopedSnapshot: async () => ({
+        ...snapshot(delivered),
+        snapshotMode: 'incremental',
+        snapshotAuthority: 'scoped',
+        scopedIssueNumbers: [42],
+      }),
+      readSnapshot: async () => ({
+        ...snapshot(delivered),
+        snapshotComplete: false,
+      }),
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 0, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        onlyIssues: new Set([42]),
+        executeAction: async () => ({ outcome: 'spawned' }),
+      },
+    });
+
+    expect(report).toMatchObject({
+      status: 'failed',
+      mutationFree: false,
+      githubUsage: { restRequests: 9 },
+    });
+    expect(report.events).toContainEqual(expect.objectContaining({
+      action: 'claim-review',
+      outcome: 'spawned',
+    }));
+  });
+
+  it('does not hide scoped mutations when the global read reaches its rate-limit reserve', async () => {
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      projectStatus: 'In Review',
+    });
+    const report = await runLifecycleCycle('active', {
+      ...deps(delivered, [], new Proxy({} as ReconciliationWriter, {
+        get() {
+          return async () => null;
+        },
+      })),
+      readGitHubUsage: () => ({
+        ...snapshot(delivered).githubUsage!,
+        graphqlRemaining: 999,
+        restRequests: 11,
+        accountingComplete: true,
+      }),
+      readScopedSnapshot: async () => ({
+        ...snapshot(delivered),
+        snapshotMode: 'incremental',
+        snapshotAuthority: 'scoped',
+        scopedIssueNumbers: [42],
+      }),
+      readSnapshot: async () => {
+        throw new LifecycleRateLimitError(999, 1_000, 0);
+      },
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 0, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        onlyIssues: new Set([42]),
+        executeAction: async () => ({ outcome: 'spawned' }),
+      },
+    });
+
+    expect(report).toMatchObject({
+      status: 'failed',
+      mutationFree: false,
+      githubUsage: { graphqlRemaining: 999, restRequests: 11 },
+    });
+    expect(report.events).toContainEqual(expect.objectContaining({
+      action: 'claim-review',
+      outcome: 'spawned',
+    }));
+  });
+
+  it('does not hide scoped mutations behind insufficient global rate-limit evidence', async () => {
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      projectStatus: 'In Review',
+    });
+    const report = await runLifecycleCycle('active', {
+      ...deps(delivered, [], new Proxy({} as ReconciliationWriter, {
+        get() {
+          return async () => null;
+        },
+      })),
+      readGitHubUsage: () => ({
+        ...snapshot(delivered).githubUsage!,
+        graphqlRemaining: 499,
+        restRequests: 13,
+        accountingComplete: true,
+      }),
+      readScopedSnapshot: async () => ({
+        ...snapshot(delivered),
+        snapshotMode: 'incremental',
+        snapshotAuthority: 'scoped',
+        scopedIssueNumbers: [42],
+      }),
+      readSnapshot: async () => ({
+        ...snapshot(delivered),
+        githubUsage: {
+          ...snapshot(delivered).githubUsage!,
+          graphqlRemaining: 499,
+        },
+      }),
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 0, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        onlyIssues: new Set([42]),
+        executeAction: async () => ({ outcome: 'spawned' }),
+      },
+    });
+
+    expect(report).toMatchObject({
+      status: 'failed',
+      mutationFree: false,
+      githubUsage: { graphqlRemaining: 499, restRequests: 13 },
+    });
+    expect(report.events).toContainEqual(expect.objectContaining({
+      action: 'claim-review',
+      outcome: 'spawned',
+    }));
+  });
+
+  it('reports a bounded review cohort in deterministic scheduled order', async () => {
+    const first = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      projectStatus: 'In Review',
+    });
+    const secondHead = gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+    const second = implementation({
+      issueNumber: 43,
+      prNumber: 102,
+      head: secondHead,
+      branchClaim: {
+        ...implementation().branchClaim,
+        issueNumber: 43,
+        prNumber: 102,
+        expectedHead: secondHead,
+        phaseComplete: true,
+      },
+      projectStatus: 'In Review',
+    });
+    const firstSnapshot = snapshot(first);
+    const world: GitHubLifecycleSnapshot = {
+      ...firstSnapshot,
+      pullRequests: [
+        firstSnapshot.pullRequests[0],
+        {
+          ...firstSnapshot.pullRequests[0],
+          number: 102,
+          body: 'Closes #43',
+          headRefName: 'autopilot/43',
+          headOid: secondHead,
+          closingIssueNumbers: [43],
+          branchClaim: second.branchClaim,
+        },
+      ],
+      lifecycle: { items: [first, second] },
+    };
+    const cohortCalls: number[][] = [];
+    const report = await runLifecycleCycle('active', {
+      ...deps(first, [], new Proxy({} as ReconciliationWriter, {
+        get() {
+          return async () => null;
+        },
+      })),
+      readSnapshot: async () => world,
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 0, review: 2 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async () => {
+          throw new Error('review cohort must not use the sequential action port');
+        },
+        executeReviewActions: async (actions) => {
+          cohortCalls.push(actions.map((action) => action.prNumber));
+          return [
+            { outcome: 'spawned' },
+            { outcome: 'failed', reason: 'isolated failure' },
+          ];
+        },
+      },
+    });
+
+    expect(cohortCalls).toEqual([[101, 102]]);
+    expect(report.events.filter((event) => event.action === 'claim-review')).toEqual([
+      expect.objectContaining({ subject: 'issue:42/pr:101', outcome: 'spawned' }),
+      expect.objectContaining({
+        subject: 'issue:43/pr:102',
+        outcome: 'failed',
+        reason: 'isolated failure',
+      }),
+    ]);
   });
 
   it('keeps merge-ready visible but never constructs a merge action under manual policy', async () => {

@@ -26,6 +26,7 @@ export interface ActiveRuntimeHandlers {
     action: Extract<NewWorkAction, { kind: 'claim-review' }>,
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
+    context?: { readonly cohortQuotaReserved: boolean },
   ): Promise<ActiveRuntimeResult>;
   updateBranch?(
     action: Extract<NewWorkAction, { kind: 'update-branch' }>,
@@ -75,6 +76,8 @@ export interface ActiveRuntimeOptions {
     readonly detail?: string;
   }>;
   readonly newWorkPaused?: () => boolean;
+  /** Reserves aggregate GitHub capacity once before a review cohort starts. */
+  readonly reserveReviewCohort?: (size: number) => Promise<void>;
   readonly handlers: ActiveRuntimeHandlers;
 }
 
@@ -130,6 +133,37 @@ export function makeActiveRuntime(
         'implementation backpressure threshold',
       ),
     ...(options.onlyIssues === undefined ? {} : { onlyIssues: options.onlyIssues }),
+    async executeReviewActions(actions, snapshot) {
+      if (actions.length === 0) return [];
+      const local = readLocalState();
+      if (actions.length > local.remaining.review) {
+        throw new Error(
+          `Review cohort of ${actions.length} exceeds remaining review capacity `
+            + `${local.remaining.review}`,
+        );
+      }
+      await options.reserveReviewCohort?.(actions.length);
+      return Promise.all(actions.map(async (action) => {
+        try {
+          const result = await options.handlers.review(
+            action,
+            options.credentials,
+            snapshot,
+            { cohortQuotaReserved: true },
+          );
+          const detail = reason(result);
+          return {
+            outcome: result.status,
+            ...(detail === undefined ? {} : { reason: detail }),
+          };
+        } catch (error) {
+          return {
+            outcome: 'failed',
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }));
+    },
     async executeAction(action, snapshot) {
       const local = readLocalState();
       const phase = action.kind === 'claim-implementation'

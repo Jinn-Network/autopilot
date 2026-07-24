@@ -11,6 +11,11 @@ export function targetedFrom(
       const snapshot = await readSnapshot();
       return snapshot.pullRequests.some((pr) => pr.number === prNumber) ? snapshot : null;
     },
+    async readReservedPullRequest(_cycle, prNumber) {
+      ledger.push({ kind: 'target-pr', points: 10 });
+      const snapshot = await readSnapshot();
+      return snapshot.pullRequests.some((pr) => pr.number === prNumber) ? snapshot : null;
+    },
     async readIssue(_cycle, issueNumber) {
       ledger.push({ kind: 'target-issue', points: 10 });
       const snapshot = await readSnapshot();

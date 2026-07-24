@@ -161,6 +161,47 @@ describe('Autopilot snapshot runtime configuration', () => {
 });
 
 describe('LifecycleSnapshotCoordinator', () => {
+  it('preserves scoped GitHub usage in the following global incremental read', async () => {
+    const readOptions: Array<{
+      readonly mode: SnapshotReadMode;
+      readonly resetUsage?: boolean;
+    }> = [];
+    const scoped = {
+      ...completeSnapshot('incremental'),
+      snapshotAuthority: 'scoped' as const,
+      scopedIssueNumbers: [42],
+    };
+    const sourceWithScope = {
+      readScoped: async () => scoped,
+      read: async (options: {
+        readonly mode: SnapshotReadMode;
+        readonly rateLimitFloor: number;
+        readonly resetUsage?: boolean;
+      }) => {
+        readOptions.push(options);
+        return completeSnapshot(options.mode);
+      },
+    };
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: sourceWithScope,
+      configuredMode: 'incremental',
+      fullReconcileMs: 60 * 60_000,
+      startupFull: true,
+      allowPartial: false,
+      now: () => START,
+    });
+
+    await expect(coordinator.readScoped(new Set([42]), 500, 2 * 60 * 60_000))
+      .resolves.toBe(scoped);
+    await coordinator.read(500);
+
+    expect(readOptions).toEqual([{
+      mode: 'incremental',
+      rateLimitFloor: 500,
+      resetUsage: false,
+    }]);
+  });
+
   it('keeps persistent failed reports on normal cadence without a busy loop', async () => {
     const reports = ['failed', 'ok', 'failed'] as const;
     const observed: string[] = [];

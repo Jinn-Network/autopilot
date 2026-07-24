@@ -63,7 +63,7 @@ import type {
   TargetedNativeIssue,
   TargetedOpenPullRequest,
 } from './targeted-action-reader.js';
-import type { GitOid, HumanReason } from './types.js';
+import type { GitOid, HumanReason, NewWorkAction } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 
 export const AUTOPILOT_V2_REMOTE = 'jinn-autopilot-v2';
@@ -74,7 +74,22 @@ export interface ProductionActiveRuntimeOptions {
   readonly runnerId: string;
   readonly credentials: CredentialPool;
   readonly authorAllowlist: ReadonlySet<string>;
-  readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
+  /** Exact per-PR reads used by review cohorts without touching coordinator state. */
+  readonly readReviewSnapshot: (
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    prNumber: number,
+  ) => Promise<GitHubLifecycleSnapshot | null>;
+  readonly readReservedReviewSnapshot: (
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    prNumber: number,
+  ) => Promise<GitHubLifecycleSnapshot | null>;
+  /** Exact issue/PR closure reads used by implementation without a global scan. */
+  readonly readImplementationSnapshot: (
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    action: Extract<NewWorkAction, { kind: 'claim-implementation' }>,
+  ) => Promise<GitHubLifecycleSnapshot>;
+  /** One aggregate quota reservation before any review cohort begins. */
+  readonly reserveReviewCohort: (size: number) => Promise<void>;
   /** Targeted reads backing the cycle-snapshot reconciliation writer. */
   readonly readPullRequestByNumber: (
     prNumber: number,
@@ -241,6 +256,24 @@ export function makeProductionActiveRuntime(
   const sleep = options.sleep ?? defaultSleep;
   const remoteName = options.remoteName ?? AUTOPILOT_V2_REMOTE;
   const alive = options.isPidAlive ?? isPidAlive;
+  let reviewMutationTail: Promise<void> = Promise.resolve();
+  const serializeReviewMutation = <Value>(
+    operation: () => Promise<Value>,
+  ): Promise<Value> => {
+    const pending = reviewMutationTail.then(operation, operation);
+    reviewMutationTail = pending.then(() => undefined, () => undefined);
+    return pending;
+  };
+  const targetedPullRequestSnapshot = (
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    prNumber: number,
+  ) => async (): Promise<GitHubLifecycleSnapshot> => {
+    const targeted = await options.readReviewSnapshot(cycleSnapshot, prNumber);
+    if (targeted === null) {
+      throw new Error(`Targeted PR authority for #${prNumber} is unavailable`);
+    }
+    return targeted;
+  };
   const track = (manifestPath: string, child: SpawnResult): void => {
     trackAttemptChild(manifestPath, requireTrackable(child), { now });
   };
@@ -352,6 +385,7 @@ export function makeProductionActiveRuntime(
       alive,
     ),
     preflight: makeProductionCapabilityPreflight(options),
+    reserveReviewCohort: options.reserveReviewCohort,
     ...(options.newWorkPaused === undefined
       ? {}
       : { newWorkPaused: options.newWorkPaused }),
@@ -377,7 +411,7 @@ export function makeProductionActiveRuntime(
         return { status: result.status };
       },
 
-      implementation: (action, credentials) => {
+      implementation: (action, credentials, cycleSnapshot) => {
         const port = makeProductionImplementationActionPort({
           repositoryPath: options.repositoryPath,
           worktreeBase: options.worktreeBase,
@@ -385,7 +419,8 @@ export function makeProductionActiveRuntime(
           remoteName,
           credentials,
           authorAllowlist: options.authorAllowlist,
-          readSnapshot: options.readSnapshot,
+          readSnapshot: () =>
+            options.readImplementationSnapshot(cycleSnapshot, action),
           runner,
           environment: ambient,
           repositorySlug: options.repositorySlug,
@@ -407,19 +442,32 @@ export function makeProductionActiveRuntime(
         });
       },
 
-      review: (action, credentials, cycleSnapshot) => {
-        const port = makeProductionReviewActionPort({
+      review: (action, credentials, cycleSnapshot, context) => {
+        const productionPort = makeProductionReviewActionPort({
           repositoryPath: options.repositoryPath,
           worktreeBase: options.worktreeBase,
           runnerId: options.runnerId,
           remoteName,
-          readSnapshot: options.readSnapshot,
+          readSnapshot: (prNumber) => (
+            context?.cohortQuotaReserved === true
+              ? options.readReservedReviewSnapshot(cycleSnapshot, prNumber)
+              : options.readReviewSnapshot(cycleSnapshot, prNumber)
+          ),
           runner,
           environment: ambient,
           repositorySlug: options.repositorySlug,
           repositoryUrl: options.repositoryUrl,
           projectMapping: options.projectMapping,
         });
+        const port = {
+          ...productionPort,
+          createAttempt: (
+            input: Parameters<typeof productionPort.createAttempt>[0],
+          ) => serializeReviewMutation(() => productionPort.createAttempt(input)),
+          repairProjection: (
+            input: Parameters<typeof productionPort.repairProjection>[0],
+          ) => serializeReviewMutation(() => productionPort.repairProjection(input)),
+        };
         return executeReviewAction({
           prNumber: action.prNumber,
           expectedHead: action.head,
@@ -435,17 +483,19 @@ export function makeProductionActiveRuntime(
           staleAfterMs: options.staleAfterMs,
           spawnCoordinator: reviewSpawner,
           trackChild: track,
-          escalateHuman: (input) => escalateReview(input, credentials, cycleSnapshot),
+          escalateHuman: (input) => serializeReviewMutation(
+            () => escalateReview(input, credentials, cycleSnapshot),
+          ),
         });
       },
 
 
-      merge: (action, credentials) => executeMergeAction({
+      merge: (action, credentials, cycleSnapshot) => executeMergeAction({
         prNumber: action.prNumber,
         expectedHead: action.head,
       }, {
         ...makeProductionMergeActionPort({
-          readSnapshot: options.readSnapshot,
+          readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
           authorAllowlist: options.authorAllowlist,
           expectedBaseRefName: options.defaultBranch,
           repositorySlug: options.repositorySlug,
@@ -458,13 +508,13 @@ export function makeProductionActiveRuntime(
         credentials,
       }),
 
-      updateBranch: async (action, credentials) => {
+      updateBranch: async (action, credentials, cycleSnapshot) => {
         const result = await executeUpdateBranchAction({
           prNumber: action.prNumber,
           expectedHead: action.head,
         }, {
           ...makeProductionMergeActionPort({
-            readSnapshot: options.readSnapshot,
+            readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
             expectedBaseRefName: options.defaultBranch,
             repositorySlug: options.repositorySlug,
@@ -491,7 +541,7 @@ export function makeProductionActiveRuntime(
           effort: action.effort,
         }, {
           ...makeProductionMergeActionPort({
-            readSnapshot: options.readSnapshot,
+            readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
             expectedBaseRefName: options.defaultBranch,
             repositorySlug: options.repositorySlug,
@@ -528,7 +578,7 @@ export function makeProductionActiveRuntime(
         };
       },
 
-      rerunFailedChecks: async (action, credentials) => {
+      rerunFailedChecks: async (action, credentials, cycleSnapshot) => {
         const selection = selectCredential(credentials, { phase: 'merge' });
         if (selection.status !== 'selected') {
           return { status: 'skipped', reason: 'credential-unavailable' };
@@ -536,7 +586,7 @@ export function makeProductionActiveRuntime(
         return executeProductionRerunFailedChecks(
           { prNumber: action.prNumber, head: action.head },
           {
-            readSnapshot: options.readSnapshot,
+            readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             repositoryPath: options.repositoryPath,
             runner,
             environment: ambient,
@@ -557,7 +607,7 @@ export function makeProductionActiveRuntime(
         const result = await executeProductionFileCiFailureChild(
           { prNumber: action.prNumber, head: action.head },
           {
-            readSnapshot: options.readSnapshot,
+            readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             repositoryPath: options.repositoryPath,
             runner,
             environment: ambient,

@@ -87,6 +87,11 @@ export interface TargetedActionReader {
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
   ): Promise<GitHubLifecycleSnapshot | null>;
+  /** Uses quota already reserved once for the enclosing review cohort. */
+  readReservedPullRequest(
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    prNumber: number,
+  ): Promise<GitHubLifecycleSnapshot | null>;
   readIssue(
     cycleSnapshot: GitHubLifecycleSnapshot,
     issueNumber: number,
@@ -194,12 +199,19 @@ function composeTargeted(
     issues: evidence.issues ?? cycle.issues,
     pullRequests: evidence.pullRequests ?? cycle.pullRequests,
     branches: cycle.branches,
+    terminalClaims: cycle.terminalClaims,
   }, {
     authorAllowlist,
     capturedAt: cycle.capturedAt,
     snapshotMode: cycle.snapshotMode ?? 'incremental',
     lastFullReconciliationAt: cycle.lastFullReconciliationAt,
     githubUsage: cycle.githubUsage,
+    ...(cycle.snapshotAuthority === undefined
+      ? {}
+      : {
+          snapshotAuthority: cycle.snapshotAuthority,
+          scopedIssueNumbers: cycle.scopedIssueNumbers,
+        }),
   });
 }
 
@@ -260,62 +272,71 @@ export function makeTargetedActionReader(
     await reserve(TARGETED_RELATION_RESERVE);
     return hydrateIssueContext(issueNumber);
   };
+  const readPullRequest = async (
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    prNumber: number,
+    reserveQuota: boolean,
+  ): Promise<GitHubLifecycleSnapshot | null> => {
+    positiveNumber(prNumber, 'Target PR number');
+    completeCycle(cycleSnapshot);
+    if (reserveQuota) await reserve(TARGETED_PR_RESERVE);
+    const raw = await options.readPullRequest(prNumber);
+    if (raw === null) return null;
+    if (raw.number !== prNumber) throw new Error('Targeted PR reader returned a different PR');
+    const mapped = issueNumbers(raw);
+    if (mapped.length !== 1) {
+      throw new Error(`Target PR #${prNumber} does not map to exactly one native issue`);
+    }
+    const issueNumber = mapped[0]!;
+    const native = await options.readIssue(issueNumber);
+    if (native === null || native.number !== issueNumber) {
+      throw new Error(`Target PR #${prNumber} mapped native issue is missing`);
+    }
+    if (!native.open && raw.state === 'OPEN') {
+      throw new Error(`Target PR #${prNumber} mapped native issue #${issueNumber} is closed`);
+    }
+    const item = await options.readProjectItem(issueNumber);
+    if (item === null) {
+      throw new Error(`Target issue #${issueNumber} has no live Project item`);
+    }
+    const existingIssue = cycleSnapshot.issues.find((issue) => issue.number === issueNumber);
+    if (existingIssue === undefined) {
+      throw new Error(`Target issue #${issueNumber} is absent from the cycle snapshot`);
+    }
+    const dependencies = await options.readBlockedByIssueNumbers(issueNumber);
+    const liveIssue: PolledIssue = {
+      ...existingIssue,
+      title: native.title,
+      author: native.author,
+      labels: [...native.labels],
+      status: item.status,
+      priority: item.priority === undefined ? existingIssue.priority : item.priority,
+      effort: item.effort === undefined ? existingIssue.effort : item.effort,
+      shape: item.issueType === undefined ? existingIssue.shape : item.issueType,
+      blockedOn: item.blockedOn,
+      blockedByIssues: [...dependencies],
+      projectItemId: item.id,
+    };
+    const issues = cycleSnapshot.issues.map((issue) => (
+      issue.number === issueNumber ? liveIssue : issue
+    ));
+    const project = projectWithTarget(cycleSnapshot, issueNumber, item);
+    const decoded = decodePullRequestSnapshot(raw);
+    const pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
+      ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
+      : [...cycleSnapshot.pullRequests, decoded];
+    return composeTargeted(
+      cycleSnapshot,
+      { project, issues, pullRequests },
+      options.authorAllowlist,
+    );
+  };
   return {
-    async readPullRequest(cycleSnapshot, prNumber) {
-      positiveNumber(prNumber, 'Target PR number');
-      completeCycle(cycleSnapshot);
-      await reserve(TARGETED_PR_RESERVE);
-      const raw = await options.readPullRequest(prNumber);
-      if (raw === null) return null;
-      if (raw.number !== prNumber) throw new Error('Targeted PR reader returned a different PR');
-      const mapped = issueNumbers(raw);
-      if (mapped.length !== 1) {
-        throw new Error(`Target PR #${prNumber} does not map to exactly one native issue`);
-      }
-      const issueNumber = mapped[0]!;
-      const native = await options.readIssue(issueNumber);
-      if (native === null || native.number !== issueNumber) {
-        throw new Error(`Target PR #${prNumber} mapped native issue is missing`);
-      }
-      if (!native.open && raw.state === 'OPEN') {
-        throw new Error(`Target PR #${prNumber} mapped native issue #${issueNumber} is closed`);
-      }
-      const item = await options.readProjectItem(issueNumber);
-      if (item === null) {
-        throw new Error(`Target issue #${issueNumber} has no live Project item`);
-      }
-      const existingIssue = cycleSnapshot.issues.find((issue) => issue.number === issueNumber);
-      if (existingIssue === undefined) {
-        throw new Error(`Target issue #${issueNumber} is absent from the cycle snapshot`);
-      }
-      const dependencies = await options.readBlockedByIssueNumbers(issueNumber);
-      const liveIssue: PolledIssue = {
-        ...existingIssue,
-        title: native.title,
-        author: native.author,
-        labels: [...native.labels],
-        status: item.status,
-        priority: item.priority === undefined ? existingIssue.priority : item.priority,
-        effort: item.effort === undefined ? existingIssue.effort : item.effort,
-        shape: item.issueType === undefined ? existingIssue.shape : item.issueType,
-        blockedOn: item.blockedOn,
-        blockedByIssues: [...dependencies],
-        projectItemId: item.id,
-      };
-      const issues = cycleSnapshot.issues.map((issue) => (
-        issue.number === issueNumber ? liveIssue : issue
-      ));
-      const project = projectWithTarget(cycleSnapshot, issueNumber, item);
-      const decoded = decodePullRequestSnapshot(raw);
-      const pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
-        ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
-        : [...cycleSnapshot.pullRequests, decoded];
-      return composeTargeted(
-        cycleSnapshot,
-        { project, issues, pullRequests },
-        options.authorAllowlist,
-      );
-    },
+    readPullRequest: (cycleSnapshot, prNumber) =>
+      readPullRequest(cycleSnapshot, prNumber, true),
+
+    readReservedPullRequest: (cycleSnapshot, prNumber) =>
+      readPullRequest(cycleSnapshot, prNumber, false),
 
     async readIssue(cycleSnapshot, issueNumber) {
       positiveNumber(issueNumber, 'Target issue number');

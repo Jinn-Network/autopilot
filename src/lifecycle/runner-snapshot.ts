@@ -330,7 +330,13 @@ function cadenceSeedAuthorityDetail(
 }
 
 export interface LifecycleSnapshotCoordinatorOptions {
-  readonly source: LifecycleSnapshotSource;
+  readonly source: LifecycleSnapshotSource & {
+    readScoped?(options: {
+      readonly issueNumbers: ReadonlySet<number>;
+      readonly rateLimitFloor: number;
+      readonly maxGlobalAgeMs: number;
+    }): Promise<GitHubLifecycleSnapshot | null>;
+  };
   readonly configuredMode: SnapshotReadMode;
   readonly fullReconcileMs: number;
   /** Active/recover runners seed authoritatively; routine observe status does not. */
@@ -349,7 +355,7 @@ export interface LifecycleSnapshotCoordinatorOptions {
  * mutation authority. The underlying source owns atomic cache replacement.
  */
 export class LifecycleSnapshotCoordinator {
-  private readonly source: LifecycleSnapshotSource;
+  private readonly source: LifecycleSnapshotCoordinatorOptions['source'];
   private readonly configuredMode: SnapshotReadMode;
   private readonly fullReconcileMs: number;
   private readonly startupFull: boolean;
@@ -360,6 +366,8 @@ export class LifecycleSnapshotCoordinator {
   private started = false;
   private lastFullReconciliationAt: string | null = null;
   private fullRetryDue = false;
+  private preserveUsageOnNextRead = false;
+  private incrementalAfterScope = false;
 
   constructor(options: LifecycleSnapshotCoordinatorOptions) {
     if (!Number.isSafeInteger(options.fullReconcileMs) || options.fullReconcileMs <= 0) {
@@ -392,6 +400,26 @@ export class LifecycleSnapshotCoordinator {
     return 'incremental';
   }
 
+  async readScoped(
+    issueNumbers: ReadonlySet<number>,
+    rateLimitFloor: number,
+    maxGlobalAgeMs: number,
+  ): Promise<GitHubLifecycleSnapshot | null> {
+    if (this.source.readScoped === undefined) return null;
+    const scoped = await this.source.readScoped({
+      issueNumbers,
+      rateLimitFloor,
+      maxGlobalAgeMs,
+    });
+    if (scoped !== null) {
+      this.preserveUsageOnNextRead = true;
+      this.incrementalAfterScope = true;
+      this.started = true;
+      this.lastFullReconciliationAt = scoped.lastFullReconciliationAt ?? null;
+    }
+    return scoped;
+  }
+
   private async retryFullAfterSeededIncremental(
     rateLimitFloor: number,
     authorityError: unknown,
@@ -422,13 +450,20 @@ export class LifecycleSnapshotCoordinator {
 
   async read(rateLimitFloor: number): Promise<GitHubLifecycleSnapshot> {
     const now = exactNow(this.now);
-    const mode = this.nextMode(now);
+    const mode = this.incrementalAfterScope ? 'incremental' : this.nextMode(now);
+    this.incrementalAfterScope = false;
+    const preserveUsage = this.preserveUsageOnNextRead;
+    this.preserveUsageOnNextRead = false;
     const startupCadenceSeed = !this.started && mode === 'incremental'
       ? this.lastFullReconciliationAt
       : null;
     this.started = true;
     try {
-      const snapshot = await this.source.read({ mode, rateLimitFloor });
+      const snapshot = await this.source.read({
+        mode,
+        rateLimitFloor,
+        ...(preserveUsage ? { resetUsage: false } : {}),
+      });
       if (mode === 'full') {
         assertFullSnapshotAuthority(snapshot, now.getTime(), exactNow(this.now).getTime());
       } else if (snapshot.snapshotComplete !== true) {

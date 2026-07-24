@@ -3,6 +3,7 @@ import {
   makeTargetedActionReader,
 } from '../../src/lifecycle/targeted-action-reader.js';
 import { GitHubRateLimitReserveError } from '../../src/lifecycle/github-usage.js';
+import { gitOid } from '../../src/lifecycle/types.js';
 import type {
   GitHubLifecycleSnapshot,
   RawPullRequest,
@@ -130,6 +131,55 @@ describe('targeted action reader', () => {
     expect(snapshot?.lifecycle.items).toEqual([
       expect.objectContaining({ kind: 'pull-request', issueNumber: 42, prNumber: 101 }),
     ]);
+  });
+
+  it('reuses an aggregate cohort reservation without per-review quota probes', async () => {
+    const calls: string[] = [];
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => {
+        calls.push('quota');
+        return 510;
+      },
+      readPullRequest: async () => rawPullRequest(),
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Review',
+        blockedOn: 'Nothing',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [],
+    });
+
+    const terminalClaims = [{
+      issueNumber: 42,
+      prNumber: 101,
+      headRefName: 'autopilot/42',
+      headOid: gitOid(HEAD),
+      claimAttempt: '11111111-1111-4111-8111-111111111111',
+      targetBase: 'next',
+      claimFingerprint: 'claim-fingerprint',
+      mergedAt: '2026-07-22T09:30:00.000Z',
+      mergeCommitOid: gitOid('b'.repeat(40)),
+    }];
+    await expect(reader.readReservedPullRequest({
+      ...cycleSnapshot(),
+      snapshotAuthority: 'scoped',
+      scopedIssueNumbers: [42],
+      terminalClaims,
+    }, 101)).resolves.toMatchObject({
+      snapshotAuthority: 'scoped',
+      scopedIssueNumbers: [42],
+      terminalClaims,
+    });
+    expect(calls).toEqual([]);
   });
 
   it('reads one live native issue, Project item, and dependency set for implementation', async () => {
