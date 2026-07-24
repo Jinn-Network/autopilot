@@ -424,16 +424,16 @@ export class LifecycleSnapshotCoordinator {
     });
     if (scoped !== null) {
       this.preserveUsageOnNextRead = true;
-      if (cadenceFence !== null) {
-        const authorityDetail = cadenceSeedAuthorityDetail(
-          scoped,
-          cadenceFence,
-          requestedAt.getTime(),
-          exactNow(this.now).getTime(),
-          this.fullReconcileMs,
-        );
-        if (authorityDetail !== null) return null;
-      }
+      const authorityFence = cadenceFence ?? scoped.lastFullReconciliationAt;
+      if (authorityFence === null || authorityFence === undefined) return null;
+      const authorityDetail = cadenceSeedAuthorityDetail(
+        scoped,
+        authorityFence,
+        requestedAt.getTime(),
+        exactNow(this.now).getTime(),
+        this.fullReconcileMs,
+      );
+      if (authorityDetail !== null) return null;
       this.lastFullReconciliationAt = scoped.lastFullReconciliationAt ?? null;
       this.scopedCadenceFence = scoped.lastFullReconciliationAt ?? null;
     }

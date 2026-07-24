@@ -396,6 +396,58 @@ describe('LifecycleSnapshotCoordinator', () => {
     expect(resetUsage).toEqual([false, false]);
   });
 
+  it.each([
+    ['due within scoped max age', '2026-07-22T09:00:00.000Z'],
+    ['exactly at the full cadence boundary', '2026-07-22T09:30:00.000Z'],
+    ['in the future', '2026-07-22T10:31:00.000Z'],
+    ['missing', null],
+    ['corrupt', '2026-07-22T09:30:00+00:00'],
+  ] as const)(
+    'rejects manual unmarked scoped authority when its full marker is %s',
+    async (_label, scopedMarker) => {
+      const now = new Date('2026-07-22T10:30:00.000Z');
+      let scopedReads = 0;
+      const globalReads: SnapshotReadMode[] = [];
+      const resetUsage: Array<boolean | undefined> = [];
+      const scoped: GitHubLifecycleSnapshot = {
+        ...completeSnapshot('incremental', now.toISOString()),
+        lastFullReconciliationAt: scopedMarker,
+        snapshotAuthority: 'scoped',
+        scopedIssueNumbers: [42],
+      };
+      const coordinator = new LifecycleSnapshotCoordinator({
+        source: {
+          readScoped: async () => {
+            scopedReads += 1;
+            return scoped;
+          },
+          read: async (options) => {
+            globalReads.push(options.mode);
+            resetUsage.push(options.resetUsage);
+            return completeSnapshot(options.mode, now.toISOString(), now.toISOString());
+          },
+        },
+        configuredMode: 'incremental',
+        fullReconcileMs: 60 * 60_000,
+        startupFull: true,
+        allowPartial: false,
+        cadenceSeed: null,
+        now: () => now,
+      });
+
+      await expect(coordinator.readScoped(new Set([42]), 500, 2 * 60 * 60_000))
+        .resolves.toBeNull();
+      await expect(coordinator.read(500)).resolves.toMatchObject({
+        snapshotMode: 'full',
+        lastFullReconciliationAt: now.toISOString(),
+      });
+
+      expect(scopedReads).toBe(1);
+      expect(globalReads).toEqual(['full']);
+      expect(resetUsage).toEqual([false]);
+    },
+  );
+
   it('keeps persistent failed reports on normal cadence without a busy loop', async () => {
     const reports = ['failed', 'ok', 'failed'] as const;
     const observed: string[] = [];
