@@ -272,7 +272,7 @@ describe('GhLifecycleReader', () => {
       .rejects.toThrow(/truncated|pagination/i);
   });
 
-  it('fails closed when targeted issue-to-closing-PR discovery omits quota evidence', async () => {
+  it('continues targeted issue-to-closing-PR discovery when quota evidence is omitted', async () => {
     const reader = new GhLifecycleReader(async () => JSON.stringify({
       data: {
         repository: {
@@ -286,8 +286,14 @@ describe('GhLifecycleReader', () => {
       },
     }));
 
-    await expect(reader.readPullRequestNumbersClosingIssues([42]))
-      .rejects.toThrow(/rateLimit/i);
+    await expect(reader.readPullRequestNumbersClosingIssues([42])).resolves.toEqual(new Set());
+    expect(reader.githubUsage()).toMatchObject({
+      graphqlRequests: 1,
+      graphqlCost: 0,
+      graphqlRemaining: null,
+      graphqlResetAt: null,
+      accountingComplete: false,
+    });
   });
 
   it('reuses a shared metered runner without counting reader traffic twice', async () => {
@@ -554,13 +560,24 @@ describe('GhLifecycleReader', () => {
       .rejects.toThrow(/exceeded 2-point reserve/i);
   });
 
-  it('fails closed when a lifecycle GraphQL response omits rate-limit evidence', async () => {
+  it('reads an empty targeted Project item result when rate-limit evidence is omitted', async () => {
     const run: CommandRunner = async () => JSON.stringify({
-      data: { repository: { issue: { projectItems: { nodes: [] } } } },
+      data: {
+        repository: {
+          issue: { projectItems: { pageInfo: { hasNextPage: false }, nodes: [] } },
+        },
+      },
     });
 
-    await expect(new GhLifecycleReader(run).readProjectItemForReconciliation(42))
-      .rejects.toThrow(/rateLimit/i);
+    const reader = new GhLifecycleReader(run);
+    await expect(reader.readProjectItemForReconciliation(42)).resolves.toBeNull();
+    expect(reader.githubUsage()).toMatchObject({
+      graphqlRequests: 1,
+      graphqlCost: 0,
+      graphqlRemaining: null,
+      graphqlResetAt: null,
+      accountingComplete: false,
+    });
   });
 
   it('parses lifecycle metadata only from the terminal trailer block', async () => {

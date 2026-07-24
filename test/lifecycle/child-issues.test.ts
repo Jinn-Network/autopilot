@@ -13,6 +13,10 @@ import {
   type ChildIssuePort,
   type ChildIssueRecord,
 } from '../../src/lifecycle/child-issues.js';
+import {
+  GitHubUsageMeter,
+  makeGitHubUsageCommandRunner,
+} from '../../src/lifecycle/github-usage.js';
 
 function record(
   over: Partial<ChildIssueRecord> & Pick<ChildIssueRecord, 'number' | 'kind' | 'parentPr'>,
@@ -279,8 +283,9 @@ describe('production port GraphQL type assign contract', () => {
     );
 
     const calls: string[][] = [];
+    const meter = new GitHubUsageMeter();
     const port = makeProductionChildIssuePort({
-      runner: async (_cmd, args) => {
+      runner: makeGitHubUsageCommandRunner(async (_cmd, args) => {
         calls.push([...args]);
         if (args[0] === 'issue' && args[1] === 'list') {
           return '[]';
@@ -292,6 +297,19 @@ describe('production port GraphQL type assign contract', () => {
           return 'I_kwIssue99\n';
         }
         if (args[0] === 'api' && args[1] === 'graphql') {
+          if (args.some((arg) => arg.includes('OpaqueGitHubUsageProbe'))) {
+            return JSON.stringify({
+              data: {
+                rateLimit: {
+                  cost: 1,
+                  remaining: 4_999,
+                  resetAt: '2026-07-24T13:00:00.000Z',
+                  used: 1,
+                  limit: 5_000,
+                },
+              },
+            });
+          }
           if (args.some((arg) => arg.includes('issueTypes(first: 100)'))) {
             return JSON.stringify({
               data: {
@@ -299,6 +317,11 @@ describe('production port GraphQL type assign contract', () => {
                   issueTypes: {
                     nodes: [{ id: 'IT_example_fix', name: 'fix', isEnabled: true }],
                   },
+                },
+                rateLimit: {
+                  cost: 1,
+                  remaining: 4_999,
+                  resetAt: '2026-07-24T13:00:00.000Z',
                 },
               },
             });
@@ -315,7 +338,7 @@ describe('production port GraphQL type assign contract', () => {
           return '';
         }
         return '';
-      },
+      }, meter),
       repo: 'example/widgets',
     });
 
@@ -353,6 +376,10 @@ describe('production port GraphQL type assign contract', () => {
     expect(itemEdits.some((args) =>
       args.includes('PVTSSF_priority') && args.includes('opt_p1'),
     )).toBe(true);
+    expect(meter.read()).toMatchObject({
+      graphqlRequests: expect.any(Number),
+      accountingComplete: false,
+    });
     // silence unused vi import if tree-shaken differently
     expect(vi).toBeDefined();
   });
