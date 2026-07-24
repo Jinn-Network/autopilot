@@ -54,6 +54,44 @@ describe('GitHubUsageMeter', () => {
     expect(meter.read()).toMatchObject({ graphqlRequests: 0, graphqlCost: 0 });
   });
 
+  it('returns a successful GraphQL mutation with no rate-limit evidence and records incomplete known-request usage', async () => {
+    const meter = new GitHubUsageMeter();
+    const run = makeGitHubUsageCommandRunner(async () => JSON.stringify({
+      data: { updateIssueIssueType: { issue: { number: 99 } } },
+    }), meter);
+
+    await expect(run('gh', ['api', 'graphql', '-f', 'query=mutation { updateIssueIssueType { issue { number } } }']))
+      .resolves.toContain('updateIssueIssueType');
+    expect(meter.read()).toEqual({
+      graphqlRequests: 1,
+      graphqlCost: 0,
+      graphqlRemaining: null,
+      graphqlResetAt: null,
+      restRequests: 0,
+      restNotModified: 0,
+      cacheHits: 0,
+      accountingComplete: false,
+      incompleteReason: expect.stringMatching(/rate-limit evidence/i),
+    });
+  });
+
+  it.each([
+    ['transport failure', async () => {
+      throw new Error('network unavailable');
+    }],
+    ['invalid JSON', async () => '{not-json'],
+    ['non-empty GraphQL errors', async () => JSON.stringify({
+      data: { updateIssueIssueType: null },
+      errors: [{ message: 'Issue Type assignment was rejected' }],
+    })],
+  ])('fails closed on explicit GraphQL %s', async (_label, raw) => {
+    const meter = new GitHubUsageMeter();
+    const run = makeGitHubUsageCommandRunner(raw, meter);
+
+    await expect(run('gh', ['api', 'graphql', '-f', 'query=mutation { updateIssueIssueType { issue { number } } }']))
+      .rejects.toThrow();
+  });
+
   it('keeps remaining and resetAt paired to the newest quota window', () => {
     const meter = new GitHubUsageMeter();
     meter.recordGraphQlResponse({

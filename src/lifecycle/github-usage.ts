@@ -116,6 +116,22 @@ function rateLimitEvidence(response: unknown): {
   };
 }
 
+function assertSuccessfulGraphQlResult(response: unknown): void {
+  if (typeof response !== 'object' || response === null || Array.isArray(response)) {
+    throw new Error('GitHub GraphQL response must be an object');
+  }
+  const result = response as { data?: unknown; errors?: unknown };
+  if (result.errors !== undefined && !Array.isArray(result.errors)) {
+    throw new Error('GitHub GraphQL errors member must be an array');
+  }
+  if (result.errors !== undefined && result.errors.length > 0) {
+    throw new Error('GitHub GraphQL errors were returned');
+  }
+  if (typeof result.data !== 'object' || result.data === null || Array.isArray(result.data)) {
+    throw new Error('GitHub GraphQL response data must be an object');
+  }
+}
+
 function opaqueRateLimitEvidence(response: unknown): {
   readonly cost: number;
   readonly remaining: number;
@@ -171,6 +187,15 @@ export class GitHubUsageMeter {
     this.graphqlRequests += 1;
     this.graphqlCost += evidence.cost;
     this.recordQuotaEvidence(evidence.remaining, evidence.resetAt, credentialKey);
+  }
+
+  /**
+   * Records a GraphQL request whose mutation/read result succeeded but omitted
+   * usable optional rate-limit accounting evidence.
+   */
+  recordGraphQlRequestWithoutRateLimit(detail: string): void {
+    this.graphqlRequests += 1;
+    this.markIncomplete(detail);
   }
 
   /** Records quota authority from REST `/rate_limit` without charging GraphQL usage. */
@@ -367,14 +392,29 @@ export function makeGitHubUsageCommandRunner(
     }
     if (args[0] === 'api' && args[1] === 'graphql') {
       const credentialKey = ephemeralCredentialKey(options);
+      let raw: string;
       try {
-        const raw = await run(command, args, options);
-        meter.recordGraphQlResponse(JSON.parse(raw) as unknown, credentialKey);
-        return raw;
+        raw = await run(command, args, options);
       } catch (error) {
         meter.markIncomplete('an explicit GraphQL command lacked rate-limit evidence');
         throw error;
       }
+      let response: unknown;
+      try {
+        response = JSON.parse(raw) as unknown;
+        assertSuccessfulGraphQlResult(response);
+      } catch (error) {
+        meter.markIncomplete('an explicit GraphQL command returned an invalid result');
+        throw error;
+      }
+      try {
+        meter.recordGraphQlResponse(response, credentialKey);
+      } catch {
+        meter.recordGraphQlRequestWithoutRateLimit(
+          'an explicit GraphQL command lacked usable rate-limit evidence',
+        );
+      }
+      return raw;
     }
 
     return meter.serializeOpaque(async () => {
