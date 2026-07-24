@@ -90,6 +90,10 @@ export interface TargetedActionReader {
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
   ): Promise<GitHubLifecycleSnapshot | null>;
+  readStaleRecoveryPullRequest(
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    prNumber: number,
+  ): Promise<GitHubLifecycleSnapshot | null>;
   /** Uses quota already reserved once for the enclosing review cohort. */
   readReservedPullRequest(
     cycleSnapshot: GitHubLifecycleSnapshot,
@@ -280,6 +284,7 @@ export function makeTargetedActionReader(
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
     reserveQuota: boolean,
+    hydrateRecoveryBlockers: boolean,
   ): Promise<GitHubLifecycleSnapshot | null> => {
     positiveNumber(prNumber, 'Target PR number');
     completeCycle(cycleSnapshot);
@@ -329,6 +334,13 @@ export function makeTargetedActionReader(
     let pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
       ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
       : [...cycleSnapshot.pullRequests, decoded];
+    if (!hydrateRecoveryBlockers) {
+      return composeTargeted(
+        cycleSnapshot,
+        { project, issues, pullRequests },
+        options.authorAllowlist,
+      );
+    }
     const dependencySet = new Set(dependencies);
     const blockerPullRequestNumbers = new Set(cycleSnapshot.pullRequests
       .filter((pr) => (
@@ -388,10 +400,13 @@ export function makeTargetedActionReader(
   };
   return {
     readPullRequest: (cycleSnapshot, prNumber) =>
-      readPullRequest(cycleSnapshot, prNumber, true),
+      readPullRequest(cycleSnapshot, prNumber, true, false),
+
+    readStaleRecoveryPullRequest: (cycleSnapshot, prNumber) =>
+      readPullRequest(cycleSnapshot, prNumber, true, true),
 
     readReservedPullRequest: (cycleSnapshot, prNumber) =>
-      readPullRequest(cycleSnapshot, prNumber, false),
+      readPullRequest(cycleSnapshot, prNumber, false, false),
 
     async readIssue(cycleSnapshot, issueNumber) {
       positiveNumber(issueNumber, 'Target issue number');

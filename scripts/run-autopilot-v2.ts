@@ -555,7 +555,7 @@ export async function runAutopilotV2(
           targeted.readReservedPullRequest(cycleSnapshot, prNumber),
         readImplementationSnapshot: async (cycleSnapshot, action) => {
           const targetedSnapshot = action.intent === 'stale-recovery'
-            ? await targeted.readPullRequest(cycleSnapshot, action.prNumber)
+            ? await targeted.readStaleRecoveryPullRequest(cycleSnapshot, action.prNumber)
             : (await targeted.readIssue(cycleSnapshot, action.issueNumber))?.snapshot ?? null;
           if (targetedSnapshot === null) {
             throw new Error(

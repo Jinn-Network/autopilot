@@ -353,12 +353,107 @@ describe('targeted action reader', () => {
     ]);
   });
 
+  it('does not probe blocker relations or details for a dependent ordinary review read', async () => {
+    const fixture = staleRecoveryCycle();
+    const calls: string[] = [];
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => {
+        calls.push('quota');
+        return 510;
+      },
+      readPullRequest: async (number) => {
+        calls.push(`pr:${number}`);
+        if (number === fixture.implementation.number) return fixture.implementation;
+        if (number === fixture.blocker.number) return fixture.blocker;
+        return null;
+      },
+      readProjectItem: async (number) => {
+        calls.push(`project:${number}`);
+        return { id: 'item-42', status: 'In Review', blockedOn: 'Another issue' };
+      },
+      readIssue: async (number) => {
+        calls.push(`issue:${number}`);
+        return { number, title: 'Target issue', open: true, author: 'oaksprout', labels: [] };
+      },
+      readBlockedByIssueNumbers: async (number) => {
+        calls.push(`dependencies:${number}`);
+        return [7];
+      },
+      readPullRequestOutcomeNumbersClosingIssues: async (numbers) => {
+        calls.push(`blocker-relations:${numbers.join(',')}`);
+        return new Set([fixture.blocker.number]);
+      },
+    });
+
+    await expect(reader.readPullRequest(
+      fixture.cycle,
+      fixture.implementation.number,
+    )).resolves.not.toBeNull();
+
+    expect(calls).toEqual([
+      'quota',
+      'pr:101',
+      'issue:42',
+      'project:42',
+      'dependencies:42',
+    ]);
+  });
+
+  it('does not probe blocker relations or details for a dependent reserved review read', async () => {
+    const fixture = staleRecoveryCycle();
+    const calls: string[] = [];
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => {
+        calls.push('quota');
+        return 510;
+      },
+      readPullRequest: async (number) => {
+        calls.push(`pr:${number}`);
+        if (number === fixture.implementation.number) return fixture.implementation;
+        if (number === fixture.blocker.number) return fixture.blocker;
+        return null;
+      },
+      readProjectItem: async (number) => {
+        calls.push(`project:${number}`);
+        return { id: 'item-42', status: 'In Review', blockedOn: 'Another issue' };
+      },
+      readIssue: async (number) => {
+        calls.push(`issue:${number}`);
+        return { number, title: 'Target issue', open: true, author: 'oaksprout', labels: [] };
+      },
+      readBlockedByIssueNumbers: async (number) => {
+        calls.push(`dependencies:${number}`);
+        return [7];
+      },
+      readPullRequestOutcomeNumbersClosingIssues: async (numbers) => {
+        calls.push(`blocker-relations:${numbers.join(',')}`);
+        return new Set([fixture.blocker.number]);
+      },
+    });
+
+    await expect(reader.readReservedPullRequest(
+      fixture.cycle,
+      fixture.implementation.number,
+    )).resolves.not.toBeNull();
+
+    expect(calls).toEqual([
+      'pr:101',
+      'issue:42',
+      'project:42',
+      'dependencies:42',
+    ]);
+  });
+
   it('withholds stale-recovery authority when a blocker closes unmerged after the cycle', async () => {
     const fixture = staleRecoveryCycle();
     const calls: number[] = [];
     const reader = staleRecoveryReader(fixture, null, calls);
 
-    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
 
     expect(targeted).not.toBeNull();
     expect(calls).toEqual([101, 201]);
@@ -371,7 +466,7 @@ describe('targeted action reader', () => {
     const fixture = staleRecoveryCycle();
     const reader = staleRecoveryReader(fixture, null);
     const events: string[] = [];
-    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
     const result = targeted === null
       ? 'withheld'
       : await executeTargetedRecovery(targeted, events);
@@ -393,7 +488,7 @@ describe('targeted action reader', () => {
     };
     const reader = staleRecoveryReader(fixture, mergedBlocker);
 
-    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -486,7 +581,10 @@ describe('targeted action reader', () => {
       pullRequests: [decodePullRequestSnapshot(implementation)],
     };
 
-    const targeted = await reader.readPullRequest(cycleWithoutMergedOutcome, 2040);
+    const targeted = await reader.readStaleRecoveryPullRequest(
+      cycleWithoutMergedOutcome,
+      2040,
+    );
     const port = makeProductionImplementationActionPort({
       repositoryPath: '/repo',
       worktreeBase: '/attempts',
@@ -513,7 +611,7 @@ describe('targeted action reader', () => {
     };
     const reader = staleRecoveryReader(fixture, liveBlocker);
 
-    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -529,7 +627,7 @@ describe('targeted action reader', () => {
       author: 'outsider',
     });
 
-    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -544,7 +642,10 @@ describe('targeted action reader', () => {
       closingIssueNumbers: [7, 8],
     });
 
-    await expect(reader.readPullRequest(fixture.cycle, 101)).resolves.toBeNull();
+    await expect(reader.readStaleRecoveryPullRequest(
+      fixture.cycle,
+      101,
+    )).resolves.toBeNull();
   });
 
   it('withholds two trusted OPEN outcomes for one blocker before reality or mutation', async () => {
@@ -588,7 +689,7 @@ describe('targeted action reader', () => {
     });
     const events: string[] = [];
 
-    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
     const result = targeted === null
       ? 'withheld'
       : await executeTargetedRecovery(targeted, events);
@@ -641,7 +742,7 @@ describe('targeted action reader', () => {
       readPullRequestOutcomeNumbersClosingIssues: async () => new Set([201, 202]),
     });
 
-    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -657,7 +758,10 @@ describe('targeted action reader', () => {
       pullRequests: fixture.cycle.pullRequests.filter((pr) => pr.number !== 201),
     };
 
-    const targeted = await reader.readPullRequest(withoutBlockerEvidence, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(
+      withoutBlockerEvidence,
+      101,
+    );
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -744,7 +848,7 @@ describe('targeted action reader', () => {
       readPullRequestOutcomeNumbersClosingIssues: async () => new Set([201, 202]),
     });
 
-    const targeted = await reader.readPullRequest(cycle, 101);
+    const targeted = await reader.readStaleRecoveryPullRequest(cycle, 101);
 
     expect(calls).toEqual([101, 201, 202]);
     expect(reserveReads).toBe(4);
