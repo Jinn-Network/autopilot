@@ -214,6 +214,54 @@ describe('production implementation session port', () => {
       readManifest: () => manifest(),
     })).toThrow(/requires its selected GH_TOKEN/);
   });
+
+  it('does not treat the child claim commit itself as a completed child checkpoint', async () => {
+    const calls: string[][] = [];
+    const runner: CommandRunner = async (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (cmd === 'git' && args.includes('log')) {
+        if (args.at(-1) === `${CLAIM}..${CLAIM}`) return '';
+        return `Autopilot implementation claim\n\nJinn-Autopilot-Issue: 42\n`;
+      }
+      throw new Error(`unexpected call: ${cmd} ${args.join(' ')}`);
+    };
+    const port = makeProductionImplementationSessionPort({
+      runner,
+      environment: { GH_TOKEN: 'selected-secret' },
+    });
+
+    await expect(
+      port.parentHeadReferencesChild!(manifest(), CLAIM, 42),
+    ).resolves.toBe(false);
+    expect(calls).toContainEqual([
+      'git',
+      '-C', '/attempt/worktree',
+      'log', '-n', '32', '--format=%B%x00',
+      `${CLAIM}..${CLAIM}`,
+    ]);
+  });
+
+  it('recognizes a child checkpoint only after the claim commit', async () => {
+    const runner: CommandRunner = async (cmd, args) => {
+      if (
+        cmd === 'git'
+        && args.includes('log')
+        && args.at(-1) === `${CLAIM}..${WORK}`
+      ) {
+        return `Fix the review finding\n\nJinn-Autopilot-Issue: 42\n`;
+      }
+      throw new Error(`unexpected call: ${cmd} ${args.join(' ')}`);
+    };
+    const port = makeProductionImplementationSessionPort({
+      runner,
+      environment: { GH_TOKEN: 'selected-secret' },
+    });
+
+    await expect(
+      port.parentHeadReferencesChild!(manifest(), WORK, 42),
+    ).resolves.toBe(true);
+  });
+
   it('reads winning claim ancestry through only the canonical HTTPS remote and selected identity', async () => {
     const calls: Array<{ cmd: string; args: string[]; env?: Record<string, string> }> = [];
     const runner: CommandRunner = async (cmd, args, options) => {
