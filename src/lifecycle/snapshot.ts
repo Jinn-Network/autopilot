@@ -217,6 +217,16 @@ export interface GitHubLifecycleSnapshot {
   readonly partialReason?: string;
   /** A complete cached/incremental view returned after a due full read failed. */
   readonly snapshotWarning?: string;
+  /**
+   * Present only on a deliberately non-global pre-dispatch view. Scoped
+   * evidence may drive reconciliation and exact action checks, but must never
+   * replace the durable global discovery cache.
+   */
+  readonly snapshotAuthority?: 'scoped';
+  /** Original operator-selected issue numbers for a scoped authority view. */
+  readonly scopedIssueNumbers?: readonly number[];
+  /** Validated global count used to preserve fresh-work backpressure in a scoped view. */
+  readonly globalOpenPipelineBacklog?: number;
 }
 
 export function decodeBranchClaimSnapshot(raw: RawBranchClaim): BranchClaimSnapshot {
@@ -839,10 +849,22 @@ export function composeGitHubLifecycleSnapshot(
     readonly githubUsage: GitHubUsage;
     readonly parityDifferences?: readonly LifecycleParityDifference[];
     readonly parityUnavailableReason?: string;
+    readonly snapshotAuthority?: 'scoped';
+    readonly scopedIssueNumbers?: readonly number[];
+    readonly globalOpenPipelineBacklog?: number;
   },
 ): GitHubLifecycleSnapshot {
   isoTimestamp(options.capturedAt);
   isoTimestamp(options.lastFullReconciliationAt);
+  if (
+    options.globalOpenPipelineBacklog !== undefined
+    && (
+      !Number.isSafeInteger(options.globalOpenPipelineBacklog)
+      || options.globalOpenPipelineBacklog < 0
+    )
+  ) {
+    throw new Error('Global open-pipeline backlog must be a non-negative integer');
+  }
   const lifecycle = lifecycleItems(
     evidence.issues,
     evidence.pullRequests,
@@ -869,6 +891,15 @@ export function composeGitHubLifecycleSnapshot(
     ...(options.parityUnavailableReason === undefined
       ? {}
       : { parityUnavailableReason: options.parityUnavailableReason }),
+    ...(options.snapshotAuthority === undefined
+      ? {}
+      : {
+          snapshotAuthority: options.snapshotAuthority,
+          scopedIssueNumbers: [...(options.scopedIssueNumbers ?? [])],
+          ...(options.globalOpenPipelineBacklog === undefined
+            ? {}
+            : { globalOpenPipelineBacklog: options.globalOpenPipelineBacklog }),
+        }),
   });
 }
 

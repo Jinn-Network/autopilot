@@ -35,6 +35,83 @@ function attempt(
 }
 
 describe('active runtime boundary', () => {
+  it('reserves one bounded review cohort, isolates failures, and returns scheduled order', async () => {
+    const started: number[] = [];
+    const reservations: number[] = [];
+    const releases = new Map<number, {
+      resolve: (value: { status: string; detail?: string }) => void;
+      reject: (error: Error) => void;
+    }>();
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      reserveReviewCohort: async (size) => { reservations.push(size); },
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async (action) => {
+          started.push(action.prNumber);
+          return new Promise((resolve, reject) => {
+            releases.set(action.prNumber, { resolve, reject });
+          });
+        },
+        merge: async () => ({ status: 'merged' }),
+      },
+    });
+    const actions = [84, 85].map((prNumber, index) => ({
+      kind: 'claim-review' as const,
+      issueNumber: 42 + index,
+      prNumber,
+      head: HEAD,
+    }));
+
+    const pending = runtime.executeReviewActions!(actions, {} as never);
+    await Promise.resolve();
+    expect(started).toEqual([84, 85]);
+    releases.get(85)!.resolve({ status: 'spawned', detail: 'second' });
+    releases.get(84)!.reject(new Error('first failed'));
+
+    await expect(pending).resolves.toEqual([
+      { outcome: 'failed', reason: 'first failed' },
+      { outcome: 'spawned', reason: 'second' },
+    ]);
+    expect(reservations).toEqual([2]);
+  });
+
+  it('rejects an oversized review cohort before reserving quota or starting handlers', async () => {
+    const calls: string[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      reserveReviewCohort: async () => { calls.push('reserve'); },
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => {
+          calls.push('review');
+          return { status: 'spawned' };
+        },
+        merge: async () => ({ status: 'merged' }),
+      },
+    });
+    const actions = [84, 85].map((prNumber, index) => ({
+      kind: 'claim-review' as const,
+      issueNumber: 42 + index,
+      prNumber,
+      head: HEAD,
+    }));
+
+    await expect(runtime.executeReviewActions!(actions, {} as never))
+      .rejects.toThrow(/cohort.*capacity/i);
+    expect(calls).toEqual([]);
+  });
+
   it('derives only this runner’s phase capacity from injected local attempts', () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),

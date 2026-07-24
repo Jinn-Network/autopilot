@@ -60,6 +60,8 @@ import {
   makeProductionReconciliationWriter,
   makeTargetedActionReader,
   assertRateLimitReserve,
+  MAX_FULL_RECONCILIATION_AGE_MS,
+  REVIEW_CLAIM_ACTION_RESERVE,
   TARGETED_PR_RESERVE,
   TARGETED_PROJECT_ITEM_RESERVE,
   parseLifecycleCli,
@@ -74,8 +76,18 @@ import {
   selectCredential,
   sweepDeadAttempts,
   freeDiskBytes,
+  type LifecycleCycleReport,
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
+
+export function lifecycleExitCodeForReport(
+  report: Pick<LifecycleCycleReport, 'status'>,
+  once: boolean,
+): number | undefined {
+  if (report.status === 'rejected') return 2;
+  if (report.status === 'failed' && once) return 1;
+  return undefined;
+}
 
 export async function loadDaemonCadenceSeed(
   context: {
@@ -535,7 +547,28 @@ export async function runAutopilotV2(
         runnerId,
         credentials: credentials!,
         authorAllowlist: allowlist,
-        readSnapshot: () => readCycleSnapshot(),
+        readReviewSnapshot: (cycleSnapshot, prNumber) =>
+          targeted.readPullRequest(cycleSnapshot, prNumber),
+        readReservedReviewSnapshot: (cycleSnapshot, prNumber) =>
+          targeted.readReservedPullRequest(cycleSnapshot, prNumber),
+        readImplementationSnapshot: async (cycleSnapshot, action) => {
+          const targetedSnapshot = action.intent === 'stale-recovery'
+            ? await targeted.readPullRequest(cycleSnapshot, action.prNumber)
+            : (await targeted.readIssue(cycleSnapshot, action.issueNumber))?.snapshot ?? null;
+          if (targetedSnapshot === null) {
+            throw new Error(
+              `Targeted implementation authority for issue #${action.issueNumber} is unavailable`,
+            );
+          }
+          return targetedSnapshot;
+        },
+        reserveReviewCohort: async (size) => {
+          assertRateLimitReserve(
+            await currentGraphQlRemaining(),
+            REVIEW_CLAIM_ACTION_RESERVE * size,
+            DEFAULT_FLOOR,
+          );
+        },
         ...reconciliationTargets,
         config,
         spawn: makeLoggingSpawn(),
@@ -573,6 +606,12 @@ export async function runAutopilotV2(
     try {
       report = await runLifecycleCycle(options.mode, {
         readSnapshot: readCycleSnapshot,
+        readScopedSnapshot: (issueNumbers, rateLimitFloor) =>
+          snapshotCoordinator.readScoped(
+            issueNumbers,
+            rateLimitFloor,
+            MAX_FULL_RECONCILIATION_AGE_MS,
+          ),
         resetGitHubUsage: () => reader.resetGitHubUsage(),
         readGitHubUsage: () => reader.githubUsage(),
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
@@ -651,7 +690,8 @@ export async function runAutopilotV2(
     } else {
       process.stdout.write(`${renderLifecycleHuman(report)}\n`);
     }
-    if (report.status === 'rejected') process.exitCode = 2;
+    const exitCode = lifecycleExitCodeForReport(report, options.once);
+    if (exitCode !== undefined) process.exitCode = exitCode;
   };
 
   await runLifecycleCadence({

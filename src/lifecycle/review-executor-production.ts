@@ -49,7 +49,9 @@ export interface ProductionReviewActionPortOptions {
   readonly repositorySlug?: string;
   readonly repositoryUrl?: string;
   readonly projectMapping?: ProjectMapping;
-  readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
+  readonly readSnapshot: (
+    prNumber: number,
+  ) => Promise<GitHubLifecycleSnapshot | null>;
   readonly changedFiles?: (prNumber: number) => Promise<readonly string[]>;
   readonly codeownersText?: (input: {
     readonly prNumber: number;
@@ -271,11 +273,15 @@ export function makeProductionReviewActionPort(
   };
 
   return {
-    readCandidate: async (prNumber) =>
-      candidateFromSnapshot(await options.readSnapshot(), prNumber),
+    readCandidate: async (prNumber) => {
+      const snapshot = await options.readSnapshot(prNumber);
+      return snapshot === null ? null : candidateFromSnapshot(snapshot, prNumber);
+    },
 
-    confirmAcquisition: async ({ prNumber }) =>
-      candidateFromSnapshot(await options.readSnapshot(), prNumber),
+    confirmAcquisition: async ({ prNumber }) => {
+      const snapshot = await options.readSnapshot(prNumber);
+      return snapshot === null ? null : candidateFromSnapshot(snapshot, prNumber);
+    },
 
     createReviewRecord: ({ record, parent, credential }) =>
       withCredential(credential, (_askpass, environment) =>

@@ -37,6 +37,7 @@ import {
   type TerminalClaimEvidence,
 } from './snapshot.js';
 import { implementationClaimFingerprint } from './terminal-claim.js';
+import { parseChildMarker } from './child-issues.js';
 
 /** Closed-index overlap selected at a full reconciliation and held fixed until the next one. */
 export const RECENTLY_CLOSED_OVERLAP_MS = 5 * 60 * 1_000;
@@ -318,6 +319,11 @@ function assertCompletedFloor(remaining: number | null, floor: number): void {
 }
 
 function evidence(snapshot: GitHubLifecycleSnapshot): LifecycleSnapshotEvidence {
+  if (snapshot.snapshotAuthority === 'scoped') {
+    throw new IncrementalSnapshotUnavailableError(
+      'scoped pre-dispatch evidence cannot become global cache authority',
+    );
+  }
   if (
     snapshot.snapshotComplete !== true
     || snapshot.snapshotMode === undefined
@@ -509,6 +515,213 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     return options.mode === 'full'
       ? this.readFull(options.rateLimitFloor, prior)
       : this.readIncremental(options.rateLimitFloor, prior);
+  }
+
+  /**
+   * Builds a non-persisted issue-closure view from a recent, fully validated
+   * global cache. Targeted live reads are limited to the selected closure; a
+   * missing, stale, corrupt, or incomplete global seed declines the fast path
+   * so the coordinator can retain its normal unrestricted read behavior.
+   */
+  async readScoped(options: {
+    readonly issueNumbers: ReadonlySet<number>;
+    readonly rateLimitFloor: number;
+    readonly maxGlobalAgeMs: number;
+  }): Promise<GitHubLifecycleSnapshot | null> {
+    if (
+      !Number.isSafeInteger(options.rateLimitFloor)
+      || options.rateLimitFloor < DEFAULT_FLOOR
+    ) {
+      throw new Error(`Lifecycle rate-limit floor must be at least ${DEFAULT_FLOOR}`);
+    }
+    if (
+      !Number.isSafeInteger(options.maxGlobalAgeMs)
+      || options.maxGlobalAgeMs < 0
+    ) {
+      throw new Error('Scoped global-authority age must be a non-negative integer');
+    }
+    const requested = [...options.issueNumbers].sort((left, right) => left - right);
+    if (
+      requested.length === 0
+      || requested.some((number) => !Number.isSafeInteger(number) || number <= 0)
+    ) return null;
+
+    let prior: LifecycleDiscoveryState | null;
+    try {
+      prior = await this.loadState('incremental');
+    } catch (error) {
+      if (error instanceof LifecycleDiscoveryCacheCorruptError) return null;
+      throw error;
+    }
+    if (prior === null) return null;
+    const now = this.now();
+    if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+      throw new Error('Incremental snapshot clock returned an invalid Date');
+    }
+    const lastFullMs = Date.parse(prior.evidence.lastFullReconciliationAt);
+    const age = now.getTime() - lastFullMs;
+    if (!Number.isFinite(lastFullMs) || age < 0 || age > options.maxGlobalAgeMs) {
+      return null;
+    }
+
+    const cachedIssues = uniqueByNumber(prior.evidence.issues, 'cached scoped issues');
+    const cachedPullRequests = uniqueByNumber(
+      prior.evidence.pullRequests,
+      'cached scoped pull requests',
+    );
+    const livePullRequests = new Map<number, PullRequestSnapshot>();
+    const selectedIssues = new Set(requested);
+    const selectedPullRequests = new Set<number>();
+    const queriedIssues = new Set<number>();
+    const hydratedPullRequests = new Set<number>();
+
+    const prIssueNumbers = (pr: PullRequestSnapshot): ReadonlySet<number> => {
+      const numbers = new Set(associatedIssueNumbers(pr));
+      if (pr.branchClaim !== undefined) numbers.add(pr.branchClaim.issueNumber);
+      if (pr.humanIssueNumber !== undefined) numbers.add(pr.humanIssueNumber);
+      const marker =
+        /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/.exec(pr.body);
+      if (marker?.[1] !== undefined) numbers.add(Number(marker[1]));
+      return numbers;
+    };
+    const expandClosure = (): boolean => {
+      let changed = false;
+      const addIssue = (number: number) => {
+        if (!selectedIssues.has(number)) {
+          selectedIssues.add(number);
+          changed = true;
+        }
+      };
+      const addPullRequest = (number: number) => {
+        if (!selectedPullRequests.has(number)) {
+          selectedPullRequests.add(number);
+          changed = true;
+        }
+      };
+
+      for (const issueNumber of [...selectedIssues]) {
+        const issue = cachedIssues.get(issueNumber);
+        for (const blocker of issue?.blockedByIssues ?? []) addIssue(blocker);
+        const child = parseChildMarker(issue?.body ?? '');
+        if (child !== null) addPullRequest(child.parentPr);
+        for (const branch of prior.evidence.branches) {
+          if (branch.issueNumber !== issueNumber) continue;
+          if (branch.claim.prNumber !== undefined) addPullRequest(branch.claim.prNumber);
+        }
+        for (const terminal of prior.terminalClaims) {
+          if (terminal.issueNumber === issueNumber) addPullRequest(terminal.prNumber);
+        }
+        for (const pr of [...cachedPullRequests.values(), ...livePullRequests.values()]) {
+          if (prIssueNumbers(pr).has(issueNumber)) addPullRequest(pr.number);
+        }
+      }
+
+      for (const prNumber of [...selectedPullRequests]) {
+        const pr = livePullRequests.get(prNumber) ?? cachedPullRequests.get(prNumber);
+        if (pr !== undefined) {
+          for (const issueNumber of prIssueNumbers(pr)) addIssue(issueNumber);
+        }
+        for (const issue of cachedIssues.values()) {
+          if (parseChildMarker(issue.body ?? '')?.parentPr === prNumber) {
+            addIssue(issue.number);
+          }
+        }
+        for (const branch of prior.evidence.branches) {
+          if (branch.claim.prNumber === prNumber) addIssue(branch.issueNumber);
+        }
+        for (const terminal of prior.terminalClaims) {
+          if (terminal.prNumber === prNumber) addIssue(terminal.issueNumber);
+        }
+      }
+      return changed;
+    };
+
+    while (true) {
+      let changed = expandClosure();
+      const pendingIssues = [...selectedIssues]
+        .filter((number) => !queriedIssues.has(number))
+        .sort((left, right) => left - right);
+      for (const issueNumber of pendingIssues) {
+        if (!cachedIssues.has(issueNumber)) return null;
+        queriedIssues.add(issueNumber);
+        const remaining = await this.requireGraphQlRemaining();
+        assertGraphQlReserve(remaining, TARGETED_RELATION_RESERVE, options.rateLimitFloor);
+        const related = await this.requireClosingPullRequestNumbers([issueNumber]);
+        for (const prNumber of related) {
+          if (!selectedPullRequests.has(prNumber)) {
+            selectedPullRequests.add(prNumber);
+            changed = true;
+          }
+        }
+      }
+
+      const pendingPullRequests = [...selectedPullRequests]
+        .filter((number) => !hydratedPullRequests.has(number))
+        .sort((left, right) => left - right);
+      for (const prNumber of pendingPullRequests) {
+        hydratedPullRequests.add(prNumber);
+        const remaining = await this.requireGraphQlRemaining();
+        assertTargetedReserve(remaining, options.rateLimitFloor);
+        const raw = await this.requireHydrator(prNumber);
+        if (raw === null) {
+          if (cachedPullRequests.get(prNumber)?.state === 'OPEN') return null;
+          continue;
+        }
+        const decoded = decodePullRequestSnapshot(raw);
+        livePullRequests.set(prNumber, decoded);
+        changed = true;
+      }
+      if (!changed && pendingIssues.length === 0 && pendingPullRequests.length === 0) break;
+    }
+
+    const issues = [...selectedIssues]
+      .sort((left, right) => left - right)
+      .map((number) => cachedIssues.get(number))
+      .filter((issue): issue is PolledIssue => issue !== undefined);
+    if (issues.length !== selectedIssues.size) return null;
+    const pullRequests = [...selectedPullRequests]
+      .sort((left, right) => left - right)
+      .map((number) => livePullRequests.get(number) ?? cachedPullRequests.get(number))
+      .filter((pr): pr is PullRequestSnapshot => pr !== undefined);
+    if (pullRequests.length !== selectedPullRequests.size) return null;
+    const branches = prior.evidence.branches.filter((branch) => (
+      selectedIssues.has(branch.issueNumber)
+      || (
+        branch.claim.prNumber !== undefined
+        && selectedPullRequests.has(branch.claim.prNumber)
+      )
+    ));
+    const terminalClaims = prior.terminalClaims.filter((terminal) => (
+      selectedIssues.has(terminal.issueNumber)
+      || selectedPullRequests.has(terminal.prNumber)
+    ));
+    const project = {
+      ...prior.evidence.project,
+      items: prior.evidence.project.items.filter((item) => (
+        item.contentType === 'Issue'
+          ? selectedIssues.has(item.number)
+          : item.contentType === 'PullRequest' && selectedPullRequests.has(item.number)
+      )),
+    };
+    const capturedAt = now.toISOString();
+    return composeGitHubLifecycleSnapshot({
+      project,
+      issues,
+      pullRequests,
+      branches,
+      terminalClaims,
+    }, {
+      authorAllowlist: this.authorAllowlist,
+      capturedAt,
+      snapshotMode: 'incremental',
+      lastFullReconciliationAt: prior.evidence.lastFullReconciliationAt,
+      githubUsage: this.fullReader.githubUsage(),
+      snapshotAuthority: 'scoped',
+      scopedIssueNumbers: requested,
+      globalOpenPipelineBacklog: prior.evidence.pullRequests.filter((pr) => (
+        pr.state === 'OPEN' && pr.labels.includes('engine:review')
+      )).length,
+    });
   }
 
   private async readFull(

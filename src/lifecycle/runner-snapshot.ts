@@ -330,7 +330,13 @@ function cadenceSeedAuthorityDetail(
 }
 
 export interface LifecycleSnapshotCoordinatorOptions {
-  readonly source: LifecycleSnapshotSource;
+  readonly source: LifecycleSnapshotSource & {
+    readScoped?(options: {
+      readonly issueNumbers: ReadonlySet<number>;
+      readonly rateLimitFloor: number;
+      readonly maxGlobalAgeMs: number;
+    }): Promise<GitHubLifecycleSnapshot | null>;
+  };
   readonly configuredMode: SnapshotReadMode;
   readonly fullReconcileMs: number;
   /** Active/recover runners seed authoritatively; routine observe status does not. */
@@ -349,7 +355,7 @@ export interface LifecycleSnapshotCoordinatorOptions {
  * mutation authority. The underlying source owns atomic cache replacement.
  */
 export class LifecycleSnapshotCoordinator {
-  private readonly source: LifecycleSnapshotSource;
+  private readonly source: LifecycleSnapshotCoordinatorOptions['source'];
   private readonly configuredMode: SnapshotReadMode;
   private readonly fullReconcileMs: number;
   private readonly startupFull: boolean;
@@ -360,6 +366,8 @@ export class LifecycleSnapshotCoordinator {
   private started = false;
   private lastFullReconciliationAt: string | null = null;
   private fullRetryDue = false;
+  private preserveUsageOnNextRead = false;
+  private scopedCadenceFence: string | null = null;
 
   constructor(options: LifecycleSnapshotCoordinatorOptions) {
     if (!Number.isSafeInteger(options.fullReconcileMs) || options.fullReconcileMs <= 0) {
@@ -390,6 +398,46 @@ export class LifecycleSnapshotCoordinator {
       return 'full';
     }
     return 'incremental';
+  }
+
+  async readScoped(
+    issueNumbers: ReadonlySet<number>,
+    rateLimitFloor: number,
+    maxGlobalAgeMs: number,
+  ): Promise<GitHubLifecycleSnapshot | null> {
+    if (this.source.readScoped === undefined) return null;
+    const requestedAt = exactNow(this.now);
+    const manualUnmarkedStartup = (
+      !this.started
+      && this.lastFullReconciliationAt === null
+      && this.startupFull
+      && this.configuredMode === 'incremental'
+      && !this.forceFull
+      && !this.fullRetryDue
+    );
+    if (this.nextMode(requestedAt) === 'full' && !manualUnmarkedStartup) return null;
+    const cadenceFence = this.lastFullReconciliationAt;
+    const scoped = await this.source.readScoped({
+      issueNumbers,
+      rateLimitFloor,
+      maxGlobalAgeMs,
+    });
+    if (scoped !== null) {
+      this.preserveUsageOnNextRead = true;
+      const authorityFence = cadenceFence ?? scoped.lastFullReconciliationAt;
+      if (authorityFence === null || authorityFence === undefined) return null;
+      const authorityDetail = cadenceSeedAuthorityDetail(
+        scoped,
+        authorityFence,
+        requestedAt.getTime(),
+        exactNow(this.now).getTime(),
+        this.fullReconcileMs,
+      );
+      if (authorityDetail !== null) return null;
+      this.lastFullReconciliationAt = scoped.lastFullReconciliationAt ?? null;
+      this.scopedCadenceFence = scoped.lastFullReconciliationAt ?? null;
+    }
+    return scoped;
   }
 
   private async retryFullAfterSeededIncremental(
@@ -423,21 +471,28 @@ export class LifecycleSnapshotCoordinator {
   async read(rateLimitFloor: number): Promise<GitHubLifecycleSnapshot> {
     const now = exactNow(this.now);
     const mode = this.nextMode(now);
-    const startupCadenceSeed = !this.started && mode === 'incremental'
-      ? this.lastFullReconciliationAt
+    const preserveUsage = this.preserveUsageOnNextRead;
+    this.preserveUsageOnNextRead = false;
+    const cadenceFence = mode === 'incremental'
+      ? this.scopedCadenceFence ?? (!this.started ? this.lastFullReconciliationAt : null)
       : null;
+    this.scopedCadenceFence = null;
     this.started = true;
     try {
-      const snapshot = await this.source.read({ mode, rateLimitFloor });
+      const snapshot = await this.source.read({
+        mode,
+        rateLimitFloor,
+        ...(preserveUsage ? { resetUsage: false } : {}),
+      });
       if (mode === 'full') {
         assertFullSnapshotAuthority(snapshot, now.getTime(), exactNow(this.now).getTime());
       } else if (snapshot.snapshotComplete !== true) {
         throw new IncrementalSnapshotUnavailableError('snapshot source returned a partial view');
       }
-      if (startupCadenceSeed !== null) {
+      if (cadenceFence !== null) {
         const authorityDetail = cadenceSeedAuthorityDetail(
           snapshot,
-          startupCadenceSeed,
+          cadenceFence,
           now.getTime(),
           exactNow(this.now).getTime(),
           this.fullReconcileMs,
@@ -452,7 +507,7 @@ export class LifecycleSnapshotCoordinator {
       return snapshot;
     } catch (error) {
       if (
-        startupCadenceSeed !== null
+        cadenceFence !== null
         && mode === 'incremental'
         && (
           error instanceof IncrementalSnapshotUnavailableError

@@ -67,6 +67,14 @@ export interface LifecycleCliOptions {
 export interface LifecycleControllerDeps {
   readSnapshot(rateLimitFloor?: number): Promise<GitHubLifecycleSnapshot>;
   /**
+   * Optional allowlist fast path. A null result means no recent global cache
+   * authority exists and the controller must keep its unrestricted behavior.
+   */
+  readScopedSnapshot?(
+    issueNumbers: ReadonlySet<number>,
+    rateLimitFloor: number,
+  ): Promise<GitHubLifecycleSnapshot | null>;
+  /**
    * Optional end-of-cycle GraphQL remaining probe. When set, the cycle report
    * includes `budget.pointsSpent` (start remaining − end remaining).
    */
@@ -116,6 +124,10 @@ export interface LifecycleControllerDeps {
       action: NewWorkAction,
       snapshot: GitHubLifecycleSnapshot,
     ): Promise<{ readonly outcome: string; readonly reason?: string }>;
+    executeReviewActions?(
+      actions: readonly Extract<NewWorkAction, { kind: 'claim-review' }>[],
+      snapshot: GitHubLifecycleSnapshot,
+    ): Promise<readonly { readonly outcome: string; readonly reason?: string }[]>;
   };
 }
 
@@ -190,11 +202,12 @@ type LifecycleFailedReport = {
   readonly status: 'failed';
   readonly mode: AutopilotMode;
   readonly message: string;
-  readonly mutationFree: true;
-  readonly items: readonly [];
-  readonly orphanBranchClaims: readonly [];
-  readonly diagnostics: readonly [];
-  readonly events: readonly [];
+  readonly mutationFree: boolean;
+  readonly items: readonly LifecycleStatusItem[];
+  readonly orphanBranchClaims: readonly LifecycleOrphanBranchClaimStatus[];
+  readonly diagnostics: readonly LifecycleStatusDiagnostic[];
+  readonly events: readonly LifecycleLogEvent[];
+  readonly reconciliation?: ReconciliationReport;
 } & LifecycleFailedUsage;
 
 export type LifecycleCycleReport =
@@ -284,6 +297,40 @@ function failedCycleGitHubUsage(deps: LifecycleControllerDeps): GitHubUsage {
     throw new Error('GitHub cycle usage meter is unavailable after snapshot failure');
   }
   return deps.readGitHubUsage();
+}
+
+function failedAfterScopedPreDispatch(
+  mode: AutopilotMode,
+  deps: LifecycleControllerDeps,
+  scopedPass: ActivePassResult,
+  message: string,
+): LifecycleFailedReport {
+  const failed = {
+    status: 'failed' as const,
+    mode,
+    message,
+    mutationFree: false,
+    items: scopedPass.items,
+    orphanBranchClaims: scopedPass.orphanBranchClaims,
+    diagnostics: scopedPass.diagnostics,
+    events: scopedPass.events,
+    reconciliation: scopedPass.reconciliation,
+  };
+  try {
+    return {
+      ...failed,
+      usageAccounting: { complete: true },
+      githubUsage: failedCycleGitHubUsage(deps),
+    };
+  } catch (error) {
+    return {
+      ...failed,
+      usageAccounting: {
+        complete: false,
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
 }
 
 function positiveNumber(raw: string | undefined, label: string): number {
@@ -896,6 +943,171 @@ export function fullReconciliationAllowsNewClaims(
   return age >= 0 && age <= MAX_FULL_RECONCILIATION_AGE_MS;
 }
 
+interface ActivePassResult {
+  readonly items: readonly LifecycleStatusItem[];
+  readonly orphanBranchClaims: readonly LifecycleOrphanBranchClaimStatus[];
+  readonly diagnostics: readonly LifecycleStatusDiagnostic[];
+  readonly events: readonly LifecycleLogEvent[];
+  readonly reconciliation: ReconciliationReport;
+}
+
+async function executeActivePass(
+  snapshot: GitHubLifecycleSnapshot,
+  deps: LifecycleControllerDeps,
+  cycleId: string,
+  now: Date,
+): Promise<ActivePassResult> {
+  const view = deriveLifecycle(snapshot.lifecycle, now, deps.staleAfterMs);
+  const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
+  const plan = planProjection(context);
+  const items = statusItems(view, plan.actions, now, context.orphanBranchClaims);
+  const orphanBranchClaims = orphanStatusItems(
+    context.orphanBranchClaims,
+    plan.actions,
+  );
+  const diagnostics: LifecycleStatusDiagnostic[] = snapshot.diagnostics.map((diagnostic) => ({
+    ...diagnostic,
+    phase: 'human',
+    desiredActions: plan.actions.filter((action) => (
+      ('prNumber' in action
+        && diagnostic.pullRequests.some((pr) => pr.number === action.prNumber))
+      || ('issueNumber' in action
+        && action.issueNumber !== undefined
+        && diagnostic.issueNumbers.includes(action.issueNumber))
+    )),
+  }));
+  const writer = deps.writerForSnapshot?.(snapshot) ?? deps.writer!;
+  const reconciliation = await executeProjectionPlan(plan, writer);
+  const reconciliationEvents = reconciliation.results.map((result) => (
+    eventFor(
+      result,
+      items,
+      orphanBranchClaims,
+      diagnostics,
+      cycleId,
+      deps.runnerId,
+      'active',
+    )
+  ));
+  const actionEvents: LifecycleLogEvent[] = [];
+  const blockedIssues = blockedIssueNumbers(plan.actions, view);
+  const local = deps.active!.readLocalState();
+  const openPipelineBacklog = snapshot.snapshotAuthority === 'scoped'
+    ? snapshot.globalOpenPipelineBacklog!
+    : snapshot.pullRequests.filter((pr) => (
+        pr.state === 'OPEN' && pr.labels.includes('engine:review')
+      )).length;
+  const candidates = applyMergePolicy(
+    activeCandidates(snapshot, view),
+    deps.mergePolicy ?? 'manual',
+  ).filter((candidate) => (
+    !blockedIssues.has(candidate.issueNumber)
+    && matchesOnlyIssuesAllowlist(candidate.issueNumber, deps.active!.onlyIssues)
+  ));
+  const reconciliationFresh = fullReconciliationAllowsNewClaims(
+    snapshot.lastFullReconciliationAt,
+    now,
+  );
+  if (!reconciliationFresh) {
+    actionEvents.push(...candidates.map((candidate): LifecycleLogEvent => ({
+      cycleId,
+      runnerId: deps.runnerId,
+      mode: 'active',
+      phase: phaseForSchedulingSkip(candidate),
+      subject: candidate.phase === 'implementation'
+        ? `issue:${candidate.issueNumber}`
+        : candidate.phase === 'repair-machine-child'
+          ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
+        : `issue:${candidate.issueNumber}/pr:${candidate.prNumber}`,
+      action: 'schedule',
+      outcome: 'skipped',
+      reason: 'full-reconciliation-stale',
+    })));
+  }
+  const scheduling = scheduleActiveActions({
+    candidates: reconciliationFresh ? candidates : [],
+    remaining: local.remaining,
+    availableLogins: local.availableLogins,
+    implementationPreferredLogin: local.implementationPreferredLogin,
+    openPipelineBacklog,
+    implementationBackpressureThreshold:
+      deps.active!.implementationBackpressureThreshold,
+    ...(local.newWorkPaused ? { newWorkPaused: true } : {}),
+  });
+  actionEvents.push(...scheduling.skips.map((skip): LifecycleLogEvent => ({
+    cycleId,
+    runnerId: deps.runnerId,
+    mode: 'active',
+    phase: phaseForSchedulingSkip(skip),
+    subject: skip.subject,
+    action: 'schedule',
+    outcome: 'skipped',
+    reason: skip.reason,
+  })));
+  const actionEvent = (
+    action: NewWorkAction,
+    result: { readonly outcome: string; readonly reason?: string },
+  ): LifecycleLogEvent => ({
+    cycleId,
+    runnerId: deps.runnerId,
+    mode: 'active',
+    phase: phaseForAction(action),
+    subject: subjectForAction(action),
+    ...('head' in action ? { head: action.head } : {}),
+    action: action.kind,
+    outcome: result.outcome,
+    ...(result.reason === undefined ? {} : { reason: result.reason }),
+  });
+  for (let index = 0; index < scheduling.actions.length;) {
+    const action = scheduling.actions[index]!;
+    if (
+      action.kind === 'claim-review'
+      && deps.active!.executeReviewActions !== undefined
+    ) {
+      const cohort: Extract<NewWorkAction, { kind: 'claim-review' }>[] = [];
+      while (scheduling.actions[index]?.kind === 'claim-review') {
+        cohort.push(scheduling.actions[index] as Extract<
+          NewWorkAction,
+          { kind: 'claim-review' }
+        >);
+        index += 1;
+      }
+      try {
+        const results = await deps.active!.executeReviewActions(cohort, snapshot);
+        if (results.length !== cohort.length) {
+          throw new Error('review cohort returned a result count different from its schedule');
+        }
+        actionEvents.push(...cohort.map((candidate, offset) => (
+          actionEvent(candidate, results[offset]!)
+        )));
+      } catch (error) {
+        actionEvents.push(...cohort.map((candidate) => actionEvent(candidate, {
+          outcome: 'failed',
+          reason: error instanceof Error ? error.message : String(error),
+        })));
+      }
+      continue;
+    }
+    try {
+      const result = await deps.active!.executeAction(action, snapshot);
+      actionEvents.push(actionEvent(action, result));
+    } catch (error) {
+      actionEvents.push(actionEvent(action, {
+        outcome: 'failed',
+        reason: error instanceof Error ? error.message : String(error),
+      }));
+    }
+    index += 1;
+  }
+  return {
+    items,
+    orphanBranchClaims,
+    diagnostics,
+    events: [...reconciliationEvents, ...actionEvents],
+    reconciliation,
+  };
+}
+
 export async function runLifecycleCycle(
   mode: AutopilotMode,
   deps: LifecycleControllerDeps,
@@ -947,10 +1159,56 @@ export async function runLifecycleCycle(
     }
   }
   const rateLimitFloor = Math.max(DEFAULT_FLOOR, deps.rateLimitFloor ?? DEFAULT_FLOOR);
+  let scopedCycleId: string | undefined;
+  const cycleIdForScopedPass = (): string => {
+    scopedCycleId ??= deps.cycleId();
+    return scopedCycleId;
+  };
+  let scopedPass: ActivePassResult | undefined;
+  if (
+    mode === 'active'
+    && deps.active!.onlyIssues !== undefined
+    && deps.active!.onlyIssues.size > 0
+    && deps.readScopedSnapshot !== undefined
+  ) {
+    const scoped = await deps.readScopedSnapshot(
+      deps.active!.onlyIssues,
+      rateLimitFloor,
+    );
+    if (scoped !== null) {
+      if (
+        scoped.snapshotAuthority !== 'scoped'
+        || scoped.snapshotComplete !== true
+        || !Number.isSafeInteger(scoped.globalOpenPipelineBacklog)
+        || scoped.globalOpenPipelineBacklog! < 0
+        || scoped.githubUsage?.graphqlRemaining === null
+        || scoped.githubUsage?.graphqlRemaining === undefined
+        || scoped.githubUsage.graphqlRemaining < rateLimitFloor
+      ) {
+        throw new Error('Scoped pre-dispatch source returned non-authoritative evidence');
+      }
+      scopedPass = await executeActivePass(
+        scoped,
+        deps,
+        cycleIdForScopedPass(),
+        deps.now(),
+      );
+    }
+  }
   let snapshot: GitHubLifecycleSnapshot;
   try {
     snapshot = await deps.readSnapshot(rateLimitFloor);
   } catch (error) {
+    if (scopedPass !== undefined) {
+      return failedAfterScopedPreDispatch(
+        mode,
+        deps,
+        scopedPass,
+        `Global lifecycle snapshot failed after scoped pre-dispatch: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
     if (error instanceof LifecycleRateLimitError) {
       return {
         status: 'rate-limited',
@@ -970,11 +1228,11 @@ export async function runLifecycleCycle(
         message: `Lifecycle snapshot failed before mutations: ${
           error instanceof Error ? error.message : String(error)
         }`,
-        mutationFree: true as const,
-        items: [] as const,
-        orphanBranchClaims: [] as const,
-        diagnostics: [] as const,
-        events: [] as const,
+        mutationFree: true,
+        items: [],
+        orphanBranchClaims: [],
+        diagnostics: [],
+        events: [],
       };
       try {
         return {
@@ -996,6 +1254,14 @@ export async function runLifecycleCycle(
   }
   if (snapshot.snapshotComplete !== true) {
     if (mode !== 'observe') {
+      if (scopedPass !== undefined) {
+        return failedAfterScopedPreDispatch(
+          mode,
+          deps,
+          scopedPass,
+          'Global lifecycle snapshot was incomplete after scoped pre-dispatch',
+        );
+      }
       return {
         status: 'rejected',
         mode,
@@ -1023,6 +1289,18 @@ export async function runLifecycleCycle(
   }
   const graphqlRemaining = snapshot.githubUsage?.graphqlRemaining ?? null;
   if (graphqlRemaining === null || graphqlRemaining < rateLimitFloor) {
+    if (scopedPass !== undefined) {
+      return failedAfterScopedPreDispatch(
+        mode,
+        deps,
+        scopedPass,
+        graphqlRemaining === null
+          ? 'Global GitHub GraphQL rate-limit evidence was unavailable after scoped pre-dispatch'
+          : `Global GitHub rate-limit budget was low after scoped pre-dispatch: ${
+              graphqlRemaining
+            } remaining`,
+      );
+    }
     return {
       status: 'rate-limited',
       mode,
@@ -1036,6 +1314,7 @@ export async function runLifecycleCycle(
       events: [],
     };
   }
+  const cycleId = scopedCycleId ?? deps.cycleId();
   const remainingStart = snapshot.project.rateLimit.remaining;
   const attachBudget = async <Report extends { readonly status: 'ok' }>(
     report: Report,
@@ -1058,10 +1337,37 @@ export async function runLifecycleCycle(
     };
   };
   const now = deps.now();
+  if (mode === 'active') {
+    const activePass = await executeActivePass(snapshot, deps, cycleId, now);
+    const combinedReconciliation = scopedPass === undefined
+      ? activePass.reconciliation
+      : {
+          results: [
+            ...scopedPass.reconciliation.results,
+            ...activePass.reconciliation.results,
+          ],
+        };
+    return attachBudget({
+      status: 'ok',
+      mode,
+      cycleId,
+      runnerId: deps.runnerId,
+      capturedAt: snapshot.capturedAt,
+      ...snapshotReportMetadata(snapshot),
+      githubUsage: finalGitHubUsage(deps, snapshot),
+      items: activePass.items,
+      orphanBranchClaims: activePass.orphanBranchClaims,
+      diagnostics: activePass.diagnostics,
+      events: [
+        ...(scopedPass?.events ?? []),
+        ...activePass.events,
+      ],
+      reconciliation: combinedReconciliation,
+    });
+  }
   const view = deriveLifecycle(snapshot.lifecycle, now, deps.staleAfterMs);
   const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
   const plan = planProjection(context);
-  const cycleId = deps.cycleId();
   const items = statusItems(view, plan.actions, now, context.orphanBranchClaims);
   const orphanBranchClaims = orphanStatusItems(
     context.orphanBranchClaims,
@@ -1103,109 +1409,9 @@ export async function runLifecycleCycle(
       diagnostics,
       cycleId,
       deps.runnerId,
-      mode === 'active' ? 'active' : 'recover',
+      'recover',
     )
   ));
-  // Stage 3: board-archive relocated to the scheduled painter
-  // (`scripts/paint-board.ts`); the cycle no longer mutates Project Status
-  // or archives Done items.
-  if (mode === 'active') {
-    const actionEvents: LifecycleLogEvent[] = [];
-    const blockedIssues = blockedIssueNumbers(plan.actions, view);
-    const local = deps.active!.readLocalState();
-    const openPipelineBacklog = snapshot.pullRequests.filter((pr) => (
-      pr.state === 'OPEN' && pr.labels.includes('engine:review')
-    )).length;
-    const candidates = applyMergePolicy(
-      activeCandidates(snapshot, view),
-      deps.mergePolicy ?? 'manual',
-    ).filter((candidate) => (
-      !blockedIssues.has(candidate.issueNumber)
-      && matchesOnlyIssuesAllowlist(candidate.issueNumber, deps.active!.onlyIssues)
-    ));
-    const reconciliationFresh = fullReconciliationAllowsNewClaims(
-      snapshot.lastFullReconciliationAt,
-      now,
-    );
-    if (!reconciliationFresh) {
-      actionEvents.push(...candidates.map((candidate): LifecycleLogEvent => ({
-        cycleId,
-        runnerId: deps.runnerId,
-        mode: 'active',
-        phase: phaseForSchedulingSkip(candidate),
-        subject: candidate.phase === 'implementation'
-          ? `issue:${candidate.issueNumber}`
-          : candidate.phase === 'repair-machine-child'
-            ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
-          : `issue:${candidate.issueNumber}/pr:${candidate.prNumber}`,
-        action: 'schedule',
-        outcome: 'skipped',
-        reason: 'full-reconciliation-stale',
-      })));
-    }
-    const scheduling = scheduleActiveActions({
-      candidates: reconciliationFresh ? candidates : [],
-      remaining: local.remaining,
-      availableLogins: local.availableLogins,
-      implementationPreferredLogin: local.implementationPreferredLogin,
-      openPipelineBacklog,
-      implementationBackpressureThreshold:
-        deps.active!.implementationBackpressureThreshold,
-      ...(local.newWorkPaused ? { newWorkPaused: true } : {}),
-    });
-    actionEvents.push(...scheduling.skips.map((skip): LifecycleLogEvent => ({
-      cycleId,
-      runnerId: deps.runnerId,
-      mode: 'active',
-      phase: phaseForSchedulingSkip(skip),
-      subject: skip.subject,
-      action: 'schedule',
-      outcome: 'skipped',
-      reason: skip.reason,
-    })));
-    for (const action of scheduling.actions) {
-      try {
-        const result = await deps.active!.executeAction(action, snapshot);
-        actionEvents.push({
-          cycleId,
-          runnerId: deps.runnerId,
-          mode: 'active',
-          phase: phaseForAction(action),
-          subject: subjectForAction(action),
-          ...('head' in action ? { head: action.head } : {}),
-          action: action.kind,
-          outcome: result.outcome,
-          ...(result.reason === undefined ? {} : { reason: result.reason }),
-        });
-      } catch (error) {
-        actionEvents.push({
-          cycleId,
-          runnerId: deps.runnerId,
-          mode: 'active',
-          phase: phaseForAction(action),
-          subject: subjectForAction(action),
-          ...('head' in action ? { head: action.head } : {}),
-          action: action.kind,
-          outcome: 'failed',
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-    return attachBudget({
-      status: 'ok',
-      mode,
-      cycleId,
-      runnerId: deps.runnerId,
-      capturedAt: snapshot.capturedAt,
-      ...snapshotReportMetadata(snapshot),
-      githubUsage: finalGitHubUsage(deps, snapshot),
-      items,
-      orphanBranchClaims,
-      diagnostics,
-      events: [...reconciliationEvents, ...actionEvents],
-      reconciliation,
-    });
-  }
   return attachBudget({
     status: 'ok',
     mode,
@@ -1371,16 +1577,40 @@ function paritySummary(
   ];
 }
 
+function lifecycleEventSummary(event: LifecycleLogEvent): string {
+  return `${event.action} ${event.subject}: ${event.outcome}${
+    event.reason === undefined ? '' : ` (${event.reason})`
+  }.`;
+}
+
 export function renderLifecycleHuman(report: LifecycleCycleReport): string {
   if (report.status === 'failed') {
+    const retainedState = [
+      `Mutation-free: ${report.mutationFree ? 'yes' : 'no'}.`,
+      `Reconciliation results retained: ${report.reconciliation?.results.length ?? 0}.`,
+      ...report.events.map(lifecycleEventSummary),
+    ];
     if (report.usageAccounting.complete === false) {
-      return `${report.message}\nGitHub usage: unavailable (${report.usageAccounting.reason}).`;
+      return [
+        report.message,
+        ...retainedState,
+        `GitHub usage: unavailable (${report.usageAccounting.reason}).`,
+      ].join('\n');
     }
     const usage = report.githubUsage;
     if (usage === undefined) {
-      return `${report.message}\nGitHub usage: unavailable (complete usage evidence is missing).`;
+      return [
+        report.message,
+        ...retainedState,
+        'GitHub usage: unavailable (complete usage evidence is missing).',
+      ].join('\n');
     }
-    return [report.message, githubUsageSummary(usage), ...accountingWarningLines(usage)].join('\n');
+    return [
+      report.message,
+      ...retainedState,
+      githubUsageSummary(usage),
+      ...accountingWarningLines(usage),
+    ].join('\n');
   }
   const usageLine = githubUsageSummary(report.githubUsage);
   const accountingLines = accountingWarningLines(report.githubUsage);
@@ -1430,10 +1660,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     ...report.items.map(explanation),
     ...report.orphanBranchClaims.map(orphanExplanation),
     ...report.diagnostics.map((diagnostic) => `Human diagnostic: ${diagnostic.detail}.`),
-    ...report.events.map((event) =>
-      `${event.action} ${event.subject}: ${event.outcome}${
-        event.reason === undefined ? '' : ` (${event.reason})`
-      }.`),
+    ...report.events.map(lifecycleEventSummary),
     ...(report.budget === undefined
       ? []
       : [
