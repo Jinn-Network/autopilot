@@ -815,6 +815,36 @@ describe('GitHubRestDiscoveryReader issue and PR indexes', () => {
     })]);
   });
 
+  it('accepts a GitHub closed PR whose close timestamp follows its update timestamp', async () => {
+    const reader = new GitHubRestDiscoveryReader(new ConditionalRestClient(mapRunner(new Map([
+      [CLOSED_PR_ENDPOINT, included([{
+        number: 1951,
+        title: 'Feed intermediate failure diffs',
+        state: 'closed',
+        draft: false,
+        updated_at: '2026-07-23T23:24:45Z',
+        closed_at: '2026-07-23T23:24:47Z',
+        merged_at: null,
+        head: { sha: 'b'.repeat(40), ref: 'feature/1951' },
+        base: { ref: 'next' },
+      }])],
+    ]))));
+
+    await expect(reader.readRecentlyClosedPullRequestIndex('2026-07-23T00:00:00.000Z'))
+      .resolves.toEqual([{
+        number: 1951,
+        title: 'Feed intermediate failure diffs',
+        state: 'CLOSED',
+        updatedAt: '2026-07-23T23:24:45Z',
+        headOid: 'b'.repeat(40),
+        headRefName: 'feature/1951',
+        baseRefName: 'next',
+        isDraft: false,
+        closedAt: '2026-07-23T23:24:47Z',
+        mergedAt: null,
+      }]);
+  });
+
   it('follows the live numeric-repository closed-PR Link in strict page-only mode', async () => {
     const linkedPage2 =
       'repositories/1190804373/pulls?state=closed&sort=updated&direction=desc'
@@ -903,11 +933,6 @@ describe('GitHubRestDiscoveryReader issue and PR indexes', () => {
     ['closed PR with null closed_at', {
       number: 100, title: 'PR 100', state: 'closed', draft: false,
       updated_at: '2026-07-22T10:00:00Z', closed_at: null, merged_at: null,
-      head: { sha: 'b'.repeat(40), ref: 'feature/100' }, base: { ref: 'next' },
-    }],
-    ['closed PR updated before close', {
-      number: 100, title: 'PR 100', state: 'closed', draft: false,
-      updated_at: '2026-07-22T08:00:00Z', closed_at: '2026-07-22T09:00:00Z', merged_at: null,
       head: { sha: 'b'.repeat(40), ref: 'feature/100' }, base: { ref: 'next' },
     }],
     ['closed PR merged after close', {

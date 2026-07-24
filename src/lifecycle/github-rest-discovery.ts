@@ -466,11 +466,7 @@ function parsePullRequestIndexRow(
   } else {
     closedAt = isoTimestamp(pr.closed_at, `pull request ${index}.closed_at`);
     mergedAt = nullableTimestamp(pr.merged_at, `pull request ${index}.merged_at`);
-    const updatedMs = exactUtcTimestamp(updatedAt, `pull request ${index}.updated_at`).ms;
     const closedMs = exactUtcTimestamp(closedAt, `pull request ${index}.closed_at`).ms;
-    if (closedMs > updatedMs) {
-      throw new GitHubRestSchemaError(`pull request ${index} was updated before it closed`);
-    }
     if (
       mergedAt !== null
       && exactUtcTimestamp(mergedAt, `pull request ${index}.merged_at`).ms > closedMs
