@@ -259,6 +259,15 @@ export interface LocalCapacity {
 export type NewWorkAction =
   | { readonly kind: 'claim-implementation'; readonly issueNumber: number }
   | {
+      readonly kind: 'repair-machine-child';
+      readonly issueNumber: number;
+      readonly parentPr: number;
+      readonly childKind: 'review-finding' | 'reconcile' | 'ci-failure';
+      readonly expectedType: 'fix';
+      readonly expectedEffort: 'low' | 'medium' | 'high';
+      readonly expectedPriority: 'p1' | 'p2';
+    }
+  | {
       readonly kind: 'claim-review';
       readonly issueNumber: number;
       readonly prNumber: number;

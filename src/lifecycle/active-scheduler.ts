@@ -14,6 +14,15 @@ export type ActiveCandidate =
       readonly isChild?: boolean;
     }
   | {
+      readonly phase: 'repair-machine-child';
+      readonly issueNumber: number;
+      readonly parentPr: number;
+      readonly childKind: 'review-finding' | 'reconcile' | 'ci-failure';
+      readonly expectedType: 'fix';
+      readonly expectedEffort: 'low' | 'medium' | 'high';
+      readonly expectedPriority: 'p1' | 'p2';
+    }
+  | {
       readonly phase: 'review';
       readonly issueNumber: number;
       readonly prNumber: number;
@@ -88,6 +97,8 @@ export function applyMergePolicy(
 function subject(candidate: ActiveCandidate): string {
   return candidate.phase === 'implementation'
     ? `issue:${candidate.issueNumber}`
+    : candidate.phase === 'repair-machine-child'
+      ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
     : `pr:${candidate.prNumber}`;
 }
 
@@ -107,6 +118,18 @@ export function scheduleActiveActions(
     (candidate): candidate is Extract<ActiveCandidate, { phase: 'implementation' }> =>
       candidate.phase === 'implementation',
   );
+  for (const candidate of input.candidates) {
+    if (candidate.phase !== 'repair-machine-child') continue;
+    actions.push({
+      kind: 'repair-machine-child',
+      issueNumber: candidate.issueNumber,
+      parentPr: candidate.parentPr,
+      childKind: candidate.childKind,
+      expectedType: candidate.expectedType,
+      expectedEffort: candidate.expectedEffort,
+      expectedPriority: candidate.expectedPriority,
+    });
+  }
   for (const candidate of implementation) {
     if (actions.filter((action) => action.kind === 'claim-implementation').length
       >= input.remaining.implementation) {

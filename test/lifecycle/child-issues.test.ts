@@ -7,8 +7,11 @@ import {
   fileChildIssue,
   findOpenChildren,
   formatChildMarker,
+  formatChildTriageIntent,
   isMachineChildIssue,
   parseChildMarker,
+  parseChildTriageIntent,
+  resolveChildTriageExpectation,
   shouldFileRunawayHold,
   type ChildIssuePort,
   type ChildIssueRecord,
@@ -17,6 +20,7 @@ import {
   GitHubUsageMeter,
   makeGitHubUsageCommandRunner,
 } from '../../src/lifecycle/github-usage.js';
+import { createProjectTriageApplier } from '../../src/lifecycle/project-triage.js';
 
 function record(
   over: Partial<ChildIssueRecord> & Pick<ChildIssueRecord, 'number' | 'kind' | 'parentPr'>,
@@ -104,6 +108,70 @@ describe('child marker parse/format', () => {
     }
   });
 
+  it('round-trips additive triage intent without changing the authoritative child marker', () => {
+    const childMarker = formatChildMarker(42, 'reconcile');
+    const triageIntent = formatChildTriageIntent({
+      issueType: 'fix',
+      effort: 'medium',
+      priority: 'p1',
+    });
+
+    expect(childMarker).toBe('<!-- jinn-autopilot:child pr=42 kind=reconcile -->');
+    expect(triageIntent).toBe(
+      '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+    );
+    expect(parseChildTriageIntent(`${childMarker}\n\n${triageIntent}`)).toEqual({
+      issueType: 'fix',
+      effort: 'medium',
+      priority: 'p1',
+    });
+  });
+
+  it('uses Fix/Medium/P1 only for legacy reconcile children without triage intent', () => {
+    expect(resolveChildTriageExpectation(
+      formatChildMarker(2140, 'reconcile'),
+      'reconcile',
+    )).toEqual({
+      issueType: 'fix',
+      effort: 'medium',
+      priority: 'p1',
+    });
+    expect(resolveChildTriageExpectation(
+      formatChildMarker(84, 'review-finding'),
+      'review-finding',
+    )).toBeNull();
+  });
+
+  it.each([
+    {
+      label: 'malformed',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=max priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'duplicate',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'near-prefix',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triageX type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
+  ])('does not apply the reconcile legacy fallback to $label durable intent', ({
+    body,
+  }) => {
+    expect(parseChildTriageIntent(body)).toBeNull();
+    expect(resolveChildTriageExpectation(body, 'reconcile')).toBeNull();
+  });
+
   it('rejects malformed markers', () => {
     expect(parseChildMarker('<!-- jinn-autopilot:child pr=0 kind=reconcile -->')).toBeNull();
     expect(parseChildMarker('<!-- jinn-autopilot:child pr=1 kind=finding -->')).toBeNull();
@@ -138,7 +206,14 @@ describe('fileChildIssue', () => {
     if ('runawayHold' in first && first.runawayHold) throw new Error('unexpected hold');
     expect(port.created).toHaveLength(1);
     expect(port.created[0]!.labels).toEqual(['review-finding']);
-    expect(port.created[0]!.body).toContain(formatChildMarker(10, 'review-finding'));
+    expect(port.created[0]!.body.split('\n\n').slice(0, 2)).toEqual([
+      formatChildMarker(10, 'review-finding'),
+      formatChildTriageIntent({
+        issueType: 'fix',
+        effort: 'low',
+        priority: 'p1',
+      }),
+    ]);
     expect(port.typed).toEqual([first.number]);
     expect(port.triaged).toEqual([
       { issueNumber: first.number, effort: 'low', priority: 'p1' },
@@ -156,7 +231,6 @@ describe('fileChildIssue', () => {
     expect(port.created).toHaveLength(1);
     expect(port.triaged).toEqual([
       { issueNumber: first.number, effort: 'low', priority: 'p1' },
-      { issueNumber: first.number, effort: 'medium', priority: 'p1' },
     ]);
   });
 
@@ -175,6 +249,77 @@ describe('fileChildIssue', () => {
     expect(result).toMatchObject({ created: true });
     if ('runawayHold' in result && result.runawayHold) throw new Error('unexpected hold');
     expect(port.created[0]!.labels[0]).toBe('reconcile');
+  });
+
+  it('adds triage intent beside an existing authoritative marker without duplicating it', async () => {
+    const port = fakePort();
+    const marker = formatChildMarker(7, 'reconcile');
+    await fileChildIssue(port, {
+      parentPr: 7,
+      kind: 'reconcile',
+      title: 'Reconcile #7',
+      body: `Context before marker\n\n${marker}\n\nconflicts`,
+      effort: 'medium',
+      priority: 'p1',
+    });
+
+    expect(port.created[0]!.body.match(/jinn-autopilot:child pr=/g)).toHaveLength(1);
+    expect(port.created[0]!.body).toContain('Context before marker');
+    expect(port.created[0]!.body).toContain(
+      formatChildTriageIntent({
+        issueType: 'fix',
+        effort: 'medium',
+        priority: 'p1',
+      }),
+    );
+  });
+
+  it.each([
+    {
+      label: 'malformed',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=max priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'duplicate',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'mismatched',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triage type=fix effort=low priority=p2 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'near-prefix',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triageX type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
+  ])('rejects $label durable triage intent before creating a child', async ({
+    body,
+  }) => {
+    const port = fakePort();
+
+    await expect(fileChildIssue(port, {
+      parentPr: 7,
+      kind: 'reconcile',
+      title: 'Reconcile #7',
+      body,
+      effort: 'medium',
+      priority: 'p1',
+    })).rejects.toThrow(/triage intent/i);
+    expect(port.created).toEqual([]);
+    expect(port.typed).toEqual([]);
+    expect(port.triaged).toEqual([]);
   });
 
   it('returns runawayHold when prior children of the kind already hit the limit', async () => {
@@ -276,6 +421,39 @@ const FIELD_LIST_JSON = JSON.stringify({
   ],
 });
 
+describe('machine triage mutation order', () => {
+  it('applies Project field mutations sequentially', async () => {
+    let activeEdits = 0;
+    let maxConcurrentEdits = 0;
+    const applier = createProjectTriageApplier(async (_cmd, args) => {
+      if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST_JSON;
+      if (args[0] === 'project' && args[1] === 'item-add') {
+        return JSON.stringify({ id: 'PVTI_child99' });
+      }
+      if (args[0] === 'project' && args[1] === 'item-edit') {
+        activeEdits += 1;
+        maxConcurrentEdits = Math.max(maxConcurrentEdits, activeEdits);
+        await Promise.resolve();
+        activeEdits -= 1;
+        return '';
+      }
+      throw new Error(`unexpected command: ${args.join(' ')}`);
+    }, {
+      repo: 'example/widgets',
+      projectOwner: 'example',
+      projectNumber: 1,
+    });
+
+    await applier.applyMachineTriage({
+      issueNumber: 99,
+      effort: 'medium',
+      priority: 'p1',
+    });
+
+    expect(maxConcurrentEdits).toBe(1);
+  });
+});
+
 describe('production port GraphQL type assign contract', () => {
   it('resolves the repository organization fix Issue Type and applies Project triage', async () => {
     const { makeProductionChildIssuePort } = await import(
@@ -283,6 +461,8 @@ describe('production port GraphQL type assign contract', () => {
     );
 
     const calls: string[][] = [];
+    let activeItemEdits = 0;
+    let maxConcurrentItemEdits = 0;
     const meter = new GitHubUsageMeter();
     const port = makeProductionChildIssuePort({
       runner: makeGitHubUsageCommandRunner(async (_cmd, args) => {
@@ -335,6 +515,10 @@ describe('production port GraphQL type assign contract', () => {
           return JSON.stringify({ id: 'PVTI_child99' });
         }
         if (args[0] === 'project' && args[1] === 'item-edit') {
+          activeItemEdits += 1;
+          maxConcurrentItemEdits = Math.max(maxConcurrentItemEdits, activeItemEdits);
+          await Promise.resolve();
+          activeItemEdits -= 1;
           return '';
         }
         return '';
@@ -376,6 +560,7 @@ describe('production port GraphQL type assign contract', () => {
     expect(itemEdits.some((args) =>
       args.includes('PVTSSF_priority') && args.includes('opt_p1'),
     )).toBe(true);
+    expect(maxConcurrentItemEdits).toBe(1);
     expect(meter.read()).toMatchObject({
       graphqlRequests: expect.any(Number),
       accountingComplete: false,

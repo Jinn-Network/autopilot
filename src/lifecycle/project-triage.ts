@@ -236,18 +236,20 @@ export function createProjectTriageApplier(
         { fieldId: fields.effort.fieldId, optionId: effortOptionId },
         { fieldId: fields.priority.fieldId, optionId: priorityOptionId },
       ];
-      await Promise.all(edits.map((edit) => runner('gh', [
-        'project',
-        'item-edit',
-        '--id',
-        itemId,
-        '--project-id',
-        fields.projectId,
-        '--field-id',
-        edit.fieldId,
-        '--single-select-option-id',
-        edit.optionId,
-      ])));
+      for (const edit of edits) {
+        await runner('gh', [
+          'project',
+          'item-edit',
+          '--id',
+          itemId,
+          '--project-id',
+          fields.projectId,
+          '--field-id',
+          edit.fieldId,
+          '--single-select-option-id',
+          edit.optionId,
+        ]);
+      }
     },
   };
 }

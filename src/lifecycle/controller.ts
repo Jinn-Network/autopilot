@@ -27,7 +27,12 @@ import {
   type ActiveSchedulingSkip,
 } from './active-scheduler.js';
 import type { MergePolicy } from '../config/config.js';
-import { childrenPathEnabled, isMachineChildIssue } from './child-issues.js';
+import {
+  childrenPathEnabled,
+  isMachineChildIssue,
+  parseChildMarker,
+  resolveChildTriageExpectation,
+} from './child-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import type {
@@ -577,6 +582,33 @@ function activeCandidates(
   view: ReturnType<typeof deriveLifecycle>,
 ): ActiveCandidate[] {
   const byPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr]));
+  const repair: ActiveCandidate[] = [];
+  const repairingIssues = new Set<number>();
+  for (const issue of snapshot.issues) {
+    const marker = parseChildMarker(issue.body ?? '');
+    if (marker === null) continue;
+    const expected = resolveChildTriageExpectation(issue.body ?? '', marker.kind);
+    if (expected === null) continue;
+    const needsRepair = (
+      !issue.onBoard
+      || issue.projectItemId === null
+      || issue.shape !== expected.issueType
+      || issue.blockedOn !== 'Nothing'
+      || issue.effort?.toLowerCase() !== expected.effort
+      || issue.priority?.toLowerCase() !== expected.priority
+    );
+    if (!needsRepair) continue;
+    repair.push({
+      phase: 'repair-machine-child',
+      issueNumber: issue.number,
+      parentPr: marker.parentPr,
+      childKind: marker.kind,
+      expectedType: expected.issueType,
+      expectedEffort: expected.effort,
+      expectedPriority: expected.priority,
+    });
+    repairingIssues.add(issue.number);
+  }
   const childImplementation: ActiveCandidate[] = [];
   const freshImplementation: ActiveCandidate[] = [];
   const other: ActiveCandidate[] = [];
@@ -587,6 +619,7 @@ function activeCandidates(
       && item.kind === 'issue'
       && item.eligible
       && !item.humanHold
+      && !repairingIssues.has(item.issueNumber)
     ) {
       const issueSource = snapshot.issues.find((candidate) =>
         candidate.number === item.issueNumber);
@@ -720,11 +753,14 @@ function activeCandidates(
     }
   }
   // Children outrank fresh implementation claims for the remaining slots.
-  return [...childImplementation, ...freshImplementation, ...other];
+  return [...repair, ...childImplementation, ...freshImplementation, ...other];
 }
 
 function phaseForAction(action: NewWorkAction): LifecyclePhase {
-  if (action.kind === 'claim-implementation') return 'eligible';
+  if (
+    action.kind === 'claim-implementation'
+    || action.kind === 'repair-machine-child'
+  ) return 'eligible';
   if (action.kind === 'claim-review') return 'awaiting-review';
   if (action.kind === 'update-branch' || action.kind === 'file-reconcile-child') {
     return 'awaiting-review';
@@ -738,13 +774,18 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
 function subjectForAction(action: NewWorkAction): string {
   return action.kind === 'claim-implementation'
     ? `issue:${action.issueNumber}`
+    : action.kind === 'repair-machine-child'
+      ? `issue:${action.issueNumber}/pr:${action.parentPr}`
     : `issue:${action.issueNumber}/pr:${action.prNumber}`;
 }
 
 function phaseForSchedulingSkip(
   skip: Pick<ActiveSchedulingSkip, 'phase'>,
 ): LifecyclePhase {
-  if (skip.phase === 'implementation') return 'eligible';
+  if (
+    skip.phase === 'implementation'
+    || skip.phase === 'repair-machine-child'
+  ) return 'eligible';
   if (skip.phase === 'review') return 'awaiting-review';
   if (
     skip.phase === 'update-branch'
@@ -1071,6 +1112,8 @@ export async function runLifecycleCycle(
         phase: phaseForSchedulingSkip(candidate),
         subject: candidate.phase === 'implementation'
           ? `issue:${candidate.issueNumber}`
+          : candidate.phase === 'repair-machine-child'
+            ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
           : `issue:${candidate.issueNumber}/pr:${candidate.prNumber}`,
         action: 'schedule',
         outcome: 'skipped',

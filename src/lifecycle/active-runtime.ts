@@ -12,6 +12,11 @@ export interface ActiveRuntimeResult {
 }
 
 export interface ActiveRuntimeHandlers {
+  repairMachineChild?(
+    action: Extract<NewWorkAction, { kind: 'repair-machine-child' }>,
+    credentials: CredentialPool,
+    snapshot: GitHubLifecycleSnapshot,
+  ): Promise<ActiveRuntimeResult>;
   implementation(
     action: Extract<NewWorkAction, { kind: 'claim-implementation' }>,
     credentials: CredentialPool,
@@ -138,6 +143,10 @@ export function makeActiveRuntime(
       const credentials = options.credentials;
       const result = action.kind === 'claim-implementation'
         ? await options.handlers.implementation(action, credentials, snapshot)
+        : action.kind === 'repair-machine-child'
+          ? options.handlers.repairMachineChild === undefined
+            ? { status: 'skipped', detail: 'repair-machine-child handler unavailable' }
+            : await options.handlers.repairMachineChild(action, credentials, snapshot)
         : action.kind === 'claim-review'
           ? await options.handlers.review(action, credentials, snapshot)
           : action.kind === 'update-branch'

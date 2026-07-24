@@ -50,6 +50,8 @@ import {
   executeProductionFileCiFailureChild,
   executeProductionRerunFailedChecks,
 } from './ci-rerun-production.js';
+import { repairProductionMachineChild } from './child-issues-production.js';
+import { withSelectedCredential } from './production-auth.js';
 import {
   makeProductionReconciliationWriter,
   type ReconciliationProjectItemNode,
@@ -354,6 +356,27 @@ export function makeProductionActiveRuntime(
       ? {}
       : { newWorkPaused: options.newWorkPaused }),
     handlers: {
+      repairMachineChild: async (action, credentials) => {
+        const selection = selectCredential(credentials, { phase: 'implement' });
+        if (selection.status !== 'selected') {
+          return { status: 'skipped', reason: 'credential-unavailable' };
+        }
+        const result = await withSelectedCredential(
+          selection.credential,
+          ambient,
+          ({ run }) => repairProductionMachineChild({
+            runner: run,
+            repo: options.repositorySlug,
+            fixIssueTypeId: options.projectMapping?.fields.type.options.fix,
+            projectOwner: options.projectMapping?.owner,
+            projectNumber: options.projectMapping?.number,
+            projectMapping: options.projectMapping,
+          }, action),
+          runner,
+        );
+        return { status: result.status };
+      },
+
       implementation: (action, credentials) => {
         const port = makeProductionImplementationActionPort({
           repositoryPath: options.repositoryPath,

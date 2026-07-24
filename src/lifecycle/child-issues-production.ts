@@ -5,10 +5,18 @@
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
-import { createProjectTriageApplier } from './project-triage.js';
+import { ORG, PROJECT_NUMBER } from '../dispatcher/constants.js';
+import {
+  EFFORT_PROJECT_NAME,
+  PRIORITY_PROJECT_NAME,
+  createProjectTriageApplier,
+  parseItemAddId,
+  parseTriageFields,
+} from './project-triage.js';
 import {
   CHILD_KINDS,
   parseChildMarker,
+  resolveChildTriageExpectation,
   type ChildIssuePort,
   type ChildIssueRecord,
   type ChildKind,
@@ -61,6 +69,495 @@ export interface ProductionChildIssuePortOptions {
   readonly projectOwner?: string;
   readonly projectNumber?: number;
   readonly projectMapping?: ProjectMapping;
+}
+
+function createFixIssueTypeIdResolver(
+  options: ProductionChildIssuePortOptions,
+  runner: CommandRunner,
+  repo: string,
+): () => Promise<string> {
+  let fixTypeIdPromise: Promise<string> | undefined;
+  return () => {
+    fixTypeIdPromise ??= (async () => {
+      if (options.fixIssueTypeId !== undefined) {
+        if (options.fixIssueTypeId.trim().length === 0) {
+          throw new Error('Configured fix Issue Type ID must not be empty');
+        }
+        return options.fixIssueTypeId;
+      }
+      const owner = repo.split('/')[0];
+      if (owner === undefined || owner.length === 0) {
+        throw new Error(`Cannot resolve repository owner from '${repo}'`);
+      }
+      const raw = await runner('gh', [
+        'api',
+        'graphql',
+        '-f',
+        `query=${FIX_ISSUE_TYPE_QUERY}`,
+        '-f',
+        `owner=${owner}`,
+      ]);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        throw new Error(`Malformed Issue Type discovery for ${owner}`);
+      }
+      const organization = (
+        parsed as {
+          data?: {
+            organization?: {
+              issueTypes?: {
+                nodes?: Array<{ id?: unknown; name?: unknown; isEnabled?: unknown }>;
+              };
+            } | null;
+          };
+        }
+      ).data?.organization;
+      const matches = organization?.issueTypes?.nodes?.filter((entry) => (
+        entry.name === 'fix' && entry.isEnabled === true
+      )) ?? [];
+      if (
+        matches.length !== 1
+        || typeof matches[0]?.id !== 'string'
+        || matches[0].id.length === 0
+      ) {
+        throw new Error(
+          `Organization ${owner} must have exactly one enabled fix Issue Type`,
+        );
+      }
+      return matches[0].id;
+    })();
+    return fixTypeIdPromise;
+  };
+}
+
+export interface ProductionMachineChildRepairInput {
+  readonly issueNumber: number;
+  readonly parentPr: number;
+  readonly childKind: ChildKind;
+  readonly expectedType: 'fix';
+  readonly expectedEffort: 'low' | 'medium' | 'high';
+  readonly expectedPriority: 'p1' | 'p2';
+}
+
+interface MachineChildRepairState {
+  readonly issueId: string;
+  readonly issueType: string | null;
+  readonly projectId: string;
+  readonly item: {
+    readonly id: string;
+    readonly blockedOn: string | null;
+    readonly effort: string | null;
+    readonly priority: string | null;
+  } | null;
+}
+
+const MACHINE_CHILD_REPAIR_STATE_QUERY = `
+query MachineChildRepairState(
+  $repositoryOwner: String!,
+  $projectOwner: String!,
+  $name: String!,
+  $issueNumber: Int!,
+  $projectNumber: Int!,
+  $cursor: String
+) {
+  repository(owner: $repositoryOwner, name: $name) {
+    issue(number: $issueNumber) {
+      id
+      state
+      body
+      issueType { name }
+    }
+  }
+  organization(login: $projectOwner) {
+    projectV2(number: $projectNumber) {
+      id
+      items(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          content {
+            __typename
+            ... on Issue {
+              number
+              repository { nameWithOwner }
+            }
+          }
+          blockedOn: fieldValueByName(name: "Blocked on") {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
+          effort: fieldValueByName(name: "Effort") {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
+          priority: fieldValueByName(name: "Priority") {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+function optionalSelectName(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  if (
+    typeof value === 'object'
+    && value !== null
+    && !Array.isArray(value)
+    && typeof (value as { name?: unknown }).name === 'string'
+  ) {
+    return (value as { name: string }).name;
+  }
+  throw new Error(`Malformed machine-child repair ${label}`);
+}
+
+async function readMachineChildRepairState(
+  runner: CommandRunner,
+  input: ProductionMachineChildRepairInput,
+  repo: string,
+  projectOwner: string,
+  projectNumber: number,
+): Promise<MachineChildRepairState> {
+  const [owner, name, ...unexpected] = repo.split('/');
+  if (
+    owner === undefined
+    || owner.length === 0
+    || name === undefined
+    || name.length === 0
+    || unexpected.length > 0
+  ) {
+    throw new Error('Machine-child repair repository must be owner/name');
+  }
+  let cursor: string | null = null;
+  let issueRecord: Record<string, unknown> | null = null;
+  let projectId: string | null = null;
+  let item: MachineChildRepairState['item'] = null;
+  for (let page = 1; page <= 100; page += 1) {
+    const args = [
+      'api',
+      'graphql',
+      '-f',
+      `query=${MACHINE_CHILD_REPAIR_STATE_QUERY}`,
+      '-F',
+      `repositoryOwner=${owner}`,
+      '-F',
+      `projectOwner=${projectOwner}`,
+      '-F',
+      `name=${name}`,
+      '-F',
+      `issueNumber=${input.issueNumber}`,
+      '-F',
+      `projectNumber=${projectNumber}`,
+      ...(cursor === null ? [] : ['-f', `cursor=${cursor}`]),
+    ];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await runner('gh', args)) as unknown;
+    } catch {
+      throw new Error('Malformed machine-child repair state readback');
+    }
+    const data = (parsed as {
+      data?: {
+        repository?: { issue?: unknown } | null;
+        organization?: {
+          projectV2?: {
+            id?: unknown;
+            items?: {
+              pageInfo?: { hasNextPage?: unknown; endCursor?: unknown };
+              nodes?: unknown;
+            };
+          } | null;
+        } | null;
+      };
+    }).data;
+    const rawIssue = data?.repository?.issue;
+    const project = data?.organization?.projectV2;
+    const nodes = project?.items?.nodes;
+    const pageInfo = project?.items?.pageInfo;
+    if (
+      typeof rawIssue !== 'object'
+      || rawIssue === null
+      || Array.isArray(rawIssue)
+      || typeof project?.id !== 'string'
+      || !Array.isArray(nodes)
+      || typeof pageInfo?.hasNextPage !== 'boolean'
+    ) {
+      throw new Error('Malformed machine-child repair state readback');
+    }
+    issueRecord = rawIssue as Record<string, unknown>;
+    projectId = project.id;
+    for (const node of nodes) {
+      if (typeof node !== 'object' || node === null || Array.isArray(node)) continue;
+      const record = node as Record<string, unknown>;
+      const content = record.content as {
+        __typename?: unknown;
+        number?: unknown;
+        repository?: { nameWithOwner?: unknown } | null;
+      } | null;
+      if (
+        content?.__typename !== 'Issue'
+        || content.number !== input.issueNumber
+        || content.repository?.nameWithOwner?.toString().toLowerCase() !== repo.toLowerCase()
+      ) {
+        continue;
+      }
+      if (typeof record.id !== 'string' || record.id.length === 0 || item !== null) {
+        throw new Error('Machine-child repair Project item is ambiguous');
+      }
+      item = {
+        id: record.id,
+        blockedOn: optionalSelectName(record.blockedOn, 'Blocked on'),
+        effort: optionalSelectName(record.effort, 'Effort'),
+        priority: optionalSelectName(record.priority, 'Priority'),
+      };
+    }
+    if (!pageInfo.hasNextPage) break;
+    if (typeof pageInfo.endCursor !== 'string' || pageInfo.endCursor.length === 0) {
+      throw new Error('Machine-child repair pagination cursor did not advance');
+    }
+    cursor = pageInfo.endCursor;
+    if (page === 100) throw new Error('Machine-child repair pagination exceeded safety limit');
+  }
+  if (issueRecord === null || projectId === null) {
+    throw new Error('Machine-child repair state is unavailable');
+  }
+  if (
+    typeof issueRecord.id !== 'string'
+    || issueRecord.id.length === 0
+    || issueRecord.state !== 'OPEN'
+    || typeof issueRecord.body !== 'string'
+  ) {
+    throw new Error('Machine-child repair issue is missing, closed, or malformed');
+  }
+  const marker = parseChildMarker(issueRecord.body);
+  if (
+    marker === null
+    || marker.parentPr !== input.parentPr
+    || marker.kind !== input.childKind
+  ) {
+    throw new Error('Machine-child repair action contradicts the authoritative child marker');
+  }
+  const liveExpectation = resolveChildTriageExpectation(issueRecord.body, marker.kind);
+  if (
+    liveExpectation === null
+    || liveExpectation.issueType !== input.expectedType
+    || liveExpectation.effort !== input.expectedEffort
+    || liveExpectation.priority !== input.expectedPriority
+  ) {
+    throw new Error('Machine-child repair live child triage intent contradicts the action');
+  }
+  const issueType = optionalSelectName(issueRecord.issueType, 'Issue Type');
+  return {
+    issueId: issueRecord.id,
+    issueType,
+    projectId,
+    item,
+  };
+}
+
+function assertMatchingRepairState(
+  state: MachineChildRepairState,
+  input: ProductionMachineChildRepairInput,
+): void {
+  const expectedEffort = EFFORT_PROJECT_NAME[input.expectedEffort];
+  const expectedPriority = PRIORITY_PROJECT_NAME[input.expectedPriority];
+  const contradictions = [
+    state.issueType !== null
+      && state.issueType.toLowerCase() !== input.expectedType
+      ? `Issue Type=${state.issueType}, expected ${input.expectedType}`
+      : null,
+    state.item?.blockedOn !== null
+      && state.item?.blockedOn !== undefined
+      && state.item.blockedOn !== 'Nothing'
+      ? `Blocked on=${state.item.blockedOn}, expected Nothing`
+      : null,
+    state.item?.effort !== null
+      && state.item?.effort !== undefined
+      && state.item.effort !== expectedEffort
+      ? `Effort=${state.item.effort}, expected ${expectedEffort}`
+      : null,
+    state.item?.priority !== null
+      && state.item?.priority !== undefined
+      && state.item.priority !== expectedPriority
+      ? `Priority=${state.item.priority}, expected ${expectedPriority}`
+      : null,
+  ].filter((value): value is string => value !== null);
+  if (contradictions.length > 0) {
+    throw new Error(`Machine-child repair found contradictory triage: ${contradictions.join('; ')}`);
+  }
+}
+
+function machineChildRepairComplete(
+  state: MachineChildRepairState,
+  input: ProductionMachineChildRepairInput,
+): boolean {
+  return (
+    state.issueType?.toLowerCase() === input.expectedType
+    && state.item?.blockedOn === 'Nothing'
+    && state.item.effort === EFFORT_PROJECT_NAME[input.expectedEffort]
+    && state.item.priority === PRIORITY_PROJECT_NAME[input.expectedPriority]
+  );
+}
+
+export async function repairProductionMachineChild(
+  options: ProductionChildIssuePortOptions,
+  input: ProductionMachineChildRepairInput,
+): Promise<{ readonly status: 'repaired' | 'already-complete' }> {
+  const runner = options.runner ?? defaultRunner;
+  const repo = options.repo ?? REPO;
+  const projectOwner = options.projectOwner ?? ORG;
+  const projectNumber = options.projectNumber ?? PROJECT_NUMBER;
+  const resolveFixTypeId = createFixIssueTypeIdResolver(options, runner, repo);
+  let current = await readMachineChildRepairState(
+    runner,
+    input,
+    repo,
+    projectOwner,
+    projectNumber,
+  );
+  assertMatchingRepairState(current, input);
+  const expectedEffort = EFFORT_PROJECT_NAME[input.expectedEffort];
+  const expectedPriority = PRIORITY_PROJECT_NAME[input.expectedPriority];
+  if (machineChildRepairComplete(current, input)) return { status: 'already-complete' };
+  const refresh = async (): Promise<MachineChildRepairState> => {
+    const state = await readMachineChildRepairState(
+      runner,
+      input,
+      repo,
+      projectOwner,
+      projectNumber,
+    );
+    assertMatchingRepairState(state, input);
+    return state;
+  };
+
+  if (current.issueType === null) {
+    const typeId = await resolveFixTypeId();
+    current = await refresh();
+    if (current.issueType === null) {
+      await runner('gh', [
+        'api',
+        'graphql',
+        '-f',
+        `query=${UPDATE_ISSUE_TYPE_MUTATION}`,
+        '-f',
+        `issueId=${current.issueId}`,
+        '-f',
+        `typeId=${typeId}`,
+      ]);
+    }
+  }
+
+  const fields = options.projectMapping === undefined
+    ? parseTriageFields(await runner('gh', [
+        'project',
+        'field-list',
+        String(projectNumber),
+        '--owner',
+        projectOwner,
+        '--format',
+        'json',
+      ]), current.projectId)
+    : {
+        projectId: options.projectMapping.id,
+        blockedOn: {
+          fieldId: options.projectMapping.fields.blockedOn.id,
+          nothingOptionId: options.projectMapping.fields.blockedOn.options.nothing,
+        },
+        effort: {
+          fieldId: options.projectMapping.fields.effort.id,
+          options: {
+            Low: options.projectMapping.fields.effort.options.low,
+            Medium: options.projectMapping.fields.effort.options.medium,
+            High: options.projectMapping.fields.effort.options.high,
+            XHigh: options.projectMapping.fields.effort.options.xhigh,
+            Max: options.projectMapping.fields.effort.options.max,
+          },
+        },
+        priority: {
+          fieldId: options.projectMapping.fields.priority.id,
+          options: {
+            P0: options.projectMapping.fields.priority.options.p0,
+            P1: options.projectMapping.fields.priority.options.p1,
+            P2: options.projectMapping.fields.priority.options.p2,
+            P3: options.projectMapping.fields.priority.options.p3,
+            P4: options.projectMapping.fields.priority.options.p4,
+          },
+        },
+      };
+
+  current = await refresh();
+  if (current.item === null) {
+    const added = parseItemAddId(await runner('gh', [
+      'project',
+      'item-add',
+      String(projectNumber),
+      '--owner',
+      projectOwner,
+      '--url',
+      `https://github.com/${repo}/issues/${input.issueNumber}`,
+      '--format',
+      'json',
+    ]));
+    current = await refresh();
+    if (current.item === null || current.item.id !== added) {
+      throw new Error('Machine-child repair Project membership readback is ambiguous');
+    }
+  }
+
+  const edits = [
+    {
+      value: (state: MachineChildRepairState) => state.item?.blockedOn,
+      expected: 'Nothing',
+      fieldId: fields.blockedOn.fieldId,
+      optionId: fields.blockedOn.nothingOptionId,
+    },
+    {
+      value: (state: MachineChildRepairState) => state.item?.effort,
+      expected: expectedEffort,
+      fieldId: fields.effort.fieldId,
+      optionId: fields.effort.options[expectedEffort],
+    },
+    {
+      value: (state: MachineChildRepairState) => state.item?.priority,
+      expected: expectedPriority,
+      fieldId: fields.priority.fieldId,
+      optionId: fields.priority.options[expectedPriority],
+    },
+  ];
+  for (const edit of edits) {
+    current = await refresh();
+    if (current.item === null) {
+      throw new Error('Machine-child repair Project item disappeared before field mutation');
+    }
+    const value = edit.value(current);
+    if (value === edit.expected) continue;
+    if (value !== null) {
+      throw new Error('Machine-child repair field state changed before mutation');
+    }
+    if (edit.optionId === undefined) {
+      throw new Error('Machine-child repair configured triage option is unavailable');
+    }
+    await runner('gh', [
+      'project',
+      'item-edit',
+      '--id',
+      current.item.id,
+      '--project-id',
+      fields.projectId,
+      '--field-id',
+      edit.fieldId,
+      '--single-select-option-id',
+      edit.optionId,
+    ]);
+  }
+  current = await refresh();
+  if (!machineChildRepairComplete(current, input)) {
+    throw new Error('Machine-child repair final readback is incomplete');
+  }
+  return { status: 'repaired' };
 }
 
 function parseIssueList(raw: string): readonly {
@@ -140,57 +637,7 @@ export function makeProductionChildIssuePort(
 ): ChildIssuePort {
   const runner = options.runner ?? defaultRunner;
   const repo = options.repo ?? REPO;
-  let fixTypeIdPromise: Promise<string> | undefined;
-  const resolveFixTypeId = (): Promise<string> => {
-    fixTypeIdPromise ??= (async () => {
-      if (options.fixIssueTypeId !== undefined) {
-        if (options.fixIssueTypeId.trim().length === 0) {
-          throw new Error('Configured fix Issue Type ID must not be empty');
-        }
-        return options.fixIssueTypeId;
-      }
-      const owner = repo.split('/')[0];
-      if (owner === undefined || owner.length === 0) {
-        throw new Error(`Cannot resolve repository owner from '${repo}'`);
-      }
-      const raw = await runner('gh', [
-        'api',
-        'graphql',
-        '-f',
-        `query=${FIX_ISSUE_TYPE_QUERY}`,
-        '-f',
-        `owner=${owner}`,
-      ]);
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw) as unknown;
-      } catch {
-        throw new Error(`Malformed Issue Type discovery for ${owner}`);
-      }
-      const organization = (
-        parsed as {
-          data?: {
-            organization?: {
-              issueTypes?: {
-                nodes?: Array<{ id?: unknown; name?: unknown; isEnabled?: unknown }>;
-              };
-            } | null;
-          };
-        }
-      ).data?.organization;
-      const matches = organization?.issueTypes?.nodes?.filter((entry) => (
-        entry.name === 'fix' && entry.isEnabled === true
-      )) ?? [];
-      if (matches.length !== 1 || typeof matches[0]?.id !== 'string'
-        || matches[0].id.length === 0) {
-        throw new Error(
-          `Organization ${owner} must have exactly one enabled fix Issue Type`,
-        );
-      }
-      return matches[0].id;
-    })();
-    return fixTypeIdPromise;
-  };
+  const resolveFixTypeId = createFixIssueTypeIdResolver(options, runner, repo);
   const triageApplier = createProjectTriageApplier(runner, {
     repo,
     projectOwner: options.projectOwner,

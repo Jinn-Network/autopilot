@@ -10,6 +10,13 @@ export const CHILD_KINDS = ['review-finding', 'reconcile', 'ci-failure'] as cons
 export type ChildKind = (typeof CHILD_KINDS)[number];
 
 export const CHILD_MARKER_PREFIX = '<!-- jinn-autopilot:child';
+export const CHILD_TRIAGE_MARKER_PREFIX = '<!-- jinn-autopilot:child-triage';
+
+export interface ChildTriageExpectation {
+  readonly issueType: 'fix';
+  readonly effort: FileChildIssueInput['effort'];
+  readonly priority: FileChildIssueInput['priority'];
+}
 
 /** Structured body marker naming the parent PR and child kind. */
 export function formatChildMarker(parentPr: number, kind: ChildKind): string {
@@ -33,6 +40,41 @@ export function parseChildMarker(
   const kind = match[2] as ChildKind;
   if (!Number.isSafeInteger(parentPr) || parentPr <= 0) return null;
   return { parentPr, kind };
+}
+
+export function formatChildTriageIntent(input: ChildTriageExpectation): string {
+  return `${CHILD_TRIAGE_MARKER_PREFIX} type=${input.issueType} `
+    + `effort=${input.effort} priority=${input.priority} -->`;
+}
+
+function hasChildTriageIntentPrefix(body: string): boolean {
+  return /<!--\s*jinn-autopilot:child-triage/.test(body);
+}
+
+export function parseChildTriageIntent(body: string): ChildTriageExpectation | null {
+  const prefixes = [...body.matchAll(/<!--\s*jinn-autopilot:child-triage\b/g)];
+  const matches = [...body.matchAll(
+    /<!--\s*jinn-autopilot:child-triage\s+type=(fix)\s+effort=(low|medium|high)\s+priority=(p1|p2)\s*-->/g,
+  )];
+  if (prefixes.length !== 1 || matches.length !== 1) return null;
+  const match = matches[0]!;
+  return {
+    issueType: match[1] as ChildTriageExpectation['issueType'],
+    effort: match[2] as ChildTriageExpectation['effort'],
+    priority: match[3] as ChildTriageExpectation['priority'],
+  };
+}
+
+export function resolveChildTriageExpectation(
+  body: string,
+  kind: ChildKind,
+): ChildTriageExpectation | null {
+  const explicit = parseChildTriageIntent(body);
+  if (explicit !== null) return explicit;
+  if (hasChildTriageIntentPrefix(body)) return null;
+  return kind === 'reconcile'
+    ? { issueType: 'fix', effort: 'medium', priority: 'p1' }
+    : null;
 }
 
 export function isChildIssueBody(body: string): boolean {
@@ -113,12 +155,9 @@ export async function fileChildIssue(
   const marker = formatChildMarker(input.parentPr, input.kind);
   const existing = await port.searchOpenByMarker(marker);
   if (existing.length > 0) {
-    // Heal label-only children filed before Project-field triage.
-    await port.ensureTriageComplete({
-      issueNumber: existing[0]!.number,
-      effort: input.effort,
-      priority: input.priority,
-    });
+    // Existing marker authority is recovery input, never an invitation to
+    // overwrite triage inline. The controller emits a field-aware maintenance
+    // action from the next complete snapshot.
     return { number: existing[0]!.number, created: false };
   }
 
@@ -127,9 +166,28 @@ export async function fileChildIssue(
     return { runawayHold: true, priorCount };
   }
 
-  const body = input.body.includes(marker)
+  const triageIntent = formatChildTriageIntent({
+    issueType: 'fix',
+    effort: input.effort,
+    priority: input.priority,
+  });
+  const bodyWithMarker = input.body.includes(marker)
     ? input.body
     : `${marker}\n\n${input.body.trim()}`;
+  const existingTriageIntent = parseChildTriageIntent(bodyWithMarker);
+  if (hasChildTriageIntentPrefix(bodyWithMarker)) {
+    if (
+      existingTriageIntent === null
+      || existingTriageIntent.issueType !== 'fix'
+      || existingTriageIntent.effort !== input.effort
+      || existingTriageIntent.priority !== input.priority
+    ) {
+      throw new Error('Child body contains invalid or contradictory triage intent');
+    }
+  }
+  const body = existingTriageIntent === null
+    ? bodyWithMarker.replace(marker, `${marker}\n\n${triageIntent}`)
+    : bodyWithMarker;
   const created = await port.createIssue({
     title: input.title,
     body,

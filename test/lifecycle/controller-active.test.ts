@@ -8,6 +8,7 @@ import {
 import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
 import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
+import { formatChildMarker } from '../../src/lifecycle/child-issues.js';
 
 const NOW = new Date('2026-07-20T12:00:00.000Z');
 
@@ -136,6 +137,112 @@ describe('active lifecycle controller', () => {
     await runLifecycleCycle('observe', controller);
     expect(actions).toEqual(['claim-implementation']);
     expect(active.status).toBe('ok');
+  });
+
+  function childRepairSnapshot(repaired: boolean): GitHubLifecycleSnapshot {
+    const childBody = formatChildMarker(2140, 'reconcile');
+    return {
+      ...snapshot(),
+      issues: [
+        {
+          number: 2141,
+          title: 'Reconcile conflicts for PR #2140',
+          body: childBody,
+          labels: ['reconcile'],
+          shape: repaired ? 'fix' : null,
+          blockedOn: repaired ? 'Nothing' : null,
+          blockedByIssues: [],
+          effort: repaired ? 'Medium' : null,
+          priority: repaired ? 'P1' : null,
+          status: repaired ? 'Todo' : null,
+          onBoard: repaired,
+          author: 'implementation-bot',
+          projectItemId: repaired ? 'PVTI_2141' : null,
+          inCurrentSprint: false,
+        },
+        {
+          number: 42,
+          title: 'Fresh implementation',
+          body: '',
+          labels: [],
+          shape: 'fix',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Low',
+          priority: 'P2',
+          status: 'Todo',
+          onBoard: true,
+          author: 'implementation-bot',
+          projectItemId: 'PVTI_42',
+          inCurrentSprint: false,
+        },
+      ],
+      lifecycle: {
+        items: [
+          {
+            kind: 'issue',
+            issueNumber: 2141,
+            v2Marked: true,
+            projectStatus: repaired ? 'Todo' : null,
+            labels: ['reconcile'],
+            eligible: repaired,
+            eligibilityReason: repaired ? 'eligible' : 'not-selected',
+          },
+          {
+            kind: 'issue',
+            issueNumber: 42,
+            v2Marked: false,
+            projectStatus: 'Todo',
+            labels: [],
+            eligible: true,
+            eligibilityReason: 'eligible',
+          },
+        ],
+      },
+    };
+  }
+
+  it('repairs an off-Project legacy reconcile child before fresh implementation work', async () => {
+    const actions: unknown[] = [];
+    const controller = deps({
+      readSnapshot: async () => childRepairSnapshot(false),
+    });
+    controller.active!.executeAction = async (action) => {
+      actions.push(action);
+      return { outcome: 'completed' };
+    };
+
+    await runLifecycleCycle('active', controller);
+
+    expect(actions).toEqual([
+      {
+        kind: 'repair-machine-child',
+        issueNumber: 2141,
+        parentPr: 2140,
+        childKind: 'reconcile',
+        expectedType: 'fix',
+        expectedEffort: 'medium',
+        expectedPriority: 'p1',
+      },
+      { kind: 'claim-implementation', issueNumber: 42 },
+    ]);
+  });
+
+  it('prioritizes the repaired child over fresh work on the next snapshot', async () => {
+    const actions: unknown[] = [];
+    const controller = deps({
+      readSnapshot: async () => childRepairSnapshot(true),
+    });
+    controller.active!.executeAction = async (action) => {
+      actions.push(action);
+      return { outcome: 'spawned' };
+    };
+
+    await runLifecycleCycle('active', controller);
+
+    expect(actions).toEqual([
+      { kind: 'claim-implementation', issueNumber: 2141 },
+    ]);
   });
 
   it('threads the same immutable cycle snapshot into reconciliation and active execution', async () => {
