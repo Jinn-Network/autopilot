@@ -31,7 +31,7 @@ import type {
 // the seam's abstract view. `import type` keeps this out of the emitted JS,
 // avoiding a runtime cycle between the two modules.
 import type { IssueBoardEntry, IssueBoardState } from './issue-source.js';
-import { ORG, PROJECT_NUMBER } from './constants.js';
+import { ORG, PROJECT_NUMBER, REPO } from './constants.js';
 
 // ---------------------------------------------------------------------------
 // Helper types
@@ -275,8 +275,13 @@ const SNAPSHOT_QUERY = `query($owner: String!, $projectNumber: Int!, $cursor: St
           id
           content {
             __typename
-            ... on Issue { number issueType { name } blockedBy(first: 20) { nodes { number } } }
-            ... on PullRequest { number }
+            ... on Issue {
+              number
+              repository { nameWithOwner }
+              issueType { name }
+              blockedBy(first: 20) { nodes { number } }
+            }
+            ... on PullRequest { number repository { nameWithOwner } }
           }
           status:    fieldValueByName(name: "Status")     { ... on ProjectV2ItemFieldSingleSelectValue { name } }
           priority:  fieldValueByName(name: "Priority")   { ... on ProjectV2ItemFieldSingleSelectValue { name } }
@@ -314,6 +319,7 @@ interface ResponseNode {
 interface ResponseContent {
   __typename: string;
   number?: number;
+  repository?: { nameWithOwner?: string } | null;
   issueType?: { name: string } | null;
   /** GitHub native issue-dependency edges — issues this Issue is blocked_by. */
   blockedBy?: { nodes: Array<{ number?: number } | null> } | null;
@@ -392,9 +398,16 @@ function parseContentType(typename: string): ProjectContentType {
   return 'DraftIssue';
 }
 
-function parseNode(node: ResponseNode): SnapshotItem | null {
+function parseNode(node: ResponseNode, repositorySlug: string): SnapshotItem | null {
   if (node.content == null) return null;
   const contentType = parseContentType(node.content.__typename);
+  if (contentType !== 'DraftIssue' && repositorySlug !== '') {
+    const fullName = node.content.repository?.nameWithOwner;
+    if (typeof fullName !== 'string' || fullName.length === 0) {
+      throw new Error('Project item repository identity is missing');
+    }
+    if (fullName.toLowerCase() !== repositorySlug.toLowerCase()) return null;
+  }
   const number = node.content.number ?? -1; // DraftIssue has no number
   const issueType =
     contentType === 'Issue'
@@ -487,6 +500,7 @@ export interface FetchOpts {
    * only for internal callers that have not yet crossed the config port. */
   projectOwner?: string;
   projectNumber?: number;
+  repositorySlug?: string;
 }
 
 export async function fetchProjectSnapshot(
@@ -497,6 +511,7 @@ export async function fetchProjectSnapshot(
   const nowMs = opts.nowMs ?? Date.now();
   const projectOwner = opts.projectOwner ?? ORG;
   const projectNumber = opts.projectNumber ?? PROJECT_NUMBER;
+  const repositorySlug = opts.repositorySlug ?? REPO;
   const items: SnapshotItem[] = [];
   let rateLimit: RateLimitInfo | null = null;
   let sprintIterations: IterationConfig[] = [];
@@ -539,7 +554,7 @@ export async function fetchProjectSnapshot(
     }
 
     for (const node of pageItems.nodes) {
-      const item = parseNode(node);
+      const item = parseNode(node, repositorySlug);
       if (item == null) continue;
       items.push(item);
       if (item.contentType === 'Issue') {

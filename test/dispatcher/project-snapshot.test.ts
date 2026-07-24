@@ -87,6 +87,7 @@ function singleSelect(name: string | null): { name: string } | null {
 function issueNode(args: {
   id: string;
   number: number;
+  repository?: string;
   issueType?: string | null;
   status?: string | null;
   priority?: string | null;
@@ -100,6 +101,7 @@ function issueNode(args: {
     content: {
       __typename: 'Issue',
       number: args.number,
+      repository: { nameWithOwner: args.repository ?? 'Jinn-Network/mono' },
       issueType: args.issueType == null ? null : { name: args.issueType },
       blockedBy:
         args.blockedBy == null ? null : { nodes: args.blockedBy.map((number) => ({ number })) },
@@ -112,12 +114,13 @@ function issueNode(args: {
   };
 }
 
-function prNode(args: { id: string; number: number }): unknown {
+function prNode(args: { id: string; number: number; repository?: string }): unknown {
   return {
     id: args.id,
     content: {
       __typename: 'PullRequest',
       number: args.number,
+      repository: { nameWithOwner: args.repository ?? 'Jinn-Network/mono' },
     },
     status: null,
     priority: null,
@@ -425,6 +428,33 @@ describe('fetchProjectSnapshot — content filtering', () => {
       number: -1,
       issueType: null,
     });
+  });
+
+  it('confines organization Project items to the configured repository', async () => {
+    const { runner } = makePagedRunner([
+      buildPageResponse({
+        rateLimitRemaining: 4999,
+        nodes: [
+          issueNode({
+            id: 'PVTI_target',
+            number: 42,
+            repository: 'Jinn-Network/mono',
+            status: 'Todo',
+          }),
+          issueNode({
+            id: 'PVTI_foreign',
+            number: 3,
+            repository: 'Jinn-Network/autopilot',
+            status: 'Todo',
+          }),
+        ],
+      }),
+    ]);
+    const snapshot = await fetchProjectSnapshot(runner, {
+      repositorySlug: 'Jinn-Network/mono',
+    });
+
+    expect(snapshot.items.map((item) => item.number)).toEqual([42]);
   });
 });
 

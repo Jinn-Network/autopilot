@@ -744,6 +744,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     return fetchProjectSnapshot(this.run, {
       projectOwner: this.projectOwner,
       projectNumber: this.projectNumber,
+      repositorySlug: this.repositorySlug,
     });
   }
 
