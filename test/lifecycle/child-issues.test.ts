@@ -158,6 +158,13 @@ describe('child marker parse/format', () => {
         '<!-- jinn-autopilot:child-triage type=fix effort=medium priority=p1 -->',
       ].join('\n\n'),
     },
+    {
+      label: 'near-prefix',
+      body: [
+        '<!-- jinn-autopilot:child pr=2140 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triageX type=fix effort=medium priority=p1 -->',
+      ].join('\n\n'),
+    },
   ])('does not apply the reconcile legacy fallback to $label durable intent', ({
     body,
   }) => {
@@ -288,6 +295,13 @@ describe('fileChildIssue', () => {
       body: [
         '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
         '<!-- jinn-autopilot:child-triage type=fix effort=low priority=p2 -->',
+      ].join('\n\n'),
+    },
+    {
+      label: 'near-prefix',
+      body: [
+        '<!-- jinn-autopilot:child pr=7 kind=reconcile -->',
+        '<!-- jinn-autopilot:child-triageX type=fix effort=medium priority=p1 -->',
       ].join('\n\n'),
     },
   ])('rejects $label durable triage intent before creating a child', async ({

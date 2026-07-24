@@ -48,7 +48,7 @@ export function formatChildTriageIntent(input: ChildTriageExpectation): string {
 }
 
 function hasChildTriageIntentPrefix(body: string): boolean {
-  return /<!--\s*jinn-autopilot:child-triage\b/.test(body);
+  return /<!--\s*jinn-autopilot:child-triage/.test(body);
 }
 
 export function parseChildTriageIntent(body: string): ChildTriageExpectation | null {
