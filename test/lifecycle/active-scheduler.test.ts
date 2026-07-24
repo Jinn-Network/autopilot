@@ -11,8 +11,8 @@ const HEAD = gitOid('1'.repeat(40));
 function input(overrides: Partial<ActiveSchedulingInput> = {}): ActiveSchedulingInput {
   return {
     candidates: [
-      { phase: 'implementation', issueNumber: 1 },
-      { phase: 'implementation', issueNumber: 2 },
+      { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
+      { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
       { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
       { phase: 'merge', issueNumber: 5, prNumber: 50, head: HEAD },
     ],
@@ -51,8 +51,8 @@ describe('active local scheduler', () => {
           expectedEffort: 'medium',
           expectedPriority: 'p1',
         },
-        { phase: 'implementation', issueNumber: 42 },
-        { phase: 'implementation', issueNumber: 43 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 42 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 43 },
       ],
       remaining: { implementation: 1, review: 0 },
     }));
@@ -67,7 +67,7 @@ describe('active local scheduler', () => {
         expectedEffort: 'medium',
         expectedPriority: 'p1',
       },
-      { kind: 'claim-implementation', issueNumber: 42 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 42 },
     ]);
     expect(plan.skips).toContainEqual({
       phase: 'implementation',
@@ -92,8 +92,8 @@ describe('active local scheduler', () => {
   it('still claims machine children under open-pipeline backpressure', () => {
     const plan = scheduleActiveActions(input({
       candidates: [
-        { phase: 'implementation', issueNumber: 99, isChild: true },
-        { phase: 'implementation', issueNumber: 1 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 99, isChild: true },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
         { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
         { phase: 'merge', issueNumber: 5, prNumber: 50, head: HEAD },
       ],
@@ -101,7 +101,7 @@ describe('active local scheduler', () => {
       remaining: { implementation: 2, review: 1 },
     }));
     expect(plan.actions).toEqual([
-      { kind: 'claim-implementation', issueNumber: 99 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 99 },
       {
         kind: 'claim-review',
         issueNumber: 3,
@@ -117,10 +117,44 @@ describe('active local scheduler', () => {
     });
   });
 
+  it('preserves pinned stale-recovery authority and exempts only recovery from backpressure', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [
+        {
+          phase: 'implementation',
+          intent: 'stale-recovery',
+          issueNumber: 42,
+          prNumber: 84,
+          expectedHead: HEAD,
+          branch: 'existing/42',
+          claimAttempt: '11111111-1111-4111-8111-111111111111',
+        },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 43 },
+      ],
+      openPipelineBacklog: 10,
+      remaining: { implementation: 2, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([{
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: HEAD,
+      branch: 'existing/42',
+      claimAttempt: '11111111-1111-4111-8111-111111111111',
+    }]);
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:43',
+      reason: 'backpressure',
+    });
+  });
+
   it('schedules both implement and review with one login when review targets another author', () => {
     const plan = scheduleActiveActions(input({
       candidates: [
-        { phase: 'implementation', issueNumber: 1 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
         { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
       ],
       availableLogins: ['implementation-bot'],
@@ -135,18 +169,18 @@ describe('active local scheduler', () => {
   it('caps implementation concurrency by phase remaining, not login count', () => {
     const plan = scheduleActiveActions(input({
       candidates: [
-        { phase: 'implementation', issueNumber: 1 },
-        { phase: 'implementation', issueNumber: 2 },
-        { phase: 'implementation', issueNumber: 3 },
-        { phase: 'implementation', issueNumber: 4 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 3 },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 4 },
       ],
       availableLogins: ['implementation-bot'],
       remaining: { implementation: 3, review: 0 },
     }));
     expect(plan.actions).toEqual([
-      { kind: 'claim-implementation', issueNumber: 1 },
-      { kind: 'claim-implementation', issueNumber: 2 },
-      { kind: 'claim-implementation', issueNumber: 3 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 3 },
     ]);
     expect(plan.skips).toContainEqual({
       phase: 'implementation',

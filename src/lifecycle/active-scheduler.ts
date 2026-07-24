@@ -1,10 +1,11 @@
 import type { NewWorkAction } from './types.js';
-import type { GitOid } from './types.js';
+import type { GitOid, GitRefName } from './types.js';
 import type { MergePolicy } from '../config/config.js';
 
 export type ActiveCandidate =
   | {
       readonly phase: 'implementation';
+      readonly intent: 'fresh';
       readonly issueNumber: number;
       /**
        * Machine child (review-finding / reconcile / ci-failure). Children
@@ -12,6 +13,15 @@ export type ActiveCandidate =
        * them or the loop deadlocks.
        */
       readonly isChild?: boolean;
+    }
+  | {
+      readonly phase: 'implementation';
+      readonly intent: 'stale-recovery';
+      readonly issueNumber: number;
+      readonly prNumber: number;
+      readonly expectedHead: GitOid;
+      readonly branch: GitRefName;
+      readonly claimAttempt: string;
     }
   | {
       readonly phase: 'repair-machine-child';
@@ -143,7 +153,8 @@ export function scheduleActiveActions(
     // Fresh work only: child fixes/reconciles/ci-failures reduce backlog and
     // must still claim under backpressure (capacity remaining still applies).
     if (
-      candidate.isChild !== true
+      candidate.intent === 'fresh'
+      && candidate.isChild !== true
       && input.openPipelineBacklog >= input.implementationBackpressureThreshold
     ) {
       skips.push({ phase: candidate.phase, subject: subject(candidate), reason: 'backpressure' });
@@ -153,7 +164,19 @@ export function scheduleActiveActions(
       skips.push({ phase: candidate.phase, subject: subject(candidate), reason: 'credential-lane' });
       continue;
     }
-    actions.push({ kind: 'claim-implementation', issueNumber: candidate.issueNumber });
+    actions.push({
+      kind: 'claim-implementation',
+      ...candidate.intent === 'fresh'
+        ? { intent: 'fresh', issueNumber: candidate.issueNumber }
+        : {
+            intent: 'stale-recovery',
+            issueNumber: candidate.issueNumber,
+            prNumber: candidate.prNumber,
+            expectedHead: candidate.expectedHead,
+            branch: candidate.branch,
+            claimAttempt: candidate.claimAttempt,
+          },
+    });
   }
 
   for (const candidate of input.candidates) {

@@ -131,10 +131,21 @@ describe('production implementation action port', () => {
     expect(treeReads).toBe(2);
   });
 
-  it('re-admits a reaped draft PR as ordinary implementation work on its existing branch', async () => {
+  it('rereads the exact durable state needed for pinned stale recovery', async () => {
     const base = snapshot();
     const current: GitHubLifecycleSnapshot = {
       ...base,
+      project: {
+        ...base.project,
+        items: [{
+          ...base.project.items[0]!,
+          status: 'In Progress',
+        }],
+      },
+      issues: [{
+        ...base.issues[0]!,
+        status: 'In Progress',
+      }],
       pullRequests: [{
         number: 84,
         title: 'Implement active lifecycle',
@@ -152,6 +163,23 @@ describe('production implementation action port', () => {
         mergeStateStatus: 'BLOCKED',
         checks: [],
         reviews: [],
+      }, {
+        number: 85,
+        title: 'Duplicate implementation',
+        body: 'Closes #42',
+        author: 'implementation-bot',
+        baseRefName: 'stack/base',
+        headRefName: 'other/42',
+        headOid: PARENT,
+        headCommittedAt: '2026-07-20T09:00:00.000Z',
+        isDraft: true,
+        state: 'OPEN',
+        labels: ['engine:review'],
+        closingIssueNumbers: [42],
+        mergeability: 'UNKNOWN',
+        mergeStateStatus: 'BLOCKED',
+        checks: [],
+        reviews: [],
       }],
       lifecycle: {
         items: [{
@@ -159,7 +187,7 @@ describe('production implementation action port', () => {
           issueNumber: 42,
           prNumber: 84,
           v2Marked: true,
-          projectStatus: 'Todo',
+          projectStatus: 'In Progress',
           labels: ['engine:review'],
           head: HEAD,
           headChangedAt: '2026-07-20T08:00:00.000Z',
@@ -195,16 +223,38 @@ describe('production implementation action port', () => {
     });
 
     await expect(port.readIssue(42)).resolves.toMatchObject({
-      eligible: true,
+      eligible: false,
+      eligibilityDetail: 'Project status is In Progress',
       targetBase: 'stack/base',
     });
-    await expect(port.listOpenPullRequests(42)).resolves.toEqual([
+    await expect(port.readStaleRecovery(42, 84)).resolves.toEqual(
       expect.objectContaining({
-        number: 84,
-        headRefName: 'existing/42',
-        head: HEAD,
+        projectStatus: 'In Progress',
+        humanHold: false,
+        claim: expect.objectContaining({
+          attempt: '11111111-1111-4111-8111-111111111111',
+        }),
+        pullRequest: expect.objectContaining({
+          state: 'OPEN',
+          draft: true,
+          number: 84,
+          headRefName: 'existing/42',
+          head: HEAD,
+        }),
+        openPullRequests: [
+          expect.objectContaining({
+            number: 84,
+            headRefName: 'existing/42',
+            head: HEAD,
+          }),
+          expect.objectContaining({
+            number: 85,
+            headRefName: 'other/42',
+            head: PARENT,
+          }),
+        ],
       }),
-    ]);
+    );
   });
 
   it('uses the selected credential and accepts a lost PR-create response only after exact readback', async () => {

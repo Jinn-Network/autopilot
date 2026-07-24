@@ -14,7 +14,7 @@ import {
   type CredentialPool,
   type SelectedCredential,
 } from './credentials.js';
-import type { HumanReason } from './types.js';
+import type { HumanReason, ImplementationClaimAction } from './types.js';
 import {
   gitOid,
   gitRefName,
@@ -46,6 +46,7 @@ export interface ImplementationIssue {
   readonly title: string;
   readonly open: boolean;
   readonly eligible: boolean;
+  readonly eligibilityDetail?: string;
   readonly targetBase: GitRefName;
   readonly effort: Effort | null;
   /** Present when this issue is a Stage 2 machine child targeting a parent PR. */
@@ -53,6 +54,17 @@ export interface ImplementationIssue {
     readonly parentPr: number;
     readonly kind: 'review-finding' | 'reconcile' | 'ci-failure';
   };
+}
+
+export interface StaleImplementationRecoveryState {
+  readonly issue: ImplementationIssue | null;
+  readonly projectStatus: 'Todo' | 'In Progress' | 'Human' | 'In Review' | 'Done' | null;
+  readonly humanHold: boolean;
+  readonly pullRequest: (ImplementationPullRequest & {
+    readonly state: 'OPEN' | 'CLOSED' | 'MERGED';
+  }) | null;
+  readonly openPullRequests: readonly ImplementationPullRequest[];
+  readonly claim: BranchClaim | null;
 }
 
 export interface ImplementationPullRequest {
@@ -123,6 +135,10 @@ interface SpawnImplementationInput {
 
 export interface ImplementationExecutorDeps {
   readIssue(issueNumber: number): Promise<ImplementationIssue | null>;
+  readStaleRecovery(
+    issueNumber: number,
+    prNumber: number,
+  ): Promise<StaleImplementationRecoveryState>;
   runRealityCheck(issueNumber: number): Promise<RealityCheckVerdict>;
   listOpenPullRequests(issueNumber: number): Promise<readonly ImplementationPullRequest[]>;
   credentials: CredentialPool;
@@ -357,12 +373,98 @@ export function makeCanonicalImplementationSpawner(
   };
 }
 
+function staleRecoveryRejection(
+  action: Extract<ImplementationClaimAction, { intent: 'stale-recovery' }>,
+  state: StaleImplementationRecoveryState,
+): string | null {
+  if (state.humanHold) {
+    return `Stale recovery for issue #${action.issueNumber} is blocked by Human authority.`;
+  }
+  if (state.issue === null || !state.issue.open || state.issue.number !== action.issueNumber) {
+    return `Stale recovery issue #${action.issueNumber} is missing or closed.`;
+  }
+  if (state.projectStatus !== 'In Progress') {
+    return `Stale recovery Project status changed from In Progress to ${
+      state.projectStatus ?? 'missing'
+    }.`;
+  }
+  const pullRequest = state.pullRequest;
+  if (pullRequest === null) {
+    return `Stale recovery PR #${action.prNumber} is missing.`;
+  }
+  if (pullRequest.number !== action.prNumber) {
+    return `Stale recovery PR #${action.prNumber} changed to PR #${pullRequest.number}.`;
+  }
+  if (pullRequest.state !== 'OPEN') {
+    return `Stale recovery PR #${action.prNumber} is not open.`;
+  }
+  if (!pullRequest.draft) {
+    return `Stale recovery PR #${action.prNumber} is not a draft.`;
+  }
+  if (pullRequest.head !== action.expectedHead) {
+    return `Stale recovery PR #${action.prNumber} head changed from ${action.expectedHead} to ${
+      pullRequest.head
+    }.`;
+  }
+  if (pullRequest.headRefName !== action.branch) {
+    return `Stale recovery PR #${action.prNumber} branch changed from ${action.branch} to ${
+      pullRequest.headRefName
+    }.`;
+  }
+  if (pullRequest.baseRefName !== state.issue.targetBase) {
+    return `Stale recovery PR #${action.prNumber} target base changed.`;
+  }
+  if (!state.openPullRequests.some((candidate) => candidate.number === action.prNumber)) {
+    return `Stale recovery PR #${action.prNumber} is no longer the bounded open mapping.`;
+  }
+  const claim = state.claim;
+  if (
+    claim === null
+    || claim.phase !== 'implement'
+    || claim.issueNumber !== action.issueNumber
+    || (claim.prNumber !== undefined && claim.prNumber !== action.prNumber)
+    || claim.targetBase !== state.issue.targetBase
+  ) {
+    return `Stale recovery PR #${action.prNumber} no longer has a matching implementation claim.`;
+  }
+  if (claim.phaseComplete === true) {
+    return `Stale recovery PR #${action.prNumber} claim is finished.`;
+  }
+  if (claim.attempt !== action.claimAttempt) {
+    return `Stale recovery PR #${action.prNumber} claim attempt changed from ${
+      action.claimAttempt
+    } to ${claim.attempt}.`;
+  }
+  return null;
+}
+
 export async function executeImplementationAction(
-  action: { readonly issueNumber: number },
+  action: ImplementationClaimAction,
   deps: ImplementationExecutorDeps,
 ): Promise<ImplementationExecutionResult> {
+  const input = action as Partial<ImplementationClaimAction>;
+  if (
+    input.kind !== 'claim-implementation'
+    || (input.intent !== 'fresh' && input.intent !== 'stale-recovery')
+  ) {
+    throw new Error(
+      'Implementation action requires an explicit fresh or stale-recovery intent',
+    );
+  }
   const issueNumber = positiveIssueNumber(action.issueNumber);
-  const issue = await deps.readIssue(issueNumber);
+  const isStaleRecovery = action.intent === 'stale-recovery';
+  const recovery = isStaleRecovery
+    ? await deps.readStaleRecovery(issueNumber, action.prNumber)
+    : null;
+  const issue = isStaleRecovery
+    ? recovery!.issue
+    : await deps.readIssue(issueNumber);
+  if (isStaleRecovery && recovery !== null) {
+    const rejection = staleRecoveryRejection(action, recovery);
+    if (rejection !== null) {
+      return { status: 'ineligible', issueNumber, detail: rejection };
+    }
+  }
   if (issue === null || issue.number !== issueNumber || !issue.open) {
     return {
       status: 'ineligible',
@@ -372,6 +474,13 @@ export async function executeImplementationAction(
   }
 
   if (issue.child !== undefined) {
+    if (isStaleRecovery) {
+      return {
+        status: 'ineligible',
+        issueNumber,
+        detail: 'Stale implementation recovery no longer targets ordinary implementation work.',
+      };
+    }
     return executeChildImplementationAction(
       { ...issue, child: issue.child },
       deps,
@@ -379,7 +488,9 @@ export async function executeImplementationAction(
   }
 
   const reality = await deps.runRealityCheck(issueNumber);
-  const openPullRequests = await deps.listOpenPullRequests(issueNumber);
+  const openPullRequests = isStaleRecovery
+    ? recovery!.openPullRequests
+    : await deps.listOpenPullRequests(issueNumber);
   const realityPrNumber = reality.classification === 'pr-open'
     ? reality.evidence.prNumber
     : undefined;
@@ -405,12 +516,15 @@ export async function executeImplementationAction(
     await deps.escalateHuman({ issueNumber, reason });
     return { status: 'human', issueNumber, code: 'branch-mapping-ambiguous' };
   }
-  if (!issue.eligible || !realityPermitsImplementation(reality, openPullRequests)) {
+  if (
+    (!isStaleRecovery && !issue.eligible)
+    || !realityPermitsImplementation(reality, openPullRequests)
+  ) {
     return {
       status: 'ineligible',
       issueNumber,
-      detail: !issue.eligible
-        ? 'Issue is not currently eligible.'
+      detail: !isStaleRecovery && !issue.eligible
+        ? issue.eligibilityDetail ?? 'Issue is not currently eligible.'
         : `Canonical reality check classified the issue as ${reality.classification}.`,
     };
   }

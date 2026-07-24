@@ -46,6 +46,7 @@ import type {
   LifecycleViewItem,
   NewWorkAction,
 } from './types.js';
+import { gitRefName } from './types.js';
 import { EMPTY_GITHUB_USAGE, type GitHubUsage } from './github-usage.js';
 import { exactUtcTimestampMs } from './exact-utc-time.js';
 
@@ -629,6 +630,7 @@ function activeCandidates(
       });
       (isChild ? childImplementation : freshImplementation).push({
         phase: 'implementation',
+        intent: 'fresh',
         issueNumber: item.issueNumber,
         ...(isChild ? { isChild: true } : {}),
       });
@@ -641,10 +643,19 @@ function activeCandidates(
       entry.phase === 'implementing'
       && entry.stale
       && item.isDraft
+      && item.branchClaim?.phase === 'implement'
+      && item.branchClaim.phaseComplete !== true
     ) {
+      const pullRequest = byPr.get(item.prNumber);
+      if (pullRequest === undefined) continue;
       freshImplementation.push({
         phase: 'implementation',
+        intent: 'stale-recovery',
         issueNumber: item.issueNumber,
+        prNumber: item.prNumber,
+        expectedHead: item.head,
+        branch: gitRefName(pullRequest.headRefName),
+        claimAttempt: item.branchClaim.attempt,
       });
     } else if (
       entry.phase === 'awaiting-review'

@@ -6,7 +6,7 @@ const HEAD = gitOid('a'.repeat(40));
 
 describe('repository merge policy', () => {
   const candidates = [
-    { phase: 'implementation' as const, issueNumber: 1 },
+    { phase: 'implementation' as const, intent: 'fresh' as const, issueNumber: 1 },
     {
       phase: 'merge' as const,
       issueNumber: 2,
@@ -17,7 +17,7 @@ describe('repository merge policy', () => {
 
   it('removes merge candidates in the default manual policy', () => {
     expect(applyMergePolicy(candidates, 'manual')).toEqual([
-      { phase: 'implementation', issueNumber: 1 },
+      { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
     ]);
   });
 
