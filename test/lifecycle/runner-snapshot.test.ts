@@ -14,7 +14,10 @@ import type {
   SnapshotReadMode,
 } from '../../src/lifecycle/snapshot.js';
 import { IncrementalSnapshotUnavailableError } from '../../src/lifecycle/incremental-snapshot-source.js';
-import { LifecycleDiscoveryCacheCorruptError } from '../../src/lifecycle/lifecycle-cache.js';
+import {
+  LifecycleDiscoveryCacheCorruptError,
+  LifecycleDiscoveryCacheUnsafePathError,
+} from '../../src/lifecycle/lifecycle-cache.js';
 import { EMPTY_GITHUB_USAGE } from '../../src/lifecycle/github-usage.js';
 
 const START = new Date('2026-07-22T10:00:00.000Z');
@@ -252,6 +255,114 @@ describe('LifecycleSnapshotCoordinator', () => {
       expect(reads).toEqual([expectedMode]);
     },
   );
+
+  it.each([
+    ['regressed due marker', '2026-07-22T08:00:00.000Z', ['incremental', 'full'], 'full'],
+    ['regressed but still recent marker', '2026-07-22T09:45:00.000Z', ['incremental', 'full'], 'full'],
+    ['newer valid marker', '2026-07-22T10:10:00.000Z', ['incremental'], 'incremental'],
+    ['newer future marker', '2026-07-22T10:31:00.000Z', ['incremental', 'full'], 'full'],
+  ] as const)(
+    'fences a changed source cache with a %s',
+    async (_label, sourceMarker, expectedReads, expectedMode) => {
+      const now = new Date('2026-07-22T10:30:00.000Z');
+      const reads: SnapshotReadMode[] = [];
+      const coordinator = new LifecycleSnapshotCoordinator({
+        source: source(reads, async (mode) => completeSnapshot(
+          mode,
+          now.toISOString(),
+          mode === 'full' ? now.toISOString() : sourceMarker,
+        )),
+        configuredMode: 'incremental',
+        fullReconcileMs: 60 * 60_000,
+        startupFull: true,
+        allowPartial: false,
+        cadenceSeed: START.toISOString(),
+        now: () => now,
+        readUsage: () => EMPTY_GITHUB_USAGE,
+      });
+
+      const snapshot = await coordinator.read(500);
+
+      expect(reads).toEqual(expectedReads);
+      expect(snapshot.snapshotMode).toBe(expectedMode);
+      expect(snapshot.lastFullReconciliationAt).toBe(
+        expectedMode === 'full' ? now.toISOString() : sourceMarker,
+      );
+    },
+  );
+
+  it.each([
+    ['missing', new IncrementalSnapshotUnavailableError('cache disappeared')],
+    ['corrupt', new LifecycleDiscoveryCacheCorruptError('cache changed')],
+  ])(
+    'retries full when the seeded source cache becomes %s before its incremental read',
+    async (_label, incrementalError) => {
+      const now = new Date('2026-07-22T10:30:00.000Z');
+      const reads: SnapshotReadMode[] = [];
+      const resetUsage: Array<boolean | undefined> = [];
+      const coordinator = new LifecycleSnapshotCoordinator({
+        source: {
+          async read(options) {
+            reads.push(options.mode);
+            resetUsage.push(options.resetUsage);
+            if (options.mode === 'incremental') throw incrementalError;
+            return completeSnapshot('full', now.toISOString(), now.toISOString());
+          },
+        },
+        configuredMode: 'incremental',
+        fullReconcileMs: 60 * 60_000,
+        startupFull: true,
+        allowPartial: false,
+        cadenceSeed: START.toISOString(),
+        now: () => now,
+        readUsage: () => EMPTY_GITHUB_USAGE,
+      });
+
+      await expect(coordinator.read(500)).resolves.toMatchObject({
+        snapshotMode: 'full',
+        lastFullReconciliationAt: now.toISOString(),
+      });
+      expect(reads).toEqual(['incremental', 'full']);
+      expect(resetUsage).toEqual([undefined, false]);
+    },
+  );
+
+  it('does not recover a seeded startup through a cache path that became unsafe', async () => {
+    const now = new Date('2026-07-22T10:30:00.000Z');
+    const reads: SnapshotReadMode[] = [];
+    const resetUsage: Array<boolean | undefined> = [];
+    let githubCalls = 0;
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: {
+        async read(options) {
+          reads.push(options.mode);
+          resetUsage.push(options.resetUsage);
+          throw new LifecycleDiscoveryCacheUnsafePathError('cache path became a symlink');
+        },
+      },
+      configuredMode: 'incremental',
+      fullReconcileMs: 60 * 60_000,
+      startupFull: true,
+      allowPartial: false,
+      cadenceSeed: START.toISOString(),
+      now: () => now,
+      readUsage: () => {
+        githubCalls += 1;
+        return EMPTY_GITHUB_USAGE;
+      },
+    });
+
+    await expect(coordinator.read(500)).rejects.toMatchObject({
+      message: expect.stringMatching(/cache authority changed and full retry failed/i),
+      errors: [
+        expect.any(LifecycleDiscoveryCacheUnsafePathError),
+        expect.any(LifecycleDiscoveryCacheUnsafePathError),
+      ],
+    });
+    expect(reads).toEqual(['incremental', 'full']);
+    expect(resetUsage).toEqual([undefined, false]);
+    expect(githubCalls).toBe(0);
+  });
 
   it('keeps configured full mode as an every-cycle rollback despite a recent seed', async () => {
     const reads: SnapshotReadMode[] = [];

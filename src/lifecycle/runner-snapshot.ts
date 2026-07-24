@@ -183,6 +183,13 @@ export class IncrementalFallbackAuthorityError extends Error {
   }
 }
 
+export class IncrementalCadenceSeedAuthorityError extends Error {
+  constructor(detail: string) {
+    super(`Seeded startup incremental snapshot is not authoritative: ${detail}`);
+    this.name = 'IncrementalCadenceSeedAuthorityError';
+  }
+}
+
 function safeNonNegativeInteger(value: unknown): value is number {
   return typeof value === 'number'
     && Number.isSafeInteger(value)
@@ -296,6 +303,32 @@ function assertIncrementalFallbackAuthority(
   if (usageDetail !== null) throw new IncrementalFallbackAuthorityError(usageDetail);
 }
 
+function cadenceSeedAuthorityDetail(
+  snapshot: GitHubLifecycleSnapshot,
+  cadenceSeed: string,
+  requestedAtMs: number,
+  completedAtMs: number,
+  fullReconcileMs: number,
+): string | null {
+  const seedMs = exactUtcTimestampMs(cadenceSeed);
+  if (seedMs === null) return 'cadence seed is not an exact UTC timestamp';
+  const capturedMs = exactUtcTimestampMs(snapshot.capturedAt);
+  if (capturedMs === null) return 'capturedAt is not an exact UTC timestamp';
+  const sourceMarkerMs = exactUtcTimestampMs(snapshot.lastFullReconciliationAt);
+  if (sourceMarkerMs === null) {
+    return 'lastFullReconciliationAt is missing or not an exact UTC timestamp';
+  }
+  if (capturedMs > completedAtMs) return 'capturedAt is future-dated';
+  if (sourceMarkerMs > capturedMs || sourceMarkerMs > completedAtMs) {
+    return 'lastFullReconciliationAt is future-dated';
+  }
+  if (sourceMarkerMs < seedMs) return 'lastFullReconciliationAt regressed behind the cadence seed';
+  const elapsed = requestedAtMs - sourceMarkerMs;
+  if (elapsed < 0) return 'lastFullReconciliationAt is future-dated';
+  if (elapsed >= fullReconcileMs) return 'lastFullReconciliationAt is due for a full reconciliation';
+  return null;
+}
+
 export interface LifecycleSnapshotCoordinatorOptions {
   readonly source: LifecycleSnapshotSource;
   readonly configuredMode: SnapshotReadMode;
@@ -359,9 +392,40 @@ export class LifecycleSnapshotCoordinator {
     return 'incremental';
   }
 
+  private async retryFullAfterSeededIncremental(
+    rateLimitFloor: number,
+    authorityError: unknown,
+  ): Promise<GitHubLifecycleSnapshot> {
+    this.fullRetryDue = true;
+    try {
+      const fullRequestedAtMs = exactNow(this.now).getTime();
+      const full = await this.source.read({
+        mode: 'full',
+        rateLimitFloor,
+        resetUsage: false,
+      });
+      assertFullSnapshotAuthority(
+        full,
+        fullRequestedAtMs,
+        exactNow(this.now).getTime(),
+      );
+      this.lastFullReconciliationAt = full.lastFullReconciliationAt!;
+      this.fullRetryDue = false;
+      return full;
+    } catch (fullError) {
+      throw new AggregateError(
+        [authorityError, fullError],
+        'Seeded startup incremental cache authority changed and full retry failed',
+      );
+    }
+  }
+
   async read(rateLimitFloor: number): Promise<GitHubLifecycleSnapshot> {
     const now = exactNow(this.now);
     const mode = this.nextMode(now);
+    const startupCadenceSeed = !this.started && mode === 'incremental'
+      ? this.lastFullReconciliationAt
+      : null;
     this.started = true;
     try {
       const snapshot = await this.source.read({ mode, rateLimitFloor });
@@ -370,10 +434,33 @@ export class LifecycleSnapshotCoordinator {
       } else if (snapshot.snapshotComplete !== true) {
         throw new IncrementalSnapshotUnavailableError('snapshot source returned a partial view');
       }
+      if (startupCadenceSeed !== null) {
+        const authorityDetail = cadenceSeedAuthorityDetail(
+          snapshot,
+          startupCadenceSeed,
+          now.getTime(),
+          exactNow(this.now).getTime(),
+          this.fullReconcileMs,
+        );
+        if (authorityDetail !== null) {
+          const authorityError = new IncrementalCadenceSeedAuthorityError(authorityDetail);
+          return this.retryFullAfterSeededIncremental(rateLimitFloor, authorityError);
+        }
+      }
       this.lastFullReconciliationAt = snapshot.lastFullReconciliationAt ?? null;
       if (mode === 'full') this.fullRetryDue = false;
       return snapshot;
     } catch (error) {
+      if (
+        startupCadenceSeed !== null
+        && mode === 'incremental'
+        && (
+          error instanceof IncrementalSnapshotUnavailableError
+          || error instanceof LifecycleDiscoveryCacheCorruptError
+        )
+      ) {
+        return this.retryFullAfterSeededIncremental(rateLimitFloor, error);
+      }
       if (
         mode === 'full'
         && this.configuredMode === 'incremental'

@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -30,6 +30,25 @@ export function daemonActiveOnceEnvironment(
     ...environment,
     [INTERNAL_DAEMON_ACTIVE_ONCE_ENV]: '1',
   };
+}
+
+export function spawnDaemonActiveOnce(input: {
+  readonly entryPath: string;
+  readonly cwd: string;
+  readonly environment: NodeJS.ProcessEnv;
+}): ChildProcess {
+  return spawn(process.execPath, [
+    input.entryPath,
+    'internal',
+    'engine',
+    '--mode',
+    'active',
+    '--once',
+  ], {
+    cwd: input.cwd,
+    env: daemonActiveOnceEnvironment(input.environment),
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
 }
 
 export async function completeDaemonCycle(options: {
@@ -458,17 +477,10 @@ export async function runDaemon(input: {
       metadata = updateMetadata(input.loaded, metadata, {
         lastCycleStartedAt: new Date().toISOString(),
       });
-      const controller = spawn(process.execPath, [
-        input.entryPath,
-        'internal',
-        'engine',
-        '--mode',
-        'active',
-        '--once',
-      ], {
+      const controller = spawnDaemonActiveOnce({
+        entryPath: input.entryPath,
         cwd: input.loaded.repositoryRoot,
-        env: daemonActiveOnceEnvironment(input.environment ?? process.env),
-        stdio: ['ignore', 'inherit', 'inherit'],
+        environment: input.environment ?? process.env,
       });
       const completed = await completeDaemonCycle({
         exit: new Promise<number | null>((resolvePromise) => {
