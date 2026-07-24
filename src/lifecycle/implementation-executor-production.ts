@@ -219,6 +219,7 @@ export function makeProductionImplementationActionPort(
       [...snapshot.issues],
       prLinks(snapshot),
       options.authorAllowlist,
+      defaultBranch,
     );
     const authorizedStack = stackReady.get(issueNumber);
     if (

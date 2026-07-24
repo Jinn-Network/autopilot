@@ -7,7 +7,7 @@ export interface StackReady {
   /**
    * Bare git branch name to branch the worktree off and target the PR at.
    * Either the single unmerged blocker's PR head branch (a real stack), or
-   * `'next'` when every blocker has already merged (build on `next` normally).
+   * the configured default base when every blocker has already merged.
    */
   baseBranch: string;
 }
@@ -21,7 +21,7 @@ const DEFAULT_BASE = 'next';
  * **Rule (single-blocker MVP, spec 2026-07-13):** admit iff every blocker is
  * either MERGED, or exactly one blocker is unmerged-with-an-open-PR while all
  * others are MERGED.
- *  - all blockers merged            → admit, `baseBranch: 'next'`
+ *  - all blockers merged            → admit, `baseBranch: <default>`
  *  - exactly one open-PR blocker    → admit, `baseBranch: <that PR's head>`
  *  - a blocker with no PR            → not admitted (stays blocked)
  *  - a blocker only closed-unmerged  → not admitted (abandoned base)
@@ -35,6 +35,7 @@ export function resolveStackReady(
   polled: PolledIssue[],
   prByIssue: ReadonlyMap<number, PrLink[]>,
   authorAllowlist: ReadonlySet<string>,
+  defaultBase = DEFAULT_BASE,
 ): Map<number, StackReady> {
   const out = new Map<number, StackReady>();
 
@@ -70,8 +71,8 @@ export function resolveStackReady(
     if (!allBlockersSatisfied) continue;
 
     if (openBlockerHeads.length === 0) {
-      // Every blocker merged: build on `next`, no real stack.
-      out.set(issue.number, { baseBranch: DEFAULT_BASE });
+      // Every blocker merged: build on the configured default, no real stack.
+      out.set(issue.number, { baseBranch: defaultBase });
     } else if (openBlockerHeads.length === 1) {
       // Exactly one unmerged blocker with an open PR: stack on its head branch.
       out.set(issue.number, { baseBranch: openBlockerHeads[0] });

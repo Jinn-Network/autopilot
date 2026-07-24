@@ -470,6 +470,8 @@ export async function runAutopilotV2(
       reader.readIssueActionContextForReconciliation(issueNumber),
     readOpenPullRequestNumbersClosingIssue: (issueNumber) =>
       reader.readPullRequestNumbersClosingIssues([issueNumber]),
+    readPullRequestOutcomeNumbersClosingIssues: (issueNumbers) =>
+      reader.readPullRequestOutcomeNumbersClosingIssues(issueNumbers),
     readPullRequestDetails: (prNumber) => restDiscovery.readPullRequestForAction(prNumber),
   });
   const withTargetedReserve = async <Value>(

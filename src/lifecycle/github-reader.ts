@@ -869,6 +869,19 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   async readPullRequestNumbersClosingIssues(
     issueNumbers: readonly number[],
   ): Promise<ReadonlySet<number>> {
+    return this.readPullRequestNumbersClosingIssuesByState(issueNumbers, false);
+  }
+
+  async readPullRequestOutcomeNumbersClosingIssues(
+    issueNumbers: readonly number[],
+  ): Promise<ReadonlySet<number>> {
+    return this.readPullRequestNumbersClosingIssuesByState(issueNumbers, true);
+  }
+
+  private async readPullRequestNumbersClosingIssuesByState(
+    issueNumbers: readonly number[],
+    includeMerged: boolean,
+  ): Promise<ReadonlySet<number>> {
     const unique = [...new Set(issueNumbers)].sort((left, right) => left - right);
     for (const number of unique) {
       if (!Number.isSafeInteger(number) || number <= 0) {
@@ -947,7 +960,9 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         if (state !== 'OPEN' && state !== 'CLOSED' && state !== 'MERGED') {
           throw new Error(`Targeted closing-PR issue #${issueNumber} PR state is unknown`);
         }
-        if (state === 'OPEN') result.add(number as number);
+        if (state === 'OPEN' || (includeMerged && state === 'MERGED')) {
+          result.add(number as number);
+        }
       }
     }
     return result;

@@ -3,7 +3,16 @@ import {
   makeTargetedActionReader,
 } from '../../src/lifecycle/targeted-action-reader.js';
 import { GitHubRateLimitReserveError } from '../../src/lifecycle/github-usage.js';
-import { gitOid } from '../../src/lifecycle/types.js';
+import {
+  makeProductionImplementationActionPort,
+} from '../../src/lifecycle/implementation-executor-production.js';
+import {
+  executeImplementationAction,
+  type ImplementationExecutorDeps,
+} from '../../src/lifecycle/implementation-executor.js';
+import { encodeBranchClaimTrailers } from '../../src/lifecycle/codecs.js';
+import { CredentialPool } from '../../src/lifecycle/credentials.js';
+import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 import type {
   GitHubLifecycleSnapshot,
   RawPullRequest,
@@ -11,6 +20,7 @@ import type {
 import { decodePullRequestSnapshot } from '../../src/lifecycle/snapshot.js';
 
 const HEAD = 'a'.repeat(40);
+const BLOCKER_HEAD = 'b'.repeat(40);
 
 function cycleSnapshot(): GitHubLifecycleSnapshot {
   return {
@@ -93,6 +103,120 @@ function rawPullRequest(overrides: Partial<RawPullRequest> = {}): RawPullRequest
   };
 }
 
+function staleRecoveryCycle(
+  implementationBase = 'autopilot/7',
+): {
+  readonly cycle: GitHubLifecycleSnapshot;
+  readonly implementation: RawPullRequest;
+  readonly blocker: RawPullRequest;
+} {
+  const base = cycleSnapshot();
+  const implementation = rawPullRequest({
+    baseRefName: implementationBase,
+    isDraft: true,
+    branchClaimTrailers: encodeBranchClaimTrailers({
+      kind: 'branch-claim',
+      protocolVersion: 2,
+      phase: 'implement',
+      issueNumber: 42,
+      prNumber: 101,
+      attempt: '11111111-1111-4111-8111-111111111111',
+      runner: 'runner-a',
+      login: 'oaksprout',
+      expectedHead: gitOid(HEAD),
+      targetBase: gitRefName('autopilot/7'),
+      claimedAt: '2026-07-22T09:00:00.000Z',
+    }),
+  });
+  const blocker = rawPullRequest({
+    number: 201,
+    title: 'Implement blocker',
+    body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+    baseRefName: 'next',
+    headRefName: 'autopilot/7',
+    headOid: BLOCKER_HEAD,
+    isDraft: true,
+    closingIssueNumbers: [7],
+  });
+  return {
+    cycle: {
+      ...base,
+      project: {
+        ...base.project,
+        items: [{
+          ...base.project.items[0]!,
+          status: 'In Progress',
+          blockedOn: 'Another issue',
+          blockedByIssues: [7],
+        }],
+      },
+      issues: [{
+        ...base.issues[0]!,
+        status: 'In Progress',
+        blockedOn: 'Another issue',
+        blockedByIssues: [7],
+      }],
+      pullRequests: [
+        decodePullRequestSnapshot(blocker),
+        decodePullRequestSnapshot(implementation),
+      ],
+    },
+    implementation,
+    blocker,
+  };
+}
+
+function staleRecoveryReader(
+  fixture: ReturnType<typeof staleRecoveryCycle>,
+  liveBlocker: RawPullRequest | null,
+  calls: number[] = [],
+  outcomeNumbers: ReadonlySet<number> = new Set([fixture.blocker.number]),
+) {
+  return makeTargetedActionReader({
+    authorAllowlist: new Set(['oaksprout']),
+    rateLimitFloor: 500,
+    readGraphQlRemaining: async () => 510,
+    readPullRequest: async (number) => {
+      calls.push(number);
+      if (number === fixture.implementation.number) return fixture.implementation;
+      if (number === fixture.blocker.number) return liveBlocker;
+      return null;
+    },
+    readProjectItem: async () => ({
+      id: 'item-42',
+      status: 'In Progress',
+      priority: 'P1',
+      effort: 'Medium',
+      blockedOn: 'Another issue',
+      issueType: 'fix',
+    }),
+    readIssue: async (number) => ({
+      number,
+      title: 'Target issue',
+      open: true,
+      author: 'oaksprout',
+      labels: [],
+    }),
+    readBlockedByIssueNumbers: async () => [7],
+    readPullRequestOutcomeNumbersClosingIssues: async () => outcomeNumbers,
+  });
+}
+
+function staleRecoveryTarget(
+  snapshot: GitHubLifecycleSnapshot,
+): ReturnType<ReturnType<typeof makeProductionImplementationActionPort>['readStaleRecovery']> {
+  const port = makeProductionImplementationActionPort({
+    repositoryPath: '/repo',
+    worktreeBase: '/attempts',
+    runnerId: 'runner-a',
+    credentials: new CredentialPool([]),
+    authorAllowlist: new Set(['oaksprout']),
+    defaultBranch: 'next',
+    readSnapshot: async () => snapshot,
+  });
+  return port.readStaleRecovery(42, 101);
+}
+
 describe('targeted action reader', () => {
   it('hydrates only the requested PR and its mapped Project item', async () => {
     const calls: string[] = [];
@@ -131,6 +255,396 @@ describe('targeted action reader', () => {
     expect(snapshot?.lifecycle.items).toEqual([
       expect.objectContaining({ kind: 'pull-request', issueNumber: 42, prNumber: 101 }),
     ]);
+  });
+
+  it('withholds stale-recovery authority when a blocker closes unmerged after the cycle', async () => {
+    const fixture = staleRecoveryCycle();
+    const calls: number[] = [];
+    const reader = staleRecoveryReader(fixture, null, calls);
+
+    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+
+    expect(targeted).not.toBeNull();
+    expect(calls).toEqual([101, 201]);
+    await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
+      issue: null,
+    });
+  });
+
+  it('stops a closed-unmerged blocker race before reality check or mutation', async () => {
+    const fixture = staleRecoveryCycle();
+    const reader = staleRecoveryReader(fixture, null);
+    const events: string[] = [];
+    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+    const result = targeted === null
+      ? 'withheld'
+      : await executeImplementationAction({
+          kind: 'claim-implementation',
+          intent: 'stale-recovery',
+          issueNumber: 42,
+          prNumber: 101,
+          expectedHead: gitOid(HEAD),
+          branch: gitRefName('autopilot/42'),
+          claimAttempt: '11111111-1111-4111-8111-111111111111',
+        }, {
+          ...makeProductionImplementationActionPort({
+            repositoryPath: '/repo',
+            worktreeBase: '/attempts',
+            runnerId: 'runner-a',
+            credentials: new CredentialPool([]),
+            authorAllowlist: new Set(['oaksprout']),
+            defaultBranch: 'next',
+            readSnapshot: async () => targeted,
+          }),
+          runRealityCheck: async () => {
+            events.push('reality');
+            return {
+              classification: 'clear',
+              evidence: {},
+              suggestedBlockedOn: null,
+              suggestedComment: null,
+            };
+          },
+          credentials: new CredentialPool([{
+            login: 'implementation-bot',
+            normalizedLogin: 'implementation-bot',
+            implementationToken: 'selected-secret',
+          }]),
+          remoteUrl: 'https://github.com/Jinn-Network/mono.git',
+          readTargetBaseHead: async () => {
+            events.push('target-head');
+            return gitOid(BLOCKER_HEAD);
+          },
+          createClaimCommit: async () => {
+            events.push('claim-commit');
+            return gitOid('c'.repeat(40));
+          },
+          claimBranch: async (input) => {
+            events.push('claim');
+            return {
+              status: 'won',
+              expected: input.expectedRemoteHead,
+              published: input.claimOid,
+              observed: input.claimOid,
+            };
+          },
+          ensureDraftPullRequest: async (input) => {
+            events.push('pull-request');
+            return {
+              number: 101,
+              headRefName: input.branch,
+              head: input.claimOid,
+              baseRefName: input.targetBase,
+              draft: true,
+              labels: [input.label],
+              body: input.body,
+            };
+          },
+          setProjectInProgress: async () => {
+            events.push('project');
+          },
+          createAttempt: async (input) => {
+            events.push('attempt');
+            return {
+              attemptId: input.attemptId,
+              paths: {
+                worktree: '/attempt/worktree',
+                manifest: '/attempt/manifest.json',
+                log: '/attempt/session.log',
+                ghConfigDir: '/attempt/gh',
+                askpass: '/attempt/askpass',
+              },
+            };
+          },
+          spawnCoordinator: () => {
+            events.push('worker');
+            return { pid: 42 };
+          },
+          trackChild: () => {
+            events.push('track');
+          },
+          ambientEnvironment: {},
+          nextAttemptId: () => '22222222-2222-4222-8222-222222222222',
+          runnerId: 'runner-a',
+          now: () => new Date('2026-07-22T10:00:00.000Z'),
+        } satisfies ImplementationExecutorDeps);
+
+    expect(result).toMatchObject({
+      status: 'ineligible',
+      issueNumber: 42,
+    });
+    expect(events).toEqual([]);
+  });
+
+  it('derives the configured default target when a blocker merges after the cycle', async () => {
+    const fixture = staleRecoveryCycle('next');
+    const mergedBlocker: RawPullRequest = {
+      ...fixture.blocker,
+      state: 'MERGED',
+      mergedAt: '2026-07-22T09:30:00.000Z',
+      mergeCommitOid: 'c'.repeat(40),
+    };
+    const reader = staleRecoveryReader(fixture, mergedBlocker);
+
+    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+
+    expect(targeted).not.toBeNull();
+    await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
+      issue: { targetBase: 'next' },
+      pullRequest: { baseRefName: 'next' },
+    });
+  });
+
+  it('recovers #2039 through merged PR #1728 omitted from the cycle cache', async () => {
+    const fixture = staleRecoveryCycle('next');
+    const implementation = {
+      ...fixture.implementation,
+      number: 2040,
+      body: '<!-- jinn-autopilot:v2 issue=2039 branch=autopilot/2039 -->',
+      baseRefName: 'main',
+      headRefName: 'autopilot/2039',
+      closingIssueNumbers: [2039],
+      branchClaimTrailers: encodeBranchClaimTrailers({
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        issueNumber: 2039,
+        prNumber: 2040,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'oaksprout',
+        expectedHead: gitOid(HEAD),
+        targetBase: gitRefName('autopilot/1243'),
+        claimedAt: '2026-07-22T09:00:00.000Z',
+      }),
+    };
+    const mergedBlocker: RawPullRequest = {
+      ...fixture.blocker,
+      number: 1728,
+      body: '<!-- jinn-autopilot:v2 issue=1243 branch=autopilot/1243 -->',
+      headRefName: 'autopilot/1243',
+      closingIssueNumbers: [1243],
+      state: 'MERGED',
+      mergedAt: '2026-07-22T09:30:00.000Z',
+      mergeCommitOid: 'c'.repeat(40),
+    };
+    const calls: string[] = [];
+    const options = {
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => 510,
+      readPullRequest: async (number: number) => {
+        calls.push(`pr:${number}`);
+        if (number === 2040) return implementation;
+        if (number === 1728) return mergedBlocker;
+        return null;
+      },
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Progress' as const,
+        priority: 'P1' as const,
+        effort: 'Medium' as const,
+        blockedOn: 'Another issue' as const,
+        issueType: 'fix' as const,
+      }),
+      readIssue: async (number: number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [1243],
+      readPullRequestOutcomeNumbersClosingIssues: async (numbers: readonly number[]) => {
+        calls.push(`relations:${numbers.join(',')}`);
+        return new Set([1728]);
+      },
+    };
+    const reader = makeTargetedActionReader(options);
+    const cycleWithoutMergedOutcome = {
+      ...fixture.cycle,
+      project: {
+        ...fixture.cycle.project,
+        items: [{
+          ...fixture.cycle.project.items[0]!,
+          number: 2039,
+          blockedByIssues: [1243],
+        }],
+      },
+      issues: [{
+        ...fixture.cycle.issues[0]!,
+        number: 2039,
+        blockedByIssues: [1243],
+      }],
+      pullRequests: [decodePullRequestSnapshot(implementation)],
+    };
+
+    const targeted = await reader.readPullRequest(cycleWithoutMergedOutcome, 2040);
+    const port = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: new CredentialPool([]),
+      authorAllowlist: new Set(['oaksprout']),
+      defaultBranch: 'main',
+      readSnapshot: async () => targeted!,
+    });
+
+    expect(calls).toEqual(['pr:2040', 'relations:1243', 'pr:1728']);
+    await expect(port.readStaleRecovery(2039, 2040)).resolves.toMatchObject({
+      issue: { targetBase: 'main' },
+      pullRequest: { baseRefName: 'main' },
+    });
+  });
+
+  it('retains a still-open trusted blocker exact live branch target', async () => {
+    const fixture = staleRecoveryCycle('stack/live-blocker');
+    const liveBlocker: RawPullRequest = {
+      ...fixture.blocker,
+      headRefName: 'stack/live-blocker',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/live-blocker -->',
+    };
+    const reader = staleRecoveryReader(fixture, liveBlocker);
+
+    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+
+    expect(targeted).not.toBeNull();
+    await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
+      issue: { targetBase: 'stack/live-blocker' },
+      pullRequest: { baseRefName: 'stack/live-blocker' },
+    });
+  });
+
+  it('withholds stale-recovery authority for untrusted live blocker evidence', async () => {
+    const fixture = staleRecoveryCycle();
+    const reader = staleRecoveryReader(fixture, {
+      ...fixture.blocker,
+      author: 'outsider',
+    });
+
+    const targeted = await reader.readPullRequest(fixture.cycle, 101);
+
+    expect(targeted).not.toBeNull();
+    await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
+      issue: null,
+    });
+  });
+
+  it('withholds stale-recovery authority for ambiguously mapped live blocker evidence', async () => {
+    const fixture = staleRecoveryCycle();
+    const reader = staleRecoveryReader(fixture, {
+      ...fixture.blocker,
+      closingIssueNumbers: [7, 8],
+    });
+
+    await expect(reader.readPullRequest(fixture.cycle, 101)).resolves.toBeNull();
+  });
+
+  it('withholds stale-recovery authority when a fresh blocker edge has no PR evidence', async () => {
+    const fixture = staleRecoveryCycle();
+    const reader = staleRecoveryReader(fixture, fixture.blocker, [], new Set());
+    const withoutBlockerEvidence = {
+      ...fixture.cycle,
+      pullRequests: fixture.cycle.pullRequests.filter((pr) => pr.number !== 201),
+    };
+
+    const targeted = await reader.readPullRequest(withoutBlockerEvidence, 101);
+
+    expect(targeted).not.toBeNull();
+    await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
+      issue: null,
+    });
+  });
+
+  it('exact-hydrates every PR referenced by fresh blocker edges', async () => {
+    const fixture = staleRecoveryCycle('next');
+    const secondBlocker = rawPullRequest({
+      number: 202,
+      title: 'Implement second blocker',
+      body: '<!-- jinn-autopilot:v2 issue=8 branch=autopilot/8 -->',
+      baseRefName: 'next',
+      headRefName: 'autopilot/8',
+      headOid: 'd'.repeat(40),
+      isDraft: false,
+      state: 'MERGED',
+      closingIssueNumbers: [8],
+      mergedAt: '2026-07-22T09:35:00.000Z',
+      mergeCommitOid: 'e'.repeat(40),
+    });
+    const firstMerged = {
+      ...fixture.blocker,
+      state: 'MERGED' as const,
+      mergedAt: '2026-07-22T09:30:00.000Z',
+      mergeCommitOid: 'c'.repeat(40),
+    };
+    const cycle = {
+      ...fixture.cycle,
+      project: {
+        ...fixture.cycle.project,
+        items: [{
+          ...fixture.cycle.project.items[0]!,
+          blockedByIssues: [7, 8],
+        }],
+      },
+      issues: [{
+        ...fixture.cycle.issues[0]!,
+        blockedByIssues: [7, 8],
+      }],
+      pullRequests: [
+        ...fixture.cycle.pullRequests,
+        decodePullRequestSnapshot({
+          ...secondBlocker,
+          state: 'OPEN',
+          mergedAt: null,
+          mergeCommitOid: null,
+        }),
+      ],
+    };
+    const calls: number[] = [];
+    let reserveReads = 0;
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => {
+        reserveReads += 1;
+        return 510;
+      },
+      readPullRequest: async (number) => {
+        calls.push(number);
+        if (number === 101) return fixture.implementation;
+        if (number === 201) return firstMerged;
+        if (number === 202) return secondBlocker;
+        return null;
+      },
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Progress',
+        priority: 'P1',
+        effort: 'Medium',
+        blockedOn: 'Another issue',
+        issueType: 'fix',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [7, 8],
+      readPullRequestOutcomeNumbersClosingIssues: async () => new Set([201, 202]),
+    });
+
+    const targeted = await reader.readPullRequest(cycle, 101);
+
+    expect(calls).toEqual([101, 201, 202]);
+    expect(reserveReads).toBe(4);
+    expect(targeted?.pullRequests.filter((pr) => (
+      pr.number === 201 || pr.number === 202
+    )).map((pr) => pr.state)).toEqual(['MERGED', 'MERGED']);
+    await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
+      issue: { targetBase: 'next' },
+    });
   });
 
   it('reuses an aggregate cohort reservation without per-review quota probes', async () => {
