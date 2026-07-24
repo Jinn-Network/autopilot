@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   classifyDaemonRecord,
+  completeDaemonCycle,
+  daemonActiveOnceEnvironment,
+  INTERNAL_DAEMON_ACTIVE_ONCE_ENV,
   serviceSocketPath,
   type DaemonMetadata,
 } from '../src/service.js';
@@ -78,5 +81,55 @@ describe('repository-scoped daemon safety', () => {
     expect(first).not.toBe(second);
     expect(Buffer.byteLength(first)).toBeLessThanOrEqual(100);
     expect(first).toMatch(/^\/tmp\/ap-\d+\/[0-9a-f]{24}\.sock$/);
+  });
+
+  it('marks a copied environment only for a daemon-spawned active once child', () => {
+    const parent = {
+      PATH: '/opt/homebrew/bin',
+      JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE: 'stale',
+    };
+
+    const child = daemonActiveOnceEnvironment(parent);
+
+    expect(child).toEqual({
+      PATH: '/opt/homebrew/bin',
+      JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE: '1',
+    });
+    expect(parent.JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE).toBe('stale');
+    expect(INTERNAL_DAEMON_ACTIVE_ONCE_ENV)
+      .toBe('JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE');
+  });
+
+  it('measures the next poll delay from child completion', async () => {
+    let completeChild: ((exitCode: number | null) => void) | undefined;
+    const exit = new Promise<number | null>((resolve) => {
+      completeChild = resolve;
+    });
+    let clockMs = 100;
+    let completionAt: number | undefined;
+    let waitStartedAt: number | undefined;
+
+    const cycle = completeDaemonCycle({
+      exit,
+      recordCompletion: () => {
+        completionAt = clockMs;
+      },
+      shouldStop: () => false,
+      intervalMs: 600_000,
+      wait: async (ms) => {
+        waitStartedAt = clockMs;
+        clockMs += ms;
+      },
+    });
+    await Promise.resolve();
+    expect(waitStartedAt).toBeUndefined();
+
+    clockMs = 1_000;
+    completeChild!(0);
+
+    await expect(cycle).resolves.toEqual({ exitCode: 0, waited: true });
+    expect(completionAt).toBe(1_000);
+    expect(waitStartedAt).toBe(completionAt);
+    expect(clockMs).toBe(601_000);
   });
 });

@@ -304,6 +304,8 @@ export interface LifecycleSnapshotCoordinatorOptions {
   readonly startupFull: boolean;
   /** Only routine read-only status may turn a missing/corrupt cache into a partial view. */
   readonly allowPartial: boolean;
+  /** Validated durable marker supplied only to a daemon-spawned active one-shot. */
+  readonly cadenceSeed?: string | null;
   readonly forceFull?: boolean;
   readonly now?: () => Date;
   readonly readUsage?: () => GitHubUsage;
@@ -338,16 +340,20 @@ export class LifecycleSnapshotCoordinator {
     this.forceFull = options.forceFull ?? false;
     this.now = options.now ?? (() => new Date());
     this.readUsage = options.readUsage ?? (() => EMPTY_GITHUB_USAGE);
+    this.lastFullReconciliationAt = options.cadenceSeed ?? null;
   }
 
   private nextMode(now: Date): SnapshotReadMode {
     if (this.forceFull || this.configuredMode === 'full') return 'full';
     if (this.fullRetryDue) return 'full';
-    if (!this.started) return this.startupFull ? 'full' : 'incremental';
+    if (!this.started && this.lastFullReconciliationAt === null) {
+      return this.startupFull ? 'full' : 'incremental';
+    }
     if (this.lastFullReconciliationAt === null) return this.startupFull ? 'full' : 'incremental';
-    const lastFullMs = Date.parse(this.lastFullReconciliationAt);
+    const lastFullMs = exactUtcTimestampMs(this.lastFullReconciliationAt);
+    if (lastFullMs === null) return 'full';
     const elapsed = now.getTime() - lastFullMs;
-    if (!Number.isFinite(lastFullMs) || elapsed < 0 || elapsed >= this.fullReconcileMs) {
+    if (elapsed < 0 || elapsed >= this.fullReconcileMs) {
       return 'full';
     }
     return 'incremental';

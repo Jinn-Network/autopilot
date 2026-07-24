@@ -222,7 +222,38 @@ describe('LifecycleSnapshotCoordinator', () => {
     expect(reads).toEqual(['full', 'incremental', 'full']);
   });
 
-  it('keeps full mode as an every-cycle rollback path', async () => {
+  it.each([
+    ['recent', START.toISOString(), new Date(START.getTime() + 30 * 60_000), 'incremental'],
+    ['missing', null, new Date(START.getTime() + 30 * 60_000), 'full'],
+    ['malformed', '2026-07-22T10:00:00+00:00', new Date(START.getTime() + 30 * 60_000), 'full'],
+    ['future', new Date(START.getTime() + 1).toISOString(), START, 'full'],
+    ['due', START.toISOString(), new Date(START.getTime() + 60 * 60_000), 'full'],
+  ] as const)(
+    'fails the %s daemon-child startup marker closed',
+    async (_label, cadenceSeed, now, expectedMode) => {
+      const reads: SnapshotReadMode[] = [];
+      const coordinator = new LifecycleSnapshotCoordinator({
+        source: source(reads, async (mode) => completeSnapshot(
+          mode,
+          now.toISOString(),
+          mode === 'full' ? now.toISOString() : cadenceSeed ?? START.toISOString(),
+        )),
+        configuredMode: 'incremental',
+        fullReconcileMs: 60 * 60_000,
+        startupFull: true,
+        allowPartial: false,
+        cadenceSeed,
+        now: () => now,
+        readUsage: () => EMPTY_GITHUB_USAGE,
+      });
+
+      await coordinator.read(500);
+
+      expect(reads).toEqual([expectedMode]);
+    },
+  );
+
+  it('keeps configured full mode as an every-cycle rollback despite a recent seed', async () => {
     const reads: SnapshotReadMode[] = [];
     const coordinator = new LifecycleSnapshotCoordinator({
       source: source(reads),
@@ -230,6 +261,7 @@ describe('LifecycleSnapshotCoordinator', () => {
       fullReconcileMs: DEFAULT_FULL_RECONCILE_MS,
       startupFull: false,
       allowPartial: false,
+      cadenceSeed: START.toISOString(),
       now: () => START,
       readUsage: () => EMPTY_GITHUB_USAGE,
     });
@@ -623,7 +655,7 @@ describe('LifecycleSnapshotCoordinator', () => {
     });
   });
 
-  it('forces an authoritative full one-shot even for routine status', async () => {
+  it('lets --full-reconcile force an authoritative full one-shot despite a recent seed', async () => {
     const reads: SnapshotReadMode[] = [];
     const coordinator = new LifecycleSnapshotCoordinator({
       source: source(reads),
@@ -632,6 +664,7 @@ describe('LifecycleSnapshotCoordinator', () => {
       startupFull: false,
       allowPartial: true,
       forceFull: true,
+      cadenceSeed: START.toISOString(),
       now: () => START,
       readUsage: () => EMPTY_GITHUB_USAGE,
     });

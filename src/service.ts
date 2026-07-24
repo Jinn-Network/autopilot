@@ -20,6 +20,32 @@ import { dirname, join } from 'node:path';
 import type { LoadedAutopilotConfig } from './config/config.js';
 import type { DoctorReport } from './doctor.js';
 
+export const INTERNAL_DAEMON_ACTIVE_ONCE_ENV =
+  'JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE';
+
+export function daemonActiveOnceEnvironment(
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  return {
+    ...environment,
+    [INTERNAL_DAEMON_ACTIVE_ONCE_ENV]: '1',
+  };
+}
+
+export async function completeDaemonCycle(options: {
+  readonly exit: Promise<number | null>;
+  readonly recordCompletion: (exitCode: number | null) => void | Promise<void>;
+  readonly shouldStop: () => boolean;
+  readonly intervalMs: number;
+  readonly wait: (ms: number) => Promise<void>;
+}): Promise<{ readonly exitCode: number | null; readonly waited: boolean }> {
+  const exitCode = await options.exit;
+  await options.recordCompletion(exitCode);
+  if (options.shouldStop()) return { exitCode, waited: false };
+  await options.wait(options.intervalMs);
+  return { exitCode, waited: true };
+}
+
 export interface DaemonMetadata {
   readonly schemaVersion: 1;
   readonly pid: number;
@@ -441,26 +467,32 @@ export async function runDaemon(input: {
         '--once',
       ], {
         cwd: input.loaded.repositoryRoot,
-        env: input.environment ?? process.env,
+        env: daemonActiveOnceEnvironment(input.environment ?? process.env),
         stdio: ['ignore', 'inherit', 'inherit'],
       });
-      const exitCode = await new Promise<number | null>((resolvePromise) => {
-        controller.once('error', () => resolvePromise(null));
-        controller.once('exit', resolvePromise);
+      const completed = await completeDaemonCycle({
+        exit: new Promise<number | null>((resolvePromise) => {
+          controller.once('error', () => resolvePromise(null));
+          controller.once('exit', resolvePromise);
+        }),
+        recordCompletion: (exitCode) => {
+          metadata = updateMetadata(input.loaded, metadata, {
+            lastCycleFinishedAt: new Date().toISOString(),
+            lastCycleExitCode: exitCode,
+            state: stopping ? 'stopping' : 'running',
+          });
+        },
+        shouldStop: () => stopping,
+        intervalMs: input.loaded.config.scheduler.pollSeconds * 1_000,
+        wait: (ms) => new Promise<void>((resolvePromise) => {
+          const timer = setTimeout(resolvePromise, ms);
+          wake = () => {
+            clearTimeout(timer);
+            resolvePromise();
+          };
+        }),
       });
-      metadata = updateMetadata(input.loaded, metadata, {
-        lastCycleFinishedAt: new Date().toISOString(),
-        lastCycleExitCode: exitCode,
-        state: stopping ? 'stopping' : 'running',
-      });
-      if (stopping) break;
-      await new Promise<void>((resolvePromise) => {
-        const timer = setTimeout(resolvePromise, input.loaded.config.scheduler.pollSeconds * 1_000);
-        wake = () => {
-          clearTimeout(timer);
-          resolvePromise();
-        };
-      });
+      if (!completed.waited) break;
       wake = undefined;
     }
   } finally {
