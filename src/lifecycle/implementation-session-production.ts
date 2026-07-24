@@ -447,7 +447,7 @@ export function makeProductionImplementationSessionPort(
     async parentHeadReferencesChild(manifest, head, childIssueNumber) {
       const log = await run(manifest, 'git', [
         '-C', manifest.paths.worktree,
-        'log', '-n', '32', '--format=%B%x00', head,
+        'log', '-n', '32', '--format=%B%x00', `${manifest.claimOid}..${head}`,
       ]);
       const needle = `Jinn-Autopilot-Issue: ${childIssueNumber}`;
       return log.includes(needle);
