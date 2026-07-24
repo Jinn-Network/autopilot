@@ -275,6 +275,7 @@ const pullRequestSchema = z.object({
     checkSuiteId: z.number().int().positive().optional(),
     runAttempt: z.number().int().positive().optional(),
   }).strict()),
+  ciRerunRecorded: z.literal(true).optional(),
   reviews: z.array(z.object({
     reviewer: z.string(),
     state: z.enum(['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED', 'PENDING']),
