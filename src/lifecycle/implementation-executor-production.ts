@@ -317,12 +317,23 @@ export function makeProductionImplementationActionPort(
         return gitOid(lines[0]!.split('\t')[0]!);
       }),
 
-    createClaimCommit: ({ claim, parent, credential }) =>
-      withCredential(credential, async ({ run }) => {
-        const tree = gitOid((await run('git', [
+    createClaimCommit: ({ claim, parent, parentFetchRef, credential }) =>
+      withCredential(credential, async ({ askpass, run }) => {
+        const readTree = async () => gitOid((await run('git', [
           '-C', options.repositoryPath,
           'rev-parse', '--verify', `${parent}^{tree}`,
         ])).trim());
+        let tree;
+        try {
+          tree = await readTree();
+        } catch {
+          await run('git', [
+            ...gitPublicationArgs(askpass, []),
+            '-C', options.repositoryPath,
+            'fetch', '--quiet', '--no-tags', repositoryUrl, parentFetchRef,
+          ]);
+          tree = await readTree();
+        }
         return gitOid((await run('git', [
           '-C', options.repositoryPath,
           'commit-tree', tree, '-p', parent,

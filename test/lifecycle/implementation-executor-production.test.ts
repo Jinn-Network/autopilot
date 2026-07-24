@@ -7,6 +7,9 @@ import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
+const PARENT = gitOid('2'.repeat(40));
+const TREE = gitOid('3'.repeat(40));
+const CLAIM = gitOid('4'.repeat(40));
 
 function snapshot(): GitHubLifecycleSnapshot {
   return {
@@ -59,6 +62,75 @@ function snapshot(): GitHubLifecycleSnapshot {
 }
 
 describe('production implementation action port', () => {
+  it('fetches a missing child parent before creating the claim commit', async () => {
+    const calls: Array<{ args: string[]; env?: Record<string, string> }> = [];
+    const pool = new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }]);
+    const selection = selectCredential(pool, { phase: 'implement' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    let treeReads = 0;
+    const port = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      repositoryUrl: 'https://github.com/Jinn-Network/mono.git',
+      credentials: pool,
+      authorAllowlist: new Set(['trusted-author']),
+      readSnapshot: async () => snapshot(),
+      runner: async (command, args, options) => {
+        if (command !== 'git') throw new Error(`unexpected ${command}`);
+        calls.push({ args, env: options?.env });
+        if (args.includes('rev-parse')) {
+          treeReads += 1;
+          if (treeReads === 1) throw new Error('fatal: Needed a single revision');
+          return `${TREE}\n`;
+        }
+        if (args.includes('fetch')) return '';
+        if (args.includes('commit-tree')) return `${CLAIM}\n`;
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.createClaimCommit({
+      claim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'fix',
+        issueNumber: 2090,
+        prNumber: 2014,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementation-bot',
+        expectedHead: PARENT,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-24T10:00:00.000Z',
+      },
+      parent: PARENT,
+      parentFetchRef: gitRefName('pull/2014/head'),
+      attempt: '11111111-1111-4111-8111-111111111111',
+      credential: selection.credential,
+    })).resolves.toBe(CLAIM);
+    expect(calls.filter((call) => call.args.includes('fetch'))).toEqual([
+      expect.objectContaining({
+        args: expect.arrayContaining([
+          'fetch',
+          '--quiet',
+          '--no-tags',
+          'https://github.com/Jinn-Network/mono.git',
+          'pull/2014/head',
+        ]),
+        env: expect.objectContaining({
+          GH_TOKEN: 'selected-secret',
+          GITHUB_TOKEN: '',
+        }),
+      }),
+    ]);
+    expect(treeReads).toBe(2);
+  });
+
   it('re-admits a reaped draft PR as ordinary implementation work on its existing branch', async () => {
     const base = snapshot();
     const current: GitHubLifecycleSnapshot = {

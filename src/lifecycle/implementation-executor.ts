@@ -131,6 +131,7 @@ export interface ImplementationExecutorDeps {
   createClaimCommit(input: {
     readonly claim: BranchClaim;
     readonly parent: GitOid;
+    readonly parentFetchRef: GitRefName;
     readonly attempt: string;
     readonly credential: SelectedCredential;
   }): Promise<GitOid>;
@@ -442,6 +443,7 @@ export async function executeImplementationAction(
   const claimOid = await deps.createClaimCommit({
     claim,
     parent: candidateParent,
+    parentFetchRef: adopted?.headRefName ?? issue.targetBase,
     attempt: attemptId,
     credential: selection.credential,
   });
@@ -600,6 +602,7 @@ async function executeChildImplementationAction(
   const claimOid = await deps.createClaimCommit({
     claim,
     parent: candidateParent,
+    parentFetchRef: gitRefName(`pull/${parent.number}/head`),
     attempt: attemptId,
     credential: selection.credential,
   });
