@@ -192,6 +192,21 @@ describe('LifecycleDiscoveryCacheStore', () => {
       .not.toMatch(/GH_TOKEN|credential|authorization/i);
   });
 
+  it('exposes only the validated durable cadence marker without a network dependency', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    await store.save(state());
+
+    await expect(store.readCadenceSeed()).resolves.toBe(CAPTURED_AT);
+  });
+
+  it('returns no cadence marker when no lifecycle cache exists', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+
+    await expect(store.readCadenceSeed()).resolves.toBeNull();
+  });
+
   it('round-trips terminal claim evidence after merged PR evidence is no longer retained', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });

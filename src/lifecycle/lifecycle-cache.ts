@@ -718,6 +718,11 @@ export class LifecycleDiscoveryCacheStore implements LifecycleDiscoveryStateStor
     return parsed.data as unknown as LifecycleDiscoveryState;
   }
 
+  /** Read-only cadence authority extracted from the fully validated cache envelope. */
+  async readCadenceSeed(): Promise<string | null> {
+    return (await this.load())?.evidence.lastFullReconciliationAt ?? null;
+  }
+
   async save(state: LifecycleDiscoveryState): Promise<void> {
     const parsed = stateSchema.safeParse(state);
     if (!parsed.success) {

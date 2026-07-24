@@ -606,6 +606,8 @@ describe('IncrementalLifecycleSnapshotSource', () => {
 
     await expect(source.read({ mode: 'full', rateLimitFloor: 500 }))
       .rejects.toThrow(/not a regular file|unsafe/i);
+    expect(context.reader.quotaProbeCalls).toBe(0);
+    expect(context.rest.cutoffs).toEqual([]);
   });
 
   it('seeds durable evidence from the full oracle and reuses it on an unchanged cycle', async () => {

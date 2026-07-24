@@ -10,6 +10,7 @@ import {
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { argv, env, pid } from 'node:process';
+import { INTERNAL_DAEMON_ACTIVE_ONCE_ENV } from '../src/service.js';
 import {
   AUTOPILOT_RUNTIME_ENV,
   parseAutopilotRuntime,
@@ -52,6 +53,8 @@ import {
   createConfiguredIncrementalLifecycleSnapshotSource,
   isRoutineCachedStatus,
   LifecycleSnapshotCoordinator,
+  LifecycleDiscoveryCacheCorruptError,
+  LifecycleDiscoveryCacheStore,
   makeProductionActiveRuntime,
   makeGitHubUsageCommandRunner,
   makeProductionReconciliationWriter,
@@ -73,6 +76,29 @@ import {
   freeDiskBytes,
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
+
+export async function loadDaemonCadenceSeed(
+  context: {
+    readonly mode: 'observe' | 'recover' | 'active';
+    readonly once: boolean;
+  },
+  environment: Readonly<Record<string, string | undefined>>,
+  readSeed: () => Promise<string | null>,
+): Promise<string | null> {
+  if (
+    context.mode !== 'active'
+    || !context.once
+    || environment[INTERNAL_DAEMON_ACTIVE_ONCE_ENV] !== '1'
+  ) {
+    return null;
+  }
+  try {
+    return await readSeed();
+  } catch (error) {
+    if (error instanceof LifecycleDiscoveryCacheCorruptError) return null;
+    throw error;
+  }
+}
 
 function authorAllowlist(raw: string | undefined): ReadonlySet<string> {
   return new Set(
@@ -303,6 +329,13 @@ export async function runAutopilotV2(
   );
   const snapshotRuntime = parseSnapshotRuntimeConfig(runtimeEnvironment);
   const stateDirectory = parseAutopilotStateDirectory(runtimeEnvironment);
+  const cadenceSeed = await loadDaemonCadenceSeed(
+    options,
+    runtimeEnvironment,
+    () => new LifecycleDiscoveryCacheStore({
+      ...(stateDirectory === undefined ? {} : { stateDirectory }),
+    }).readCadenceSeed(),
+  );
   const legacyAllowlist = env.JINN_DISPATCHER_AUTHOR_ALLOWLIST;
   if (legacyAllowlist !== undefined && legacyAllowlist.trim().length > 0) {
     warnLegacyOverride('JINN_DISPATCHER_AUTHOR_ALLOWLIST');
@@ -402,6 +435,7 @@ export async function runAutopilotV2(
     fullReconcileMs: snapshotRuntime.fullReconcileMs,
     startupFull: !routineStatus,
     allowPartial: routineStatus,
+    cadenceSeed,
     forceFull: options.fullReconcile,
     readUsage: () => reader.githubUsage(),
   });
