@@ -48,7 +48,8 @@ Added explicit safety-property regressions without changing production code:
   and no field edits;
 - a first visible item with a different ID fails immediately without waiting
   or editing;
-- duplicate matching membership fails before an edit;
+- duplicate matching membership fails before an edit or wait (the injected
+  wait spy throws if invoked);
 - marker and durable-intent drift on an absent-item retry each fail on the
   next authoritative reread before an edit; and
 - a partial repair resumes without another item-add, then a later complete

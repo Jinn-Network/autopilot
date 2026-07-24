@@ -269,28 +269,36 @@ describe('production machine-child repair', () => {
 
   it('fails immediately when the first visible membership is duplicated', async () => {
     const fieldEdits: string[][] = [];
+    const waits: number[] = [];
     let added = false;
 
-    await expect(repairProductionMachineChild(options(async (_cmd, args) => {
-      if (args[0] === 'api' && args[1] === 'graphql'
-        && args.some((arg) => arg.includes('MachineChildRepairState'))) {
-        return state({
-          issueType: 'fix',
-          ...(added ? {
-            duplicateItem: true,
-            item: { blockedOn: null, effort: null, priority: null },
-          } : {}),
-        });
-      }
-      if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
-      if (args[0] === 'project' && args[1] === 'item-add') {
-        added = true;
-        return JSON.stringify({ id: 'PVTI_2141' });
-      }
-      if (args[0] === 'project' && args[1] === 'item-edit') fieldEdits.push(args);
-      return '';
-    }), ACTION)).rejects.toThrow(/Project item is ambiguous/i);
+    await expect(repairProductionMachineChild({
+      ...options(async (_cmd, args) => {
+        if (args[0] === 'api' && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+          return state({
+            issueType: 'fix',
+            ...(added ? {
+              duplicateItem: true,
+              item: { blockedOn: null, effort: null, priority: null },
+            } : {}),
+          });
+        }
+        if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+        if (args[0] === 'project' && args[1] === 'item-add') {
+          added = true;
+          return JSON.stringify({ id: 'PVTI_2141' });
+        }
+        if (args[0] === 'project' && args[1] === 'item-edit') fieldEdits.push(args);
+        return '';
+      }),
+      wait: async (milliseconds: number) => {
+        waits.push(milliseconds);
+        throw new Error('duplicate membership must fail before waiting');
+      },
+    }, ACTION)).rejects.toThrow(/Project item is ambiguous/i);
 
+    expect(waits).toEqual([]);
     expect(fieldEdits).toEqual([]);
   });
 
