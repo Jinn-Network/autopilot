@@ -211,6 +211,7 @@ function composeTargeted(
       : {
           snapshotAuthority: cycle.snapshotAuthority,
           scopedIssueNumbers: cycle.scopedIssueNumbers,
+          globalOpenPipelineBacklog: cycle.globalOpenPipelineBacklog,
         }),
   });
 }

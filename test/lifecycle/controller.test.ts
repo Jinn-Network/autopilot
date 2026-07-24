@@ -764,6 +764,7 @@ describe('lifecycle controller', () => {
           snapshotMode: 'incremental',
           snapshotAuthority: 'scoped',
           scopedIssueNumbers: [42],
+          globalOpenPipelineBacklog: 1,
         };
       },
       readSnapshot: async () => {
@@ -798,6 +799,98 @@ describe('lifecycle controller', () => {
     }));
   });
 
+  it('uses global scoped backlog for fresh work without blocking child or stale recovery', async () => {
+    const eligible: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'Todo',
+      labels: [],
+      eligible: true,
+      eligibilityReason: 'eligible',
+      eligibilityDetail: 'All implementation admission gates pass',
+    };
+    const ineligible: LifecycleItem = {
+      ...eligible,
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+      eligibilityDetail: 'Not selected in the mandatory global pass',
+    };
+    const stale = implementation({
+      headChangedAt: '2026-07-20T08:00:00.000Z',
+      isDraft: true,
+      projectStatus: 'In Progress',
+    });
+    const cases = [
+      {
+        label: 'fresh top-level',
+        item: eligible,
+        issues: [],
+        expectedActions: [],
+      },
+      {
+        label: 'fresh machine child',
+        item: eligible,
+        issues: [{
+          number: 42,
+          body: '<!-- jinn-autopilot:child pr=99 kind=review-finding -->',
+          labels: [],
+        }],
+        expectedActions: ['claim-implementation'],
+      },
+      {
+        label: 'stale recovery',
+        item: stale,
+        issues: [],
+        expectedActions: ['claim-implementation'],
+      },
+    ] as const;
+
+    for (const scenario of cases) {
+      const actions: string[] = [];
+      const scoped = {
+        ...snapshot(scenario.item),
+        issues: scenario.issues,
+        snapshotMode: 'incremental' as const,
+        snapshotAuthority: 'scoped' as const,
+        scopedIssueNumbers: [42],
+        globalOpenPipelineBacklog: 5,
+      };
+      const report = await runLifecycleCycle('active', {
+        ...deps(eligible, [], new Proxy({} as ReconciliationWriter, {
+          get() {
+            return async () => null;
+          },
+        })),
+        readScopedSnapshot: async () => scoped,
+        readSnapshot: async () => snapshot(ineligible),
+        active: {
+          preflight: async () => ({ ok: true }),
+          readLocalState: () => ({
+            remaining: { implementation: 1, review: 0 },
+            availableLogins: ['implementer'],
+            implementationPreferredLogin: 'implementer',
+          }),
+          implementationBackpressureThreshold: 1,
+          onlyIssues: new Set([42]),
+          executeAction: async (action) => {
+            actions.push(action.kind);
+            return { outcome: 'spawned' };
+          },
+        },
+      });
+
+      expect(actions, scenario.label).toEqual(scenario.expectedActions);
+      if (scenario.label === 'fresh top-level') {
+        expect(report.events).toContainEqual(expect.objectContaining({
+          action: 'schedule',
+          outcome: 'skipped',
+          reason: 'backpressure',
+        }));
+      }
+    }
+  });
+
   it('reports scoped mutations and combined usage when the mandatory global read fails', async () => {
     const delivered = implementation({
       branchClaim: {
@@ -830,6 +923,7 @@ describe('lifecycle controller', () => {
         snapshotMode: 'incremental',
         snapshotAuthority: 'scoped',
         scopedIssueNumbers: [42],
+        globalOpenPipelineBacklog: 1,
       }),
       readSnapshot: async () => {
         throw new Error('global incremental unavailable');
@@ -861,6 +955,20 @@ describe('lifecycle controller', () => {
       outcome: 'spawned',
     }));
     expect(report.message).toMatch(/global.*failed after scoped pre-dispatch/i);
+    const human = renderLifecycleHuman(report);
+    expect(human).toMatch(/mutation-free: no/i);
+    expect(human).toContain('claim-review issue:42/pr:101: spawned.');
+    expect(human).toMatch(/reconciliation results retained: 0/i);
+    const json = JSON.parse(renderLifecycleJson(report));
+    expect(json).toMatchObject({
+      status: 'failed',
+      mutationFree: false,
+      events: [expect.objectContaining({
+        action: 'claim-review',
+        outcome: 'spawned',
+      })],
+      reconciliation: { results: [] },
+    });
   });
 
   it('does not hide scoped mutations behind an incomplete global snapshot gate', async () => {
@@ -887,6 +995,7 @@ describe('lifecycle controller', () => {
         snapshotMode: 'incremental',
         snapshotAuthority: 'scoped',
         scopedIssueNumbers: [42],
+        globalOpenPipelineBacklog: 1,
       }),
       readSnapshot: async () => ({
         ...snapshot(delivered),
@@ -941,6 +1050,7 @@ describe('lifecycle controller', () => {
         snapshotMode: 'incremental',
         snapshotAuthority: 'scoped',
         scopedIssueNumbers: [42],
+        globalOpenPipelineBacklog: 1,
       }),
       readSnapshot: async () => {
         throw new LifecycleRateLimitError(999, 1_000, 0);
@@ -994,6 +1104,7 @@ describe('lifecycle controller', () => {
         snapshotMode: 'incremental',
         snapshotAuthority: 'scoped',
         scopedIssueNumbers: [42],
+        globalOpenPipelineBacklog: 1,
       }),
       readSnapshot: async () => ({
         ...snapshot(delivered),

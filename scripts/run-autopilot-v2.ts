@@ -76,8 +76,18 @@ import {
   selectCredential,
   sweepDeadAttempts,
   freeDiskBytes,
+  type LifecycleCycleReport,
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
+
+export function lifecycleExitCodeForReport(
+  report: Pick<LifecycleCycleReport, 'status'>,
+  once: boolean,
+): number | undefined {
+  if (report.status === 'rejected') return 2;
+  if (report.status === 'failed' && once) return 1;
+  return undefined;
+}
 
 export async function loadDaemonCadenceSeed(
   context: {
@@ -680,7 +690,8 @@ export async function runAutopilotV2(
     } else {
       process.stdout.write(`${renderLifecycleHuman(report)}\n`);
     }
-    if (report.status === 'rejected') process.exitCode = 2;
+    const exitCode = lifecycleExitCodeForReport(report, options.once);
+    if (exitCode !== undefined) process.exitCode = exitCode;
   };
 
   await runLifecycleCadence({

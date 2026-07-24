@@ -225,6 +225,8 @@ export interface GitHubLifecycleSnapshot {
   readonly snapshotAuthority?: 'scoped';
   /** Original operator-selected issue numbers for a scoped authority view. */
   readonly scopedIssueNumbers?: readonly number[];
+  /** Validated global count used to preserve fresh-work backpressure in a scoped view. */
+  readonly globalOpenPipelineBacklog?: number;
 }
 
 export function decodeBranchClaimSnapshot(raw: RawBranchClaim): BranchClaimSnapshot {
@@ -849,10 +851,20 @@ export function composeGitHubLifecycleSnapshot(
     readonly parityUnavailableReason?: string;
     readonly snapshotAuthority?: 'scoped';
     readonly scopedIssueNumbers?: readonly number[];
+    readonly globalOpenPipelineBacklog?: number;
   },
 ): GitHubLifecycleSnapshot {
   isoTimestamp(options.capturedAt);
   isoTimestamp(options.lastFullReconciliationAt);
+  if (
+    options.globalOpenPipelineBacklog !== undefined
+    && (
+      !Number.isSafeInteger(options.globalOpenPipelineBacklog)
+      || options.globalOpenPipelineBacklog < 0
+    )
+  ) {
+    throw new Error('Global open-pipeline backlog must be a non-negative integer');
+  }
   const lifecycle = lifecycleItems(
     evidence.issues,
     evidence.pullRequests,
@@ -884,6 +896,9 @@ export function composeGitHubLifecycleSnapshot(
       : {
           snapshotAuthority: options.snapshotAuthority,
           scopedIssueNumbers: [...(options.scopedIssueNumbers ?? [])],
+          ...(options.globalOpenPipelineBacklog === undefined
+            ? {}
+            : { globalOpenPipelineBacklog: options.globalOpenPipelineBacklog }),
         }),
   });
 }

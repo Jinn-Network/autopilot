@@ -718,6 +718,9 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       githubUsage: this.fullReader.githubUsage(),
       snapshotAuthority: 'scoped',
       scopedIssueNumbers: requested,
+      globalOpenPipelineBacklog: prior.evidence.pullRequests.filter((pr) => (
+        pr.state === 'OPEN' && pr.labels.includes('engine:review')
+      )).length,
     });
   }
 

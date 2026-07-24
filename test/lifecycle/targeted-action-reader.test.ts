@@ -173,10 +173,12 @@ describe('targeted action reader', () => {
       ...cycleSnapshot(),
       snapshotAuthority: 'scoped',
       scopedIssueNumbers: [42],
+      globalOpenPipelineBacklog: 7,
       terminalClaims,
     }, 101)).resolves.toMatchObject({
       snapshotAuthority: 'scoped',
       scopedIssueNumbers: [42],
+      globalOpenPipelineBacklog: 7,
       terminalClaims,
     });
     expect(calls).toEqual([]);

@@ -992,9 +992,11 @@ async function executeActivePass(
   const actionEvents: LifecycleLogEvent[] = [];
   const blockedIssues = blockedIssueNumbers(plan.actions, view);
   const local = deps.active!.readLocalState();
-  const openPipelineBacklog = snapshot.pullRequests.filter((pr) => (
-    pr.state === 'OPEN' && pr.labels.includes('engine:review')
-  )).length;
+  const openPipelineBacklog = snapshot.snapshotAuthority === 'scoped'
+    ? snapshot.globalOpenPipelineBacklog!
+    : snapshot.pullRequests.filter((pr) => (
+        pr.state === 'OPEN' && pr.labels.includes('engine:review')
+      )).length;
   const candidates = applyMergePolicy(
     activeCandidates(snapshot, view),
     deps.mergePolicy ?? 'manual',
@@ -1177,6 +1179,8 @@ export async function runLifecycleCycle(
       if (
         scoped.snapshotAuthority !== 'scoped'
         || scoped.snapshotComplete !== true
+        || !Number.isSafeInteger(scoped.globalOpenPipelineBacklog)
+        || scoped.globalOpenPipelineBacklog! < 0
         || scoped.githubUsage?.graphqlRemaining === null
         || scoped.githubUsage?.graphqlRemaining === undefined
         || scoped.githubUsage.graphqlRemaining < rateLimitFloor
@@ -1573,16 +1577,40 @@ function paritySummary(
   ];
 }
 
+function lifecycleEventSummary(event: LifecycleLogEvent): string {
+  return `${event.action} ${event.subject}: ${event.outcome}${
+    event.reason === undefined ? '' : ` (${event.reason})`
+  }.`;
+}
+
 export function renderLifecycleHuman(report: LifecycleCycleReport): string {
   if (report.status === 'failed') {
+    const retainedState = [
+      `Mutation-free: ${report.mutationFree ? 'yes' : 'no'}.`,
+      `Reconciliation results retained: ${report.reconciliation?.results.length ?? 0}.`,
+      ...report.events.map(lifecycleEventSummary),
+    ];
     if (report.usageAccounting.complete === false) {
-      return `${report.message}\nGitHub usage: unavailable (${report.usageAccounting.reason}).`;
+      return [
+        report.message,
+        ...retainedState,
+        `GitHub usage: unavailable (${report.usageAccounting.reason}).`,
+      ].join('\n');
     }
     const usage = report.githubUsage;
     if (usage === undefined) {
-      return `${report.message}\nGitHub usage: unavailable (complete usage evidence is missing).`;
+      return [
+        report.message,
+        ...retainedState,
+        'GitHub usage: unavailable (complete usage evidence is missing).',
+      ].join('\n');
     }
-    return [report.message, githubUsageSummary(usage), ...accountingWarningLines(usage)].join('\n');
+    return [
+      report.message,
+      ...retainedState,
+      githubUsageSummary(usage),
+      ...accountingWarningLines(usage),
+    ].join('\n');
   }
   const usageLine = githubUsageSummary(report.githubUsage);
   const accountingLines = accountingWarningLines(report.githubUsage);
@@ -1632,10 +1660,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     ...report.items.map(explanation),
     ...report.orphanBranchClaims.map(orphanExplanation),
     ...report.diagnostics.map((diagnostic) => `Human diagnostic: ${diagnostic.detail}.`),
-    ...report.events.map((event) =>
-      `${event.action} ${event.subject}: ${event.outcome}${
-        event.reason === undefined ? '' : ` (${event.reason})`
-      }.`),
+    ...report.events.map(lifecycleEventSummary),
     ...(report.budget === undefined
       ? []
       : [

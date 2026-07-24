@@ -704,7 +704,7 @@ describe('IncrementalLifecycleSnapshotSource', () => {
           headRefName: `unrelated/${offset}`,
           headOid: offset % 2 === 0 ? HEAD_C : HEAD_D,
           closingIssueNumbers: [300 + offset],
-          labels: [],
+          labels: ['engine:review'],
         })),
       ];
       context.rest.openPrs = context.reader.fullPrs.map((pr) => openIndex({
@@ -738,6 +738,8 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     expect(withUnrelatedBacklog.relationCalls).toEqual(baseline.relationCalls);
     expect(withUnrelatedBacklog.quotaProbeCalls).toBe(baseline.quotaProbeCalls);
     expect(withUnrelatedBacklog.scoped?.pullRequests.map((pr) => pr.number)).toEqual([101]);
+    expect(baseline.scoped?.globalOpenPipelineBacklog).toBe(1);
+    expect(withUnrelatedBacklog.scoped?.globalOpenPipelineBacklog).toBe(41);
   });
 
   it('persists and reloads a full source seeded from a live-shaped Project rate limit', async () => {

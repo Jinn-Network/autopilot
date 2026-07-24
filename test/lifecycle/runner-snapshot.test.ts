@@ -162,12 +162,13 @@ describe('Autopilot snapshot runtime configuration', () => {
 
 describe('LifecycleSnapshotCoordinator', () => {
   it('preserves scoped GitHub usage in the following global incremental read', async () => {
+    const now = new Date('2026-07-22T10:30:00.000Z');
     const readOptions: Array<{
       readonly mode: SnapshotReadMode;
       readonly resetUsage?: boolean;
     }> = [];
     const scoped = {
-      ...completeSnapshot('incremental'),
+      ...completeSnapshot('incremental', now.toISOString(), START.toISOString()),
       snapshotAuthority: 'scoped' as const,
       scopedIssueNumbers: [42],
     };
@@ -179,7 +180,11 @@ describe('LifecycleSnapshotCoordinator', () => {
         readonly resetUsage?: boolean;
       }) => {
         readOptions.push(options);
-        return completeSnapshot(options.mode);
+        return completeSnapshot(
+          options.mode,
+          now.toISOString(),
+          options.mode === 'full' ? now.toISOString() : START.toISOString(),
+        );
       },
     };
     const coordinator = new LifecycleSnapshotCoordinator({
@@ -188,7 +193,8 @@ describe('LifecycleSnapshotCoordinator', () => {
       fullReconcileMs: 60 * 60_000,
       startupFull: true,
       allowPartial: false,
-      now: () => START,
+      cadenceSeed: START.toISOString(),
+      now: () => now,
     });
 
     await expect(coordinator.readScoped(new Set([42]), 500, 2 * 60 * 60_000))
@@ -200,6 +206,194 @@ describe('LifecycleSnapshotCoordinator', () => {
       rateLimitFloor: 500,
       resetUsage: false,
     }]);
+  });
+
+  it.each([
+    ['configured full mode', 'full' as const, false],
+    ['explicit force-full mode', 'incremental' as const, true],
+  ])('bypasses scoped pre-dispatch when %s has precedence', async (
+    _label,
+    configuredMode,
+    forceFull,
+  ) => {
+    let scopedReads = 0;
+    const globalReads: SnapshotReadMode[] = [];
+    const scoped = {
+      ...completeSnapshot('incremental'),
+      snapshotAuthority: 'scoped' as const,
+      scopedIssueNumbers: [42],
+    };
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: {
+        readScoped: async () => {
+          scopedReads += 1;
+          return scoped;
+        },
+        read: async (options) => {
+          globalReads.push(options.mode);
+          return completeSnapshot(options.mode);
+        },
+      },
+      configuredMode,
+      fullReconcileMs: 60 * 60_000,
+      startupFull: false,
+      allowPartial: false,
+      cadenceSeed: START.toISOString(),
+      forceFull,
+      now: () => START,
+    });
+
+    await expect(coordinator.readScoped(new Set([42]), 500, 2 * 60 * 60_000))
+      .resolves.toBeNull();
+    await coordinator.read(500);
+
+    expect(scopedReads).toBe(0);
+    expect(globalReads).toEqual(['full']);
+  });
+
+  it.each([
+    [
+      'equal recent authority',
+      START.toISOString(),
+      START.toISOString(),
+      true,
+      1,
+      ['incremental'],
+    ],
+    [
+      'safe newer authority',
+      START.toISOString(),
+      '2026-07-22T10:15:00.000Z',
+      true,
+      1,
+      ['incremental'],
+    ],
+    [
+      'regressed authority',
+      START.toISOString(),
+      '2026-07-22T09:45:00.000Z',
+      false,
+      1,
+      ['incremental', 'full'],
+    ],
+    [
+      'future authority',
+      START.toISOString(),
+      '2026-07-22T10:31:00.000Z',
+      false,
+      1,
+      ['incremental', 'full'],
+    ],
+    [
+      'due authority',
+      '2026-07-22T09:30:00.000Z',
+      '2026-07-22T09:30:00.000Z',
+      false,
+      0,
+      ['full'],
+    ],
+  ] as const)(
+    'fences scoped pre-dispatch against %s before returning mutation authority',
+    async (
+      _label,
+      cadenceSeed,
+      scopedMarker,
+      scopeAccepted,
+      expectedScopedReads,
+      expectedGlobalReads,
+    ) => {
+      const now = new Date('2026-07-22T10:30:00.000Z');
+      let scopedReads = 0;
+      const globalReads: SnapshotReadMode[] = [];
+      const resetUsage: Array<boolean | undefined> = [];
+      const scoped = {
+        ...completeSnapshot('incremental', now.toISOString(), scopedMarker),
+        snapshotAuthority: 'scoped' as const,
+        scopedIssueNumbers: [42],
+      };
+      const coordinator = new LifecycleSnapshotCoordinator({
+        source: {
+          readScoped: async () => {
+            scopedReads += 1;
+            return scoped;
+          },
+          read: async (options) => {
+            globalReads.push(options.mode);
+            resetUsage.push(options.resetUsage);
+            return completeSnapshot(
+              options.mode,
+              now.toISOString(),
+              options.mode === 'full' ? now.toISOString() : scopedMarker,
+            );
+          },
+        },
+        configuredMode: 'incremental',
+        fullReconcileMs: 60 * 60_000,
+        startupFull: true,
+        allowPartial: false,
+        cadenceSeed,
+        now: () => now,
+      });
+
+      const result = await coordinator.readScoped(
+        new Set([42]),
+        500,
+        2 * 60 * 60_000,
+      );
+      expect(result === scoped).toBe(scopeAccepted);
+      await coordinator.read(500);
+
+      expect(scopedReads).toBe(expectedScopedReads);
+      expect(globalReads).toEqual(expectedGlobalReads);
+      expect(resetUsage).toEqual(
+        expectedGlobalReads.map((_mode, index) => (
+          expectedScopedReads === 1 || index > 0 ? false : undefined
+        )),
+      );
+    },
+  );
+
+  it('keeps manual unmarked active-once scope and fences its mandatory incremental read', async () => {
+    const now = new Date('2026-07-22T10:30:00.000Z');
+    const scopedMarker = '2026-07-22T10:15:00.000Z';
+    const regressedGlobalMarker = START.toISOString();
+    const reads: SnapshotReadMode[] = [];
+    const resetUsage: Array<boolean | undefined> = [];
+    const scoped = {
+      ...completeSnapshot('incremental', now.toISOString(), scopedMarker),
+      snapshotAuthority: 'scoped' as const,
+      scopedIssueNumbers: [42],
+    };
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: {
+        readScoped: async () => scoped,
+        read: async (options) => {
+          reads.push(options.mode);
+          resetUsage.push(options.resetUsage);
+          return completeSnapshot(
+            options.mode,
+            now.toISOString(),
+            options.mode === 'full' ? now.toISOString() : regressedGlobalMarker,
+          );
+        },
+      },
+      configuredMode: 'incremental',
+      fullReconcileMs: 60 * 60_000,
+      startupFull: true,
+      allowPartial: false,
+      cadenceSeed: null,
+      now: () => now,
+    });
+
+    await expect(coordinator.readScoped(new Set([42]), 500, 2 * 60 * 60_000))
+      .resolves.toBe(scoped);
+    await expect(coordinator.read(500)).resolves.toMatchObject({
+      snapshotMode: 'full',
+      lastFullReconciliationAt: now.toISOString(),
+    });
+
+    expect(reads).toEqual(['incremental', 'full']);
+    expect(resetUsage).toEqual([false, false]);
   });
 
   it('keeps persistent failed reports on normal cadence without a busy loop', async () => {
