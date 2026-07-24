@@ -814,6 +814,71 @@ describe('lifecycle controller', () => {
     expect(explainPullRequest(report, 101)).toContain('awaiting');
   });
 
+  it('explains CI-blocked PRs without reporting that they are merged', async () => {
+    const calls: string[] = [];
+    const report = await runLifecycleCycle('observe', deps(implementation({
+      approved: true,
+      needsReview: false,
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{
+        source: 'check-run',
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'FAILURE',
+      }],
+    }), calls));
+
+    expect(report.items[0]).toMatchObject({ phase: 'ci-blocked' });
+    expect(explainPullRequest(report, 101)).toContain('CI');
+    expect(explainPullRequest(report, 101)).not.toContain('is merged');
+  });
+
+  it('explains child-blocked PRs without reporting that they are merged', async () => {
+    const calls: string[] = [];
+    const report = await runLifecycleCycle('observe', deps(implementation({
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      openChildKinds: ['ci-failure'],
+    }), calls));
+
+    expect(report.items[0]).toMatchObject({ phase: 'blocked-by-child' });
+    expect(explainPullRequest(report, 101)).toContain('child');
+    expect(explainPullRequest(report, 101)).not.toContain('is merged');
+  });
+
+  it('reserves merged wording for merged PRs', async () => {
+    const calls: string[] = [];
+    const report = await runLifecycleCycle('observe', deps(implementation({ merged: true }), calls));
+
+    expect(report.items[0]).toMatchObject({ phase: 'merged' });
+    expect(explainPullRequest(report, 101)).toContain('is merged');
+  });
+
   it('rejects trailing positional arguments for every operator command', () => {
     expect(() => parseLifecycleCli(['status', 'extra'])).toThrow(/Expected status/);
     expect(() => parseLifecycleCli(['sessions', 'extra'])).toThrow(/Expected status/);

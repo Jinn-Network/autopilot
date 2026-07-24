@@ -1224,25 +1224,38 @@ function explanation(item: LifecycleStatusItem): string {
   const identity = item.prNumber === undefined
     ? `Issue #${item.issueNumber}`
     : `PR #${item.prNumber} (issue #${item.issueNumber})`;
-  if (item.phase === 'human') {
-    return `${identity} is blocked in Human: ${item.humanReason?.detail ?? 'explicit Human hold'}.`;
-  }
   if (item.stale) {
     return `${identity} is stale in ${item.phase}; recovery is awaiting an exact-head correction.`;
   }
-  if (item.phase === 'eligible') {
-    if (item.eligible === true) return `${identity} is eligible for an ordinary claim.`;
-    return `${identity} is not eligible for an ordinary claim: ${
-      item.eligibilityDetail ?? item.eligibilityReason ?? 'source admission gates did not select it'
-    }.`;
+  switch (item.phase) {
+    case 'eligible':
+      if (item.eligible === true) return `${identity} is eligible for an ordinary claim.`;
+      return `${identity} is not eligible for an ordinary claim: ${
+        item.eligibilityDetail ?? item.eligibilityReason ?? 'source admission gates did not select it'
+      }.`;
+    case 'implementing':
+      return `${identity} is implementing and awaiting durable phase completion before review.`;
+    case 'awaiting-review':
+      return `${identity} is awaiting an exact-head review claim.`;
+    case 'reviewing':
+      return `${identity} is reviewing the current exact head.`;
+    case 'blocked-by-child':
+      return `${identity} is blocked by an open child issue before the lifecycle can continue.`;
+    case 'ci-blocked':
+      return `${identity} is blocked by CI before it can enter the native merge gate.`;
+    case 'merge-ready':
+      return `${identity} is awaiting the native merge gate.`;
+    case 'human':
+      return `${identity} is blocked in Human: ${item.humanReason?.detail ?? 'explicit Human hold'}.`;
+    case 'merged':
+      return `${identity} is merged and awaiting no lifecycle gate.`;
+    default:
+      return assertNever(item.phase);
   }
-  if (item.phase === 'implementing') {
-    return `${identity} is implementing and awaiting durable phase completion before review.`;
-  }
-  if (item.phase === 'awaiting-review') return `${identity} is awaiting an exact-head review claim.`;
-  if (item.phase === 'reviewing') return `${identity} is reviewing the current exact head.`;
-  if (item.phase === 'merge-ready') return `${identity} is awaiting the native merge gate.`;
-  return `${identity} is merged and awaiting no lifecycle gate.`;
+}
+
+function assertNever(phase: never): never {
+  throw new Error(`Unhandled lifecycle phase: ${phase}`);
 }
 
 function orphanExplanation(item: LifecycleOrphanBranchClaimStatus): string {
