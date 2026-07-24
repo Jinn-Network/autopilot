@@ -157,6 +157,53 @@ describe('production machine-child repair', () => {
     ]);
   });
 
+  it('retries an absent immediate Project membership readback after exact item-add ID', async () => {
+    const mutations: string[] = [];
+    const waits: number[] = [];
+    let added = false;
+    let visible = false;
+    const item = {
+      blockedOn: null as string | null,
+      effort: null as string | null,
+      priority: null as string | null,
+    };
+
+    const result = await repairProductionMachineChild({
+      ...options(async (_cmd, args) => {
+        if (args[0] === 'api' && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('MachineChildRepairState'))) {
+          return state({
+            issueType: 'fix',
+            ...(added && visible ? { item: { ...item } } : {}),
+          });
+        }
+        if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST;
+        if (args[0] === 'project' && args[1] === 'item-add') {
+          mutations.push('item-add');
+          added = true;
+          return JSON.stringify({ id: 'PVTI_2141' });
+        }
+        if (args[0] === 'project' && args[1] === 'item-edit') {
+          const option = String(args[args.indexOf('--single-select-option-id') + 1]);
+          mutations.push(option);
+          if (option === 'opt_nothing') item.blockedOn = 'Nothing';
+          if (option === 'opt_medium') item.effort = 'Medium';
+          if (option === 'opt_p1') item.priority = 'P1';
+          return '';
+        }
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      }),
+      wait: async (milliseconds: number) => {
+        waits.push(milliseconds);
+        visible = true;
+      },
+    }, ACTION);
+
+    expect(result).toEqual({ status: 'repaired' });
+    expect(waits).toHaveLength(1);
+    expect(mutations).toEqual(['item-add', 'opt_nothing', 'opt_medium', 'opt_p1']);
+  });
+
   it('leaves matching fields untouched and fills only the missing priority', async () => {
     const mutations: string[] = [];
     let priority: string | null = null;
