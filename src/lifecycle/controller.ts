@@ -20,6 +20,7 @@ import {
   type LifecycleParityDifference,
   type SnapshotReadMode,
 } from './snapshot.js';
+import { implementationClaimFingerprint } from './terminal-claim.js';
 import {
   applyMergePolicy,
   scheduleActiveActions,
@@ -369,13 +370,24 @@ function projectionContext(
       .filter((pr) => pr.state === 'MERGED')
       .flatMap((pr) => pr.closingIssueNumbers),
   ]);
+  const terminalClaims = snapshot.terminalClaims ?? [];
   const orphanBranchClaims: OrphanBranchClaim[] = snapshot.branches
-    .filter((branch) => (
-      branch.claim.phase === 'implement'
-      && !prBranches.has(branch.headRefName)
-      && !ambiguousIssues.has(branch.issueNumber)
-      && !terminalIssues.has(branch.issueNumber)
-    ))
+    .filter((branch) => {
+      const claim = branch.claim;
+      return claim.phase === 'implement'
+        && !prBranches.has(branch.headRefName)
+        && !ambiguousIssues.has(branch.issueNumber)
+        && !terminalIssues.has(branch.issueNumber)
+        && !terminalClaims.some((terminal) => (
+          terminal.issueNumber === branch.issueNumber
+          && terminal.prNumber === claim.prNumber
+          && terminal.headRefName === branch.headRefName
+          && terminal.headOid === branch.headOid
+          && terminal.claimAttempt === claim.attempt
+          && terminal.targetBase === claim.targetBase
+          && implementationClaimFingerprint(claim) === terminal.claimFingerprint
+        ));
+    })
     .map((branch) => {
       const projectIssue = snapshot.project.items.find((item) => (
         item.contentType === 'Issue' && item.number === branch.issueNumber

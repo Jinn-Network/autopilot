@@ -1086,6 +1086,166 @@ describe('lifecycle controller', () => {
     expect(calls).toEqual([]);
   });
 
+  it('uses matching terminal claim evidence only to suppress retained-branch orphan recovery', async () => {
+    const calls: string[] = [];
+    const eligibleIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'Todo',
+      labels: [],
+      eligible: true,
+      eligibilityReason: 'eligible',
+      eligibilityDetail: 'All implementation admission gates pass',
+    };
+    const terminalSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(eligibleIssue),
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+      terminalClaims: [{
+        issueNumber: 42,
+        prNumber: 101,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        claimAttempt: implementation().branchClaim!.attempt,
+        targetBase: gitRefName('next'),
+        claimFingerprint: '6f0c55eda2d8d6b32c6f24ccac605d377c48acb0d8ab41ca9dd443f16c13613b',
+        mergedAt: '2026-07-20T11:30:00.000Z',
+        mergeCommitOid: gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+      }],
+    };
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(eligibleIssue, calls),
+      readSnapshot: async () => terminalSnapshot,
+    });
+
+    expect(report.orphanBranchClaims).toEqual([]);
+    expect(report.items).toEqual([
+      expect.objectContaining({
+        issueNumber: 42,
+        phase: 'eligible',
+      }),
+    ]);
+    expect(report.items.flatMap((item) => item.desiredActions)).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'ensure-draft-pr' }),
+        expect.objectContaining({ kind: 'set-project-status', status: 'Done' }),
+      ]),
+    );
+    expect(report.items.some((item) => item.phase === 'merged')).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('keeps orphan recovery fail-closed when terminal claim identity does not match the branch', async () => {
+    const calls: string[] = [];
+    const eligibleIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'Todo',
+      labels: [],
+      eligible: true,
+      eligibilityReason: 'eligible',
+      eligibilityDetail: 'All implementation admission gates pass',
+    };
+    const mismatchedSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(eligibleIssue),
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+      terminalClaims: [{
+        issueNumber: 42,
+        prNumber: 101,
+        headRefName: 'autopilot/42',
+        headOid: gitOid('cccccccccccccccccccccccccccccccccccccccc'),
+        claimAttempt: implementation().branchClaim!.attempt,
+        targetBase: gitRefName('next'),
+        claimFingerprint: '6f0c55eda2d8d6b32c6f24ccac605d377c48acb0d8ab41ca9dd443f16c13613b',
+        mergedAt: '2026-07-20T11:30:00.000Z',
+        mergeCommitOid: gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+      }],
+    };
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(eligibleIssue, calls),
+      readSnapshot: async () => mismatchedSnapshot,
+    });
+
+    expect(report.orphanBranchClaims).toEqual([
+      expect.objectContaining({
+        issueNumber: 42,
+        desiredActions: expect.arrayContaining([
+          expect.objectContaining({ kind: 'ensure-draft-pr' }),
+        ]),
+      }),
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  it('keeps orphan recovery fail-closed when an omitted implementation claim field changes', async () => {
+    const calls: string[] = [];
+    const eligibleIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'Todo',
+      labels: [],
+      eligible: true,
+      eligibilityReason: 'eligible',
+      eligibilityDetail: 'All implementation admission gates pass',
+    };
+    const changedClaim = {
+      ...implementation().branchClaim!,
+      runner: 'runner-b',
+    };
+    const mismatchedSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(eligibleIssue),
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: changedClaim,
+      }],
+      terminalClaims: [{
+        issueNumber: 42,
+        prNumber: 101,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        claimAttempt: implementation().branchClaim!.attempt,
+        targetBase: gitRefName('next'),
+        claimFingerprint: '6f0c55eda2d8d6b32c6f24ccac605d377c48acb0d8ab41ca9dd443f16c13613b',
+        mergedAt: '2026-07-20T11:30:00.000Z',
+        mergeCommitOid: gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+      }],
+    };
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(eligibleIssue, calls),
+      readSnapshot: async () => mismatchedSnapshot,
+    });
+
+    expect(report.orphanBranchClaims).toEqual([
+      expect.objectContaining({
+        issueNumber: 42,
+        desiredActions: expect.arrayContaining([
+          expect.objectContaining({ kind: 'ensure-draft-pr' }),
+        ]),
+      }),
+    ]);
+    expect(calls).toEqual([]);
+  });
+
   it.skip('never reopens Done or otherwise merged work because its stable ref was retained', async () => {
     const calls: string[] = [];
     const doneIssue: LifecycleItem = {

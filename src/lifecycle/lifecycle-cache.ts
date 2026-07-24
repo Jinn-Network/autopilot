@@ -22,8 +22,10 @@ import type {
   BranchClaimSnapshot,
   PullRequestSnapshot,
   SnapshotReadMode,
+  TerminalClaimEvidence,
 } from './snapshot.js';
 import type { GitHubUsage } from './github-usage.js';
+import { implementationClaimFingerprint } from './terminal-claim.js';
 
 export const DEFAULT_AUTOPILOT_STATE_DIRECTORY = join(
   homedir(),
@@ -48,6 +50,8 @@ export interface LifecycleSnapshotEvidence {
 export interface LifecycleDiscoveryState {
   readonly version: 1;
   readonly evidence: LifecycleSnapshotEvidence;
+  /** Exact terminal proof retained only for the currently surviving implementation claim. */
+  readonly terminalClaims: readonly TerminalClaimEvidence[];
   /** Exact evidence retained for lifecycle-relevant or previously hydrated open PRs. */
   readonly openPullRequestEvidence: readonly PullRequestSnapshot[];
   /** Complete open REST index; null is accepted only for a legacy full-oracle seed. */
@@ -301,6 +305,18 @@ const branchSchema = z.object({
   implementationCompletionSummary: z.string().optional(),
 }).strict();
 
+const terminalClaimSchema = z.object({
+  issueNumber: positiveInteger,
+  prNumber: positiveInteger,
+  headRefName: z.string().min(1),
+  headOid: oid,
+  claimAttempt: z.string().min(1),
+  targetBase: z.string().min(1),
+  claimFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+  mergedAt: exactTimestamp,
+  mergeCommitOid: oid,
+}).strict();
+
 const usageSchema = z.object({
   graphqlRequests: nonNegativeInteger,
   graphqlCost: nonNegativeInteger,
@@ -365,6 +381,7 @@ const restCacheSchema = z.object({
 const stateSchema = z.object({
   version: z.literal(1),
   evidence: evidenceSchema,
+  terminalClaims: z.array(terminalClaimSchema).default([]),
   openPullRequestEvidence: z.array(pullRequestSchema),
   openPullRequests: z.array(pullRequestIndexSchema).nullable(),
   recentlyClosedPullRequests: z.array(pullRequestIndexSchema),
@@ -470,6 +487,24 @@ const stateSchema = z.object({
     'branch ref',
   );
   unique(
+    state.terminalClaims,
+    (entry) => String(entry.issueNumber),
+    ['terminalClaims'],
+    'terminal claim issue',
+  );
+  unique(
+    state.terminalClaims,
+    (entry) => String(entry.prNumber),
+    ['terminalClaims'],
+    'terminal claim PR',
+  );
+  unique(
+    state.terminalClaims,
+    (entry) => entry.headRefName,
+    ['terminalClaims'],
+    'terminal claim branch',
+  );
+  unique(
     state.openPullRequests ?? [],
     (pr) => String(pr.number),
     ['openPullRequests'],
@@ -541,6 +576,26 @@ const stateSchema = z.object({
   for (const branch of state.evidence.branches) {
     if (branch.claim.issueNumber !== branch.issueNumber) {
       issue(['evidence', 'branches'], `branch ${branch.headRefName} issue is contradictory`);
+    }
+  }
+  for (const terminal of state.terminalClaims) {
+    const branch = state.evidence.branches.find((candidate) => (
+      candidate.issueNumber === terminal.issueNumber
+      && candidate.headRefName === terminal.headRefName
+    ));
+    if (
+      branch === undefined
+      || branch.headOid !== terminal.headOid
+      || branch.claim.phase !== 'implement'
+      || branch.claim.prNumber !== terminal.prNumber
+      || branch.claim.attempt !== terminal.claimAttempt
+      || branch.claim.targetBase !== terminal.targetBase
+      || implementationClaimFingerprint(branch.claim) !== terminal.claimFingerprint
+    ) {
+      issue(
+        ['terminalClaims'],
+        `terminal claim for issue #${terminal.issueNumber} does not match its current branch`,
+      );
     }
   }
 });
