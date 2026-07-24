@@ -85,7 +85,10 @@ function issueItem(input: {
     id: 1000 + input.number,
     node_id: `PVTI_${input.number}`,
     content_type: 'Issue',
-    content: { number: input.number },
+    content: {
+      number: input.number,
+      repository: { full_name: 'Jinn-Network/mono' },
+    },
     fields: [
       select(11, 'Status', 'Todo'),
       select(12, 'Priority', 'P1'),
@@ -337,7 +340,16 @@ describe('GitHubRestDiscoveryReader project discovery', () => {
     const reader = new GitHubRestDiscoveryReader(new ConditionalRestClient(mapRunner(new Map([
       [FIELDS_ENDPOINT, included(projectFields())],
       [ITEMS_ENDPOINT, included([
-        { ...base, node_id: 'PVTI_pr', content_type: 'PullRequest', content: { number: 101 }, fields: withoutType },
+        {
+          ...base,
+          node_id: 'PVTI_pr',
+          content_type: 'PullRequest',
+          content: {
+            number: 101,
+            repository: { full_name: 'Jinn-Network/mono' },
+          },
+          fields: withoutType,
+        },
         { ...base, node_id: 'PVTI_draft', content_type: 'DraftIssue', content: {}, fields: withoutType },
         { ...base, node_id: 'PVTI_deleted', content: null },
       ])],
@@ -349,6 +361,34 @@ describe('GitHubRestDiscoveryReader project discovery', () => {
         { id: 'PVTI_draft', number: -1, contentType: 'DraftIssue', issueType: null },
       ],
     });
+  });
+
+  it('confines organization Project items to the configured repository', async () => {
+    const target = issueItem({ number: 42, blockedOn: 'Nothing' });
+    const foreign = {
+      ...issueItem({ number: 3, blockedOn: 'Nothing' }),
+      node_id: 'PVTI_foreign',
+      content: {
+        number: 3,
+        repository: { full_name: 'Jinn-Network/autopilot' },
+      },
+    };
+    const reader = new GitHubRestDiscoveryReader(new ConditionalRestClient(mapRunner(new Map([
+      [FIELDS_ENDPOINT, included(projectFields())],
+      [ITEMS_ENDPOINT, included([target, foreign])],
+    ]))));
+
+    const snapshot = await reader.readProjectSnapshot({ nowMs: NOW });
+
+    expect(snapshot.items.map((item) => ({
+      id: item.id,
+      number: item.number,
+      contentType: item.contentType,
+    }))).toEqual([{
+      id: 'PVTI_42',
+      number: 42,
+      contentType: 'Issue',
+    }]);
   });
 
   it.each([

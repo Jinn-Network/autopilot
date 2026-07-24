@@ -342,12 +342,21 @@ function contentType(value: unknown): ProjectContentType {
 function parseProjectItem(
   input: unknown,
   fields: ReadonlyMap<ProjectFieldName, DiscoveredField>,
+  repositorySlug: string,
 ): SnapshotItem | null {
   const item = record(input, 'Project item');
   const nodeId = nonEmptyString(item.node_id, 'Project item.node_id');
   const type = contentType(item.content_type);
   if (item.content === null) return null;
   const content = record(item.content, 'Project item.content');
+  if (type !== 'DraftIssue') {
+    const repository = record(content.repository, 'Project item.content.repository');
+    const fullName = nonEmptyString(
+      repository.full_name,
+      'Project item.content.repository.full_name',
+    );
+    if (fullName.toLowerCase() !== repositorySlug.toLowerCase()) return null;
+  }
   const number = type === 'DraftIssue'
     ? -1
     : positiveInteger(content.number, 'Project item.content.number');
@@ -820,7 +829,7 @@ export class GitHubRestDiscoveryReader {
       'after',
     );
     const items = itemPages.rows
-      .map((item) => parseProjectItem(item, fields))
+      .map((item) => parseProjectItem(item, fields, this.repositorySlug))
       .filter((item): item is SnapshotItem => item !== null);
     const issues = items.filter((item) => item.contentType === 'Issue');
     if (issues.length >= SCHEMA_DRIFT_MIN_ISSUE_COUNT) {
