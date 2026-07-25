@@ -26,6 +26,7 @@ import {
   cleanupAttempt,
   countRunnerLiveAttempts,
   createAttemptWorkspace,
+  decodeAttemptManifest,
   defaultRunnerId,
   freeDiskBytes,
   listRunnerLiveAttempts,
@@ -366,6 +367,175 @@ describe('attempt workspace and manifest', () => {
     expect(JSON.stringify(updated)).not.toMatch(/must-not-be-accepted/i);
     expect(Object.keys(JSON.parse(JSON.stringify(updated)) as Record<string, unknown>))
       .not.toContain('token');
+  });
+
+  it('normalizes absent execution metadata to the local backend and writes local executions', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+
+    expect(manifest.execution).toEqual({ backend: 'local' });
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    delete raw.execution;
+    expect(decodeAttemptManifest(raw).execution).toEqual({ backend: 'local' });
+  });
+
+  it('round-trips an explicitly-created submitted marketplace execution', async () => {
+    const fixture = repositoryFixture();
+    const execution = {
+      backend: 'marketplace',
+      state: {
+        schemaVersion: 'marketplace-execution-v1',
+        status: 'submitted',
+        requestPath: join(fixture.root, 'marketplace-request.json'),
+        taskId: 'task-42',
+        taskCid: 'bafybeigdyrzt5m6u2r3o4exampletaskcid',
+        submittedAt: '2026-07-20T00:01:00.000Z',
+      },
+    } as const;
+
+    const manifest = await createAttemptWorkspace(options(fixture, { execution }), defaultRunner);
+
+    expect(manifest.execution).toEqual(execution);
+    expect(readAttemptManifest(manifest.paths.manifest).execution).toEqual(execution);
+  });
+
+  it('rejects malformed execution discriminants and marketplace state records', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    const requestPath = join(fixture.root, 'marketplace-request.json');
+    const invalidExecutions = [
+      { backend: 'local', state: {} },
+      { backend: 'marketplace' },
+      { backend: 'remote', state: {} },
+      {
+        backend: 'marketplace',
+        unexpected: true,
+        state: { schemaVersion: 'marketplace-execution-v1', status: 'unsubmitted', requestPath },
+      },
+      {
+        backend: 'marketplace',
+        state: { schemaVersion: 'marketplace-execution-v2', status: 'unsubmitted', requestPath },
+      },
+      {
+        backend: 'marketplace',
+        state: { schemaVersion: 'marketplace-execution-v1', status: 'accepted', requestPath },
+      },
+      {
+        backend: 'marketplace',
+        state: { schemaVersion: 'marketplace-execution-v1', status: 'unsubmitted', requestPath: 'relative.json' },
+      },
+      {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'unsubmitted',
+          requestPath,
+          unexpected: true,
+        },
+      },
+      {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'submitted',
+          requestPath,
+          taskCid: 'cid',
+          submittedAt: '2026-07-20T00:01:00.000Z',
+        },
+      },
+      {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'submitted',
+          requestPath,
+          taskId: '',
+          taskCid: 'cid',
+          submittedAt: '2026-07-20T00:01:00.000Z',
+        },
+      },
+      {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'submitted',
+          requestPath,
+          taskId: 'task-42',
+          taskCid: '',
+          submittedAt: '2026-07-20T00:01:00.000Z',
+        },
+      },
+      {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'submitted',
+          requestPath,
+          taskId: 'task-42',
+          taskCid: 'cid',
+          submittedAt: 'not-a-timestamp',
+        },
+      },
+    ];
+
+    for (const execution of invalidExecutions) {
+      expect(() => decodeAttemptManifest({ ...raw, execution })).toThrow();
+    }
+  });
+
+  it('rejects execution backend and marketplace-state changes through atomic updates', async () => {
+    const fixture = repositoryFixture();
+    const requestPath = join(fixture.root, 'marketplace-request.json');
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'unsubmitted',
+          requestPath,
+        },
+      },
+    }), defaultRunner);
+    const original = readFileSync(manifest.paths.manifest, 'utf8');
+    const mutations = [
+      (current: AttemptManifest) => ({ ...current, execution: { backend: 'local' } }),
+      (current: AttemptManifest) => ({
+        ...current,
+        execution: {
+          backend: 'marketplace',
+          state: {
+            schemaVersion: 'marketplace-execution-v1',
+            status: 'submitted',
+            requestPath,
+            taskId: 'task-42',
+            taskCid: 'bafybeigdyrzt5m6u2r3o4exampletaskcid',
+            submittedAt: '2026-07-20T00:01:00.000Z',
+          },
+        },
+      }),
+    ];
+
+    for (const mutate of mutations) {
+      expect(() => updateAttemptManifest(manifest.paths.manifest, mutate)).toThrow(
+        /static attempt fields/,
+      );
+      expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(original);
+    }
+
+    const local = await createAttemptWorkspace(options(fixture, { attemptId: UUID_B }), defaultRunner);
+    expect(() => updateAttemptManifest(local.paths.manifest, (current) => ({
+      ...current,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'unsubmitted',
+          requestPath,
+        },
+      },
+    }))).toThrow(/static attempt fields/);
+    expect(readAttemptManifest(local.paths.manifest).execution).toEqual({ backend: 'local' });
   });
 
   it('locks every static manifest authority, identity, and path field across updates', async () => {
