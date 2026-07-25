@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import {
   LocalSessionExecutionBackend,
   MarketplaceSessionExecutionBackend,
   MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
   type LocalSessionExecutionRequest,
+  type MarketplaceSessionExecutionRequest,
 } from '../../src/lifecycle/session-execution-backend.js';
 
 const implementationRequest = (): LocalSessionExecutionRequest => ({
@@ -16,6 +17,7 @@ const implementationRequest = (): LocalSessionExecutionRequest => ({
   targetBase: 'next',
   worktreePath: '/worktrees/42',
   logPath: '/logs/42.log',
+  backend: 'local',
   local: {
     spawnInput: {
       attemptId: 'attempt-implementation',
@@ -47,6 +49,9 @@ const reviewRequest = (): LocalSessionExecutionRequest => ({
   targetBase: 'next',
   worktreePath: '/worktrees/42',
   logPath: '/logs/42.log',
+  backend: 'local',
+  reviewedHead: 'a'.repeat(40),
+  reviewerLogin: 'review-bot',
   local: {
     spawnInput: {
       attemptId: 'attempt-review',
@@ -74,13 +79,25 @@ const reviewRequest = (): LocalSessionExecutionRequest => ({
 });
 
 describe('session execution backends', () => {
-  it('local start tracks a spawned implementation child only after validating its PID', async () => {
-    const child = { pid: 1234 };
-    const spawnImplementation = vi.fn(() => child);
-    const trackChild = vi.fn();
+  it('local implementation start orders spawn, PID validation, and tracking without invoking review spawn', async () => {
+    const events: string[] = [];
+    const child = {
+      get pid() {
+        events.push('pid');
+        return 1234;
+      },
+    };
+    const spawnImplementation = vi.fn(() => {
+      events.push('spawn');
+      return child;
+    });
+    const spawnExactHeadReview = vi.fn();
+    const trackChild = vi.fn((_manifestPath: string, _child: typeof child) => {
+      events.push('track');
+    });
     const backend = new LocalSessionExecutionBackend({
       spawnImplementation,
-      spawnExactHeadReview: vi.fn(),
+      spawnExactHeadReview,
       trackChild,
     });
 
@@ -92,10 +109,40 @@ describe('session execution backends', () => {
     expect(spawnImplementation).toHaveBeenCalledWith(
       implementationRequest().local.spawnInput,
     );
-    expect(trackChild).toHaveBeenCalledWith(
-      '/attempts/implementation/manifest.json',
-      child,
-    );
+    expect(trackChild).toHaveBeenCalledTimes(1);
+    expect(trackChild.mock.calls[0]?.[0]).toBe('/attempts/implementation/manifest.json');
+    expect(trackChild.mock.calls[0]?.[1]).toBe(child);
+    expect(spawnExactHeadReview).not.toHaveBeenCalled();
+    expect(events).toEqual(['spawn', 'pid', 'track', 'pid']);
+  });
+
+  it('local review start orders spawn, PID validation, and tracking without invoking implementation spawn', async () => {
+    const events: string[] = [];
+    const child = {
+      get pid() {
+        events.push('pid');
+        return 5678;
+      },
+    };
+    const spawnImplementation = vi.fn();
+    const spawnExactHeadReview = vi.fn(() => {
+      events.push('spawn');
+      return child;
+    });
+    const trackChild = vi.fn(() => { events.push('track'); });
+    const backend = new LocalSessionExecutionBackend({
+      spawnImplementation,
+      spawnExactHeadReview,
+      trackChild,
+    });
+
+    await expect(backend.start(reviewRequest())).resolves.toEqual({
+      status: 'started',
+      backend: 'local',
+      pid: 5678,
+    });
+    expect(spawnImplementation).not.toHaveBeenCalled();
+    expect(events).toEqual(['spawn', 'pid', 'track', 'pid']);
   });
 
   it('local start rejects a missing PID before tracking an exact-head review child', async () => {
@@ -133,18 +180,18 @@ describe('session execution backends', () => {
 
   it('marketplace never calls local execution capabilities and reports its stable foundation outcome', async () => {
     const backend = new MarketplaceSessionExecutionBackend();
-    const request = implementationRequest();
-    const marketplaceRequest = {
-      kind: request.kind,
-      manifestPath: request.manifestPath,
-      attemptId: request.attemptId,
-      issueNumber: request.issueNumber,
-      prNumber: request.prNumber,
-      branch: request.branch,
-      targetBase: request.targetBase,
-      worktreePath: request.worktreePath,
-      logPath: request.logPath,
-    } as const;
+    const marketplaceRequest: MarketplaceSessionExecutionRequest = {
+      kind: 'implementation',
+      manifestPath: '/attempts/implementation/manifest.json',
+      attemptId: 'attempt-implementation',
+      issueNumber: 42,
+      prNumber: 43,
+      branch: 'autopilot/42',
+      targetBase: 'next',
+      worktreePath: '/worktrees/42',
+      logPath: '/logs/42.log',
+      backend: 'marketplace',
+    };
 
     await expect(backend.start(marketplaceRequest)).resolves.toEqual({
       status: 'unavailable',
@@ -161,5 +208,20 @@ describe('session execution backends', () => {
       backend: 'marketplace',
       detail: MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
     });
+  });
+
+  it('uses a backend discriminator that keeps local launch input out of marketplace methods', () => {
+    const marketplace = new MarketplaceSessionExecutionBackend();
+    const local = new LocalSessionExecutionBackend({
+      spawnImplementation: vi.fn(),
+      spawnExactHeadReview: vi.fn(),
+      trackChild: vi.fn(),
+    });
+    expectTypeOf<LocalSessionExecutionRequest>()
+      .not.toMatchTypeOf<Parameters<typeof marketplace.start>[0]>();
+    expectTypeOf<Parameters<typeof marketplace.start>[0]>()
+      .toMatchTypeOf<MarketplaceSessionExecutionRequest>();
+    expectTypeOf<MarketplaceSessionExecutionRequest>()
+      .not.toMatchTypeOf<Parameters<typeof local.start>[0]>();
   });
 });

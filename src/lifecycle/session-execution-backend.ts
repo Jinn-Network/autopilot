@@ -25,11 +25,11 @@ export interface ImplementationSessionExecutionRequest
 export interface ExactHeadReviewSessionExecutionRequest
   extends SessionExecutionRequestBase {
   readonly kind: 'exact-head-review';
+  /** Exact head that the review claim fenced and the marketplace must review. */
+  readonly reviewedHead: string;
+  /** Non-secret selected reviewer identity; never a credential or token. */
+  readonly reviewerLogin: string;
 }
-
-export type SessionExecutionRequest =
-  | ImplementationSessionExecutionRequest
-  | ExactHeadReviewSessionExecutionRequest;
 
 /**
  * Local-only launch data. Task 4 will supply the existing executor spawn
@@ -40,11 +40,32 @@ export type LocalSessionExecutionRequest<
   ReviewSpawnInput = unknown,
 > =
   | (ImplementationSessionExecutionRequest & {
+      readonly backend: 'local';
       readonly local: { readonly spawnInput: ImplementationSpawnInput };
     })
   | (ExactHeadReviewSessionExecutionRequest & {
+      readonly backend: 'local';
       readonly local: { readonly spawnInput: ReviewSpawnInput };
     });
+
+/**
+ * Credential-free request surface used by the marketplace adapter. The
+ * `local?: never` discriminator prevents a local launch payload from being
+ * structurally passed to this backend.
+ */
+export type MarketplaceSessionExecutionRequest =
+  | (ImplementationSessionExecutionRequest & {
+      readonly backend: 'marketplace';
+      readonly local?: never;
+    })
+  | (ExactHeadReviewSessionExecutionRequest & {
+      readonly backend: 'marketplace';
+      readonly local?: never;
+    });
+
+export type SessionExecutionRequest =
+  | LocalSessionExecutionRequest
+  | MarketplaceSessionExecutionRequest;
 
 export type SessionExecutionResult =
   | {
@@ -64,12 +85,13 @@ export type SessionExecutionResult =
     };
 
 export interface SessionExecutionBackend<
-  StartRequest extends SessionExecutionRequest = SessionExecutionRequest,
+  Backend extends AutopilotExecutionBackend,
+  Request extends SessionExecutionRequest & { readonly backend: Backend },
 > {
-  readonly backend: AutopilotExecutionBackend;
-  start(request: StartRequest): Promise<SessionExecutionResult>;
-  recover(request: SessionExecutionRequest): Promise<SessionExecutionResult>;
-  cancel(request: SessionExecutionRequest): Promise<SessionExecutionResult>;
+  readonly backend: Backend;
+  start(request: Request): Promise<SessionExecutionResult>;
+  recover(request: Request): Promise<SessionExecutionResult>;
+  cancel(request: Request): Promise<SessionExecutionResult>;
 }
 
 /**
@@ -92,6 +114,7 @@ export class LocalSessionExecutionBackend<
   ReviewSpawnInput = unknown,
   Child extends SpawnResult = SpawnResult,
 > implements SessionExecutionBackend<
+  'local',
   LocalSessionExecutionRequest<ImplementationSpawnInput, ReviewSpawnInput>
 > {
   readonly backend = 'local' as const;
@@ -121,13 +144,17 @@ export class LocalSessionExecutionBackend<
     return { status: 'started', backend: 'local', pid: child.pid };
   }
 
-  async recover(_request: SessionExecutionRequest): Promise<SessionExecutionResult> {
+  async recover(
+    _request: LocalSessionExecutionRequest<ImplementationSpawnInput, ReviewSpawnInput>,
+  ): Promise<SessionExecutionResult> {
     // Existing recovery derives sessions from attempts/worktrees; it has no
     // per-child backend operation to invoke.
     return { status: 'unsupported', backend: 'local', operation: 'recover' };
   }
 
-  async cancel(_request: SessionExecutionRequest): Promise<SessionExecutionResult> {
+  async cancel(
+    _request: LocalSessionExecutionRequest<ImplementationSpawnInput, ReviewSpawnInput>,
+  ): Promise<SessionExecutionResult> {
     // Existing local sessions have no safe per-session cancellation protocol.
     return { status: 'unsupported', backend: 'local', operation: 'cancel' };
   }
@@ -141,18 +168,18 @@ export const MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL =
  * intentionally deferred; this class has no local spawn or tracking ports.
  */
 export class MarketplaceSessionExecutionBackend
-  implements SessionExecutionBackend {
+  implements SessionExecutionBackend<'marketplace', MarketplaceSessionExecutionRequest> {
   readonly backend = 'marketplace' as const;
 
-  async start(_request: SessionExecutionRequest): Promise<SessionExecutionResult> {
+  async start(_request: MarketplaceSessionExecutionRequest): Promise<SessionExecutionResult> {
     return this.unavailable();
   }
 
-  async recover(_request: SessionExecutionRequest): Promise<SessionExecutionResult> {
+  async recover(_request: MarketplaceSessionExecutionRequest): Promise<SessionExecutionResult> {
     return this.unavailable();
   }
 
-  async cancel(_request: SessionExecutionRequest): Promise<SessionExecutionResult> {
+  async cancel(_request: MarketplaceSessionExecutionRequest): Promise<SessionExecutionResult> {
     return this.unavailable();
   }
 
