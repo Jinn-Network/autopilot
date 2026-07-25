@@ -19,6 +19,12 @@ import {
   loadAutopilotConfig,
   type AutopilotConfig,
 } from '../src/config/config.js';
+import {
+  parseAutopilotExecutionBackend,
+} from '../src/config/execution-backend.js';
+import {
+  MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+} from '../src/lifecycle/session-execution-backend.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
 import {
   paintBoardOptionsFromConfig,
@@ -200,6 +206,46 @@ function configuredEnvironment(
   };
 }
 
+export function executionBackendForEnvironment(
+  environment: NodeJS.ProcessEnv,
+): ReturnType<typeof parseAutopilotExecutionBackend> {
+  return parseAutopilotExecutionBackend(
+    environment.JINN_AUTOPILOT_EXECUTION_BACKEND,
+  );
+}
+
+export async function preflightProductionEntrypoint<Value>(
+  mode: 'observe' | 'recover' | 'active',
+  environment: NodeJS.ProcessEnv,
+  setup: () => Promise<Value>,
+): Promise<Value> {
+  if (
+    mode === 'active'
+    && executionBackendForEnvironment(environment) === 'marketplace'
+  ) {
+    throw new Error(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+  }
+  return setup();
+}
+
+export function shouldSweepAttempts(input: {
+  readonly mode: 'observe' | 'recover' | 'active';
+  readonly executionBackend: 'local' | 'marketplace';
+  readonly cleanupEnabled: boolean;
+  readonly hasMaintenanceCredential: boolean;
+  readonly report: {
+    readonly status: LifecycleCycleReport['status'];
+    readonly snapshotComplete?: boolean;
+  };
+}): boolean {
+  return input.mode === 'active'
+    && input.executionBackend === 'local'
+    && input.cleanupEnabled
+    && input.hasMaintenanceCredential
+    && input.report.status === 'ok'
+    && input.report.snapshotComplete === true;
+}
+
 function dispatcherConfig(
   allowlist: ReadonlySet<string>,
   product: AutopilotConfig,
@@ -321,9 +367,16 @@ export async function runAutopilotV2(
   }
 
   const options = parseLifecycleCli(arguments_);
-  const repositoryPath = (await defaultRunner('git', [
-    'rev-parse', '--path-format=absolute', '--show-toplevel',
-  ])).trim();
+  // `configuredEnvironment` preserves this process-local selector unchanged.
+  // Check it before repository/config/credential setup so the foundation
+  // marketplace lane always fails with its stable outcome.
+  const repositoryPath = (await preflightProductionEntrypoint(
+    options.mode,
+    env,
+    () => defaultRunner('git', [
+      'rev-parse', '--path-format=absolute', '--show-toplevel',
+    ]),
+  )).trim();
   const loaded = await loadAutopilotConfig(repositoryPath, env);
   configureRepositoryConstants({
     repositorySlug: loaded.config.repository.slug,
@@ -339,6 +392,7 @@ export async function runAutopilotV2(
     loaded.paths.capabilityAttestation,
     loaded.configPath,
   );
+  const executionBackend = executionBackendForEnvironment(runtimeEnvironment);
   const snapshotRuntime = parseSnapshotRuntimeConfig(runtimeEnvironment);
   const stateDirectory = parseAutopilotStateDirectory(runtimeEnvironment);
   const cadenceSeed = await loadDaemonCadenceSeed(
@@ -544,6 +598,7 @@ export async function runAutopilotV2(
   const active = options.mode !== 'active'
     ? undefined
     : makeProductionActiveRuntime({
+        executionBackend,
         repositoryPath,
         worktreeBase,
         runnerId,
@@ -640,15 +695,17 @@ export async function runAutopilotV2(
     // A snapshot-failed cycle must remain mutation-free. Local attempt
     // cleanup therefore follows the same complete-snapshot boundary as all
     // GitHub reconciliation/archive/action mutations.
-    if (
-      options.mode === 'active'
-      && cleanupEnabled
-      && maintenanceCredential !== undefined
-    ) {
+    if (shouldSweepAttempts({
+      mode: options.mode,
+      executionBackend,
+      cleanupEnabled,
+      hasMaintenanceCredential: maintenanceCredential !== undefined,
+      report,
+    })) {
       const cleanup = await sweepDeadAttempts(runner, {
         v2Base: v2AttemptsBase,
         isPidAlive: childIsAlive,
-        env: { GH_TOKEN: maintenanceCredential.secret() },
+        env: { GH_TOKEN: maintenanceCredential!.secret() },
         graceMs: attemptGracePeriodMs,
         now: () => new Date(),
         diskFloorBytes,

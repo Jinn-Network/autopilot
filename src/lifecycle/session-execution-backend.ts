@@ -48,6 +48,20 @@ export type LocalSessionExecutionRequest<
       readonly local: { readonly spawnInput: ReviewSpawnInput };
     });
 
+export type LocalImplementationSessionExecutionRequest<
+  ImplementationSpawnInput = unknown,
+> = Extract<
+  LocalSessionExecutionRequest<ImplementationSpawnInput, never>,
+  { readonly kind: 'implementation' }
+>;
+
+export type LocalExactHeadReviewSessionExecutionRequest<
+  ReviewSpawnInput = unknown,
+> = Extract<
+  LocalSessionExecutionRequest<never, ReviewSpawnInput>,
+  { readonly kind: 'exact-head-review' }
+>;
+
 /**
  * Credential-free request surface used by the marketplace adapter. The
  * `local?: never` discriminator prevents a local launch payload from being

@@ -1,9 +1,16 @@
 // @ts-nocheck — Stage 5: deleted merge-prep/review-fix/project-status fixtures.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
 import {
+  makeProductionActiveRuntime,
   makeProductionCapabilityPreflight,
 } from '../../src/lifecycle/active-runtime-production.js';
+import {
+  runLifecycleCycle,
+} from '../../src/lifecycle/controller.js';
+import {
+  MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+} from '../../src/lifecycle/session-execution-backend.js';
 import {
   decodeCapabilityAttestation,
 } from '../../src/lifecycle/capability-attestation.js';
@@ -17,6 +24,43 @@ function pool(): CredentialPool {
     normalizedLogin: 'implementation-bot',
     implementationToken: 'secret',
   }]);
+}
+
+function marketplaceRuntime(overrides: Record<string, unknown> = {}) {
+  return makeProductionActiveRuntime({
+    executionBackend: 'marketplace',
+    repositoryPath: '/repo',
+    worktreeBase: '/tmp/autopilot-marketplace-preflight-test',
+    runnerId: 'runner-a',
+    credentials: pool(),
+    authorAllowlist: new Set(['implementation-bot']),
+    readReviewSnapshot: async () => null,
+    readReservedReviewSnapshot: async () => null,
+    readImplementationSnapshot: async () => {
+      throw new Error('implementation authority must remain untouched');
+    },
+    reserveReviewCohort: async () => {},
+    readPullRequestByNumber: async () => null,
+    readProjectItemForReconciliation: async () => null,
+    readBranchHeadByName: async () => null,
+    readIssueByNumber: async () => null,
+    readBlockedByIssueNumbers: async () => [],
+    readOpenPullRequestsByIssue: async () => [],
+    readIssueActionContext: async () => {
+      throw new Error('issue action context must remain untouched');
+    },
+    config: DEFAULT_CONFIG,
+    spawn: vi.fn(() => {
+      throw new Error('local spawn must remain untouched');
+    }),
+    caps: { implementation: 1, review: 1 },
+    implementationBackpressureThreshold: 30,
+    staleAfterMs: 60_000,
+    runner: vi.fn(async () => {
+      throw new Error('runner must remain untouched');
+    }),
+    ...overrides,
+  });
 }
 
 describe('decodeCapabilityAttestation timestamps', () => {
@@ -79,6 +123,157 @@ describe('decodeCapabilityAttestation timestamps', () => {
 });
 
 describe('production active runtime preflight', () => {
+  it('rejects marketplace execution before Git, credentials, attestation, or local runtime probes', async () => {
+    const runner = vi.fn(async () => {
+      throw new Error('Git probe must remain untouched');
+    });
+    const readCapabilityAttestation = vi.fn(() => {
+      throw new Error('attestation probe must remain untouched');
+    });
+    const credentials = {
+      logins: vi.fn(() => {
+        throw new Error('credential probe must remain untouched');
+      }),
+    };
+    const preflight = makeProductionCapabilityPreflight({
+      executionBackend: 'marketplace',
+      repositoryPath: '/repo',
+      credentials,
+      config: {
+        ...DEFAULT_CONFIG,
+        runtime: 'cursor',
+        cursorBin: '/missing/cursor-agent',
+      },
+      runner,
+      readCapabilityAttestation,
+    });
+
+    await expect(preflight()).resolves.toEqual({
+      ok: false,
+      detail: MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+    });
+    expect(runner).not.toHaveBeenCalled();
+    expect(readCapabilityAttestation).not.toHaveBeenCalled();
+    expect(credentials.logins).not.toHaveBeenCalled();
+  });
+
+  it('rejects a marketplace production cycle before snapshot discovery or any claim path', async () => {
+    const spawn = vi.fn(() => {
+      throw new Error('local spawn must remain untouched');
+    });
+    const readSnapshot = vi.fn(async () => {
+      throw new Error('snapshot discovery must remain untouched');
+    });
+    const isPidAlive = vi.fn(() => {
+      throw new Error('local PID probe must remain untouched');
+    });
+    const trackAttemptChild = vi.fn(() => {
+      throw new Error('local tracking must remain untouched');
+    });
+    const active = marketplaceRuntime({
+      spawn,
+      isPidAlive,
+      trackAttemptChild,
+    });
+
+    await expect(runLifecycleCycle('active', {
+      active,
+      writer: {} as never,
+      readSnapshot,
+      now: () => NOW,
+      staleAfterMs: 60_000,
+      runnerId: 'runner-a',
+      cycleId: () => 'cycle-a',
+    })).resolves.toMatchObject({
+      status: 'rejected',
+      message:
+        `active capability preflight failed: ${MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL}`,
+      events: [],
+    });
+    expect(readSnapshot).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(isPidAlive).not.toHaveBeenCalled();
+    expect(trackAttemptChild).not.toHaveBeenCalled();
+  });
+
+  it('fails a direct marketplace implementation dispatch before authority reads or local spawn', async () => {
+    const spawn = vi.fn(() => {
+      throw new Error('local spawn must remain untouched');
+    });
+    const readImplementationSnapshot = vi.fn(async () => {
+      throw new Error('implementation authority must remain untouched');
+    });
+    const trackAttemptChild = vi.fn(() => {
+      throw new Error('local tracking must remain untouched');
+    });
+    const active = marketplaceRuntime({
+      spawn,
+      readImplementationSnapshot,
+      trackAttemptChild,
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-implementation',
+      intent: 'fresh',
+      issueNumber: 42,
+    }, {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+    expect(readImplementationSnapshot).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(trackAttemptChild).not.toHaveBeenCalled();
+  });
+
+  it('fails a direct marketplace exact-head review before acquisition reads or local spawn', async () => {
+    const spawn = vi.fn(() => {
+      throw new Error('local spawn must remain untouched');
+    });
+    const readReviewSnapshot = vi.fn(async () => {
+      throw new Error('review authority must remain untouched');
+    });
+    const trackAttemptChild = vi.fn(() => {
+      throw new Error('local tracking must remain untouched');
+    });
+    const active = marketplaceRuntime({
+      spawn,
+      readReviewSnapshot,
+      trackAttemptChild,
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head: '1'.repeat(40),
+    }, {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+    expect(readReviewSnapshot).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+    expect(trackAttemptChild).not.toHaveBeenCalled();
+  });
+
+  it('guards direct marketplace dispatch before credential and full-capacity local-state reads', async () => {
+    const credentials = {
+      logins: vi.fn(() => {
+        throw new Error('credential/local-state probe must remain untouched');
+      }),
+    };
+    const active = marketplaceRuntime({
+      credentials,
+      caps: { implementation: 0, review: 0 },
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-implementation',
+      intent: 'fresh',
+      issueNumber: 42,
+    }, {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+    await expect(active.executeReviewActions!([{
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head: '1'.repeat(40),
+    }], {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+    expect(credentials.logins).not.toHaveBeenCalled();
+  });
+
   it('rejects active mode when no live capability attestation is configured', async () => {
     const preflight = makeProductionCapabilityPreflight({
       repositoryPath: '/repo',

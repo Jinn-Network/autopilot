@@ -34,11 +34,15 @@ import {
   CANONICAL_GITHUB_HTTPS_REMOTE,
   executeImplementationAction,
   makeCanonicalImplementationSpawner,
+  type SpawnImplementationInput,
 } from './implementation-executor.js';
 import {
   makeProductionImplementationActionPort,
 } from './implementation-executor-production.js';
-import { executeReviewAction } from './review-executor.js';
+import {
+  executeReviewAction,
+  type SpawnExactHeadReviewInput,
+} from './review-executor.js';
 import { makeProductionReviewActionPort } from './review-executor-production.js';
 import {
   executeMergeAction,
@@ -65,10 +69,22 @@ import type {
 } from './targeted-action-reader.js';
 import type { GitOid, HumanReason, NewWorkAction } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
+import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
+import {
+  LocalSessionExecutionBackend,
+  MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+  type LocalExactHeadReviewSessionExecutionRequest,
+  type LocalImplementationSessionExecutionRequest,
+} from './session-execution-backend.js';
 
 export const AUTOPILOT_V2_REMOTE = 'jinn-autopilot-v2';
 
 export interface ProductionActiveRuntimeOptions {
+  /**
+   * Process-local execution selector. The production entrypoint always passes
+   * its parsed value; local remains the default for source compatibility.
+   */
+  readonly executionBackend?: AutopilotExecutionBackend;
   readonly repositoryPath: string;
   readonly worktreeBase: string;
   readonly runnerId: string;
@@ -126,6 +142,7 @@ export interface ProductionActiveRuntimeOptions {
   readonly now?: () => Date;
   readonly nextId?: () => string;
   readonly isPidAlive?: (pid: number) => boolean;
+  readonly trackAttemptChild?: typeof trackAttemptChild;
   readonly remoteName?: string;
   readonly repositorySlug?: string;
   readonly repositoryUrl?: string;
@@ -181,6 +198,7 @@ function reviewScenario(input: {
 export function makeProductionCapabilityPreflight(
   options: Pick<
   ProductionActiveRuntimeOptions,
+  | 'executionBackend'
   | 'repositoryPath'
   | 'credentials'
   | 'config'
@@ -192,6 +210,7 @@ export function makeProductionCapabilityPreflight(
   | 'repositoryUrl'
   >,
 ): () => Promise<{ readonly ok: boolean; readonly detail?: string }> {
+  const executionBackend = options.executionBackend ?? 'local';
   const runner = options.runner ?? defaultRunner;
   const remoteName = options.remoteName ?? AUTOPILOT_V2_REMOTE;
   const ambient = options.environment ?? process.env;
@@ -201,6 +220,12 @@ export function makeProductionCapabilityPreflight(
   const repositoryUrl =
     options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   return async () => {
+    if (executionBackend === 'marketplace') {
+      return {
+        ok: false,
+        detail: MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+      };
+    }
     try {
       if (options.credentials.logins().length === 0) {
         throw new Error('no configured GitHub credential is available');
@@ -249,6 +274,7 @@ export function makeProductionCapabilityPreflight(
 export function makeProductionActiveRuntime(
   options: ProductionActiveRuntimeOptions,
 ): ReturnType<typeof makeActiveRuntime> {
+  const executionBackend = options.executionBackend ?? 'local';
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
   const now = options.now ?? (() => new Date());
@@ -256,6 +282,7 @@ export function makeProductionActiveRuntime(
   const sleep = options.sleep ?? defaultSleep;
   const remoteName = options.remoteName ?? AUTOPILOT_V2_REMOTE;
   const alive = options.isPidAlive ?? isPidAlive;
+  const trackAttempt = options.trackAttemptChild ?? trackAttemptChild;
   let reviewMutationTail: Promise<void> = Promise.resolve();
   const serializeReviewMutation = <Value>(
     operation: () => Promise<Value>,
@@ -275,21 +302,25 @@ export function makeProductionActiveRuntime(
     return targeted;
   };
   const track = (manifestPath: string, child: SpawnResult): void => {
-    trackAttemptChild(manifestPath, requireTrackable(child), { now });
+    trackAttempt(manifestPath, requireTrackable(child), { now });
   };
-  const implementationPreferred = selectCredential(
-    options.credentials,
-    { phase: 'implement' },
-  );
-  const implementationPreferredLogin = implementationPreferred.status === 'selected'
-    ? implementationPreferred.login
-    : options.credentials.logins()[0] ?? '';
+  const implementationPreferredLogin = executionBackend === 'marketplace'
+    ? ''
+    : (() => {
+        const implementationPreferred = selectCredential(
+          options.credentials,
+          { phase: 'implement' },
+        );
+        return implementationPreferred.status === 'selected'
+          ? implementationPreferred.login
+          : options.credentials.logins()[0] ?? '';
+      })();
   const implementationSpawner = makeCanonicalImplementationSpawner(
     options.config,
     options.spawn,
   );
   const reviewSpawner = (
-    input: Parameters<import('./review-executor.js').ReviewExecutorDeps['spawnCoordinator']>[0],
+    input: SpawnExactHeadReviewInput,
   ) => spawnCoordinatorSession({
     kind: 'review',
     number: input.candidate.number,
@@ -309,6 +340,31 @@ export function makeProductionActiveRuntime(
       logPath: input.logPath,
     },
   }, options.config, { spawn: options.spawn });
+  type ProductionLocalExecutionBackend = LocalSessionExecutionBackend<
+    SpawnImplementationInput,
+    SpawnExactHeadReviewInput,
+    SpawnResult
+  >;
+  const localExecutionBackend: ProductionLocalExecutionBackend | undefined =
+    executionBackend === 'local'
+      ? new LocalSessionExecutionBackend({
+          spawnImplementation: implementationSpawner,
+          spawnExactHeadReview: reviewSpawner,
+          trackChild: track,
+        })
+      : undefined;
+  const requireLocalExecutionBackend = (): ProductionLocalExecutionBackend => {
+    if (localExecutionBackend === undefined) {
+      throw new Error(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+    }
+    return localExecutionBackend;
+  };
+  const startImplementationSession = (
+    request: LocalImplementationSessionExecutionRequest<SpawnImplementationInput>,
+  ) => requireLocalExecutionBackend().start(request);
+  const startExactHeadReviewSession = (
+    request: LocalExactHeadReviewSessionExecutionRequest<SpawnExactHeadReviewInput>,
+  ) => requireLocalExecutionBackend().start(request);
   const escalateReview = async (
     input: {
       readonly candidate: {
@@ -372,7 +428,7 @@ export function makeProductionActiveRuntime(
     // Stage 3: Human Status paint is painter-owned; label+marker are authority.
   };
 
-  return makeActiveRuntime({
+  const activeRuntime = makeActiveRuntime({
     credentials: options.credentials,
     caps: options.caps,
     implementationPreferredLogin,
@@ -412,6 +468,7 @@ export function makeProductionActiveRuntime(
       },
 
       implementation: (action, credentials, cycleSnapshot) => {
+        requireLocalExecutionBackend();
         const port = makeProductionImplementationActionPort({
           repositoryPath: options.repositoryPath,
           worktreeBase: options.worktreeBase,
@@ -437,12 +494,12 @@ export function makeProductionActiveRuntime(
           nextAttemptId: nextId,
           runnerId: options.runnerId,
           now,
-          spawnCoordinator: implementationSpawner,
-          trackChild: track,
+          startSession: startImplementationSession,
         });
       },
 
       review: (action, credentials, cycleSnapshot, context) => {
+        requireLocalExecutionBackend();
         const productionPort = makeProductionReviewActionPort({
           repositoryPath: options.repositoryPath,
           worktreeBase: options.worktreeBase,
@@ -481,8 +538,7 @@ export function makeProductionActiveRuntime(
           now,
           sleep,
           staleAfterMs: options.staleAfterMs,
-          spawnCoordinator: reviewSpawner,
-          trackChild: track,
+          startSession: startExactHeadReviewSession,
           escalateHuman: (input) => serializeReviewMutation(
             () => escalateReview(input, credentials, cycleSnapshot),
           ),
@@ -639,4 +695,15 @@ export function makeProductionActiveRuntime(
       },
     },
   });
+  if (executionBackend === 'marketplace') {
+    const unavailable = async (): Promise<never> => {
+      throw new Error(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+    };
+    return {
+      ...activeRuntime,
+      executeAction: unavailable,
+      executeReviewActions: unavailable,
+    };
+  }
+  return activeRuntime;
 }

@@ -134,17 +134,16 @@ function harness(overrides: Partial<ImplementationExecutorDeps> = {}) {
         },
       };
     },
-    spawnCoordinator: (input) => {
+    startSession: async (request) => {
       events.push('spawn');
+      const input = request.local.spawnInput;
       expect(input.environment.GH_TOKEN).toBe('selected-secret');
       expect(input.environment.GITHUB_TOKEN).toBeUndefined();
       expect(input.environment.GIT_SSH_COMMAND).toBe('false');
       expect(input.environment.JINN_AUTOPILOT_SESSION_MANIFEST)
         .toBe(`/tmp/${input.attemptId}/manifest.json`);
-      return { pid: 4242 };
-    },
-    trackChild: () => {
       events.push('track');
+      return { status: 'started', backend: 'local', pid: 4242 };
     },
     escalateHuman: async (input) => {
       human.push(input);
@@ -294,6 +293,49 @@ describe('implementation action executor', () => {
     expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
   });
 
+  it('starts a local implementation session with the full sanitized launch request after attempt setup', async () => {
+    const requests: unknown[] = [];
+    const { deps, events } = harness({
+      startSession: async (request) => {
+        events.push('start');
+        requests.push(request);
+        return { status: 'started', backend: 'local', pid: 4242 };
+      },
+    });
+
+    await expect(executeImplementationAction(freshAction(), deps))
+      .resolves.toMatchObject({ status: 'spawned', attemptId: ATTEMPT_A });
+    expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'start']);
+    expect(requests).toEqual([{
+      kind: 'implementation',
+      backend: 'local',
+      manifestPath: `/tmp/${ATTEMPT_A}/manifest.json`,
+      attemptId: ATTEMPT_A,
+      issueNumber: 42,
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBase: 'next',
+      worktreePath: `/tmp/${ATTEMPT_A}/worktree`,
+      logPath: `/tmp/${ATTEMPT_A}/session.log`,
+      local: {
+        spawnInput: expect.objectContaining({
+          attemptId: ATTEMPT_A,
+          issue: expect.objectContaining({ number: 42 }),
+          prNumber: 84,
+          branch: 'autopilot/42',
+          targetBase: 'next',
+          environment: expect.objectContaining({
+            GH_TOKEN: 'selected-secret',
+            GIT_SSH_COMMAND: 'false',
+            JINN_AUTOPILOT_SESSION_MANIFEST: `/tmp/${ATTEMPT_A}/manifest.json`,
+          }),
+          worktreePath: `/tmp/${ATTEMPT_A}/worktree`,
+          logPath: `/tmp/${ATTEMPT_A}/session.log`,
+        }),
+      },
+    }]);
+  });
+
   it.skip('carries a brand-new executor claim into an authoritative session checkpoint', async () => {
     let initialClaim: BranchClaim | undefined;
     let createdAttempt: Parameters<ImplementationExecutorDeps['createAttempt']>[0] | undefined;
@@ -315,7 +357,7 @@ describe('implementation action executor', () => {
           },
         };
       },
-      spawnCoordinator: () => ({ pid: 4242 }),
+      startSession: async () => ({ status: 'started', backend: 'local', pid: 4242 }),
     });
     await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'spawned', prNumber: 84 });
@@ -922,63 +964,70 @@ describe('implementation action executor', () => {
     expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
   });
 
-  it('claims the parent branch for machine child issues instead of opening a new PR', async () => {
-    const parent = pr({
-      number: 2065,
-      headRefName: gitRefName('autopilot/2044'),
-      head: ADOPTED_HEAD,
-      baseRefName: gitRefName('next'),
-      draft: false,
-    });
-    const spawns: unknown[] = [];
-    const claimCommits: BranchClaim[] = [];
-    const { deps, claims } = harness({
-      readIssue: async () => issue({
-        number: 2069,
-        title: 'Address review findings for PR #2065',
-        child: { parentPr: 2065, kind: 'review-finding' },
-      }),
-      readParentPullRequest: async () => parent,
-      createClaimCommit: async ({ claim }) => {
-        claimCommits.push(claim);
-        return CLAIM_A;
-      },
-      spawnCoordinator: (input) => {
-        spawns.push(input);
-        return { pid: 4242 };
-      },
-    });
+  it.each([
+    ['review-finding', 'fix'],
+    ['reconcile', 'reconcile'],
+    ['ci-failure', 'fix'],
+  ] as const)(
+    'claims the parent branch and starts the shared implementation session for %s children',
+    async (childKind, phase) => {
+      const parent = pr({
+        number: 2065,
+        headRefName: gitRefName('autopilot/2044'),
+        head: ADOPTED_HEAD,
+        baseRefName: gitRefName('next'),
+        draft: false,
+      });
+      const spawns: unknown[] = [];
+      const claimCommits: BranchClaim[] = [];
+      const { deps, claims } = harness({
+        readIssue: async () => issue({
+          number: 2069,
+          title: `Address ${childKind} work for PR #2065`,
+          child: { parentPr: 2065, kind: childKind },
+        }),
+        readParentPullRequest: async () => parent,
+        createClaimCommit: async ({ claim }) => {
+          claimCommits.push(claim);
+          return CLAIM_A;
+        },
+        startSession: async (request) => {
+          spawns.push(request.local.spawnInput);
+          return { status: 'started', backend: 'local', pid: 4242 };
+        },
+      });
 
-    const result = await executeImplementationAction(freshAction(2069), deps);
+      const result = await executeImplementationAction(freshAction(2069), deps);
 
-    expect(result).toMatchObject({
-      status: 'spawned',
-      issueNumber: 2069,
-      prNumber: 2065,
-      branch: parent.headRefName,
-    });
-    expect(claimCommits[0]).toMatchObject({
-      phase: 'fix',
-      issueNumber: 2069,
-      prNumber: 2065,
-    });
-    expect(claims[0]).toMatchObject({
-      branch: parent.headRefName,
-      candidateParent: parent.head,
-      expectedRemoteHead: parent.head,
-      claimOid: CLAIM_A,
-      remoteUrl: HTTPS_REMOTE,
-      login: 'implementation-bot',
-    });
-    expect(spawns[0]).toMatchObject({
-      issue: expect.objectContaining({
-        number: 2069,
-        child: { parentPr: 2065, kind: 'review-finding' },
-      }),
-      prNumber: 2065,
-      branch: parent.headRefName,
-    });
-  });
+      expect(result).toMatchObject({
+        status: 'spawned',
+        issueNumber: 2069,
+        prNumber: 2065,
+        branch: parent.headRefName,
+      });
+      expect(claimCommits[0]).toMatchObject({
+        phase,
+        issueNumber: 2069,
+        prNumber: 2065,
+      });
+      expect(claims[0]).toMatchObject({
+        branch: parent.headRefName,
+        candidateParent: parent.head,
+        expectedRemoteHead: parent.head,
+        claimOid: CLAIM_A,
+        remoteUrl: HTTPS_REMOTE,
+        login: 'implementation-bot',
+      });
+      expect(spawns[0]).toMatchObject({
+        issue: expect.objectContaining({
+          number: 2069,
+          child: { parentPr: 2065, kind: childKind },
+        }),
+        prNumber: 2065,
+        branch: parent.headRefName,
+      });
+    },
+  );
 
   it('fails closed when the claim result remains ambiguous', async () => {
     const { deps, events } = harness({

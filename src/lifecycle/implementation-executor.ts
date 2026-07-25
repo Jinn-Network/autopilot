@@ -15,6 +15,10 @@ import {
   type SelectedCredential,
 } from './credentials.js';
 import type { HumanReason, ImplementationClaimAction } from './types.js';
+import type {
+  LocalImplementationSessionExecutionRequest,
+  SessionExecutionResult,
+} from './session-execution-backend.js';
 import {
   gitOid,
   gitRefName,
@@ -122,7 +126,7 @@ interface CreateAttemptInput {
   readonly credential: SelectedCredential;
 }
 
-interface SpawnImplementationInput {
+export interface SpawnImplementationInput {
   readonly attemptId: string;
   readonly issue: ImplementationIssue;
   readonly prNumber: number;
@@ -160,8 +164,9 @@ export interface ImplementationExecutorDeps {
     credential: SelectedCredential,
   ): Promise<void>;
   createAttempt(input: CreateAttemptInput): Promise<ImplementationAttemptBinding>;
-  spawnCoordinator(input: SpawnImplementationInput): SpawnResult;
-  trackChild(manifestPath: string, child: SpawnResult): void;
+  startSession(
+    request: LocalImplementationSessionExecutionRequest<SpawnImplementationInput>,
+  ): Promise<SessionExecutionResult>;
   escalateHuman(input: {
     readonly issueNumber: number;
     readonly reason: HumanReason;
@@ -339,7 +344,7 @@ function canonicalScenario(
 export function makeCanonicalImplementationSpawner(
   config: DispatcherConfig,
   spawn: SpawnFn,
-): ImplementationExecutorDeps['spawnCoordinator'] {
+): (input: SpawnImplementationInput) => SpawnResult {
   return (input) => {
     const skill = input.issue.child?.kind === 'reconcile'
       ? 'reconcile'
@@ -637,20 +642,33 @@ export async function executeImplementationAction(
       manifestPath: attempt.paths.manifest,
     },
   );
-  const child = deps.spawnCoordinator({
+  const started = await deps.startSession({
+    kind: 'implementation',
+    backend: 'local',
+    manifestPath: attempt.paths.manifest,
     attemptId,
-    issue,
+    issueNumber,
     prNumber: pullRequest.number,
     branch,
     targetBase: issue.targetBase,
-    environment,
     worktreePath: attempt.paths.worktree,
     logPath: attempt.paths.log,
+    local: {
+      spawnInput: {
+        attemptId,
+        issue,
+        prNumber: pullRequest.number,
+        branch,
+        targetBase: issue.targetBase,
+        environment,
+        worktreePath: attempt.paths.worktree,
+        logPath: attempt.paths.log,
+      },
+    },
   });
-  if (child.pid === undefined) {
-    throw new Error('Implementation coordinator did not report a child PID');
+  if (started.status !== 'started') {
+    throw new Error('Implementation session execution did not start');
   }
-  deps.trackChild(attempt.paths.manifest, child);
   return {
     status: 'spawned',
     issueNumber,
@@ -759,20 +777,33 @@ async function executeChildImplementationAction(
       manifestPath: attempt.paths.manifest,
     },
   );
-  const child = deps.spawnCoordinator({
+  const started = await deps.startSession({
+    kind: 'implementation',
+    backend: 'local',
+    manifestPath: attempt.paths.manifest,
     attemptId,
-    issue,
+    issueNumber,
     prNumber: parent.number,
     branch,
     targetBase: issue.targetBase,
-    environment,
     worktreePath: attempt.paths.worktree,
     logPath: attempt.paths.log,
+    local: {
+      spawnInput: {
+        attemptId,
+        issue,
+        prNumber: parent.number,
+        branch,
+        targetBase: issue.targetBase,
+        environment,
+        worktreePath: attempt.paths.worktree,
+        logPath: attempt.paths.log,
+      },
+    },
   });
-  if (child.pid === undefined) {
-    throw new Error('Child coordinator did not report a child PID');
+  if (started.status !== 'started') {
+    throw new Error('Child session execution did not start');
   }
-  deps.trackChild(attempt.paths.manifest, child);
   return {
     status: 'spawned',
     issueNumber,

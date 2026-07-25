@@ -1,4 +1,3 @@
-import type { SpawnResult } from '../dispatcher/coordinator-session.js';
 import type {
   AttemptPaths,
   ReviewApprovalPolicy,
@@ -19,6 +18,10 @@ import type {
   PublicationOutcome,
   ReviewClaimRecord,
 } from './types.js';
+import type {
+  LocalExactHeadReviewSessionExecutionRequest,
+  SessionExecutionResult,
+} from './session-execution-backend.js';
 
 export interface ReviewNativeReview {
   readonly reviewer: string;
@@ -57,6 +60,14 @@ export interface ReviewAttemptBinding {
   AttemptPaths,
   'worktree' | 'manifest' | 'log' | 'ghConfigDir' | 'askpass'
   >;
+}
+
+export interface SpawnExactHeadReviewInput {
+  readonly attemptId: string;
+  readonly candidate: ReviewActionCandidate;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly worktreePath: string;
+  readonly logPath: string;
 }
 
 export interface ReviewExecutorDeps {
@@ -98,14 +109,9 @@ export interface ReviewExecutorDeps {
     readonly expectedReviewRefOid: GitOid;
     readonly credential: SelectedCredential;
   }): Promise<void>;
-  spawnCoordinator(input: {
-    readonly attemptId: string;
-    readonly candidate: ReviewActionCandidate;
-    readonly environment: NodeJS.ProcessEnv;
-    readonly worktreePath: string;
-    readonly logPath: string;
-  }): SpawnResult;
-  trackChild(manifestPath: string, child: SpawnResult): void;
+  startSession(
+    request: LocalExactHeadReviewSessionExecutionRequest<SpawnExactHeadReviewInput>,
+  ): Promise<SessionExecutionResult>;
   escalateHuman(input: {
     readonly candidate: ReviewActionCandidate;
     readonly reason: HumanReason;
@@ -522,17 +528,32 @@ export async function executeReviewAction(
       manifestPath: attempt.paths.manifest,
     },
   );
-  const child = deps.spawnCoordinator({
+  const started = await deps.startSession({
+    kind: 'exact-head-review',
+    backend: 'local',
+    manifestPath: attempt.paths.manifest,
     attemptId,
-    candidate: confirmed,
-    environment,
+    issueNumber: candidate.issueNumber,
+    prNumber: candidate.number,
+    branch: candidate.headRefName,
+    targetBase: candidate.baseRefName,
     worktreePath: attempt.paths.worktree,
     logPath: attempt.paths.log,
+    reviewedHead: candidate.head,
+    reviewerLogin: selection.login,
+    local: {
+      spawnInput: {
+        attemptId,
+        candidate: confirmed,
+        environment,
+        worktreePath: attempt.paths.worktree,
+        logPath: attempt.paths.log,
+      },
+    },
   });
-  if (child.pid === undefined) {
-    throw new Error('Review coordinator did not report a child PID');
+  if (started.status !== 'started') {
+    throw new Error('Review session execution did not start');
   }
-  deps.trackChild(attempt.paths.manifest, child);
   return {
     status: 'spawned',
     prNumber: candidate.number,
