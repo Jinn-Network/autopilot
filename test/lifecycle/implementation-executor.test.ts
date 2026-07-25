@@ -308,6 +308,7 @@ describe('implementation action executor', () => {
     expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'start']);
     expect(requests).toEqual([{
       kind: 'implementation',
+      workflow: 'implementation',
       backend: 'local',
       manifestPath: `/tmp/${ATTEMPT_A}/manifest.json`,
       attemptId: ATTEMPT_A,
@@ -978,7 +979,7 @@ describe('implementation action executor', () => {
         baseRefName: gitRefName('next'),
         draft: false,
       });
-      const spawns: unknown[] = [];
+      const starts: unknown[] = [];
       const claimCommits: BranchClaim[] = [];
       const { deps, claims } = harness({
         readIssue: async () => issue({
@@ -992,7 +993,7 @@ describe('implementation action executor', () => {
           return CLAIM_A;
         },
         startSession: async (request) => {
-          spawns.push(request.local.spawnInput);
+          starts.push(request);
           return { status: 'started', backend: 'local', pid: 4242 };
         },
       });
@@ -1018,13 +1019,19 @@ describe('implementation action executor', () => {
         remoteUrl: HTTPS_REMOTE,
         login: 'implementation-bot',
       });
-      expect(spawns[0]).toMatchObject({
-        issue: expect.objectContaining({
-          number: 2069,
-          child: { parentPr: 2065, kind: childKind },
-        }),
-        prNumber: 2065,
-        branch: parent.headRefName,
+      expect(starts[0]).toMatchObject({
+        kind: 'implementation',
+        workflow: childKind,
+        local: {
+          spawnInput: {
+            issue: expect.objectContaining({
+              number: 2069,
+              child: { parentPr: 2065, kind: childKind },
+            }),
+            prNumber: 2065,
+            branch: parent.headRefName,
+          },
+        },
       });
     },
   );

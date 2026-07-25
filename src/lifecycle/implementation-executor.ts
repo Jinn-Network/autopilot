@@ -644,6 +644,7 @@ export async function executeImplementationAction(
   );
   const started = await deps.startSession({
     kind: 'implementation',
+    workflow: 'implementation',
     backend: 'local',
     manifestPath: attempt.paths.manifest,
     attemptId,
@@ -779,6 +780,7 @@ async function executeChildImplementationAction(
   );
   const started = await deps.startSession({
     kind: 'implementation',
+    workflow: issue.child.kind,
     backend: 'local',
     manifestPath: attempt.paths.manifest,
     attemptId,

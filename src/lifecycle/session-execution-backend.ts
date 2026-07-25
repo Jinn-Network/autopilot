@@ -20,6 +20,12 @@ interface SessionExecutionRequestBase {
 export interface ImplementationSessionExecutionRequest
   extends SessionExecutionRequestBase {
   readonly kind: 'implementation';
+  /** Non-secret workflow identity used for routing and stable diagnostics. */
+  readonly workflow:
+    | 'implementation'
+    | 'review-finding'
+    | 'reconcile'
+    | 'ci-failure';
 }
 
 export interface ExactHeadReviewSessionExecutionRequest
@@ -150,7 +156,9 @@ export class LocalSessionExecutionBackend<
     if (child.pid === undefined) {
       throw new Error(
         request.kind === 'implementation'
-          ? 'Implementation coordinator did not report a child PID'
+          ? request.workflow === 'implementation'
+            ? 'Implementation coordinator did not report a child PID'
+            : 'Child coordinator did not report a child PID'
           : 'Review coordinator did not report a child PID',
       );
     }

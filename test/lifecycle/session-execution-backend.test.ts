@@ -3,12 +3,14 @@ import {
   LocalSessionExecutionBackend,
   MarketplaceSessionExecutionBackend,
   MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+  type LocalImplementationSessionExecutionRequest,
   type LocalSessionExecutionRequest,
   type MarketplaceSessionExecutionRequest,
 } from '../../src/lifecycle/session-execution-backend.js';
 
-const implementationRequest = (): LocalSessionExecutionRequest => ({
+const implementationRequest = (): LocalImplementationSessionExecutionRequest => ({
   kind: 'implementation',
+  workflow: 'implementation',
   manifestPath: '/attempts/implementation/manifest.json',
   attemptId: 'attempt-implementation',
   issueNumber: 42,
@@ -159,6 +161,26 @@ describe('session execution backends', () => {
     expect(trackChild).not.toHaveBeenCalled();
   });
 
+  it('preserves distinct missing-PID diagnostics for root and child implementation workflows', async () => {
+    const trackChild = vi.fn();
+    const backend = new LocalSessionExecutionBackend({
+      spawnImplementation: vi.fn(() => ({ pid: undefined })),
+      spawnExactHeadReview: vi.fn(),
+      trackChild,
+    });
+
+    await expect(backend.start(implementationRequest())).rejects.toThrow(
+      'Implementation coordinator did not report a child PID',
+    );
+    await expect(backend.start({
+      ...implementationRequest(),
+      workflow: 'ci-failure',
+    })).rejects.toThrow(
+      'Child coordinator did not report a child PID',
+    );
+    expect(trackChild).not.toHaveBeenCalled();
+  });
+
   it('reports existing local recovery and cancellation as unsupported rather than inventing control behavior', async () => {
     const backend = new LocalSessionExecutionBackend({
       spawnImplementation: vi.fn(),
@@ -182,6 +204,7 @@ describe('session execution backends', () => {
     const backend = new MarketplaceSessionExecutionBackend();
     const marketplaceRequest: MarketplaceSessionExecutionRequest = {
       kind: 'implementation',
+      workflow: 'implementation',
       manifestPath: '/attempts/implementation/manifest.json',
       attemptId: 'attempt-implementation',
       issueNumber: 42,

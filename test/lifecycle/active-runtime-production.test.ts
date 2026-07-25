@@ -15,6 +15,10 @@ import {
   decodeCapabilityAttestation,
 } from '../../src/lifecycle/capability-attestation.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
+import {
+  gitOid,
+  gitRefName,
+} from '../../src/lifecycle/types.js';
 
 const NOW = new Date('2026-07-20T12:00:00.000Z');
 
@@ -272,6 +276,204 @@ describe('production active runtime preflight', () => {
       head: '1'.repeat(40),
     }], {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
     expect(credentials.logins).not.toHaveBeenCalled();
+  });
+
+  it('binds local implementation dispatch through the production backend composition', async () => {
+    const base = gitOid('1'.repeat(40));
+    const claim = gitOid('2'.repeat(40));
+    const attemptId = '11111111-1111-4111-8111-111111111111';
+    const events: string[] = [];
+    const child = {
+      get pid() {
+        events.push('pid');
+        return 4242;
+      },
+      once: vi.fn(),
+    };
+    const spawn = vi.fn((_command, args) => {
+      events.push('spawn');
+      expect(args.join('\n')).toContain('Use the implement-issue skill on issue #42.');
+      return child;
+    });
+    const trackAttemptChild = vi.fn((manifestPath, trackedChild) => {
+      events.push('track');
+      expect(manifestPath).toBe('/attempt/implementation-manifest.json');
+      expect(trackedChild).toBe(child);
+    });
+    const makeImplementationActionPort = vi.fn(() => ({
+      readIssue: async () => ({
+        number: 42,
+        title: 'Wire the local production backend',
+        open: true,
+        eligible: true,
+        targetBase: gitRefName('next'),
+        effort: 'High',
+      }),
+      readStaleRecovery: async () => {
+        throw new Error('not used');
+      },
+      runRealityCheck: async () => ({
+        classification: 'clear',
+        evidence: {},
+        suggestedBlockedOn: null,
+        suggestedComment: null,
+      }),
+      listOpenPullRequests: async () => [],
+      readTargetBaseHead: async () => base,
+      createClaimCommit: async () => claim,
+      claimBranch: async (input) => ({
+        status: 'won',
+        expected: input.expectedRemoteHead,
+        published: input.claimOid,
+        observed: input.claimOid,
+      }),
+      ensureDraftPullRequest: async (input) => ({
+        number: 84,
+        headRefName: input.branch,
+        head: input.claimOid,
+        baseRefName: input.targetBase,
+        draft: true,
+        labels: [input.label],
+        body: input.body,
+      }),
+      setProjectInProgress: async () => {},
+      createAttempt: async (input) => {
+        events.push('attempt');
+        return {
+          attemptId: input.attemptId,
+          paths: {
+            worktree: '/attempt/implementation-worktree',
+            manifest: '/attempt/implementation-manifest.json',
+            log: '/attempt/implementation.log',
+            ghConfigDir: '/attempt/implementation-gh',
+            askpass: '/attempt/implementation-askpass',
+          },
+        };
+      },
+      escalateHuman: async () => {},
+    }));
+    const active = marketplaceRuntime({
+      executionBackend: 'local',
+      environment: {},
+      repositoryUrl: 'https://github.com/Jinn-Network/mono.git',
+      makeImplementationActionPort,
+      spawn,
+      trackAttemptChild,
+      nextId: () => attemptId,
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-implementation',
+      intent: 'fresh',
+      issueNumber: 42,
+    }, {} as never)).resolves.toEqual({ outcome: 'spawned' });
+    expect(makeImplementationActionPort).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(trackAttemptChild).toHaveBeenCalledTimes(1);
+    expect(events.slice(0, 2)).toEqual(['attempt', 'spawn']);
+    expect(events.indexOf('pid')).toBeLessThan(events.indexOf('track'));
+  });
+
+  it('binds exact-head review dispatch through the production backend composition', async () => {
+    const head = gitOid('3'.repeat(40));
+    const recordOid = gitOid('4'.repeat(40));
+    const attemptId = '22222222-2222-4222-8222-222222222222';
+    const generation = '33333333-3333-4333-8333-333333333333';
+    const events: string[] = [];
+    const candidate = {
+      issueNumber: 42,
+      number: 84,
+      open: true,
+      head,
+      headChangedAt: '2026-07-20T08:00:00.000Z',
+      headRefName: gitRefName('autopilot/42'),
+      baseRefName: gitRefName('next'),
+      draft: false,
+      author: 'implementation-bot',
+      labels: ['engine:review'],
+      body: 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      humanHold: false,
+      approvalPolicy: 'approve-eligible',
+      nativeReviews: [],
+    };
+    let reviewRecord: unknown;
+    const child = {
+      get pid() {
+        events.push('pid');
+        return 4343;
+      },
+      once: vi.fn(),
+    };
+    const spawn = vi.fn((_command, args) => {
+      events.push('spawn');
+      expect(args.join('\n')).toContain('Use the review-pr skill on PR #84');
+      return child;
+    });
+    const trackAttemptChild = vi.fn((manifestPath, trackedChild) => {
+      events.push('track');
+      expect(manifestPath).toBe('/attempt/review-manifest.json');
+      expect(trackedChild).toBe(child);
+    });
+    const makeReviewActionPort = vi.fn(() => ({
+      readCandidate: async () => candidate,
+      confirmAcquisition: async () => ({
+        ...candidate,
+        reviewRef: { oid: recordOid, record: reviewRecord },
+      }),
+      createReviewRecord: async ({ record }) => {
+        reviewRecord = record;
+        return recordOid;
+      },
+      publishReviewClaim: async ({ expectedRemoteRecordOid, recordOid: published }) => ({
+        status: 'won',
+        expected: expectedRemoteRecordOid,
+        published,
+        observed: published,
+      }),
+      createAttempt: async (input) => ({
+        attemptId: input.attemptId,
+        paths: {
+          worktree: '/attempt/review-worktree',
+          manifest: '/attempt/review-manifest.json',
+          log: '/attempt/review.log',
+          ghConfigDir: '/attempt/review-gh',
+          askpass: '/attempt/review-askpass',
+        },
+      }),
+      repairProjection: async () => {},
+      escalateHuman: async () => {},
+    }));
+    const active = marketplaceRuntime({
+      executionBackend: 'local',
+      environment: {},
+      credentials: new CredentialPool([{
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'implementation-secret',
+      }, {
+        login: 'review-bot',
+        normalizedLogin: 'review-bot',
+        reviewToken: 'review-secret',
+      }]),
+      makeReviewActionPort,
+      spawn,
+      trackAttemptChild,
+      nextId: vi.fn()
+        .mockReturnValueOnce(attemptId)
+        .mockReturnValueOnce(generation),
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, {} as never)).resolves.toEqual({ outcome: 'spawned' });
+    expect(makeReviewActionPort).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(trackAttemptChild).toHaveBeenCalledTimes(1);
+    expect(events[0]).toBe('spawn');
+    expect(events.indexOf('pid')).toBeLessThan(events.indexOf('track'));
   });
 
   it('rejects active mode when no live capability attestation is configured', async () => {

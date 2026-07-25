@@ -143,6 +143,9 @@ export interface ProductionActiveRuntimeOptions {
   readonly nextId?: () => string;
   readonly isPidAlive?: (pid: number) => boolean;
   readonly trackAttemptChild?: typeof trackAttemptChild;
+  readonly makeImplementationActionPort?:
+    typeof makeProductionImplementationActionPort;
+  readonly makeReviewActionPort?: typeof makeProductionReviewActionPort;
   readonly remoteName?: string;
   readonly repositorySlug?: string;
   readonly repositoryUrl?: string;
@@ -283,6 +286,12 @@ export function makeProductionActiveRuntime(
   const remoteName = options.remoteName ?? AUTOPILOT_V2_REMOTE;
   const alive = options.isPidAlive ?? isPidAlive;
   const trackAttempt = options.trackAttemptChild ?? trackAttemptChild;
+  const implementationActionPort =
+    options.makeImplementationActionPort
+    ?? makeProductionImplementationActionPort;
+  const reviewActionPort =
+    options.makeReviewActionPort
+    ?? makeProductionReviewActionPort;
   let reviewMutationTail: Promise<void> = Promise.resolve();
   const serializeReviewMutation = <Value>(
     operation: () => Promise<Value>,
@@ -469,7 +478,7 @@ export function makeProductionActiveRuntime(
 
       implementation: (action, credentials, cycleSnapshot) => {
         requireLocalExecutionBackend();
-        const port = makeProductionImplementationActionPort({
+        const port = implementationActionPort({
           repositoryPath: options.repositoryPath,
           worktreeBase: options.worktreeBase,
           runnerId: options.runnerId,
@@ -500,7 +509,7 @@ export function makeProductionActiveRuntime(
 
       review: (action, credentials, cycleSnapshot, context) => {
         requireLocalExecutionBackend();
-        const productionPort = makeProductionReviewActionPort({
+        const productionPort = reviewActionPort({
           repositoryPath: options.repositoryPath,
           worktreeBase: options.worktreeBase,
           runnerId: options.runnerId,
