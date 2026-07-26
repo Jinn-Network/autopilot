@@ -24,6 +24,8 @@ const NEXT_ACTIVE = gitOid('7'.repeat(40));
 const TERMINAL = gitOid('8'.repeat(40));
 const ATTEMPT = '11111111-1111-4111-8111-111111111111';
 const GENERATION = '22222222-2222-4222-8222-222222222222';
+const PRIOR_ATTEMPT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const PRIOR_GENERATION = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const MARKER = '33333333-3333-4333-8333-333333333333';
 
 function record(
@@ -346,6 +348,103 @@ describe('review session protocol', () => {
       commitId: FIX_ONE,
       body: 'Still unresolved.',
       submittedAt: '2026-07-20T12:00:30.000Z',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .rejects.toThrow(/requested changes.*block/i);
+    expect(h.events).not.toContain(`native:APPROVE:${HEAD}`);
+  });
+
+  it('exempts an owned marker-valid REQUEST_CHANGES on a superseded head across attempts', async () => {
+    const h = harness({ draft: true });
+    h.native.push({
+      reviewer: 'review-bot',
+      state: 'CHANGES_REQUESTED',
+      commitId: FIX_ONE,
+      body: formatAutomatedReviewMarker({
+        generation: PRIOR_GENERATION,
+        attempt: PRIOR_ATTEMPT,
+        intent: MARKER,
+        reviewer: 'review-bot',
+        head: FIX_ONE,
+        verdict: 'REQUEST_CHANGES',
+      }),
+      submittedAt: '2026-07-20T12:00:10.000Z',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'approved' });
+    expect(h.events).toContain(`native:APPROVE:${HEAD}`);
+  });
+
+  it.each([
+    {
+      name: 'a foreign reviewer with a valid marker',
+      review: {
+        reviewer: 'oaksprout',
+        commitId: FIX_ONE,
+        body: formatAutomatedReviewMarker({
+          generation: PRIOR_GENERATION,
+          attempt: PRIOR_ATTEMPT,
+          intent: MARKER,
+          reviewer: 'oaksprout',
+          head: FIX_ONE,
+          verdict: 'REQUEST_CHANGES',
+        }),
+      },
+    },
+    {
+      name: 'the selected reviewer on the current head with a valid marker',
+      review: {
+        reviewer: 'review-bot',
+        commitId: HEAD,
+        body: nativeBody('REQUEST_CHANGES'),
+      },
+    },
+    {
+      name: 'a malformed marker',
+      review: {
+        reviewer: 'review-bot',
+        commitId: FIX_ONE,
+        body: '<!-- jinn-autopilot-review:v2 malformed -->',
+      },
+    },
+    {
+      name: 'a copied marker with a mismatched reviewer',
+      review: {
+        reviewer: 'review-bot',
+        commitId: FIX_ONE,
+        body: formatAutomatedReviewMarker({
+          generation: PRIOR_GENERATION,
+          attempt: PRIOR_ATTEMPT,
+          intent: MARKER,
+          reviewer: 'oaksprout',
+          head: FIX_ONE,
+          verdict: 'REQUEST_CHANGES',
+        }),
+      },
+    },
+    {
+      name: 'a copied marker with a mismatched head',
+      review: {
+        reviewer: 'review-bot',
+        commitId: FIX_ONE,
+        body: formatAutomatedReviewMarker({
+          generation: PRIOR_GENERATION,
+          attempt: PRIOR_ATTEMPT,
+          intent: MARKER,
+          reviewer: 'review-bot',
+          head: FIX_TWO,
+          verdict: 'REQUEST_CHANGES',
+        }),
+      },
+    },
+  ])('keeps $name as an approval blocker', async ({ review }) => {
+    const h = harness({ draft: true });
+    h.native.push({
+      ...review,
+      state: 'CHANGES_REQUESTED',
+      submittedAt: '2026-07-20T12:00:10.000Z',
     });
 
     await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))

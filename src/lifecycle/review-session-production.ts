@@ -19,6 +19,7 @@ import {
 import {
   decodeReviewClaimPayload,
   encodeReviewClaimPayload,
+  formatAutomatedReviewMarker,
 } from './codecs.js';
 import {
   gitPublicationArgs,
@@ -32,6 +33,10 @@ import { fileChildIssue } from './child-issues.js';
 import { makeProductionChildIssuePort } from './child-issues-production.js';
 import { fileReviewFollowUps } from './review-follow-ups.js';
 import { makeProductionReviewFollowUpPort } from './review-follow-ups-production.js';
+import {
+  effectiveNativeReviews,
+  isSupersededOwnedNativeRequest,
+} from './native-review.js';
 import type { ReviewSessionPort } from './review-session.js';
 import type { ReviewNativeReview } from './review-executor.js';
 import {
@@ -444,20 +449,13 @@ export function makeProductionReviewSessionPort(
   };
   const effectiveNativeBlocker = (
     reviews: readonly ReviewNativeReview[],
+    manifest: AttemptManifest,
+    head: GitOid,
   ): ReviewNativeReview | undefined => {
-    const latest = new Map<string, ReviewNativeReview>();
-    for (const review of [...reviews].sort((left, right) =>
-      left.submittedAt.localeCompare(right.submittedAt))) {
-      if (
-        !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)
-      ) {
-        continue;
-      }
-      latest.set(review.reviewer.toLowerCase(), review);
-    }
-    return [...latest.values()].find(
-      (review) => review.state === 'CHANGES_REQUESTED',
-    );
+    return effectiveNativeReviews(reviews).find((review) => {
+      if (review.state !== 'CHANGES_REQUESTED') return false;
+      return !isSupersededOwnedNativeRequest(review, manifest.selectedLogin, head);
+    });
   };
   const requireReadyBoundary = async (
     manifest: AttemptManifest,
@@ -481,8 +479,29 @@ export function makeProductionReviewSessionPort(
     if (pullRequest.labels.includes('review:needs-human')) {
       throw new Error('Review ready boundary stopped because Human is dominant');
     }
+    const reviews = await readNativeReviews(manifest, prNumber, expectedHead);
+    const selectedReview = effectiveNativeReviews(reviews).find(
+      (review) => review.reviewer.toLowerCase() === manifest.selectedLogin.toLowerCase(),
+    );
+    const approvalMarker = formatAutomatedReviewMarker({
+      generation: record.generation,
+      attempt: record.attempt,
+      intent: record.verdict.marker,
+      reviewer: record.reviewer,
+      head: expectedHead,
+      verdict: 'APPROVE',
+    });
+    if (
+      selectedReview?.state !== 'APPROVED'
+      || selectedReview.commitId !== expectedHead
+      || !selectedReview.body.includes(approvalMarker)
+    ) {
+      throw new Error('Review ready boundary lost exact current-head approval');
+    }
     const blocker = effectiveNativeBlocker(
-      await readNativeReviews(manifest, prNumber, expectedHead),
+      reviews,
+      manifest,
+      expectedHead,
     );
     if (blocker !== undefined) {
       throw new Error(

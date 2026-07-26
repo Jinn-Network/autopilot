@@ -2,8 +2,11 @@ import type { AttemptManifest } from './attempt-workspace.js';
 import {
   formatAutomatedReviewMarker,
   formatHumanCommentMarker,
-  parseAutomatedReviewMarker,
 } from './codecs.js';
+import {
+  effectiveNativeReviews,
+  isSupersededOwnedNativeRequest,
+} from './native-review.js';
 import type {
   FiledReviewFollowUp,
   ReviewFollowUpEntry,
@@ -403,22 +406,6 @@ async function enterHuman(
   return { status: 'human', head };
 }
 
-function effectiveNativeReviews(
-  reviews: readonly ReviewNativeReview[],
-): readonly ReviewNativeReview[] {
-  const latest = new Map<string, ReviewNativeReview>();
-  for (const review of [...reviews].sort((left, right) =>
-    left.submittedAt.localeCompare(right.submittedAt))) {
-    if (
-      !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)
-    ) {
-      continue;
-    }
-    latest.set(review.reviewer.toLowerCase(), review);
-  }
-  return [...latest.values()];
-}
-
 async function requireNoNativeChangeRequests(
   manifest: AttemptManifest,
   port: ReviewSessionPort,
@@ -429,30 +416,8 @@ async function requireNoNativeChangeRequests(
     await port.readNativeReviews(manifest.prNumber!, head),
   ).find((review) => {
     if (review.state !== 'CHANGES_REQUESTED') return false;
-    if (
-      allowOwnedPriorRequest
-      && review.commitId !== head
-      && review.reviewer.toLowerCase() === manifest.selectedLogin.toLowerCase()
-    ) {
-      const markerText = review.body.match(/<!-- jinn-autopilot-review:v2\b[^>]* -->/)?.[0];
-      if (markerText !== undefined) {
-        try {
-          const marker = parseAutomatedReviewMarker(markerText);
-          if (
-            marker.generation === manifest.reviewGeneration
-            && marker.attempt === manifest.attemptId
-            && marker.reviewer.toLowerCase() === manifest.selectedLogin.toLowerCase()
-            && marker.head === review.commitId
-            && marker.verdict === 'REQUEST_CHANGES'
-          ) {
-            return false;
-          }
-        } catch {
-          // A malformed or copied marker never exempts a native blocker.
-        }
-      }
-    }
-    return true;
+    return !allowOwnedPriorRequest
+      || !isSupersededOwnedNativeRequest(review, manifest.selectedLogin, head);
   });
   if (blocking !== undefined) {
     throw new Error(
