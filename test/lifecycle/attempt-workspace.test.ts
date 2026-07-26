@@ -1,5 +1,5 @@
 // @ts-nocheck — Stage 5: deleted merge-prep/review-fix/project-status fixtures.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
@@ -15,7 +15,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { hostname as systemHostname, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultRunner, type CommandRunner } from '../../src/dispatcher/issue-source.js';
@@ -45,7 +45,7 @@ const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
 const UUID_C = '33333333-3333-4333-8333-333333333333';
 const NOW = '2026-07-20T00:00:00.000Z';
-const MARKETPLACE_TRANSITION_LOCK_SUFFIX = '.marketplace-transition.lock';
+const MARKETPLACE_TERMINAL_RECORD_SUFFIX = '.marketplace-terminal.json';
 const SUBMISSION_RESULT = {
   schemaVersion: 1,
   generatedAt: '2026-07-20T00:01:30.000Z',
@@ -146,6 +146,31 @@ function terminalAttempt(manifest: AttemptManifest): AttemptManifest {
     () => new Date('2026-07-20T00:02:00.000Z'),
     manifest.expectedHead,
   );
+}
+
+function transitionInWorker(input: Record<string, unknown>): Promise<{
+  readonly code: number | null;
+  readonly result: { readonly ok: boolean; readonly error?: string };
+}> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'),
+      join(process.cwd(), 'test/lifecycle/attempt-transition-worker.ts'),
+      JSON.stringify(input),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      try {
+        resolve({ code, result: JSON.parse(stdout) as { readonly ok: boolean; readonly error?: string } });
+      } catch {
+        reject(new Error(`Marketplace transition worker did not return JSON: ${stderr}`));
+      }
+    });
+  });
 }
 
 describe('attempt workspace and manifest', () => {
@@ -582,6 +607,7 @@ describe('attempt workspace and manifest', () => {
       () => new Date('2026-07-20T00:02:00.000Z'),
     );
     const persisted = readFileSync(manifest.paths.manifest, 'utf8');
+    expect(existsSync(`${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`)).toBe(true);
 
     expect(transitionMarketplaceExecution(
       manifest.paths.manifest,
@@ -645,205 +671,6 @@ describe('attempt workspace and manifest', () => {
     for (const execution of invalidExecutions) {
       expect(() => decodeAttemptManifest({ ...raw, execution })).toThrow();
     }
-  });
-
-  it('does not read or rewrite a manifest while a live same-host marketplace transition lock exists', async () => {
-    const fixture = repositoryFixture();
-    const requestDigest = `sha256:${'a'.repeat(64)}`;
-    const manifest = await createAttemptWorkspace(options(fixture, {
-      execution: {
-        backend: 'marketplace',
-        state: {
-          schemaVersion: 'marketplace-execution-v2',
-          status: 'prepared',
-          requestPath: join(fixture.root, 'marketplace-request.json'),
-          requestDigest,
-          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
-          preparedAt: '2026-07-20T00:01:00.000Z',
-          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
-          adoptionDeadline: '2026-07-20T01:30:00.000Z',
-        },
-      },
-    }), defaultRunner);
-    const lockPath = `${manifest.paths.manifest}${MARKETPLACE_TRANSITION_LOCK_SUFFIX}`;
-    writeFileSync(lockPath, JSON.stringify({
-      version: 1,
-      token: 'live-owner',
-      pid: process.pid,
-      host: systemHostname(),
-      createdAt: NOW,
-    }));
-    const original = readFileSync(manifest.paths.manifest, 'utf8');
-
-    expect(() => transitionMarketplaceExecution(
-      manifest.paths.manifest,
-      requestDigest,
-      { status: 'submitted', submission: SUBMISSION_RESULT },
-    )).toThrow(/transition is locked/i);
-    expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(original);
-  });
-
-  it('reclaims a demonstrably-dead same-host marketplace transition lock without retaining it', async () => {
-    const fixture = repositoryFixture();
-    const requestDigest = `sha256:${'a'.repeat(64)}`;
-    const manifest = await createAttemptWorkspace(options(fixture, {
-      execution: {
-        backend: 'marketplace',
-        state: {
-          schemaVersion: 'marketplace-execution-v2',
-          status: 'prepared',
-          requestPath: join(fixture.root, 'marketplace-request.json'),
-          requestDigest,
-          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
-          preparedAt: '2026-07-20T00:01:00.000Z',
-          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
-          adoptionDeadline: '2026-07-20T01:30:00.000Z',
-        },
-      },
-    }), defaultRunner);
-    const deadPid = Number(execFileSync(process.execPath, [
-      '-e',
-      'process.stdout.write(String(process.pid))',
-    ], { encoding: 'utf8' }));
-    const lockPath = `${manifest.paths.manifest}${MARKETPLACE_TRANSITION_LOCK_SUFFIX}`;
-    writeFileSync(lockPath, JSON.stringify({
-      version: 1,
-      token: 'dead-owner',
-      pid: deadPid,
-      host: systemHostname(),
-      createdAt: NOW,
-    }));
-
-    expect(transitionMarketplaceExecution(
-      manifest.paths.manifest,
-      requestDigest,
-      { status: 'submitted', submission: SUBMISSION_RESULT },
-      () => new Date('2026-07-20T00:02:00.000Z'),
-    ).execution).toMatchObject({
-      backend: 'marketplace',
-      state: { status: 'submitted' },
-    });
-    expect(existsSync(lockPath)).toBe(false);
-  });
-
-  it('reclaims a dead reclaim sentinel instead of permanently wedging a stale marketplace lock', async () => {
-    const fixture = repositoryFixture();
-    const requestDigest = `sha256:${'a'.repeat(64)}`;
-    const manifest = await createAttemptWorkspace(options(fixture, {
-      execution: {
-        backend: 'marketplace',
-        state: {
-          schemaVersion: 'marketplace-execution-v2',
-          status: 'prepared',
-          requestPath: join(fixture.root, 'marketplace-request.json'),
-          requestDigest,
-          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
-          preparedAt: '2026-07-20T00:01:00.000Z',
-          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
-          adoptionDeadline: '2026-07-20T01:30:00.000Z',
-        },
-      },
-    }), defaultRunner);
-    const deadPid = Number(execFileSync(process.execPath, [
-      '-e',
-      'process.stdout.write(String(process.pid))',
-    ], { encoding: 'utf8' }));
-    const lockPath = `${manifest.paths.manifest}${MARKETPLACE_TRANSITION_LOCK_SUFFIX}`;
-    const staleOwner = {
-      version: 1,
-      token: 'dead-owner',
-      pid: deadPid,
-      host: systemHostname(),
-      createdAt: NOW,
-    };
-    writeFileSync(lockPath, JSON.stringify(staleOwner));
-    writeFileSync(`${lockPath}.reclaim`, JSON.stringify({ ...staleOwner, token: 'dead-reclaimer' }));
-
-    expect(transitionMarketplaceExecution(
-      manifest.paths.manifest,
-      requestDigest,
-      { status: 'submitted', submission: SUBMISSION_RESULT },
-      () => new Date('2026-07-20T00:02:00.000Z'),
-    ).execution).toMatchObject({
-      backend: 'marketplace',
-      state: { status: 'submitted' },
-    });
-    expect(existsSync(lockPath)).toBe(false);
-    expect(existsSync(`${lockPath}.reclaim`)).toBe(false);
-  });
-
-  it('keeps a completed transition successful when its owned lock disappears before release', async () => {
-    const fixture = repositoryFixture();
-    const requestDigest = `sha256:${'a'.repeat(64)}`;
-    const manifest = await createAttemptWorkspace(options(fixture, {
-      execution: {
-        backend: 'marketplace',
-        state: {
-          schemaVersion: 'marketplace-execution-v2',
-          status: 'prepared',
-          requestPath: join(fixture.root, 'marketplace-request.json'),
-          requestDigest,
-          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
-          preparedAt: '2026-07-20T00:01:00.000Z',
-          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
-          adoptionDeadline: '2026-07-20T01:30:00.000Z',
-        },
-      },
-    }), defaultRunner);
-    const lockPath = `${manifest.paths.manifest}${MARKETPLACE_TRANSITION_LOCK_SUFFIX}`;
-
-    expect(transitionMarketplaceExecution(
-      manifest.paths.manifest,
-      requestDigest,
-      { status: 'submitted', submission: SUBMISSION_RESULT },
-      () => {
-        rmSync(lockPath);
-        return new Date('2026-07-20T00:02:00.000Z');
-      },
-    ).execution).toMatchObject({
-      backend: 'marketplace',
-      state: { status: 'submitted' },
-    });
-  });
-
-  it('does not remove a replacement marketplace transition lock when releasing its own lock', async () => {
-    const fixture = repositoryFixture();
-    const requestDigest = `sha256:${'a'.repeat(64)}`;
-    const manifest = await createAttemptWorkspace(options(fixture, {
-      execution: {
-        backend: 'marketplace',
-        state: {
-          schemaVersion: 'marketplace-execution-v2',
-          status: 'prepared',
-          requestPath: join(fixture.root, 'marketplace-request.json'),
-          requestDigest,
-          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
-          preparedAt: '2026-07-20T00:01:00.000Z',
-          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
-          adoptionDeadline: '2026-07-20T01:30:00.000Z',
-        },
-      },
-    }), defaultRunner);
-    const lockPath = `${manifest.paths.manifest}${MARKETPLACE_TRANSITION_LOCK_SUFFIX}`;
-    const replacement = {
-      version: 1,
-      token: 'replacement-owner',
-      pid: process.pid,
-      host: systemHostname(),
-      createdAt: NOW,
-    };
-
-    transitionMarketplaceExecution(
-      manifest.paths.manifest,
-      requestDigest,
-      { status: 'submitted', submission: SUBMISSION_RESULT },
-      () => {
-        writeFileSync(lockPath, JSON.stringify(replacement));
-        return new Date('2026-07-20T00:02:00.000Z');
-      },
-    );
-
-    expect(JSON.parse(readFileSync(lockPath, 'utf8'))).toEqual(replacement);
   });
 
   it('rejects terminal marketplace timestamps and transition clocks that predate durable state', async () => {
@@ -989,6 +816,259 @@ describe('attempt workspace and manifest', () => {
       () => new Date('2026-07-20T00:03:00.000Z'),
     )).toEqual(cancelled);
     expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(persisted);
+  });
+
+  it('uses one durable terminal winner when submitted and cancelled workers race', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+
+    const [submitted, cancelled] = await Promise.all([
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'submitted', submission: SUBMISSION_RESULT },
+      }),
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'cancelled', reason: 'operator-cancelled' },
+      }),
+    ]);
+
+    expect([submitted.result.ok, cancelled.result.ok].filter(Boolean)).toHaveLength(1);
+    const terminal = JSON.parse(readFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      'utf8',
+    )) as Record<string, unknown>;
+    const current = readAttemptManifest(manifest.paths.manifest);
+    expect(current.execution).toMatchObject({
+      backend: 'marketplace',
+      state: { status: terminal.status },
+    });
+    expect((current.execution as { state: Record<string, unknown> }).state.requestDigest)
+      .toBe(terminal.requestDigest);
+  });
+
+  it('repairs a prepared manifest from committed terminal evidence after a crash before rename', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    writeFileSync(`${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, JSON.stringify({
+      schemaVersion: 'marketplace-terminal-v1',
+      requestDigest,
+      status: 'submitted',
+      submission: SUBMISSION_RESULT,
+      submittedAt: '2026-07-20T00:02:00.000Z',
+    }));
+
+    const repaired = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:03:00.000Z'),
+    );
+
+    expect(repaired.execution).toMatchObject({
+      backend: 'marketplace',
+      state: {
+        status: 'submitted',
+        submittedAt: '2026-07-20T00:02:00.000Z',
+      },
+    });
+    expect(repaired.timestamps.updatedAt).toBe('2026-07-20T00:02:00.000Z');
+  });
+
+  it('keeps a newer manifest update timestamp while repairing committed terminal evidence', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    writeFileSync(`${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, JSON.stringify({
+      schemaVersion: 'marketplace-terminal-v1',
+      requestDigest,
+      status: 'submitted',
+      submission: SUBMISSION_RESULT,
+      submittedAt: '2026-07-20T00:02:00.000Z',
+    }));
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    writeFileSync(manifest.paths.manifest, JSON.stringify({
+      ...raw,
+      timestamps: { ...(raw.timestamps as Record<string, unknown>), updatedAt: '2026-07-20T00:03:00.000Z' },
+    }));
+
+    const repaired = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:04:00.000Z'),
+    );
+
+    expect((repaired.execution as { state: Record<string, unknown> }).state.submittedAt)
+      .toBe('2026-07-20T00:02:00.000Z');
+    expect(repaired.timestamps.updatedAt).toBe('2026-07-20T00:03:00.000Z');
+  });
+
+  it('accepts an equivalent SDK submit replay but persists the terminal winner wrapper', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const winner = {
+      ...SUBMISSION_RESULT,
+      attemptId: 'solver-attempt-42',
+      attemptNumber: 7,
+    };
+    const replay = {
+      ...winner,
+      generatedAt: '2026-07-20T00:03:00.000Z',
+      status: 'already_submitted',
+      idempotent: true,
+    } as const;
+
+    const submitted = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: winner },
+      () => new Date('2026-07-20T00:02:00.000Z'),
+    );
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    const execution = raw.execution as { readonly state: Record<string, unknown> };
+    writeFileSync(manifest.paths.manifest, JSON.stringify({
+      ...raw,
+      execution: {
+        backend: 'marketplace',
+        state: { ...execution.state, submission: replay },
+      },
+    }));
+    const replayed = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: replay },
+      () => new Date('2026-07-20T00:04:00.000Z'),
+    );
+
+    expect(replayed).toEqual(submitted);
+    expect((replayed.execution as { state: Record<string, unknown> }).state.submission)
+      .toEqual(winner);
+    expect(() => transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: { ...replay, taskId: 'task-43' } },
+    )).toThrow(/contradictory submission/i);
+  });
+
+  it('fails closed without rewriting when terminal evidence is malformed or bound to another digest', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const malformed = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const malformedOriginal = readFileSync(malformed.paths.manifest, 'utf8');
+    writeFileSync(`${malformed.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, '{bad json');
+    expect(() => transitionMarketplaceExecution(
+      malformed.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+    )).toThrow(/terminal evidence/i);
+    expect(readFileSync(malformed.paths.manifest, 'utf8')).toBe(malformedOriginal);
+
+    const mismatched = await createAttemptWorkspace(options(fixture, {
+      attemptId: UUID_B,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const mismatchedOriginal = readFileSync(mismatched.paths.manifest, 'utf8');
+    writeFileSync(`${mismatched.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, JSON.stringify({
+      schemaVersion: 'marketplace-terminal-v1',
+      requestDigest: `sha256:${'b'.repeat(64)}`,
+      status: 'cancelled',
+      reason: 'operator-cancelled',
+      cancelledAt: '2026-07-20T00:02:00.000Z',
+    }));
+    expect(() => transitionMarketplaceExecution(
+      mismatched.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+    )).toThrow(/terminal evidence.*digest/i);
+    expect(readFileSync(mismatched.paths.manifest, 'utf8')).toBe(mismatchedOriginal);
   });
 
   it('rejects malformed execution discriminants and marketplace state records', async () => {

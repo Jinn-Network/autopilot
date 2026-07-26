@@ -4,6 +4,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -14,7 +15,6 @@ import {
   rmSync,
   statSync,
   statfsSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { hostname as systemHostname } from 'node:os';
@@ -791,147 +791,209 @@ export type MarketplaceExecutionTransition =
   | { readonly status: 'submitted'; readonly submission: TaskSubmitResultV1 }
   | { readonly status: 'cancelled'; readonly reason: string };
 
-const MARKETPLACE_TRANSITION_LOCK_SUFFIX = '.marketplace-transition.lock';
-const MARKETPLACE_TRANSITION_RECLAIM_SUFFIX = '.reclaim';
+const MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION = 'marketplace-terminal-v1';
+const MARKETPLACE_TERMINAL_EVIDENCE_SUFFIX = '.marketplace-terminal.json';
 
-interface MarketplaceTransitionLock {
-  readonly version: 1;
-  readonly token: string;
-  readonly pid: number;
-  readonly host: string;
-  readonly createdAt: string;
+type MarketplaceTerminalEvidence =
+  | {
+      readonly schemaVersion: typeof MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION;
+      readonly requestDigest: string;
+      readonly status: 'submitted';
+      readonly submission: TaskSubmitResultV1;
+      readonly submittedAt: string;
+    }
+  | {
+      readonly schemaVersion: typeof MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION;
+      readonly requestDigest: string;
+      readonly status: 'cancelled';
+      readonly reason: string;
+      readonly cancelledAt: string;
+    };
+
+function marketplaceTerminalEvidencePath(manifestPath: string): string {
+  return `${manifestPath}${MARKETPLACE_TERMINAL_EVIDENCE_SUFFIX}`;
 }
 
-function marketplaceTransitionLockPath(manifestPath: string): string {
-  return `${manifestPath}${MARKETPLACE_TRANSITION_LOCK_SUFFIX}`;
+function decodeMarketplaceTerminalEvidence(value: unknown): MarketplaceTerminalEvidence {
+  const evidence = record(value, 'marketplace terminal evidence');
+  if (evidence.schemaVersion !== MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION) {
+    throw new Error('Invalid marketplace terminal evidence schema version');
+  }
+  if (evidence.status === 'submitted') {
+    exactKeys(evidence, [
+      'schemaVersion',
+      'requestDigest',
+      'status',
+      'submission',
+      'submittedAt',
+    ], 'submitted marketplace terminal evidence');
+    return {
+      schemaVersion: MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION,
+      requestDigest: marketplaceRequestDigest(evidence.requestDigest),
+      status: 'submitted',
+      submission: decodeMarketplaceSubmission(evidence.submission),
+      submittedAt: isoTimestamp(
+        stringField(evidence.submittedAt, 'marketplace terminal submitted timestamp'),
+      ),
+    };
+  }
+  if (evidence.status === 'cancelled') {
+    exactKeys(evidence, [
+      'schemaVersion',
+      'requestDigest',
+      'status',
+      'reason',
+      'cancelledAt',
+    ], 'cancelled marketplace terminal evidence');
+    return {
+      schemaVersion: MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION,
+      requestDigest: marketplaceRequestDigest(evidence.requestDigest),
+      status: 'cancelled',
+      reason: stringField(evidence.reason, 'marketplace terminal cancellation reason'),
+      cancelledAt: isoTimestamp(
+        stringField(evidence.cancelledAt, 'marketplace terminal cancellation timestamp'),
+      ),
+    };
+  }
+  throw new Error('Invalid marketplace terminal evidence status');
 }
 
-function transitionLockRecord(value: unknown): MarketplaceTransitionLock {
-  const lock = record(value, 'marketplace transition lock');
-  exactKeys(lock, ['version', 'token', 'pid', 'host', 'createdAt'], 'marketplace transition lock');
-  if (lock.version !== 1) throw new Error('Invalid marketplace transition lock version');
-  return {
-    version: 1,
-    token: stringField(lock.token, 'marketplace transition lock token'),
-    pid: positiveInteger(lock.pid, 'marketplace transition lock PID'),
-    host: stringField(lock.host, 'marketplace transition lock host'),
-    createdAt: isoTimestamp(stringField(lock.createdAt, 'marketplace transition lock timestamp')),
-  };
-}
-
-function readTransitionLock(path: string): MarketplaceTransitionLock {
+function readMarketplaceTerminalEvidence(path: string): MarketplaceTerminalEvidence | undefined {
+  if (!existsSync(path)) return undefined;
   try {
-    return transitionLockRecord(JSON.parse(readFileSync(path, 'utf8')) as unknown);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error;
-    throw new Error('Marketplace execution transition is locked');
+    return decodeMarketplaceTerminalEvidence(JSON.parse(readFileSync(path, 'utf8')) as unknown);
+  } catch {
+    throw new Error('Invalid marketplace terminal evidence');
   }
 }
 
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
+function terminalEvidenceTimestamp(evidence: MarketplaceTerminalEvidence): string {
+  return evidence.status === 'submitted' ? evidence.submittedAt : evidence.cancelledAt;
 }
 
-function writeTransitionLock(path: string, lock: MarketplaceTransitionLock): void {
+function marketplaceSubmissionIdentityMatches(
+  left: TaskSubmitResultV1,
+  right: TaskSubmitResultV1,
+): boolean {
+  const compatibleOptionalIdentity = <Value>(
+    leftValue: Value | undefined,
+    rightValue: Value | undefined,
+  ): boolean => leftValue === undefined || rightValue === undefined || leftValue === rightValue;
+  return left.id === right.id
+    && left.creatorMultisig === right.creatorMultisig
+    && left.taskId === right.taskId
+    && left.taskCid === right.taskCid
+    && left.creationTx === right.creationTx
+    && left.creationBlock === right.creationBlock
+    && left.solverNetManifestCid === right.solverNetManifestCid
+    && compatibleOptionalIdentity(left.attemptId, right.attemptId)
+    && compatibleOptionalIdentity(left.attemptNumber, right.attemptNumber);
+}
+
+function terminalEvidenceMatchesTransition(
+  evidence: MarketplaceTerminalEvidence,
+  transition: MarketplaceExecutionTransition,
+): boolean {
+  return evidence.status === 'submitted' && transition.status === 'submitted'
+    ? marketplaceSubmissionIdentityMatches(
+        evidence.submission,
+        decodeMarketplaceSubmission(transition.submission),
+      )
+    : evidence.status === 'cancelled' && transition.status === 'cancelled'
+      ? evidence.reason === stringField(transition.reason, 'marketplace cancellation reason')
+      : false;
+}
+
+function terminalEvidenceForTransition(
+  requestDigest: string,
+  transition: MarketplaceExecutionTransition,
+  timestamp: string,
+): MarketplaceTerminalEvidence {
+  return transition.status === 'submitted'
+    ? {
+        schemaVersion: MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION,
+        requestDigest,
+        status: 'submitted',
+        submission: decodeMarketplaceSubmission(transition.submission),
+        submittedAt: timestamp,
+      }
+    : {
+        schemaVersion: MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION,
+        requestDigest,
+        status: 'cancelled',
+        reason: stringField(transition.reason, 'marketplace cancellation reason'),
+        cancelledAt: timestamp,
+      };
+}
+
+function writeMarketplaceTerminalCandidate(
+  terminalPath: string,
+  evidence: MarketplaceTerminalEvidence,
+): string {
+  const candidate = join(
+    dirname(terminalPath),
+    `.${basename(terminalPath)}.candidate-${process.pid}-${randomUUID()}`,
+  );
   let descriptor: number | undefined;
   try {
-    descriptor = openSync(path, 'wx', 0o600);
-    writeFileSync(descriptor, `${JSON.stringify(lock)}\n`, 'utf8');
+    descriptor = openSync(candidate, 'wx', 0o600);
+    writeFileSync(descriptor, `${JSON.stringify(evidence, null, 2)}\n`, 'utf8');
     fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    return candidate;
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
-function isAlreadyExists(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException).code === 'EEXIST';
+function installMarketplaceTerminalEvidence(
+  manifestPath: string,
+  candidate: string,
+): MarketplaceTerminalEvidence {
+  const terminalPath = marketplaceTerminalEvidencePath(manifestPath);
+  try {
+    linkSync(candidate, terminalPath);
+    fsyncDirectory(dirname(terminalPath));
+    return readMarketplaceTerminalEvidence(terminalPath)!;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    return readMarketplaceTerminalEvidence(terminalPath)!;
+  } finally {
+    if (existsSync(candidate)) rmSync(candidate);
+  }
 }
 
-function lockOwner(): MarketplaceTransitionLock {
-  return {
-    version: 1,
-    token: randomUUID(),
-    pid: process.pid,
-    host: systemHostname(),
-    createdAt: new Date().toISOString(),
+function marketplaceStateForTerminalEvidence(
+  state: MarketplacePreparedExecutionFields & {
+    readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+  },
+  evidence: MarketplaceTerminalEvidence,
+): MarketplaceExecutionState {
+  const prepared: MarketplacePreparedExecutionFields & {
+    readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+  } = {
+    schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+    requestPath: state.requestPath,
+    requestDigest: state.requestDigest,
+    solverNetSelectionPath: state.solverNetSelectionPath,
+    preparedAt: state.preparedAt,
+    agentSoftDeadline: state.agentSoftDeadline,
+    adoptionDeadline: state.adoptionDeadline,
   };
-}
-
-function createTransitionLock(path: string): MarketplaceTransitionLock {
-  const lock = lockOwner();
-  writeTransitionLock(path, lock);
-  return lock;
-}
-
-function reclaimTransitionLock(
-  lockPath: string,
-  reclaimPath: string,
-): MarketplaceTransitionLock {
-  let reclaimLock: MarketplaceTransitionLock;
-  try {
-    reclaimLock = createTransitionLock(reclaimPath);
-  } catch (error) {
-    if (isAlreadyExists(error)) throw new Error('Marketplace execution transition is locked');
-    throw error;
-  }
-  try {
-    const existing = readTransitionLock(lockPath);
-    if (existing.host !== systemHostname() || processIsAlive(existing.pid)) {
-      throw new Error('Marketplace execution transition is locked');
-    }
-    unlinkSync(lockPath);
-    return createTransitionLock(lockPath);
-  } finally {
-    releaseTransitionLock({ path: reclaimPath, token: reclaimLock.token });
-  }
-}
-
-function reclaimAbandonedReclaimLock(reclaimPath: string): void {
-  const existing = readTransitionLock(reclaimPath);
-  if (existing.host !== systemHostname() || processIsAlive(existing.pid)) {
-    throw new Error('Marketplace execution transition is locked');
-  }
-  releaseTransitionLock({ path: reclaimPath, token: existing.token });
-}
-
-function acquireTransitionLock(manifestPath: string): {
-  readonly path: string;
-  readonly token: string;
-} {
-  const path = marketplaceTransitionLockPath(manifestPath);
-  const reclaimPath = `${path}${MARKETPLACE_TRANSITION_RECLAIM_SUFFIX}`;
-  if (existsSync(reclaimPath)) reclaimAbandonedReclaimLock(reclaimPath);
-  try {
-    const lock = createTransitionLock(path);
-    return { path, token: lock.token };
-  } catch (error) {
-    if (!isAlreadyExists(error)) throw error;
-  }
-  const lock = reclaimTransitionLock(path, reclaimPath);
-  return { path, token: lock.token };
-}
-
-function releaseTransitionLock(lock: { readonly path: string; readonly token: string }): void {
-  try {
-    if (readTransitionLock(lock.path).token !== lock.token) return;
-    unlinkSync(lock.path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-}
-
-function withTransitionLock<T>(manifestPath: string, operation: () => T): T {
-  const lock = acquireTransitionLock(manifestPath);
-  try {
-    return operation();
-  } finally {
-    releaseTransitionLock(lock);
-  }
+  return evidence.status === 'submitted'
+    ? {
+        ...prepared,
+        status: 'submitted',
+        submission: evidence.submission,
+        submittedAt: evidence.submittedAt,
+      }
+    : {
+        ...prepared,
+        status: 'cancelled',
+        reason: evidence.reason,
+        cancelledAt: evidence.cancelledAt,
+      };
 }
 
 /**
@@ -949,31 +1011,17 @@ export function transitionMarketplaceExecution(
     throw new Error('Invalid marketplace execution transition');
   }
   const expectedDigest = marketplaceRequestDigest(expectedRequestDigest);
-  return withTransitionLock(path, () => {
+  const terminalPath = marketplaceTerminalEvidencePath(path);
+  let evidence = readMarketplaceTerminalEvidence(terminalPath);
+  if (evidence === undefined) {
     const previous = readAttemptManifest(path);
     if (previous.execution.backend !== 'marketplace') {
       throw new Error('Only marketplace attempts may transition marketplace execution');
     }
     const state = previous.execution.state;
-    if (
-      state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
-      || state.requestDigest !== expectedDigest
-    ) {
+    if (state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      || state.requestDigest !== expectedDigest) {
       throw new Error('Marketplace request digest changed before execution transition');
-    }
-    const submission = transition.status === 'submitted'
-      ? decodeMarketplaceSubmission(transition.submission)
-      : undefined;
-    const cancellationReason = transition.status === 'cancelled'
-      ? stringField(transition.reason, 'marketplace cancellation reason')
-      : undefined;
-    if (state.status === 'submitted' && transition.status === 'submitted') {
-      if (isDeepStrictEqual(state.submission, submission)) return previous;
-      throw new Error('Marketplace execution already has a contradictory submission');
-    }
-    if (state.status === 'cancelled' && transition.status === 'cancelled') {
-      if (state.reason === cancellationReason) return previous;
-      throw new Error('Marketplace execution already has a contradictory cancellation');
     }
     if (state.status !== 'prepared') {
       throw new Error('Only a prepared marketplace execution may transition');
@@ -985,32 +1033,58 @@ export function transitionMarketplaceExecution(
     if (Date.parse(timestamp) < Date.parse(previous.timestamps.updatedAt)) {
       throw new Error('Marketplace transition timestamp predates manifest updated timestamp');
     }
-    const next = decodeAttemptManifest({
-      ...previous,
-      execution: {
-        backend: 'marketplace',
-        state: transition.status === 'submitted'
-          ? {
-              ...state,
-              status: 'submitted',
-              submission: submission!,
-              submittedAt: timestamp,
-            }
-          : {
-              ...state,
-              status: 'cancelled',
-              cancelledAt: timestamp,
-              reason: cancellationReason!,
-            },
-      },
-      timestamps: {
-        ...previous.timestamps,
-        updatedAt: timestamp,
-      },
-    });
-    writeManifestAtomic(path, next);
-    return next;
+    const candidate = writeMarketplaceTerminalCandidate(
+      terminalPath,
+      terminalEvidenceForTransition(expectedDigest, transition, timestamp),
+    );
+    evidence = installMarketplaceTerminalEvidence(path, candidate);
+  }
+  if (evidence.requestDigest !== expectedDigest) {
+    throw new Error('Marketplace terminal evidence request digest changed before transition');
+  }
+  if (!terminalEvidenceMatchesTransition(evidence, transition)) {
+    if (evidence.status === 'submitted' && transition.status === 'submitted') {
+      throw new Error('Marketplace execution already has a contradictory submission');
+    }
+    if (evidence.status === 'cancelled' && transition.status === 'cancelled') {
+      throw new Error('Marketplace execution already has a contradictory cancellation');
+    }
+    throw new Error('Only a prepared marketplace execution may transition');
+  }
+  const current = readAttemptManifest(path);
+  if (
+    current.execution.backend !== 'marketplace'
+    || current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || current.execution.state.requestDigest !== expectedDigest
+  ) {
+    throw new Error('Marketplace terminal evidence does not match the attempt manifest');
+  }
+  const state = current.execution.state;
+  if (Date.parse(terminalEvidenceTimestamp(evidence)) < Date.parse(state.preparedAt)) {
+    throw new Error('Marketplace terminal evidence predates preparation timestamp');
+  }
+  const persistedMatchesEvidence = state.status === 'submitted'
+    ? evidence.status === 'submitted'
+      && marketplaceSubmissionIdentityMatches(state.submission, evidence.submission)
+    : state.status === 'cancelled'
+      ? evidence.status === 'cancelled' && state.reason === evidence.reason
+      : true;
+  if (!persistedMatchesEvidence) {
+    throw new Error('Marketplace terminal evidence contradicts persisted execution');
+  }
+  const terminalState = marketplaceStateForTerminalEvidence(state, evidence);
+  const next = decodeAttemptManifest({
+    ...current,
+    execution: { backend: 'marketplace', state: terminalState },
+    timestamps: {
+      ...current.timestamps,
+      updatedAt: Date.parse(current.timestamps.updatedAt) >= Date.parse(terminalEvidenceTimestamp(evidence))
+        ? current.timestamps.updatedAt
+        : terminalEvidenceTimestamp(evidence),
+    },
   });
+  if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
+  return next;
 }
 
 /**
