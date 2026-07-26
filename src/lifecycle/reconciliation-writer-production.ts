@@ -17,9 +17,12 @@ import {
 import {
   decodeReviewClaimPayload,
   encodeReviewClaimPayload,
+  parseHumanCommentEvidence,
 } from './codecs.js';
 import {
   gitPublicationArgs,
+  selectCredential,
+  type CredentialPool,
   type SelectedCredential,
 } from './credentials.js';
 import { makeGitProtocolPort } from './git-protocol.js';
@@ -62,6 +65,10 @@ export interface ReconciliationPullRequestNode {
   readonly closingIssueNumbers: readonly number[];
   readonly humanIssueNumber?: number | null;
   readonly humanAuthor?: string | null;
+  readonly humanHead?: string | null;
+  readonly humanGeneration?: string | null;
+  readonly humanLabelActor?: string | null;
+  readonly draftActor?: string | null;
   readonly humanReason?: HumanReason | null;
   readonly reviewClaim: { readonly oid: string; readonly payload: string } | null;
 }
@@ -112,7 +119,11 @@ export interface ProductionReconciliationWriterOptions {
   readonly readIssueActionContext: (
     issueNumber: number,
   ) => Promise<TargetedIssueActionContext>;
+  readonly readCanonicalSnapshot?: (
+    prNumber: number,
+  ) => Promise<GitHubLifecycleSnapshot | null>;
   readonly credential: SelectedCredential;
+  readonly credentials?: CredentialPool;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
@@ -342,6 +353,26 @@ function makeProductionReconciliationWriterWithScope(
     operation,
     runner,
   );
+  const repairCredentialForAuthor = (author: string): SelectedCredential => {
+    const normalizedAuthor = author.toLowerCase();
+    if (options.credentials === undefined) {
+      if (options.credential.normalizedLogin !== normalizedAuthor) {
+        throw new Error(`Configured repair credential for ${author} is unavailable`);
+      }
+      return options.credential;
+    }
+    const selection = selectCredential(
+      options.credentials.restrictedTo([author]),
+      { phase: 'implement' },
+    );
+    if (
+      selection.status !== 'selected'
+      || selection.credential.normalizedLogin !== normalizedAuthor
+    ) {
+      throw new Error(`Configured repair credential for ${author} is unavailable`);
+    }
+    return selection.credential;
+  };
   type LiveMapping =
     | { readonly kind: 'normal'; readonly issueNumber: number }
     | { readonly kind: 'diagnostic' };
@@ -406,29 +437,10 @@ function makeProductionReconciliationWriterWithScope(
     const recordedCycle = options.cycleSnapshot.pullRequestMappings?.find(
       (mapping) => mapping.prNumber === prNumber,
     );
-    const cycleLifecycle = options.cycleSnapshot.lifecycle.items.find((item) => (
-      item.kind === 'pull-request' && item.prNumber === prNumber
-    ));
-    const cycle = recordedCycle ?? (
-      cycleLifecycle?.kind === 'pull-request'
-        ? {
-            status: 'resolved' as const,
-            prNumber,
-            issueNumber: cycleLifecycle.issueNumber,
-            expectedBaseRefName: cycleLifecycle.expectedBaseRefName ?? cyclePr.baseRefName,
-            evidence: 'closing-reference' as const,
-          }
-        : options.cycleSnapshot.diagnostics.some((diagnostic) => (
-            diagnostic.pullRequests.some((pr) => pr.number === prNumber)
-          ))
-          ? {
-              status: 'ambiguous' as const,
-              prNumber,
-              issueNumbers: [],
-              details: [],
-            }
-          : undefined
-    );
+    if (recordedCycle === undefined) {
+      throw new Error(`Live PR #${prNumber} canonical mapping is absent from cycle context`);
+    }
+    const cycle = recordedCycle;
     if (
       live?.status === 'resolved'
       && cycle?.status === 'resolved'
@@ -502,6 +514,7 @@ function makeProductionReconciliationWriterWithScope(
     expectedReviewRefOid: GitOid,
     desired: 'terminal-approved' | 'stale',
     allowObsoleteMappingHuman = false,
+    mutationCredential?: SelectedCredential,
   ): Promise<void> => {
     const beforeRaw = await readMappedRawPr(prNumber);
     const beforeClaim = beforeRaw?.reviewClaim;
@@ -532,7 +545,12 @@ function makeProductionReconciliationWriterWithScope(
       desired,
       now().toISOString(),
     );
-    await selected(async ({ askpass, run }) => {
+    const authenticate = mutationCredential === undefined
+      ? selected
+      : <Value>(
+          operation: Parameters<typeof withSelectedCredential<Value>>[2],
+        ) => withSelectedCredential(mutationCredential, ambient, operation, runner);
+    await authenticate(async ({ askpass, run }) => {
       const directory = mkdtempSync(join(tmpdir(), 'jinn-reconcile-review-'));
       const payloadPath = join(directory, 'jinn-autopilot-review.json');
       const indexPath = join(directory, 'index');
@@ -938,65 +956,20 @@ function makeProductionReconciliationWriterWithScope(
     readReviewRef: readReview,
 
     async repairObsoleteMappingHuman(input) {
-      const before = await readMappedRawPr(input.prNumber);
-      const mapping = before === null ? null : validateLiveMapping(input.prNumber, before);
-      if (
-        before === null
-        || before.state !== 'OPEN'
-        || mapping?.kind !== 'normal'
-        || mapping.issueNumber !== input.issueNumber
-        || gitOid(before.headOid) !== input.expectedHead
-        || before.humanIssueNumber !== input.issueNumber
-        || before.humanAuthor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
-        || input.expectedAuthor.toLowerCase() !== options.credential.normalizedLogin
-        || before.humanReason?.code !== 'branch-mapping-ambiguous'
-      ) {
-        throw new Error('Obsolete mapping Human overlay authority changed');
+      if (options.readCanonicalSnapshot === undefined) {
+        throw new Error('Complete canonical repair authority is unavailable');
       }
-      const claim = before.reviewClaim;
-      if (claim === null) {
-        throw new Error('Obsolete mapping Human review-ref authority is absent');
+      const repairCredential = repairCredentialForAuthor(input.expectedAuthor);
+      const runAsRepairAuthor = <Value>(
+        operation: Parameters<typeof withSelectedCredential<Value>>[2],
+      ) => withSelectedCredential(repairCredential, ambient, operation, runner);
+      interface HumanCommentRead {
+        readonly exactIds: readonly number[];
+        readonly otherStructured: boolean;
       }
-      const record = decodeReviewClaimPayload(claim.payload);
-      if (
-        gitOid(claim.oid) !== input.expectedReviewRefOid
-        || record.generation !== input.expectedGeneration
-        || record.head !== input.expectedHead
-        || (record.state !== 'human' && record.state !== 'stale')
-      ) {
-        throw new Error('Obsolete mapping Human review-ref authority changed');
-      }
-      const cycleIssue = options.cycleSnapshot.issues.find(
-        (issue) => issue.number === input.issueNumber,
-      );
-      const [project, nativeIssue, liveDependencies] = await Promise.all([
-        readProjectItem(input.issueNumber),
-        options.readIssueByNumber(input.issueNumber),
-        options.readBlockedByIssueNumbers(input.issueNumber),
-      ]);
-      const expectedDependencies = [...(cycleIssue?.blockedByIssues ?? [])]
-        .sort((left, right) => left - right);
-      const observedDependencies = [...liveDependencies]
-        .sort((left, right) => left - right);
-      if (
-        cycleIssue === undefined
-        || project === null
-        || project.status === 'Human'
-        || project.blockedOn === 'Human'
-        || nativeIssue === null
-        || !nativeIssue.open
-        || nativeIssue.labels.includes('review:needs-human')
-        || nativeIssue.labels.includes('autopilot:human')
-        || expectedDependencies.length !== observedDependencies.length
-        || expectedDependencies.some((number, index) => (
-          number !== observedDependencies[index]
-        ))
-      ) {
-        throw new Error('Human or dependency authority dominates obsolete mapping repair');
-      }
-      const readMatchingComments = async (
+      const readHumanComments = async (
         run: Parameters<Parameters<typeof selected>[0]>[0]['run'],
-      ): Promise<readonly number[]> => {
+      ): Promise<HumanCommentRead> => {
         const raw = await run('gh', [
           'api', `repos/${repositorySlug}/issues/${input.prNumber}/comments`,
           '--paginate', '--slurp',
@@ -1006,7 +979,9 @@ function makeProductionReconciliationWriterWithScope(
         const comments = parsed.every((entry) => Array.isArray(entry))
           ? parsed.flat()
           : parsed;
-        return comments.flatMap((entry) => {
+        const exactIds: number[] = [];
+        let otherStructured = false;
+        for (const entry of comments) {
           if (typeof entry !== 'object' || entry === null) {
             throw new Error('Malformed mapping Human comment readback');
           }
@@ -1024,29 +999,173 @@ function makeProductionReconciliationWriterWithScope(
             throw new Error('Malformed mapping Human comment readback');
           }
           const author = comment.user?.login;
-          return typeof author === 'string'
+          const exact = typeof author === 'string'
             && author.toLowerCase() === input.expectedAuthor.toLowerCase()
-            && comment.body.includes(input.marker)
-            ? [comment.id]
-            : [];
-        });
-      };
-      await selected(async ({ run }) => {
-        const matches = await readMatchingComments(run);
-        if (matches.length !== 1) {
-          throw new Error('Obsolete mapping Human comment is absent or ambiguous');
+            && comment.body.includes(input.marker);
+          if (exact) {
+            exactIds.push(comment.id);
+            continue;
+          }
+          let structured = null;
+          try {
+            structured = parseHumanCommentEvidence(comment.body);
+          } catch {
+            otherStructured = true;
+            continue;
+          }
+          if (
+            structured !== null
+            || comment.body.includes('<!-- jinn-autopilot-human:')
+          ) {
+            otherStructured = true;
+          }
         }
+        return { exactIds, otherStructured };
+      };
+
+      type FenceMode = 'overlay' | 'comment-only' | 'clean';
+      const fence = async (
+        mode: FenceMode,
+        expectedReviewState: 'human' | 'stale',
+        requireInitialOid = false,
+      ): Promise<ReconciliationPullRequestNode> => {
+        invalidateActionAuthority();
+        const [canonical, raw, project, nativeIssue, liveDependencies, commentRead] =
+          await Promise.all([
+            options.readCanonicalSnapshot!(input.prNumber),
+            options.readPullRequestByNumber(input.prNumber),
+            options.readProjectItemForReconciliation(input.issueNumber),
+            options.readIssueByNumber(input.issueNumber),
+            options.readBlockedByIssueNumbers(input.issueNumber),
+            runAsRepairAuthor(({ run }) => readHumanComments(run)),
+          ]);
+        const cycleMapping = options.cycleSnapshot.pullRequestMappings?.find(
+          (mapping) => mapping.prNumber === input.prNumber,
+        );
+        const liveMapping = canonical?.pullRequestMappings?.find(
+          (mapping) => mapping.prNumber === input.prNumber,
+        );
+        const livePr = canonical?.pullRequests.find((pr) => pr.number === input.prNumber);
+        const liveIssue = canonical?.issues.find((issue) => issue.number === input.issueNumber);
+        if (
+          canonical?.snapshotComplete !== true
+          || cycleMapping?.status !== 'resolved'
+          || liveMapping?.status !== 'resolved'
+          || liveMapping.issueNumber !== input.issueNumber
+          || liveMapping.expectedBaseRefName !== cycleMapping.expectedBaseRefName
+          || livePr?.state !== 'OPEN'
+          || livePr.headOid !== input.expectedHead
+          || livePr.baseRefName !== liveMapping.expectedBaseRefName
+          || raw === null
+          || raw.state !== 'OPEN'
+          || gitOid(raw.headOid) !== input.expectedHead
+          || raw.baseRefName !== liveMapping.expectedBaseRefName
+          || liveIssue === undefined
+          || project === null
+          || project.blockedOn === 'Human'
+          || nativeIssue === null
+          || !nativeIssue.open
+          || nativeIssue.labels.includes('review:needs-human')
+          || nativeIssue.labels.includes('autopilot:human')
+        ) {
+          throw new Error('Obsolete mapping Human canonical or Human authority changed');
+        }
+        const expectedDependencies = [...liveIssue.blockedByIssues]
+          .sort((left, right) => left - right);
+        const observedDependencies = [...liveDependencies]
+          .sort((left, right) => left - right);
+        if (
+          expectedDependencies.length !== observedDependencies.length
+          || expectedDependencies.some((number, index) => (
+            number !== observedDependencies[index]
+          ))
+        ) {
+          throw new Error('Obsolete mapping Human dependency authority changed');
+        }
+        const claim = raw.reviewClaim;
+        if (claim === null) {
+          throw new Error('Obsolete mapping Human review-ref authority is absent');
+        }
+        const record = decodeReviewClaimPayload(claim.payload);
+        if (
+          (requireInitialOid && gitOid(claim.oid) !== input.expectedReviewRefOid)
+          || record.generation !== input.expectedGeneration
+          || record.head !== input.expectedHead
+          || record.state !== expectedReviewState
+        ) {
+          throw new Error('Obsolete mapping Human review-ref authority changed');
+        }
+        const labelPresent = raw.labels.includes(NEEDS_HUMAN_LABEL);
+        if (
+          mode === 'overlay'
+          && (
+            raw.humanIssueNumber !== input.issueNumber
+            || raw.humanAuthor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
+            || raw.humanHead !== input.expectedHead
+            || raw.humanGeneration !== input.expectedGeneration
+            || raw.humanReason?.code !== 'branch-mapping-ambiguous'
+            || (labelPresent && (
+              raw.humanLabelActor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
+            ))
+            || (raw.isDraft && (
+              raw.draftActor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
+            ))
+            || commentRead.exactIds.length !== 1
+            || commentRead.otherStructured
+          )
+        ) {
+          throw new Error('Obsolete mapping Human overlay provenance changed');
+        }
+        if (
+          mode === 'comment-only'
+          && (
+            labelPresent
+            || raw.humanIssueNumber !== input.issueNumber
+            || raw.humanAuthor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
+            || raw.humanHead !== input.expectedHead
+            || raw.humanGeneration !== input.expectedGeneration
+            || raw.humanReason?.code !== 'branch-mapping-ambiguous'
+            || (raw.isDraft && (
+              raw.draftActor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
+            ))
+            || commentRead.exactIds.length !== 1
+            || commentRead.otherStructured
+          )
+        ) {
+          throw new Error('Obsolete mapping Human cleanup authority changed');
+        }
+        if (
+          mode === 'clean'
+          && (
+            labelPresent
+            || raw.isDraft
+            || commentRead.exactIds.length !== 0
+            || commentRead.otherStructured
+          )
+        ) {
+          throw new Error('Obsolete mapping Human cleanup is incomplete');
+        }
+        return raw;
+      };
+
+      const before = await fence('overlay', 'human', true).catch(async (error) => {
+        const retry = await fence('overlay', 'stale', true).catch(() => null);
+        if (retry !== null) return retry;
+        throw error;
       });
-      if (record.state === 'human') {
+      const beforeRecord = decodeReviewClaimPayload(before.reviewClaim!.payload);
+      if (beforeRecord.state === 'human') {
         await updateReviewRef(
           input.prNumber,
           input.expectedReviewRefOid,
           'stale',
           true,
+          repairCredential,
         );
       }
-      await selected(async ({ run }) => {
-        if (before.labels.includes(NEEDS_HUMAN_LABEL)) {
+      let current = await fence('overlay', 'stale');
+      if (current.labels.includes(NEEDS_HUMAN_LABEL)) {
+        await runAsRepairAuthor(async ({ run }) => {
           await mutateWithExactReadback(
             () => {
               invalidateActionAuthority();
@@ -1056,25 +1175,103 @@ function makeProductionReconciliationWriterWithScope(
               ]);
             },
             async () => {
-              const after = await readMappedRawPr(input.prNumber);
+              const after = await options.readPullRequestByNumber(input.prNumber);
               return after !== null
                 && gitOid(after.headOid) === input.expectedHead
                 && !after.labels.includes(NEEDS_HUMAN_LABEL);
             },
             'Obsolete mapping Human label repair was ambiguous',
           );
+        });
+      }
+      current = await fence('comment-only', 'stale');
+      if (current.isDraft) {
+        await runAsRepairAuthor(async ({ run }) => {
+          await mutateWithExactReadback(
+            () => {
+              invalidateActionAuthority();
+              return run('gh', [
+                'pr', 'ready', String(input.prNumber), '--repo', repositorySlug,
+              ]);
+            },
+            async () => {
+              const after = await options.readPullRequestByNumber(input.prNumber);
+              return after !== null
+                && gitOid(after.headOid) === input.expectedHead
+                && !after.isDraft
+                && !after.labels.includes(NEEDS_HUMAN_LABEL);
+            },
+            'Obsolete mapping Human draft repair was ambiguous',
+          );
+        });
+      }
+      await fence('comment-only', 'stale');
+      await runAsRepairAuthor(async ({ run }) => {
+        const comments = await readHumanComments(run);
+        if (comments.exactIds.length !== 1 || comments.otherStructured) {
+          throw new Error('Obsolete mapping Human comment is absent or ambiguous');
         }
-        const [commentId] = await readMatchingComments(run);
-        if (commentId === undefined) return;
+        const commentId = comments.exactIds[0]!;
         await mutateWithExactReadback(
           () => run('gh', [
             'api', '--method', 'DELETE',
             `repos/${repositorySlug}/issues/comments/${commentId}`,
           ]),
-          async () => !(await readMatchingComments(run)).includes(commentId),
+          async () => {
+            const after = await readHumanComments(run);
+            return after.exactIds.length === 0 && !after.otherStructured;
+          },
           'Obsolete mapping Human comment repair was ambiguous',
         );
       });
+      await fence('clean', 'stale');
+    },
+
+    async readObsoleteMappingHumanRepairState(input) {
+      if (options.readCanonicalSnapshot === undefined) return { complete: false };
+      const repairCredential = repairCredentialForAuthor(input.expectedAuthor);
+      invalidateActionAuthority();
+      const [canonical, raw, commentsRaw] = await Promise.all([
+        options.readCanonicalSnapshot(input.prNumber),
+        options.readPullRequestByNumber(input.prNumber),
+        withSelectedCredential(repairCredential, ambient, ({ run }) => run('gh', [
+          'api', `repos/${repositorySlug}/issues/${input.prNumber}/comments`,
+          '--paginate', '--slurp',
+        ]), runner),
+      ]);
+      const mapping = canonical?.pullRequestMappings?.find(
+        (candidate) => candidate.prNumber === input.prNumber,
+      );
+      const claim = raw?.reviewClaim === null || raw?.reviewClaim === undefined
+        ? undefined
+        : decodeReviewClaimPayload(raw.reviewClaim.payload);
+      const parsed = JSON.parse(commentsRaw) as unknown;
+      if (!Array.isArray(parsed)) return { complete: false };
+      const rows = parsed.every((entry) => Array.isArray(entry)) ? parsed.flat() : parsed;
+      const humanComments = rows.filter((entry) => {
+        if (typeof entry !== 'object' || entry === null) return true;
+        const body = (entry as { body?: unknown }).body;
+        if (typeof body !== 'string') return true;
+        try {
+          return parseHumanCommentEvidence(body) !== null
+            || body.includes('<!-- jinn-autopilot-human:');
+        } catch {
+          return true;
+        }
+      });
+      return {
+        complete: canonical?.snapshotComplete === true
+          && mapping?.status === 'resolved'
+          && mapping.issueNumber === input.issueNumber
+          && raw?.state === 'OPEN'
+          && gitOid(raw.headOid) === input.expectedHead
+          && !raw.labels.includes(NEEDS_HUMAN_LABEL)
+          && !raw.isDraft
+          && claim?.head === input.expectedHead
+          && claim.generation === input.expectedGeneration
+          && claim.state === 'stale'
+          && humanComments.length === 0,
+      };
     },
 
     markReviewStale: (prNumber, expectedReviewRefOid) =>

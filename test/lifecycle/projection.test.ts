@@ -200,7 +200,10 @@ describe('planProjection', () => {
       expectedReviewRefOid: REVIEW_OID,
       expectedGeneration: '22222222-2222-4222-8222-222222222222',
       expectedAuthor: 'maintenance-bot',
-      marker: '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing code=branch-mapping-ambiguous -->',
+      marker: '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing '
+        + 'code=branch-mapping-ambiguous '
+        + 'head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '
+        + 'generation=22222222-2222-4222-8222-222222222222 -->',
     }]);
   });
 

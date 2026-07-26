@@ -86,6 +86,7 @@ function rawPullRequest(overrides: Partial<RawPullRequest> = {}): RawPullRequest
     headRefName: 'autopilot/42',
     headOid: HEAD,
     headCommittedAt: '2026-07-22T09:00:00.000Z',
+    updatedAt: '2026-07-22T09:30:00.000Z',
     isDraft: false,
     state: 'OPEN',
     labels: ['engine:review'],
@@ -349,6 +350,68 @@ describe('targeted action reader', () => {
     expect(snapshot?.lifecycle.items).toEqual([
       expect.objectContaining({ kind: 'pull-request', issueNumber: 42, prNumber: 101 }),
     ]);
+  });
+
+  it('refreshes a newly opened unlabeled mapping competitor before review authority', async () => {
+    const target = rawPullRequest();
+    const competitor = rawPullRequest({
+      number: 102,
+      title: 'Competing implementation',
+      headOid: 'c'.repeat(40),
+      headRefName: 'feature/duplicate-42',
+      labels: [],
+      body: 'Closes #42',
+      updatedAt: '2026-07-22T09:40:00.000Z',
+    });
+    const base = cycleSnapshot();
+    const cycle: GitHubLifecycleSnapshot = {
+      ...base,
+      pullRequests: [decodePullRequestSnapshot(target)],
+    };
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => 4_000,
+      readPullRequest: async (number) => (
+        number === target.number ? target : number === competitor.number ? competitor : null
+      ),
+      readOpenPullRequestIndex: async () => [target, competitor].map((pr) => ({
+        number: pr.number,
+        title: pr.title,
+        state: 'OPEN' as const,
+        updatedAt: pr.updatedAt!,
+        headOid: pr.headOid,
+        headRefName: pr.headRefName,
+        baseRefName: pr.baseRefName,
+        isDraft: pr.isDraft,
+        closedAt: null,
+        mergedAt: null,
+      })),
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Review',
+        blockedOn: 'Nothing',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [],
+    });
+
+    const snapshot = await reader.readPullRequest(cycle, target.number);
+
+    expect(snapshot?.pullRequestMappings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        status: 'ambiguous',
+        prNumber: target.number,
+        details: [expect.stringMatching(/unique open PR/i)],
+      }),
+    ]));
+    expect(snapshot?.lifecycle.items).toEqual([]);
   });
 
   it('does not probe blocker relations or details for a dependent ordinary review read', async () => {

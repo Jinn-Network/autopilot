@@ -407,11 +407,13 @@ export function parseAutomatedReviewMarker(marker: string): AutomatedReviewMarke
 export interface HumanCommentEvidence {
   readonly issueNumber?: number;
   readonly prNumber: number;
+  readonly head?: GitOid;
+  readonly generation?: string;
   readonly reason: HumanReason;
 }
 
 const HUMAN_MARKER_PATTERN =
-  /^<!-- jinn-autopilot-human:v2(?: issue=([1-9][0-9]*))? pr=([1-9][0-9]*) phase=([a-z-]+) code=([a-z-]+) -->$/;
+  /^<!-- jinn-autopilot-human:v2(?: issue=([1-9][0-9]*))? pr=([1-9][0-9]*) phase=([a-z-]+) code=([a-z-]+)(?: head=([0-9a-f]{40}) generation=([0-9a-f-]+))? -->$/;
 
 function humanReason(phase: string, code: string, detail: string): HumanReason {
   if (
@@ -452,14 +454,25 @@ function humanReason(phase: string, code: string, detail: string): HumanReason {
 export function formatHumanCommentMarker(input: {
   readonly issueNumber?: number;
   readonly prNumber: number;
+  readonly head?: GitOid;
+  readonly generation?: string;
   readonly reason: HumanReason;
 }): string {
   if (input.issueNumber !== undefined) positiveNumber(input.issueNumber, 'issue number');
   positiveNumber(input.prNumber, 'PR number');
   humanReason(input.reason.phase, input.reason.code, input.reason.detail);
+  if ((input.head === undefined) !== (input.generation === undefined)) {
+    throw new Error('Human comment provenance requires both head and generation');
+  }
+  if (input.head !== undefined) gitOid(input.head);
+  if (input.generation !== undefined) uuid(input.generation, 'generation');
   return `<!-- jinn-autopilot-human:v2`
     + (input.issueNumber === undefined ? '' : ` issue=${input.issueNumber}`)
-    + ` pr=${input.prNumber} phase=${input.reason.phase} code=${input.reason.code} -->`;
+    + ` pr=${input.prNumber} phase=${input.reason.phase} code=${input.reason.code}`
+    + (input.head === undefined
+      ? ''
+      : ` head=${input.head} generation=${input.generation}`)
+    + ' -->';
 }
 
 export function parseHumanCommentEvidence(body: string): HumanCommentEvidence | null {
@@ -467,7 +480,7 @@ export function parseHumanCommentEvidence(body: string): HumanCommentEvidence | 
   if (marker === undefined) return null;
   const match = HUMAN_MARKER_PATTERN.exec(marker);
   if (match === null) return null;
-  const [, issueRaw, prRaw, phase, code] = match;
+  const [, issueRaw, prRaw, phase, code, headRaw, generationRaw] = match;
   if (prRaw === undefined || phase === undefined || code === undefined) return null;
   const detail = paragraphs.at(-1)?.trim() ?? '';
   if (detail.length === 0 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(detail)) {
@@ -478,6 +491,8 @@ export function parseHumanCommentEvidence(body: string): HumanCommentEvidence | 
       ? {}
       : { issueNumber: positiveInteger(issueRaw, 'issue number') }),
     prNumber: positiveInteger(prRaw, 'PR number'),
+    ...(headRaw === undefined ? {} : { head: gitOid(headRaw) }),
+    ...(generationRaw === undefined ? {} : { generation: uuid(generationRaw, 'generation') }),
     reason: humanReason(phase, code, detail),
   };
 }

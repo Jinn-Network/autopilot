@@ -8,7 +8,9 @@ import {
   encodeReviewClaimPayload,
   extractMergePrepCompletionSummary,
   formatAutomatedReviewMarker,
+  formatHumanCommentMarker,
   parseAutomatedReviewMarker,
+  parseHumanCommentEvidence,
   reviewClaimRef,
 } from '../../src/lifecycle/codecs.js';
 import {
@@ -217,6 +219,36 @@ describe('lifecycle metadata codecs', () => {
       verdict: 'REQUEST_CHANGES',
     });
     expect(() => parseAutomatedReviewMarker(`${marker} trailing`)).toThrow(/review marker/);
+  });
+
+  it('round-trips exact head and generation provenance in a mapping Human marker', () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const reason = {
+      phase: 'implementing' as const,
+      code: 'branch-mapping-ambiguous' as const,
+      detail: 'Mapping was ambiguous.',
+    };
+    const marker = formatHumanCommentMarker({
+      issueNumber: 42,
+      prNumber: 101,
+      head: OID_A,
+      generation,
+      reason,
+    });
+
+    expect(marker).toBe(
+      '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing '
+      + 'code=branch-mapping-ambiguous '
+      + 'head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '
+      + 'generation=22222222-2222-4222-8222-222222222222 -->',
+    );
+    expect(parseHumanCommentEvidence(`${marker}\n\nMapping was ambiguous.`)).toEqual({
+      issueNumber: 42,
+      prNumber: 101,
+      head: OID_A,
+      generation,
+      reason,
+    });
   });
 
   it('rejects string numerics in runtime ref-name helpers', () => {

@@ -56,6 +56,31 @@ function effectiveCurrentHeadReviews(
   return [...latest.values()];
 }
 
+function hasExactCanonicalMergeAuthority(
+  snapshot: GitHubLifecycleSnapshot,
+  prNumber: number,
+  head: string,
+  expectedBaseRefName: string,
+): boolean {
+  if (snapshot.snapshotComplete !== true) return false;
+  const pr = snapshot.pullRequests.find((entry) => entry.number === prNumber);
+  const lifecycle = snapshot.lifecycle.items.find((entry) => (
+    entry.kind === 'pull-request' && entry.prNumber === prNumber
+  ));
+  const mappings = snapshot.pullRequestMappings?.filter(
+    (entry) => entry.prNumber === prNumber,
+  ) ?? [];
+  const mapping = mappings.length === 1 ? mappings[0] : undefined;
+  return pr?.state === 'OPEN'
+    && pr.headOid === head
+    && pr.baseRefName === expectedBaseRefName
+    && lifecycle?.kind === 'pull-request'
+    && lifecycle.head === head
+    && mapping?.status === 'resolved'
+    && mapping.issueNumber === lifecycle.issueNumber
+    && mapping.expectedBaseRefName === expectedBaseRefName;
+}
+
 export function makeProductionMergeActionPort(
   options: ProductionMergeActionPortOptions,
 ): ProductionMergeActionPort {
@@ -73,9 +98,15 @@ export function makeProductionMergeActionPort(
     if (pr === undefined) return null;
     const lifecycle = snapshot.lifecycle.items.find((entry) =>
       entry.kind === 'pull-request' && entry.prNumber === prNumber);
-    const diagnostic = snapshot.diagnostics.find((entry) =>
-      entry.pullRequests.some((candidate) => candidate.number === prNumber));
-    if (lifecycle?.kind !== 'pull-request') return null;
+    if (
+      lifecycle?.kind !== 'pull-request'
+      || !hasExactCanonicalMergeAuthority(
+        snapshot,
+        prNumber,
+        pr.headOid,
+        expectedBase,
+      )
+    ) return null;
     const changedFiles = await readExactChangedFiles({
       run: runner,
       prNumber: pr.number,
@@ -147,7 +178,7 @@ export function makeProductionMergeActionPort(
         || pr.labels.includes('review:needs-human'),
       author: pr.author,
       authorAllowed: options.authorAllowlist.has(pr.author.toLowerCase()),
-      uniqueIssueMapping: diagnostic === undefined,
+      uniqueIssueMapping: true,
       terminalApprovalMatches,
       ...(lifecycle.reviewClaim?.reviewer === undefined
         ? {}
@@ -179,6 +210,25 @@ export function makeProductionMergeActionPort(
       credential,
     }): Promise<ExactMergeOutcome> =>
       withCredential(credential, async ({ run }) => {
+        const canonical = await options.readSnapshot();
+        const canonicalPr = canonical.pullRequests.find(
+          (entry) => entry.number === prNumber,
+        );
+        if (canonicalPr !== undefined && canonicalPr.headOid !== head) {
+          return { status: 'changed-head', head: canonicalPr.headOid };
+        }
+        if (!hasExactCanonicalMergeAuthority(
+          canonical,
+          prNumber,
+          head,
+          expectedBaseRefName,
+        )) {
+          return {
+            status: 'rejected',
+            head,
+            reason: 'Canonical mapping authority changed before the exact-head merge',
+          };
+        }
         const authority = JSON.parse(await run('gh', [
           'pr', 'view', String(prNumber), '--repo', repositorySlug,
           '--json', 'state,headRefOid,baseRefName',

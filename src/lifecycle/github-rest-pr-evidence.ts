@@ -166,6 +166,8 @@ function exactPullRequestDetail(
 function latestHuman(value: unknown, prNumber: number): {
   readonly issueNumber?: number;
   readonly author?: string;
+  readonly head?: PullRequestSnapshot['humanHead'];
+  readonly generation?: string;
   readonly reason: NonNullable<PullRequestSnapshot['humanReason']>;
 } | null {
   const evidence = rows(value, 'PR comments').map((raw, index) => {
@@ -192,7 +194,51 @@ function latestHuman(value: unknown, prNumber: number): {
       ? {}
       : { issueNumber: evidence.parsed.issueNumber }),
     ...(evidence.author === undefined ? {} : { author: evidence.author }),
+    ...(evidence.parsed.head === undefined ? {} : { head: evidence.parsed.head }),
+    ...(evidence.parsed.generation === undefined
+      ? {}
+      : { generation: evidence.parsed.generation }),
     reason: evidence.parsed.reason,
+  };
+}
+
+function currentSurfaceActors(
+  value: unknown,
+  humanLabelPresent: boolean,
+  draft: boolean,
+): {
+  readonly humanLabelActor?: string;
+  readonly draftActor?: string;
+} {
+  const events = rows(value, 'PR events').flatMap((raw, index) => {
+    const event = record(raw, `PR event ${index}`);
+    const kind = nonEmptyString(event.event, `PR event ${index}.event`);
+    if (!['labeled', 'unlabeled', 'convert_to_draft', 'ready_for_review'].includes(kind)) {
+      return [];
+    }
+    const createdAt = exactTimestamp(event.created_at, `PR event ${index}.created_at`);
+    const actor = event.actor === null
+      ? undefined
+      : nonEmptyString(record(event.actor, `PR event ${index}.actor`).login, `PR event ${index}.actor.login`);
+    const label = kind === 'labeled' || kind === 'unlabeled'
+      ? nonEmptyString(record(event.label, `PR event ${index}.label`).name, `PR event ${index}.label.name`)
+      : undefined;
+    return [{ kind, createdAt, actor, label }];
+  }).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const latestLabel = [...events].reverse().find((event) => (
+    (event.kind === 'labeled' || event.kind === 'unlabeled')
+    && event.label === 'review:needs-human'
+  ));
+  const latestDraft = [...events].reverse().find((event) => (
+    event.kind === 'convert_to_draft' || event.kind === 'ready_for_review'
+  ));
+  return {
+    ...(humanLabelPresent && latestLabel?.kind === 'labeled' && latestLabel.actor !== undefined
+      ? { humanLabelActor: latestLabel.actor }
+      : {}),
+    ...(draft && latestDraft?.kind === 'convert_to_draft' && latestDraft.actor !== undefined
+      ? { draftActor: latestDraft.actor }
+      : {}),
   };
 }
 
@@ -323,6 +369,9 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
     const commentResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/issues/${pr.number}/comments?per_page=100&page=1`,
     );
+    const eventResponse = await this.rest.getJson(
+      `repos/${this.repositorySlug}/issues/${pr.number}/events?per_page=100&page=1`,
+    );
     const checkResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/commits/${pr.headOid}/check-runs?per_page=100&page=1`,
     );
@@ -335,6 +384,11 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       completeBody(commentResponse, 'PR comments'),
       pr.number,
     );
+    const currentActors = currentSurfaceActors(
+      completeBody(eventResponse, 'PR events'),
+      detail.labels.includes('review:needs-human'),
+      detail.isDraft,
+    );
     const currentChecks = [
       ...checkRuns(completeBody(checkResponse, 'check runs')),
       ...commitStatuses(completeBody(statusResponse, 'commit statuses')),
@@ -344,8 +398,14 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       : {
           ...(pr.humanIssueNumber === undefined ? {} : { issueNumber: pr.humanIssueNumber }),
           ...(pr.humanAuthor === undefined ? {} : { author: pr.humanAuthor }),
+          ...(pr.humanHead === undefined ? {} : { head: pr.humanHead }),
+          ...(pr.humanGeneration === undefined ? {} : { generation: pr.humanGeneration }),
           reason: pr.humanReason,
         };
+    const cachedActors = {
+      ...(pr.humanLabelActor === undefined ? {} : { humanLabelActor: pr.humanLabelActor }),
+      ...(pr.draftActor === undefined ? {} : { draftActor: pr.draftActor }),
+    };
     const cachedDetail = {
       title: pr.title,
       body: pr.body,
@@ -362,6 +422,7 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
         !== JSON.stringify({ ...cachedDetail, labels: [...cachedDetail.labels].sort() })
       || canonical(currentReviews) !== canonical(pr.reviews)
       || JSON.stringify(currentHuman) !== JSON.stringify(cachedHuman)
+      || JSON.stringify(currentActors) !== JSON.stringify(cachedActors)
       || canonicalChecks(currentChecks) !== canonicalChecks(pr.checks);
   }
 }

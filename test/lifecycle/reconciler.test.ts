@@ -145,6 +145,39 @@ describe('executeProjectionPlan', () => {
     expect(repairs).toBe(0);
   });
 
+  it('does not report repair applied while the exact label/comment cleanup is incomplete', async () => {
+    const state = initial();
+    const generation = '11111111-1111-4111-8111-111111111111';
+    const calls: string[] = [];
+    const action: ProjectionAction = {
+      kind: 'repair-obsolete-mapping-human',
+      issueNumber: 42,
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW,
+      expectedGeneration: generation,
+      expectedAuthor: 'maintenance-bot',
+      marker: '<!-- exact-machine-marker -->',
+    };
+    let reviewState: 'human' | 'stale' = 'human';
+    const baseWriter = writer(state, calls);
+
+    const report = await executeProjectionPlan({ actions: [action] }, {
+      ...baseWriter,
+      readReviewRef: async () => ({
+        ...state.review,
+        state: reviewState,
+        generation,
+      }),
+      repairObsoleteMappingHuman: async () => {
+        reviewState = 'stale';
+      },
+      readObsoleteMappingHumanRepairState: async () => ({ complete: false }),
+    });
+
+    expect(report.results).toEqual([{ action, outcome: 'lost-race' }]);
+  });
+
   it('recovers a durable implementation summary before making the PR ready', async () => {
     const state = initial();
     state.status = 'In Review';

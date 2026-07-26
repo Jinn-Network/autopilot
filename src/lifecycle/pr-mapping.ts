@@ -209,9 +209,10 @@ export function resolveStructuredPullRequestMappings(
       && (
         stableClaim.headRefName !== pr.headRefName
         || stableClaim.head !== pr.head
+        || stableClaim.targetBase !== pr.baseRefName
       )
     ) {
-      details.push('stable branch claim does not match the exact PR branch and head.');
+      details.push('stable branch claim does not match the exact PR branch, head, and base.');
     }
 
     const emptyClosing = pr.closingIssueNumbers.length === 0;
@@ -237,6 +238,15 @@ export function resolveStructuredPullRequestMappings(
         || stableClaim.targetBase !== pr.baseRefName
       ) {
         details.push('Empty closing references require an exact stable branch claim and head.');
+      }
+      if (
+        issue?.blockedOn !== 'Another issue'
+        || issue.blockedByIssues.length === 0
+        || pr.baseRefName === input.defaultBranch
+      ) {
+        details.push(
+          'Empty closing references require exact issue dependency evidence for the parent base.',
+        );
       }
     }
 

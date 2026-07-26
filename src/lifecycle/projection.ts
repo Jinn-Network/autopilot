@@ -171,6 +171,8 @@ function planItem(
         marker: formatHumanCommentMarker({
           issueNumber: item.issueNumber,
           prNumber: item.prNumber,
+          head: item.head,
+          generation: obsoleteMapping.generation,
           reason: obsoleteMapping.reason,
         }),
       }];

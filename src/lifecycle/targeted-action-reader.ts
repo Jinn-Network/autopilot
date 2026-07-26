@@ -18,6 +18,7 @@ import {
   type GitHubLifecycleSnapshot,
   type RawPullRequest,
 } from './snapshot.js';
+import type { PullRequestIndexEntry } from './github-rest-discovery.js';
 
 export interface TargetedNativeIssue {
   readonly number: number;
@@ -58,6 +59,8 @@ export interface TargetedActionReaderOptions {
   readonly rateLimitFloor: number;
   readonly readGraphQlRemaining: () => Promise<number>;
   readonly readPullRequest: (prNumber: number) => Promise<RawPullRequest | null>;
+  /** Complete REST index used to refresh every canonical mapping contender. */
+  readonly readOpenPullRequestIndex?: () => Promise<readonly PullRequestIndexEntry[]>;
   readonly readProjectItem: (issueNumber: number) => Promise<TargetedProjectItem | null>;
   readonly readIssue: (issueNumber: number) => Promise<TargetedNativeIssue | null>;
   readonly readBlockedByIssueNumbers: (issueNumber: number) => Promise<readonly number[]>;
@@ -339,9 +342,71 @@ export function makeTargetedActionReader(
     ));
     const project = projectWithTarget(cycleSnapshot, issueNumber, item);
     const decoded = decodePullRequestSnapshot(raw);
-    let pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
-      ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
-      : [...cycleSnapshot.pullRequests, decoded];
+    let pullRequests: GitHubLifecycleSnapshot['pullRequests'];
+    if (options.readOpenPullRequestIndex === undefined) {
+      pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
+        ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
+        : [...cycleSnapshot.pullRequests, decoded];
+    } else {
+      const index = await options.readOpenPullRequestIndex();
+      const indexed = new Map<number, PullRequestIndexEntry>();
+      for (const entry of index) {
+        positiveNumber(entry.number, 'Open PR index number');
+        if (entry.state !== 'OPEN' || indexed.has(entry.number)) {
+          throw new Error('Complete open PR index is contradictory');
+        }
+        indexed.set(entry.number, entry);
+      }
+      const targetIndex = indexed.get(prNumber);
+      if (
+        targetIndex === undefined
+        || targetIndex.headOid !== raw.headOid
+        || targetIndex.headRefName !== raw.headRefName
+        || targetIndex.baseRefName !== raw.baseRefName
+      ) {
+        return null;
+      }
+      const cycleOpen = new Map(cycleSnapshot.pullRequests
+        .filter((pr) => pr.state === 'OPEN')
+        .map((pr) => [pr.number, pr]));
+      const refreshed: GitHubLifecycleSnapshot['pullRequests'][number][] = [];
+      for (const entry of [...indexed.values()].sort((left, right) => left.number - right.number)) {
+        if (entry.number === prNumber) {
+          refreshed.push(decoded);
+          continue;
+        }
+        const prior = cycleOpen.get(entry.number);
+        if (
+          prior !== undefined
+          && prior.updatedAt !== undefined
+          && prior.updatedAt === entry.updatedAt
+          && prior.headOid === entry.headOid
+          && prior.headRefName === entry.headRefName
+          && prior.baseRefName === entry.baseRefName
+          && prior.isDraft === entry.isDraft
+        ) {
+          refreshed.push(prior);
+          continue;
+        }
+        await reserve(TARGETED_PR_RESERVE);
+        const live = await options.readPullRequest(entry.number);
+        if (
+          live === null
+          || live.state !== 'OPEN'
+          || live.number !== entry.number
+          || live.headOid !== entry.headOid
+          || live.headRefName !== entry.headRefName
+          || live.baseRefName !== entry.baseRefName
+        ) {
+          return null;
+        }
+        refreshed.push(decodePullRequestSnapshot(live));
+      }
+      pullRequests = [
+        ...cycleSnapshot.pullRequests.filter((pr) => pr.state === 'MERGED'),
+        ...refreshed,
+      ];
+    }
     if (!hydrateRecoveryBlockers) {
       return composeTargeted(
         cycleSnapshot,

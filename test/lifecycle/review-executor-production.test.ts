@@ -34,6 +34,13 @@ function snapshot(): GitHubLifecycleSnapshot {
     issues: [],
     branches: [],
     diagnostics: [],
+    pullRequestMappings: [{
+      status: 'resolved',
+      prNumber: 84,
+      issueNumber: 42,
+      expectedBaseRefName: 'next',
+      evidence: 'closing-reference',
+    }],
     pullRequests: [{
       number: 84,
       title: 'Review me',
@@ -293,6 +300,31 @@ describe('production review acquisition port', () => {
     })).resolves.toMatchObject({
       mappingProblem: 'PR #84 marker and dependency evidence contradict each other',
     });
+  });
+
+  it('fails closed when the target PR has no canonical mapping result', async () => {
+    const missing: GitHubLifecycleSnapshot = {
+      ...snapshot(),
+      pullRequestMappings: [],
+    };
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => missing,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async () => {
+        throw new Error('missing canonical authority must not reach changed-file reads');
+      },
+    });
+
+    await expect(port.readCandidate(84)).resolves.toBeNull();
+    await expect(port.confirmAcquisition({
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW,
+    })).resolves.toBeNull();
   });
 
   it('forces Human approval policy when REST total disproves file completeness', async () => {

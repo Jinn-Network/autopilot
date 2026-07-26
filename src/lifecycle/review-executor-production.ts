@@ -178,20 +178,15 @@ export function makeProductionReviewActionPort(
     if (pr === undefined) return null;
     const lifecycle = snapshot.lifecycle.items.find((item) =>
       item.kind === 'pull-request' && item.prNumber === prNumber);
-    const diagnostic = snapshot.diagnostics.find((entry) =>
-      entry.pullRequests.some((candidate) => candidate.number === prNumber));
     const structuredMapping = snapshot.pullRequestMappings?.find(
       (entry) => entry.prNumber === prNumber,
     );
-    const marker = /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/
-      .exec(pr.body);
+    if (structuredMapping === undefined) return null;
     const issueNumber = structuredMapping?.status === 'resolved'
       ? structuredMapping.issueNumber
       : structuredMapping?.status === 'ambiguous'
         ? structuredMapping.issueNumbers[0]
-        : lifecycle?.issueNumber
-          ?? diagnostic?.issueNumbers[0]
-          ?? (marker === null ? undefined : Number(marker[1]));
+        : undefined;
     if (issueNumber === undefined) return null;
     const changedFiles = await readExactChangedFiles({
       run: runner,
@@ -248,9 +243,7 @@ export function makeProductionReviewActionPort(
       ...(terminalApprovalMatches ? { terminalApprovalMatches: true } : {}),
       ...(structuredMapping?.status === 'ambiguous'
         ? { mappingProblem: structuredMapping.details.join(' ') }
-        : diagnostic === undefined
-          ? {}
-          : { mappingProblem: diagnostic.detail }),
+        : {}),
     };
   };
   const createMetadataCommit = async (

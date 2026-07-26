@@ -42,6 +42,7 @@ function snapshot(
   reviews: readonly NativeReviewSnapshot[] = [approvedReview()],
 ): GitHubLifecycleSnapshot {
   return {
+    snapshotComplete: true,
     pullRequests: [{
       number: 84,
       title: 'PR',
@@ -113,7 +114,27 @@ function snapshot(
       }],
     },
     diagnostics: [],
+    pullRequestMappings: [{
+      status: 'resolved',
+      prNumber: 84,
+      issueNumber: 84,
+      expectedBaseRefName: 'stack/base',
+      evidence: 'closing-reference',
+    }],
   } as unknown as GitHubLifecycleSnapshot;
+}
+
+function snapshotWithBase(baseRefName: string): GitHubLifecycleSnapshot {
+  const current = snapshot();
+  return {
+    ...current,
+    pullRequests: current.pullRequests.map((pr) => ({ ...pr, baseRefName })),
+    pullRequestMappings: current.pullRequestMappings?.map((mapping) => (
+      mapping.status === 'resolved'
+        ? { ...mapping, expectedBaseRefName: baseRefName }
+        : mapping
+    )),
+  };
 }
 
 function candidateRunner(changedFiles: number, filenames: readonly string[]) {
@@ -277,9 +298,7 @@ describe('production head-pinned merge port', () => {
       throw new Error(`unexpected ${command} ${args.join(' ')}`);
     };
     const port = makeProductionMergeActionPort({
-      readSnapshot: async () => {
-        throw new Error('unused');
-      },
+      readSnapshot: async () => snapshotWithBase('next'),
       authorAllowlist: new Set(['implementation-bot']),
       runner,
       environment: { GH_TOKEN: 'ambient-secret' },
@@ -328,9 +347,7 @@ describe('production head-pinned merge port', () => {
       throw new Error(`unexpected ${args.join(' ')}`);
     };
     const port = makeProductionMergeActionPort({
-      readSnapshot: async () => {
-        throw new Error('unused');
-      },
+      readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
       runner,
@@ -352,6 +369,65 @@ describe('production head-pinned merge port', () => {
       reason: expect.stringMatching(/base authority changed/i),
     });
     expect(mergeCalls).toBe(0);
+  });
+
+  it.each([
+    'a newly opened unlabeled duplicate',
+    'a closed custom parent',
+  ])('rejects %s from the final complete canonical snapshot before merge', async () => {
+    let mergeCalls = 0;
+    const ambiguous: GitHubLifecycleSnapshot = {
+      ...snapshot(),
+      diagnostics: [{
+        issueNumber: 84,
+        pullRequests: [{ number: 84, head: HEAD }],
+        reason: 'ambiguous',
+      }],
+      pullRequestMappings: [{
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [84],
+        details: ['Live canonical relation evidence changed'],
+      }],
+    } as unknown as GitHubLifecycleSnapshot;
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => ambiguous,
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: async (_command, args) => {
+        if (args.includes('-X') && args.includes('PUT')) mergeCalls += 1;
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+    const selection = selectCredential(new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+
+    await expect(port.mergeExactHead({
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: gitRefName('stack/base'),
+      credential: selection.credential,
+    })).resolves.toMatchObject({
+      status: 'rejected',
+      reason: expect.stringMatching(/canonical mapping authority changed/i),
+    });
+    expect(mergeCalls).toBe(0);
+  });
+
+  it('fails closed when the candidate snapshot omits canonical mapping authority', async () => {
+    const current = snapshot();
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => ({ ...current, pullRequestMappings: undefined }),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: candidateRunner(1, ['GREETING.md']),
+    });
+
+    await expect(port.readCandidate(84)).resolves.toBeNull();
   });
 
   it.each([

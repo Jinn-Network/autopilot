@@ -9,6 +9,11 @@ import {
 } from '../../src/lifecycle/snapshot.js';
 import { deriveLifecycle, planCycle } from '../../src/lifecycle/lifecycle.js';
 import { FULL_SCAN_RESERVE } from '../../src/lifecycle/github-usage.js';
+import { planProjection } from '../../src/lifecycle/projection.js';
+import { executeProjectionPlan } from '../../src/lifecycle/reconciler.js';
+import { executeReviewAction } from '../../src/lifecycle/review-executor.js';
+import { CredentialPool } from '../../src/lifecycle/credentials.js';
+import { formatAutomatedReviewMarker } from '../../src/lifecycle/codecs.js';
 
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const REVIEW_REF = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -250,6 +255,353 @@ describe('buildGitHubLifecycleSnapshot', () => {
       reviewSlots: 0,
       usableCredentialLanes: 1,
     }, 'active')).toEqual([{
+      kind: 'merge',
+      issueNumber: 2084,
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: 'autopilot/2083',
+    }]);
+  });
+
+  it('runs #2084 from ambiguous machine Human through one repair and fresh review to its pinned parent merge', async () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const attempt = '33333333-3333-4333-8333-333333333333';
+    const newGeneration = '44444444-4444-4444-8444-444444444444';
+    const newAttempt = '55555555-5555-4555-8555-555555555555';
+    const newReviewOid = 'cccccccccccccccccccccccccccccccccccccccc';
+    const intent = '66666666-6666-4666-8666-666666666666';
+    const mappingReason = {
+      phase: 'implementing' as const,
+      code: 'branch-mapping-ambiguous' as const,
+      detail: 'A competing PR made the #2084 mapping ambiguous.',
+    };
+    let duplicatePresent = true;
+    let projectStatus: 'Human' | 'In Review' = 'Human';
+    let draft = true;
+    let humanOverlay = true;
+    let reviewState: 'human' | 'stale' | 'terminal-approved' = 'human';
+    let nativeReviews = [];
+    let checks = [];
+    let mergeability = 'UNKNOWN';
+    let mergeStateStatus = 'BLOCKED';
+    const reviewPayload = () => JSON.stringify({
+      protocolVersion: 2,
+      prNumber: 84,
+      generation: reviewState === 'terminal-approved' ? newGeneration : generation,
+      attempt: reviewState === 'terminal-approved' ? newAttempt : attempt,
+      reviewer: reviewState === 'terminal-approved' ? 'review-bot' : 'maintenance-bot',
+      head: HEAD,
+      state: reviewState,
+      recordedAt: '2026-07-20T11:00:00.000Z',
+      ...(reviewState === 'terminal-approved'
+        ? { verdict: { marker: intent, state: 'APPROVE' } }
+        : {}),
+    });
+    const targetPr = () => ({
+      ...page('page-2').nodes[0]!,
+      number: 84,
+      body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+      baseRefName: 'autopilot/2083',
+      headRefName: 'autopilot/2084',
+      closingIssueNumbers: [],
+      isDraft: draft,
+      labels: humanOverlay
+        ? ['engine:review', 'review:needs-human']
+        : ['engine:review'],
+      humanIssueNumber: humanOverlay ? 2084 : null,
+      humanAuthor: humanOverlay ? 'maintenance-bot' : null,
+      humanHead: humanOverlay ? HEAD : null,
+      humanGeneration: humanOverlay ? generation : null,
+      humanLabelActor: humanOverlay ? 'maintenance-bot' : null,
+      draftActor: humanOverlay && draft ? 'maintenance-bot' : null,
+      humanReason: humanOverlay ? mappingReason : null,
+      reviews: nativeReviews,
+      checks,
+      mergeability,
+      mergeStateStatus,
+      reviewClaim: {
+        oid: reviewState === 'terminal-approved' ? newReviewOid : REVIEW_REF,
+        payload: reviewPayload(),
+      },
+      branchClaimTrailers: [
+        'Jinn-Autopilot-Protocol: 2',
+        'Jinn-Autopilot-Phase: implement',
+        'Jinn-Autopilot-Issue: 2084',
+        'Jinn-Autopilot-PR: 84',
+        'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
+        'Jinn-Autopilot-Runner: runner-a',
+        'Jinn-Autopilot-Login: trusted',
+        `Jinn-Autopilot-Expected-Head: ${HEAD}`,
+        'Jinn-Autopilot-Target-Base: autopilot/2083',
+        'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
+        'Jinn-Autopilot-Phase-Complete: true',
+      ].join('\n'),
+    });
+    const source = reader({
+      readProjectSnapshot: async () => ({
+        ...(await reader().readProjectSnapshot()),
+        items: [{
+          id: 'PVTI_2084',
+          number: 2084,
+          contentType: 'Issue',
+          status: projectStatus,
+          priority: 'P1',
+          effort: 'Medium',
+          blockedOn: 'Another issue',
+          issueType: 'feat',
+          blockedByIssues: [2083],
+          sprintIterationId: 'sprint',
+        }],
+      }),
+      readIssues: async () => [{
+        ...issue(),
+        number: 2084,
+        status: projectStatus,
+        blockedOn: 'Another issue',
+        blockedByIssues: [2083],
+      }],
+      readPullRequests: async () => ({
+        nodes: [
+          targetPr(),
+          ...(duplicatePresent ? [{
+            ...page('page-2').nodes[0]!,
+            number: 85,
+            title: 'competing unlabeled PR',
+            body: 'Closes #2084',
+            headRefName: 'feature/duplicate-2084',
+            closingIssueNumbers: [2084],
+            labels: [],
+            reviewClaim: null,
+            branchClaimTrailers: null,
+          }] : []),
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readBranchClaims: async () => [{
+        issueNumber: 2084,
+        headRefName: 'autopilot/2084',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T09:00:00.000Z',
+        claimTrailers: [
+          'Jinn-Autopilot-Protocol: 2',
+          'Jinn-Autopilot-Phase: implement',
+          'Jinn-Autopilot-Issue: 2084',
+          'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
+          'Jinn-Autopilot-Runner: runner-a',
+          'Jinn-Autopilot-Login: trusted',
+          `Jinn-Autopilot-Expected-Head: ${HEAD}`,
+          'Jinn-Autopilot-Target-Base: autopilot/2083',
+          'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
+        ].join('\n'),
+      }],
+    });
+    const build = () => buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      defaultBranch: 'next',
+      machineAuthorLogins: new Set(['maintenance-bot', 'review-bot']),
+    });
+
+    const ambiguous = await build();
+    expect(ambiguous.pullRequestMappings?.find((mapping) => mapping.prNumber === 84))
+      .toMatchObject({ status: 'ambiguous' });
+    expect(planProjection({
+      view: deriveLifecycle(
+        ambiguous.lifecycle,
+        new Date('2026-07-20T12:00:00.000Z'),
+        2 * 60 * 60_000,
+      ),
+      pullRequests: ambiguous.pullRequests.map((pr) => ({
+        number: pr.number,
+        reviewRefOid: pr.reviewClaim?.oid,
+      })),
+      orphanBranchClaims: [],
+      mappingDiagnostics: ambiguous.diagnostics,
+    }).actions.some((action) => action.kind === 'ensure-human-comment')).toBe(true);
+
+    duplicatePresent = false;
+    const repairable = await build();
+    const repairPlan = planProjection({
+      view: deriveLifecycle(
+        repairable.lifecycle,
+        new Date('2026-07-20T12:00:00.000Z'),
+        2 * 60 * 60_000,
+      ),
+      pullRequests: repairable.pullRequests.map((pr) => ({
+        number: pr.number,
+        reviewRefOid: pr.reviewClaim?.oid,
+      })),
+      orphanBranchClaims: [],
+      mappingDiagnostics: repairable.diagnostics,
+    });
+    expect(repairPlan.actions).toEqual([expect.objectContaining({
+      kind: 'repair-obsolete-mapping-human',
+      issueNumber: 2084,
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedGeneration: generation,
+      expectedAuthor: 'maintenance-bot',
+    })]);
+
+    let repairs = 0;
+    const reconciliation = await executeProjectionPlan(repairPlan, {
+      readPullRequest: async () => ({
+        head: HEAD,
+        draft,
+        labels: humanOverlay
+          ? ['engine:review', 'review:needs-human']
+          : ['engine:review'],
+      }),
+      readReviewRef: async () => ({
+        oid: REVIEW_REF,
+        head: HEAD,
+        generation,
+        state: reviewState,
+      }),
+      repairObsoleteMappingHuman: async () => {
+        repairs += 1;
+        reviewState = 'stale';
+        humanOverlay = false;
+        draft = false;
+      },
+      readObsoleteMappingHumanRepairState: async () => ({
+        complete: !humanOverlay && !draft && reviewState === 'stale',
+      }),
+    });
+    expect(reconciliation.results).toEqual([{
+      action: repairPlan.actions[0],
+      outcome: 'applied',
+    }]);
+    expect(repairs).toBe(1);
+
+    // The normal painter observes the removed durable Human sources.
+    projectStatus = 'In Review';
+    const repainted = await build();
+    const reviewView = deriveLifecycle(
+      repainted.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60_000,
+    );
+    const scheduled = planCycle(reviewView, {
+      implementationSlots: 0,
+      reviewSlots: 1,
+      usableCredentialLanes: 1,
+    }, 'active');
+    expect(scheduled).toEqual([{
+      kind: 'claim-review',
+      issueNumber: 2084,
+      prNumber: 84,
+      head: HEAD,
+    }]);
+
+    let spawned = 0;
+    let activeRecord;
+    const candidate = {
+      issueNumber: 2084,
+      number: 84,
+      open: true,
+      head: HEAD,
+      headChangedAt: '2026-07-20T09:00:00.000Z',
+      headRefName: 'autopilot/2084',
+      baseRefName: 'autopilot/2083',
+      draft: false,
+      author: 'trusted',
+      labels: ['engine:review'],
+      body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+      humanHold: false,
+      approvalPolicy: 'approve-eligible',
+      nativeReviews: [],
+      reviewRef: {
+        oid: REVIEW_REF,
+        record: JSON.parse(reviewPayload()),
+      },
+    };
+    const reviewResult = await executeReviewAction({
+      prNumber: 84,
+      expectedHead: HEAD,
+    }, {
+      readCandidate: async () => candidate,
+      confirmAcquisition: async ({ expectedReviewRefOid }) => ({
+        ...candidate,
+        reviewRef: { oid: expectedReviewRefOid, record: activeRecord },
+      }),
+      credentials: new CredentialPool([{
+        login: 'review-bot',
+        normalizedLogin: 'review-bot',
+        reviewToken: 'review-secret',
+      }]),
+      createReviewRecord: async ({ record }) => {
+        activeRecord = record;
+        return newReviewOid;
+      },
+      publishReviewClaim: async ({ recordOid, expectedRemoteRecordOid }) => ({
+        status: 'won',
+        expected: expectedRemoteRecordOid,
+        published: recordOid,
+        observed: recordOid,
+      }),
+      createAttempt: async (input) => ({
+        attemptId: input.attemptId,
+        paths: {
+          worktree: '/tmp/review/worktree',
+          manifest: '/tmp/review/manifest.json',
+          log: '/tmp/review/session.log',
+          ghConfigDir: '/tmp/review/gh-config',
+          askpass: '/tmp/review/askpass',
+        },
+      }),
+      repairProjection: async () => {},
+      startSession: async () => {
+        spawned += 1;
+        return { status: 'started', backend: 'local', pid: 42 };
+      },
+      escalateHuman: async () => {
+        throw new Error('fresh repaired review must not escalate');
+      },
+      ambientEnvironment: {},
+      nextAttemptId: () => newAttempt,
+      nextGeneration: () => newGeneration,
+      runnerId: 'runner-a',
+      now: () => new Date('2026-07-20T12:00:00.000Z'),
+      staleAfterMs: 2 * 60 * 60_000,
+      sleep: async () => {},
+    });
+    expect(reviewResult).toMatchObject({
+      status: 'spawned',
+      prNumber: 84,
+      head: HEAD,
+      generation: newGeneration,
+    });
+    expect(spawned).toBe(1);
+
+    reviewState = 'terminal-approved';
+    nativeReviews = [{
+      reviewer: 'review-bot',
+      state: 'APPROVED',
+      commitId: HEAD,
+      body: formatAutomatedReviewMarker({
+        generation: newGeneration,
+        attempt: newAttempt,
+        intent,
+        reviewer: 'review-bot',
+        head: HEAD,
+        verdict: 'APPROVE',
+      }),
+      submittedAt: '2026-07-20T12:10:00.000Z',
+    }];
+    checks = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+    mergeability = 'MERGEABLE';
+    mergeStateStatus = 'CLEAN';
+    const terminal = await build();
+    const mergeActions = planCycle(deriveLifecycle(
+      terminal.lifecycle,
+      new Date('2026-07-20T12:15:00.000Z'),
+      2 * 60 * 60_000,
+    ), {
+      implementationSlots: 0,
+      reviewSlots: 0,
+      usableCredentialLanes: 1,
+    }, 'active');
+    expect(mergeActions).toEqual([{
       kind: 'merge',
       issueNumber: 2084,
       prNumber: 84,
@@ -956,6 +1308,10 @@ describe('buildGitHubLifecycleSnapshot', () => {
           labels: ['engine:review', 'review:needs-human'],
           humanIssueNumber: 42,
           humanAuthor: 'maintenance-bot',
+          humanHead: HEAD,
+          humanGeneration: '22222222-2222-4222-8222-222222222222',
+          humanLabelActor: 'maintenance-bot',
+          draftActor: null,
           humanReason: mappingReason,
           reviewClaim: {
             ...original.reviewClaim!,
@@ -988,6 +1344,66 @@ describe('buildGitHubLifecycleSnapshot', () => {
         reason: mappingReason,
       },
     });
+  });
+
+  it.each([
+    ['maintainer-owned Human label', {
+      humanLabelActor: 'maintainer',
+      draftActor: null,
+    }],
+    ['maintainer-owned diagnostic draft', {
+      humanLabelActor: 'maintenance-bot',
+      draftActor: 'maintainer',
+    }],
+    ['comment missing exact head/generation provenance', {
+      humanLabelActor: 'maintenance-bot',
+      draftActor: null,
+      humanHead: undefined,
+      humanGeneration: undefined,
+    }],
+  ])('preserves a %s instead of planning automatic repair', async (_name, provenance) => {
+    const original = page('page-2').nodes[0]!;
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...original,
+          labels: ['engine:review', 'review:needs-human'],
+          humanIssueNumber: 42,
+          humanAuthor: 'maintenance-bot',
+          humanHead: HEAD,
+          humanGeneration: generation,
+          humanReason: {
+            phase: 'implementing',
+            code: 'branch-mapping-ambiguous',
+            detail: 'Old evidence could not uniquely map this PR.',
+          },
+          isDraft: provenance.draftActor !== null,
+          ...provenance,
+          reviewClaim: {
+            ...original.reviewClaim!,
+            payload: JSON.stringify({
+              protocolVersion: 2,
+              prNumber: 101,
+              generation,
+              attempt: '33333333-3333-4333-8333-333333333333',
+              reviewer: 'reviewer',
+              head: HEAD,
+              state: 'human',
+              recordedAt: '2026-07-20T09:00:00.000Z',
+            }),
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      machineAuthorLogins: new Set(['maintenance-bot']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).not.toHaveProperty('obsoleteMachineMappingHuman');
   });
 
   it.each([

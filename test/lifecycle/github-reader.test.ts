@@ -71,6 +71,13 @@ function graphQlPr(input: {
   readonly state: 'OPEN' | 'MERGED' | 'CLOSED';
   readonly head: string;
   readonly comments?: readonly string[];
+  readonly commentAuthor?: string;
+  readonly timelineItems?: readonly {
+    readonly __typename: 'LabeledEvent' | 'UnlabeledEvent' | 'ConvertToDraftEvent' | 'ReadyForReviewEvent';
+    readonly actor: { readonly login: string } | null;
+    readonly createdAt: string;
+    readonly label?: { readonly name: string };
+  }[];
   readonly headRefName?: string;
   readonly historyTruncated?: boolean;
   readonly commentsTruncated?: boolean;
@@ -83,6 +90,7 @@ function graphQlPr(input: {
     number: input.number,
     title: `PR ${input.number}`,
     body: 'Lifecycle PR',
+    updatedAt: '2026-07-20T09:30:00.000Z',
     author: { login: 'trusted' },
     baseRefName: 'next',
     headRefName: input.headRefName ?? `autopilot/${input.number === 101 ? 42 : 41}`,
@@ -120,7 +128,12 @@ function graphQlPr(input: {
       nodes: (input.comments ?? []).map((body, index) => ({
         body,
         createdAt: `2026-07-20T09:0${index}:00.000Z`,
+        author: input.commentAuthor === undefined ? null : { login: input.commentAuthor },
       })),
+    },
+    timelineItems: {
+      pageInfo: { hasPreviousPage: false },
+      nodes: [...(input.timelineItems ?? [])],
     },
     statusCheckRollup: input.statusCheckRollup ?? null,
   };
@@ -816,7 +829,7 @@ describe('GhLifecycleReader', () => {
     });
     const queries = calls.map((args) => args.find((arg) => arg.startsWith('query=')) ?? '');
     expect(queries[0]).toContain('states: [OPEN]');
-    expect(queries[0]).toContain('labels: ["engine:review"]');
+    expect(queries[0]).not.toContain('labels: ["engine:review"]');
     const mergedQuery = queries.find((query) => query.includes('closedByPullRequestsReferences'));
     expect(mergedQuery).toContain('issue42: issue(number: 42)');
     expect(mergedQuery).toContain(
@@ -833,6 +846,64 @@ describe('GhLifecycleReader', () => {
       [101, 'OPEN'],
       [99, 'MERGED'],
     ]);
+  });
+
+  it('retains exact mapping-comment and current Human label/draft timeline provenance', async () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const marker = '<!-- jinn-autopilot-human:v2 issue=42 pr=101 '
+      + 'phase=implementing code=branch-mapping-ambiguous '
+      + `head=${OPEN_HEAD} generation=${generation} -->`;
+    const reader = new GhLifecycleReader(async (command, args) => {
+      const stub = noReviewClaimRefs(command);
+      if (stub !== undefined) return stub;
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('closedByPullRequestsReferences')) {
+        return JSON.stringify({
+          data: {
+            rateLimit: rateLimit(),
+            repository: {},
+          },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [graphQlPr({
+                number: 101,
+                state: 'OPEN',
+                head: OPEN_HEAD,
+                labels: ['engine:review', 'review:needs-human'],
+                comments: [`${marker}\n\nMapping was ambiguous.`],
+                commentAuthor: 'maintenance-bot',
+                timelineItems: [{
+                  __typename: 'LabeledEvent',
+                  actor: { login: 'maintenance-bot' },
+                  createdAt: '2026-07-20T09:10:00.000Z',
+                  label: { name: 'review:needs-human' },
+                }, {
+                  __typename: 'ConvertToDraftEvent',
+                  actor: { login: 'maintenance-bot' },
+                  createdAt: '2026-07-20T09:11:00.000Z',
+                }],
+              })],
+            },
+          },
+        },
+      });
+    });
+
+    await expect(reader.readPullRequests(null)).resolves.toMatchObject({
+      nodes: [{
+        humanAuthor: 'maintenance-bot',
+        humanHead: OPEN_HEAD,
+        humanGeneration: generation,
+        humanLabelActor: 'maintenance-bot',
+        draftActor: 'maintenance-bot',
+      }],
+    });
   });
 
   it('paginates adopted-branch ancestry until it finds the latest v2 marker', async () => {

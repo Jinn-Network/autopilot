@@ -109,6 +109,7 @@ export interface PullRequestSnapshot {
   readonly headRefName: string;
   readonly headOid: GitOid;
   readonly headCommittedAt: string;
+  readonly updatedAt?: string;
   readonly isDraft: boolean;
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
@@ -124,6 +125,12 @@ export interface PullRequestSnapshot {
   readonly reviewClaim?: ReviewClaimSnapshot;
   readonly humanIssueNumber?: number;
   readonly humanAuthor?: string;
+  readonly humanHead?: GitOid;
+  readonly humanGeneration?: string;
+  /** Actor on the latest timeline event for the current Human label. */
+  readonly humanLabelActor?: string;
+  /** Actor on the latest timeline event for the current draft state. */
+  readonly draftActor?: string;
   readonly humanReason?: HumanReason;
   readonly mergedAt?: string;
   readonly mergeCommitOid?: GitOid;
@@ -146,6 +153,7 @@ export interface RawPullRequest {
   readonly headRefName: string;
   readonly headOid: string;
   readonly headCommittedAt: string;
+  readonly updatedAt?: string;
   readonly isDraft: boolean;
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
@@ -161,6 +169,10 @@ export interface RawPullRequest {
   readonly reviewClaim: { readonly oid: string; readonly payload: string } | null;
   readonly humanIssueNumber?: number | null;
   readonly humanAuthor?: string | null;
+  readonly humanHead?: string | null;
+  readonly humanGeneration?: string | null;
+  readonly humanLabelActor?: string | null;
+  readonly draftActor?: string | null;
   readonly humanReason: HumanReason | null;
   readonly mergedAt: string | null;
   readonly mergeCommitOid: string | null;
@@ -305,6 +317,7 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
     assertPositiveInteger(raw.number, 'PR number');
     const headOid = gitOid(raw.headOid);
     isoTimestamp(raw.headCommittedAt);
+    if (raw.updatedAt !== undefined) isoTimestamp(raw.updatedAt);
     const reviews = raw.reviews.map((review): NativeReviewSnapshot => {
       isoTimestamp(review.submittedAt);
       return {
@@ -335,6 +348,9 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
     if (raw.humanIssueNumber !== undefined && raw.humanIssueNumber !== null) {
       assertPositiveInteger(raw.humanIssueNumber, 'Human marker issue number');
     }
+    const humanHead = raw.humanHead === undefined || raw.humanHead === null
+      ? undefined
+      : gitOid(raw.humanHead);
     return {
       number: raw.number,
       title: raw.title,
@@ -344,6 +360,7 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       headRefName: raw.headRefName,
       headOid,
       headCommittedAt: raw.headCommittedAt,
+      ...(raw.updatedAt === undefined ? {} : { updatedAt: raw.updatedAt }),
       isDraft: raw.isDraft,
       state: raw.state,
       labels: [...raw.labels],
@@ -366,6 +383,16 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       ...(raw.humanAuthor === undefined || raw.humanAuthor === null
         ? {}
         : { humanAuthor: raw.humanAuthor }),
+      ...(humanHead === undefined ? {} : { humanHead }),
+      ...(raw.humanGeneration === undefined || raw.humanGeneration === null
+        ? {}
+        : { humanGeneration: raw.humanGeneration }),
+      ...(raw.humanLabelActor === undefined || raw.humanLabelActor === null
+        ? {}
+        : { humanLabelActor: raw.humanLabelActor }),
+      ...(raw.draftActor === undefined || raw.draftActor === null
+        ? {}
+        : { draftActor: raw.draftActor }),
       ...(raw.humanReason === null ? {} : { humanReason: raw.humanReason }),
       ...(raw.mergedAt === null ? {} : { mergedAt: raw.mergedAt }),
       ...(raw.mergeCommitOid === null ? {} : { mergeCommitOid: gitOid(raw.mergeCommitOid) }),
@@ -502,6 +529,16 @@ function lifecyclePr(
     && pr.humanIssueNumber === issue.number
     && pr.humanAuthor !== undefined
     && machineAuthorLogins.has(pr.humanAuthor.toLowerCase())
+    && pr.humanHead === pr.headOid
+    && pr.humanGeneration === reviewClaim?.generation
+    && (
+      !pr.labels.includes('review:needs-human')
+      || pr.humanLabelActor?.toLowerCase() === pr.humanAuthor.toLowerCase()
+    )
+    && (
+      !pr.isDraft
+      || pr.draftActor?.toLowerCase() === pr.humanAuthor.toLowerCase()
+    )
     && reviewClaim !== undefined
     && reviewClaim.head === pr.headOid
     && (reviewClaim.state === 'human' || reviewClaim.state === 'stale')

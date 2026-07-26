@@ -524,6 +524,7 @@ export async function runAutopilotV2(
     rateLimitFloor: DEFAULT_FLOOR,
     readGraphQlRemaining: currentGraphQlRemaining,
     readPullRequest: (prNumber) => reader.readPullRequestForReconciliation(prNumber),
+    readOpenPullRequestIndex: () => restDiscovery.readOpenPullRequestIndex(),
     readProjectItem: (issueNumber) => reader.readProjectItemForReconciliation(issueNumber),
     readIssue: (issueNumber) => restDiscovery.readIssueForAction(issueNumber),
     readBlockedByIssueNumbers: (issueNumber) =>
@@ -595,7 +596,10 @@ export async function runAutopilotV2(
             repositoryPath,
             cycleSnapshot,
             ...reconciliationTargets,
+            readCanonicalSnapshot: (prNumber) =>
+              targeted.readPullRequest(cycleSnapshot, prNumber),
             credential: selection.credential,
+            credentials,
             runner,
             environment: runtimeEnvironment,
             repositorySlug: loaded.config.repository.slug,

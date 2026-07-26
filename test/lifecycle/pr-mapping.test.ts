@@ -129,6 +129,48 @@ describe('canonical structured PR-to-issue mapping', () => {
     }]);
   });
 
+  it('rejects empty closing references on the default branch without an issue dependency', () => {
+    const input = stackedInput({
+      issues: [{ number: 2084, blockedOn: 'Nothing', blockedByIssues: [] }],
+      pullRequests: [{
+        ...stackedInput().pullRequests[0]!,
+        baseRefName: 'next',
+      }],
+      stableBranches: [{
+        ...stackedInput().stableBranches[0]!,
+        targetBase: 'next',
+      }],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)).toEqual([
+      expect.objectContaining({
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [2084],
+        details: [expect.stringMatching(/empty closing references.*dependency/i)],
+      }),
+    ]);
+  });
+
+  it('rejects a normal closing-reference PR retargeted away from its exact stable claim base', () => {
+    const input = stackedInput({
+      pullRequests: [{
+        ...stackedInput().pullRequests[0]!,
+        baseRefName: 'next',
+        closingIssueNumbers: [2084],
+      }],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)).toEqual([
+      expect.objectContaining({
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [2084],
+        details: [expect.stringMatching(/stable branch claim.*base/i)],
+      }),
+    ]);
+  });
+
   it('authorizes an exact unique open dependency PR branch without trusting its name', () => {
     const input = stackedInput({
       issues: [

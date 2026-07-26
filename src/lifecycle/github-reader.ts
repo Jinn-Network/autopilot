@@ -48,7 +48,7 @@ const COMMIT_HISTORY_PAGE_SIZE = 100;
 const MAX_COMMIT_HISTORY_PAGES = 100;
 
 const PR_FIELDS = `
-        number title body baseRefName headRefName headRefOid isDraft state
+        number title body updatedAt baseRefName headRefName headRefOid isDraft state
         author { login }
         labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
         closingIssuesReferences(first: 20) { pageInfo { hasNextPage } nodes { number } }
@@ -70,6 +70,16 @@ const PR_FIELDS = `
         comments(last: 100) {
           pageInfo { hasPreviousPage }
           nodes { body createdAt author { login } }
+        }
+        timelineItems(last: 100, itemTypes: [LABELED_EVENT, UNLABELED_EVENT, CONVERT_TO_DRAFT_EVENT, READY_FOR_REVIEW_EVENT]) {
+          pageInfo { hasPreviousPage }
+          nodes {
+            __typename
+            ... on LabeledEvent { actor { login } createdAt label { name } }
+            ... on UnlabeledEvent { actor { login } createdAt label { name } }
+            ... on ConvertToDraftEvent { actor { login } createdAt }
+            ... on ReadyForReviewEvent { actor { login } createdAt }
+          }
         }
         statusCheckRollup {
           contexts(first: 100) {
@@ -101,7 +111,7 @@ const MERGED_PR_FIELDS = `
 const PR_QUERY = `query($owner: String!, $name: String!, $cursor: String) {
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
-    pullRequests(first: ${PR_PAGE_SIZE}, after: $cursor, states: [OPEN], labels: ["engine:review"], orderBy: {field: UPDATED_AT, direction: DESC}) {
+    pullRequests(first: ${PR_PAGE_SIZE}, after: $cursor, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         ${PR_FIELDS}
@@ -380,6 +390,7 @@ interface GraphQlPr {
   number: number;
   title: string;
   body: string;
+  updatedAt: string;
   author: { login?: string } | null;
   baseRefName: string;
   headRefName: string;
@@ -415,6 +426,19 @@ interface GraphQlPr {
   comments: {
     pageInfo: { hasPreviousPage: boolean };
     nodes: Array<{ body: string; createdAt: string; author?: { login?: string } | null }>;
+  };
+  timelineItems: {
+    pageInfo: { hasPreviousPage: boolean };
+    nodes: Array<{
+      __typename:
+        | 'LabeledEvent'
+        | 'UnlabeledEvent'
+        | 'ConvertToDraftEvent'
+        | 'ReadyForReviewEvent';
+      actor: { login?: string } | null;
+      createdAt: string;
+      label?: { name: string };
+    }>;
   };
   statusCheckRollup: {
     contexts: {
@@ -534,6 +558,9 @@ function assertCompletePrNode(pr: GraphQlPr): void {
   }
   if (pr.comments.pageInfo.hasPreviousPage) {
     throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} comments were truncated`);
+  }
+  if (pr.timelineItems.pageInfo.hasPreviousPage) {
+    throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} timeline was truncated`);
   }
   if (pr.statusCheckRollup?.contexts.pageInfo.hasNextPage === true) {
     throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} checks were truncated`);
@@ -1211,6 +1238,26 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         `PR #${pr.number} has contradictory structured Human evidence`,
       );
     }
+    const latestHumanLabelEvent = [...pr.timelineItems.nodes]
+      .reverse()
+      .find((event) => (
+        (event.__typename === 'LabeledEvent' || event.__typename === 'UnlabeledEvent')
+        && event.label?.name === 'review:needs-human'
+      ));
+    const latestDraftEvent = [...pr.timelineItems.nodes]
+      .reverse()
+      .find((event) => (
+        event.__typename === 'ConvertToDraftEvent'
+        || event.__typename === 'ReadyForReviewEvent'
+      ));
+    const humanLabelActor = pr.labels.nodes.some((label) => label.name === 'review:needs-human')
+      && latestHumanLabelEvent?.__typename === 'LabeledEvent'
+      ? latestHumanLabelEvent.actor?.login
+      : undefined;
+    const draftActor = pr.isDraft
+      && latestDraftEvent?.__typename === 'ConvertToDraftEvent'
+      ? latestDraftEvent.actor?.login
+      : undefined;
     return {
       number: pr.number,
       title: pr.title,
@@ -1220,6 +1267,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       headRefName: pr.headRefName,
       headOid: pr.headRefOid,
       headCommittedAt: latest.committedDate,
+      updatedAt: pr.updatedAt,
       isDraft: pr.isDraft,
       state: pr.state,
       labels: pr.labels.nodes.map((label) => label.name),
@@ -1235,6 +1283,10 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         : null,
       humanIssueNumber: humanEvidence?.issueNumber ?? null,
       humanAuthor: humanEvidence?.author ?? null,
+      humanHead: humanEvidence?.head ?? null,
+      humanGeneration: humanEvidence?.generation ?? null,
+      humanLabelActor: humanLabelActor ?? null,
+      draftActor: draftActor ?? null,
       humanReason: humanEvidence?.reason ?? null,
       mergedAt: pr.mergedAt,
       mergeCommitOid: pr.mergeCommit?.oid ?? null,

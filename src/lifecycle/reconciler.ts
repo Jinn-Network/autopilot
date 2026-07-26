@@ -83,6 +83,15 @@ export interface ReconciliationWriter {
     readonly expectedAuthor: string;
     readonly marker: string;
   }): Promise<void>;
+  readObsoleteMappingHumanRepairState?(input: {
+    readonly issueNumber: number;
+    readonly prNumber: number;
+    readonly expectedHead: GitOid;
+    readonly expectedReviewRefOid: GitOid;
+    readonly expectedGeneration: string;
+    readonly expectedAuthor: string;
+    readonly marker: string;
+  }): Promise<{ readonly complete: boolean }>;
   completeVerdictIntent(
     prNumber: number,
     expectedReviewRefOid: GitOid,
@@ -391,9 +400,13 @@ async function repairObsoleteMappingHuman(
       return { action, outcome: 'changed-head' };
     }
     const after = await writer.readReviewRef(action.prNumber);
+    const cleanup = writer.readObsoleteMappingHumanRepairState === undefined
+      ? { complete: false }
+      : await writer.readObsoleteMappingHumanRepairState(action);
     return after?.head === action.expectedHead
       && after.generation === action.expectedGeneration
       && after.state === 'stale'
+      && cleanup.complete
       ? { action, outcome: 'applied' }
       : { action, outcome: 'lost-race' };
   } catch (error) {
