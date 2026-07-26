@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import {
   mkdtempSync,
   readFileSync,
@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AutopilotSessionCapsuleSchema,
@@ -30,29 +31,57 @@ import {
 const CREATED_AT = Date.parse('2026-07-26T12:00:00.000Z');
 const ATTEMPT_ID = '123e4567-e89b-42d3-a456-426614174001';
 const temporaryDirectories: string[] = [];
+const activeMarketplaceTaskWriters = new Map<ChildProcess, Promise<void>>();
 
-function startMarketplaceTaskWriter(input: Record<string, unknown>): {
+interface MarketplaceTaskWriterHandle {
   readonly ready: Promise<void>;
   readonly result: Promise<{
     readonly ok: boolean;
     readonly artifact?: { readonly requestDigest: string };
     readonly error?: string;
   }>;
-} {
-  const child = spawn(process.execPath, [
-    join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'),
-    join(process.cwd(), 'test/lifecycle/marketplace-task-writer.ts'),
-    JSON.stringify(input),
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function startMarketplaceTaskWriterProcess(
+  command: string,
+  args: readonly string[],
+  readyTimeoutMs = 10_000,
+): MarketplaceTaskWriterHandle {
+  const child = spawn(command, [...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const closed = new Promise<void>((resolve) => {
+    child.once('close', () => resolve());
+  });
+  activeMarketplaceTaskWriters.set(child, closed);
+  void closed.then(() => {
+    activeMarketplaceTaskWriters.delete(child);
+  });
   let stdout = '';
   let stderr = '';
   let markReady: (() => void) | undefined;
-  const ready = new Promise<void>((resolve) => {
+  let rejectReady: ((error: Error) => void) | undefined;
+  let readySettled = false;
+  const ready = new Promise<void>((resolve, reject) => {
     markReady = resolve;
+    rejectReady = reject;
   });
+  const readyTimeout = setTimeout(() => {
+    if (readySettled) return;
+    readySettled = true;
+    rejectReady?.(new Error(
+      `Marketplace Task writer did not become ready within ${readyTimeoutMs}ms`,
+    ));
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+    }
+  }, readyTimeoutMs);
+  readyTimeout.unref();
   child.stdout.on('data', (chunk: Buffer) => {
     stdout += chunk.toString();
-    if (stdout.startsWith('ready\n')) markReady?.();
+    if (!readySettled && stdout.startsWith('ready\n')) {
+      readySettled = true;
+      clearTimeout(readyTimeout);
+      markReady?.();
+    }
   });
   child.stderr.on('data', (chunk: Buffer) => {
     stderr += chunk.toString();
@@ -62,8 +91,23 @@ function startMarketplaceTaskWriter(input: Record<string, unknown>): {
     readonly artifact?: { readonly requestDigest: string };
     readonly error?: string;
   }>((resolve, reject) => {
-    child.on('error', reject);
-    child.on('close', () => {
+    child.on('error', (error) => {
+      clearTimeout(readyTimeout);
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady?.(error);
+      }
+      reject(error);
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(readyTimeout);
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady?.(new Error(
+          `Marketplace Task writer exited before ready `
+          + `(code ${code ?? 'null'}, signal ${signal ?? 'none'}): ${stderr}`,
+        ));
+      }
       try {
         const line = stdout.trimEnd().split('\n').at(-1) ?? '';
         resolve(JSON.parse(line) as {
@@ -79,7 +123,24 @@ function startMarketplaceTaskWriter(input: Record<string, unknown>): {
   return { ready, result };
 }
 
-afterEach(() => {
+function startMarketplaceTaskWriter(
+  input: Record<string, unknown>,
+): MarketplaceTaskWriterHandle {
+  return startMarketplaceTaskWriterProcess(process.execPath, [
+    join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'),
+    join(process.cwd(), 'test/lifecycle/marketplace-task-writer.ts'),
+    JSON.stringify(input),
+  ]);
+}
+
+afterEach(async () => {
+  const active = [...activeMarketplaceTaskWriters.entries()];
+  for (const [child] of active) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+    }
+  }
+  await Promise.all(active.map(([, closed]) => closed));
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -243,6 +304,49 @@ describe('marketplace Task request builder', () => {
 });
 
 describe('marketplace Task request artifact', () => {
+  it('rejects writer readiness when the child exits before its ready signal', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-marketplace-task-'));
+    temporaryDirectories.push(directory);
+    const originalCwd = process.cwd();
+    let writer: ReturnType<typeof startMarketplaceTaskWriter>;
+    try {
+      process.chdir(directory);
+      writer = startMarketplaceTaskWriter({});
+    } finally {
+      process.chdir(originalCwd);
+    }
+    const resultState = writer.result.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    const readyState = await Promise.race([
+      writer.ready.then(
+        () => 'resolved',
+        () => 'rejected',
+      ),
+      delay(250).then(() => 'hung'),
+    ]);
+
+    expect(readyState).toBe('rejected');
+    await expect(resultState).resolves.toBe('rejected');
+  });
+
+  it('bounds writer readiness and terminates a child that never becomes ready', async () => {
+    const writer = startMarketplaceTaskWriterProcess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1_000)'],
+      50,
+    );
+    const resultState = writer.result.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+
+    await expect(writer.ready).rejects.toThrow(/did not become ready within 50ms/i);
+    await expect(resultState).resolves.toBe('rejected');
+    expect(activeMarketplaceTaskWriters.size).toBe(0);
+  });
+
   it('durably writes canonical SDK-validated bytes with their digest and private mode', () => {
     const directory = mkdtempSync(join(tmpdir(), 'autopilot-marketplace-task-'));
     temporaryDirectories.push(directory);
