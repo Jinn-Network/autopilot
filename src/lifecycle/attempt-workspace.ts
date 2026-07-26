@@ -16,6 +16,10 @@ import {
 import { hostname as systemHostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import {
+  TaskSubmitResultV1Schema,
+  type TaskSubmitResultV1,
+} from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { gitOid, gitRefName, isoTimestamp } from './types.js';
 import {
@@ -29,6 +33,16 @@ export type AttemptPhase = 'implement' | 'review';
 export type AttemptProcessState = 'preparing' | 'running' | 'exited';
 export type ReviewApprovalPolicy = 'approve-eligible' | 'human-codeowner';
 export const MARKETPLACE_EXECUTION_SCHEMA_VERSION = 'marketplace-execution-v1';
+export const MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION = 'marketplace-execution-v2';
+
+interface MarketplacePreparedExecutionFields {
+  readonly requestPath: string;
+  readonly requestDigest: string;
+  readonly solverNetSelectionPath: string;
+  readonly preparedAt: string;
+  readonly agentSoftDeadline: string;
+  readonly adoptionDeadline: string;
+}
 
 export type MarketplaceExecutionState =
   | {
@@ -43,7 +57,23 @@ export type MarketplaceExecutionState =
       readonly taskId: string;
       readonly taskCid: string;
       readonly submittedAt: string;
-    };
+    }
+  | ({
+      readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+      readonly status: 'prepared';
+    } & MarketplacePreparedExecutionFields)
+  | ({
+      readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+      readonly status: 'submitted';
+      readonly submission: TaskSubmitResultV1;
+      readonly submittedAt: string;
+    } & MarketplacePreparedExecutionFields)
+  | ({
+      readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+      readonly status: 'cancelled';
+      readonly cancelledAt: string;
+      readonly reason: string;
+    } & MarketplacePreparedExecutionFields);
 
 export type AttemptExecution =
   | { readonly backend: 'local' }
@@ -226,10 +256,7 @@ function exactKeys(
 
 function decodeMarketplaceExecutionState(value: unknown): MarketplaceExecutionState {
   const state = record(value, 'marketplace execution state');
-  if (state.schemaVersion !== MARKETPLACE_EXECUTION_SCHEMA_VERSION) {
-    throw new Error('Unsupported marketplace execution schema version');
-  }
-  if (state.status === 'unsubmitted') {
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_SCHEMA_VERSION && state.status === 'unsubmitted') {
     exactKeys(state, [
       'schemaVersion',
       'status',
@@ -241,7 +268,7 @@ function decodeMarketplaceExecutionState(value: unknown): MarketplaceExecutionSt
       requestPath: absolutePath(state.requestPath, 'marketplace request path'),
     };
   }
-  if (state.status === 'submitted') {
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_SCHEMA_VERSION && state.status === 'submitted') {
     exactKeys(state, [
       'schemaVersion',
       'status',
@@ -257,6 +284,126 @@ function decodeMarketplaceExecutionState(value: unknown): MarketplaceExecutionSt
       taskId: stringField(state.taskId, 'marketplace task ID'),
       taskCid: stringField(state.taskCid, 'marketplace task CID'),
       submittedAt: isoTimestamp(stringField(state.submittedAt, 'marketplace submitted timestamp')),
+    };
+  }
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION) {
+    return decodeMarketplaceExecutionV2State(state);
+  }
+  if (
+    state.schemaVersion !== MARKETPLACE_EXECUTION_SCHEMA_VERSION
+    && state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+  ) {
+    throw new Error('Unsupported marketplace execution schema version');
+  }
+  throw new Error('Invalid marketplace execution status');
+}
+
+function marketplaceRequestDigest(value: unknown): string {
+  const digest = stringField(value, 'marketplace request digest');
+  if (!/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    throw new Error('Invalid marketplace request digest');
+  }
+  return digest;
+}
+
+function decodeMarketplacePreparedExecutionFields(
+  state: Record<string, unknown>,
+): MarketplacePreparedExecutionFields {
+  const preparedAt = isoTimestamp(stringField(state.preparedAt, 'marketplace preparation timestamp'));
+  const agentSoftDeadline = isoTimestamp(
+    stringField(state.agentSoftDeadline, 'marketplace agent soft deadline'),
+  );
+  const adoptionDeadline = isoTimestamp(
+    stringField(state.adoptionDeadline, 'marketplace adoption deadline'),
+  );
+  if (
+    Date.parse(preparedAt) > Date.parse(agentSoftDeadline)
+    || Date.parse(agentSoftDeadline) > Date.parse(adoptionDeadline)
+  ) {
+    throw new Error('Marketplace execution deadlines disagree');
+  }
+  return {
+    requestPath: absolutePath(state.requestPath, 'marketplace request path'),
+    requestDigest: marketplaceRequestDigest(state.requestDigest),
+    solverNetSelectionPath: absolutePath(
+      state.solverNetSelectionPath,
+      'marketplace SolverNet selection path',
+    ),
+    preparedAt,
+    agentSoftDeadline,
+    adoptionDeadline,
+  };
+}
+
+function decodeMarketplaceSubmission(value: unknown): TaskSubmitResultV1 {
+  const parsed = TaskSubmitResultV1Schema.safeParse(value);
+  if (!parsed.success) throw new Error('Invalid marketplace task submission result');
+  return parsed.data;
+}
+
+function decodeMarketplaceExecutionV2State(
+  state: Record<string, unknown>,
+): MarketplaceExecutionState {
+  const fields = decodeMarketplacePreparedExecutionFields(state);
+  if (state.status === 'prepared') {
+    exactKeys(state, [
+      'schemaVersion',
+      'status',
+      'requestPath',
+      'requestDigest',
+      'solverNetSelectionPath',
+      'preparedAt',
+      'agentSoftDeadline',
+      'adoptionDeadline',
+    ], 'prepared marketplace execution state');
+    return {
+      schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+      status: 'prepared',
+      ...fields,
+    };
+  }
+  if (state.status === 'submitted') {
+    exactKeys(state, [
+      'schemaVersion',
+      'status',
+      'requestPath',
+      'requestDigest',
+      'solverNetSelectionPath',
+      'preparedAt',
+      'agentSoftDeadline',
+      'adoptionDeadline',
+      'submission',
+      'submittedAt',
+    ], 'submitted marketplace execution state');
+    return {
+      schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+      status: 'submitted',
+      ...fields,
+      submission: decodeMarketplaceSubmission(state.submission),
+      submittedAt: isoTimestamp(stringField(state.submittedAt, 'marketplace submitted timestamp')),
+    };
+  }
+  if (state.status === 'cancelled') {
+    exactKeys(state, [
+      'schemaVersion',
+      'status',
+      'requestPath',
+      'requestDigest',
+      'solverNetSelectionPath',
+      'preparedAt',
+      'agentSoftDeadline',
+      'adoptionDeadline',
+      'cancelledAt',
+      'reason',
+    ], 'cancelled marketplace execution state');
+    return {
+      schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+      status: 'cancelled',
+      ...fields,
+      cancelledAt: isoTimestamp(
+        stringField(state.cancelledAt, 'marketplace cancellation timestamp'),
+      ),
+      reason: stringField(state.reason, 'marketplace cancellation reason'),
     };
   }
   throw new Error('Invalid marketplace execution status');
@@ -594,6 +741,78 @@ export function updateAttemptManifest(
   if (!isDeepStrictEqual(staticFields(next), previousStaticFields)) {
     throw new Error('Atomic manifest update cannot change static attempt fields');
   }
+  writeManifestAtomic(path, next);
+  return next;
+}
+
+export type MarketplaceExecutionTransition =
+  | { readonly status: 'submitted'; readonly submission: TaskSubmitResultV1 }
+  | { readonly status: 'cancelled'; readonly reason: string };
+
+/**
+ * Records exactly one durable marketplace outcome for a prepared request.
+ * Replaying the same terminal outcome is a no-op; any competing outcome is
+ * rejected before the manifest can be rewritten.
+ */
+export function transitionMarketplaceExecution(
+  path: string,
+  expectedRequestDigest: string,
+  transition: MarketplaceExecutionTransition,
+  now: () => Date = () => new Date(),
+): AttemptManifest {
+  const expectedDigest = marketplaceRequestDigest(expectedRequestDigest);
+  const previous = readAttemptManifest(path);
+  if (previous.execution.backend !== 'marketplace') {
+    throw new Error('Only marketplace attempts may transition marketplace execution');
+  }
+  const state = previous.execution.state;
+  if (
+    state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || state.requestDigest !== expectedDigest
+  ) {
+    throw new Error('Marketplace request digest changed before execution transition');
+  }
+  const submission = transition.status === 'submitted'
+    ? decodeMarketplaceSubmission(transition.submission)
+    : undefined;
+  const cancellationReason = transition.status === 'cancelled'
+    ? stringField(transition.reason, 'marketplace cancellation reason')
+    : undefined;
+  if (state.status === 'submitted' && transition.status === 'submitted') {
+    if (isDeepStrictEqual(state.submission, submission)) return previous;
+    throw new Error('Marketplace execution already has a contradictory submission');
+  }
+  if (state.status === 'cancelled' && transition.status === 'cancelled') {
+    if (state.reason === cancellationReason) return previous;
+    throw new Error('Marketplace execution already has a contradictory cancellation');
+  }
+  if (state.status !== 'prepared') {
+    throw new Error('Only a prepared marketplace execution may transition');
+  }
+  const timestamp = transitionTimestamp(now);
+  const next = decodeAttemptManifest({
+    ...previous,
+    execution: {
+      backend: 'marketplace',
+      state: transition.status === 'submitted'
+        ? {
+            ...state,
+            status: 'submitted',
+            submission: submission!,
+            submittedAt: timestamp,
+          }
+        : {
+            ...state,
+            status: 'cancelled',
+            cancelledAt: timestamp,
+            reason: cancellationReason!,
+          },
+    },
+    timestamps: {
+      ...previous.timestamps,
+      updatedAt: timestamp,
+    },
+  });
   writeManifestAtomic(path, next);
   return next;
 }
@@ -1108,14 +1327,7 @@ export function listRunnerLiveAttempts(
         const manifest = readAttemptManifest(manifestPath);
         if (
           manifest.runnerId === runnerId
-          && (
-            manifest.processState === 'preparing'
-            || (
-              manifest.processState === 'running'
-              && manifest.pid !== null
-              && isPidAlive(manifest.pid)
-            )
-          )
+          && isRunnerLiveAttempt(manifest, isPidAlive)
         ) {
           attempts.push(manifest);
         }
@@ -1126,6 +1338,25 @@ export function listRunnerLiveAttempts(
     }
   }
   return attempts;
+}
+
+function isRunnerLiveAttempt(
+  manifest: AttemptManifest,
+  isPidAlive: (pid: number) => boolean,
+): boolean {
+  if (
+    manifest.execution.backend === 'marketplace'
+    && manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+  ) {
+    return manifest.execution.state.status === 'prepared'
+      || manifest.execution.state.status === 'submitted';
+  }
+  return manifest.processState === 'preparing'
+    || (
+      manifest.processState === 'running'
+      && manifest.pid !== null
+      && isPidAlive(manifest.pid)
+    );
 }
 
 export type CleanupReasonCode =
