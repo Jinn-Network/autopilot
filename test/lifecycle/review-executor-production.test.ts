@@ -253,6 +253,48 @@ describe('production review acquisition port', () => {
     });
   });
 
+  it('fails closed on the canonical structured mapping result during acquisition and confirmation', async () => {
+    const ambiguous: GitHubLifecycleSnapshot = {
+      ...snapshot(),
+      pullRequestMappings: [{
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [42, 84],
+        details: ['PR #84 marker and dependency evidence contradict each other'],
+      }],
+    };
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => ambiguous,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async (command, args) => {
+        expect(command).toBe('gh');
+        if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+          return JSON.stringify({
+            changed_files: 0,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: '4'.repeat(40) },
+          });
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      mappingProblem: 'PR #84 marker and dependency evidence contradict each other',
+    });
+    await expect(port.confirmAcquisition({
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW,
+    })).resolves.toMatchObject({
+      mappingProblem: 'PR #84 marker and dependency evidence contradict each other',
+    });
+  });
+
   it('forces Human approval policy when REST total disproves file completeness', async () => {
     const port = makeProductionReviewActionPort({
       repositoryPath: '/repo',

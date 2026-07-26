@@ -115,6 +115,7 @@ export interface MergeExecutorDeps {
   mergeExactHead(input: {
     readonly prNumber: number;
     readonly head: GitOid;
+    readonly expectedBaseRefName: GitRefName;
     readonly credential: SelectedCredential;
   }): Promise<ExactMergeOutcome>;
   reconcileDone(input: {
@@ -170,7 +171,11 @@ export type MergeExecutionResult =
     };
 
 export async function executeMergeAction(
-  action: { readonly prNumber: number; readonly expectedHead: GitOid },
+  action: {
+    readonly prNumber: number;
+    readonly expectedHead: GitOid;
+    readonly expectedBaseRefName: GitRefName;
+  },
   deps: MergeExecutorDeps,
 ): Promise<MergeExecutionResult> {
   if (!Number.isSafeInteger(action.prNumber) || action.prNumber <= 0) {
@@ -186,6 +191,14 @@ export async function executeMergeAction(
   }
   if (initial.head !== action.expectedHead) {
     return { status: 'changed-head', prNumber: action.prNumber, head: initial.head };
+  }
+  if (initial.expectedBaseRefName !== action.expectedBaseRefName) {
+    return {
+      status: 'ineligible',
+      prNumber: action.prNumber,
+      head: initial.head,
+      reasons: ['base'],
+    };
   }
   const initialGate = evaluateMergeGate(initial);
   if (!initialGate.pass) {
@@ -216,6 +229,14 @@ export async function executeMergeAction(
   if (current.head !== action.expectedHead) {
     return { status: 'changed-head', prNumber: action.prNumber, head: current.head };
   }
+  if (current.expectedBaseRefName !== action.expectedBaseRefName) {
+    return {
+      status: 'ineligible',
+      prNumber: action.prNumber,
+      head: current.head,
+      reasons: ['base'],
+    };
+  }
   const gate = evaluateMergeGate(current);
   if (!gate.pass) {
     return {
@@ -228,6 +249,7 @@ export async function executeMergeAction(
   const outcome = await deps.mergeExactHead({
     prNumber: action.prNumber,
     head: action.expectedHead,
+    expectedBaseRefName: action.expectedBaseRefName,
     credential: selection.credential,
   });
   if (outcome.status !== 'merged' && outcome.status !== 'already-merged') {

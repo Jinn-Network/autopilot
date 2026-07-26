@@ -284,6 +284,7 @@ function targetedWriterOptions(
         body: pr.body,
         closingIssueNumbers: pr.closingIssueNumbers,
         humanIssueNumber: pr.humanIssueNumber,
+        humanAuthor: pr.humanAuthor,
         humanReason: pr.humanReason,
         reviewClaim: pr.reviewClaim === undefined ? null : {
           oid: pr.reviewClaim.oid,
@@ -1512,6 +1513,112 @@ describe('production reconciliation writer', () => {
 
     expect(calls.filter((call) => call === 'readPullRequestByNumber').length).toBeGreaterThan(0);
     expect(pushed).toBe(true);
+  });
+
+  it('repairs only the exact machine mapping Human overlay under review-ref CAS', async () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const marker =
+      '<!-- jinn-autopilot-human:v2 issue=42 pr=84 phase=implementing code=branch-mapping-ambiguous -->';
+    const reason = {
+      phase: 'implementing' as const,
+      code: 'branch-mapping-ambiguous' as const,
+      detail: 'Old mapping evidence was ambiguous.',
+    };
+    const before: ReviewClaimRecord = {
+      kind: 'review-claim',
+      protocolVersion: 2,
+      prNumber: 84,
+      generation,
+      attempt: '33333333-3333-4333-8333-333333333333',
+      reviewer: 'jinn-reviewer',
+      head: HEAD,
+      recordedAt: '2026-07-20T11:00:00.000Z',
+      state: 'human',
+    };
+    const after: ReviewClaimRecord = {
+      ...before,
+      state: 'stale',
+      recordedAt: '2026-07-20T12:00:00.000Z',
+    };
+    const labels = new Set(['engine:review', 'review:needs-human']);
+    let pushed = false;
+    let comments = [{
+      id: 123,
+      body: `${marker}\n\nOld mapping evidence was ambiguous.`,
+      user: { login: 'implementation-bot' },
+    }];
+    const cycleBase = snapshot(true);
+    const cycle: GitHubLifecycleSnapshot = {
+      ...cycleBase,
+      pullRequests: cycleBase.pullRequests.map((pr) => ({
+        ...pr,
+        labels: [...labels],
+        humanIssueNumber: 42,
+        humanAuthor: 'implementation-bot',
+        humanReason: reason,
+        reviewClaim: { oid: CLAIM_OID, record: before },
+      })),
+    };
+    const targeted = targetedWriterOptions(() => cycle, cycle);
+    const ref = reviewClaimRef(84);
+    const writer = makeProductionReconciliationWriter({
+      repositoryPath: '/repo',
+      ...targeted,
+      readPullRequestByNumber: async () => reconciliationPr({
+        labels: [...labels],
+        humanIssueNumber: comments.length === 0 ? null : 42,
+        humanAuthor: comments.length === 0 ? null : 'implementation-bot',
+        humanReason: comments.length === 0 ? null : reason,
+        reviewClaim: {
+          oid: pushed ? RECORD_OID : CLAIM_OID,
+          payload: encodeReviewClaimPayload(pushed ? after : before),
+        },
+      }),
+      credential: selectedCredential(),
+      now: () => new Date('2026-07-20T12:00:00.000Z'),
+      runner: async (_command, args) => {
+        if (args.includes('hash-object')) return `${BLOB_OID}\n`;
+        if (args.includes('write-tree')) return `${TREE_OID}\n`;
+        if (args.includes('commit-tree')) return `${RECORD_OID}\n`;
+        if (args.includes('rev-list')) return `${RECORD_OID} ${CLAIM_OID}`;
+        if (args.includes('ls-remote')) return `${CLAIM_OID}\t${ref}\n`;
+        if (args.includes('push')) {
+          pushed = true;
+          return '';
+        }
+        if (args.includes('read-tree') || args.includes('update-index')) return '';
+        if (args[0] === 'pr' && args[1] === 'edit') {
+          labels.delete('review:needs-human');
+          return '';
+        }
+        if (
+          args[0] === 'api'
+          && args.includes('--method')
+          && args.includes('DELETE')
+        ) {
+          comments = [];
+          return '';
+        }
+        if (args[0] === 'api' && args[1]?.endsWith('/comments')) {
+          return JSON.stringify(comments);
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(writer.repairObsoleteMappingHuman?.({
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedReviewRefOid: CLAIM_OID,
+      expectedGeneration: generation,
+      expectedAuthor: 'implementation-bot',
+      marker,
+    })).resolves.toBeUndefined();
+
+    expect(pushed).toBe(true);
+    expect(labels.has('review:needs-human')).toBe(false);
+    expect(comments).toEqual([]);
   });
 
   // jinn-mono#1883 follow-up: the first pass converted the three named

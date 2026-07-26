@@ -114,6 +114,37 @@ function initial(): MutableState {
 }
 
 describe('executeProjectionPlan', () => {
+  it('preserves an obsolete mapping Human overlay when review generation changed', async () => {
+    const state = initial();
+    let repairs = 0;
+    const calls: string[] = [];
+    const baseWriter = writer(state, calls);
+    const action: ProjectionAction = {
+      kind: 'repair-obsolete-mapping-human',
+      issueNumber: 42,
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW,
+      expectedGeneration: '11111111-1111-4111-8111-111111111111',
+      expectedAuthor: 'maintenance-bot',
+      marker: '<!-- exact-machine-marker -->',
+    };
+
+    const report = await executeProjectionPlan({ actions: [action] }, {
+      ...baseWriter,
+      readReviewRef: async () => ({
+        ...state.review,
+        generation: '22222222-2222-4222-8222-222222222222',
+      }),
+      repairObsoleteMappingHuman: async () => {
+        repairs += 1;
+      },
+    });
+
+    expect(report.results).toEqual([{ action, outcome: 'lost-race' }]);
+    expect(repairs).toBe(0);
+  });
+
   it('recovers a durable implementation summary before making the PR ready', async () => {
     const state = initial();
     state.status = 'In Review';

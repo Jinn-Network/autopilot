@@ -80,7 +80,7 @@ export function makeProductionMergeActionPort(
       run: runner,
       prNumber: pr.number,
       expectedHead: pr.headOid,
-      expectedBaseRefName: pr.baseRefName,
+      expectedBaseRefName: expectedBase,
       context: 'Merge',
       repositorySlug,
     });
@@ -172,8 +172,35 @@ export function makeProductionMergeActionPort(
 
   return {
     readCandidate,
-    mergeExactHead: ({ prNumber, head, credential }): Promise<ExactMergeOutcome> =>
+    mergeExactHead: ({
+      prNumber,
+      head,
+      expectedBaseRefName,
+      credential,
+    }): Promise<ExactMergeOutcome> =>
       withCredential(credential, async ({ run }) => {
+        const authority = JSON.parse(await run('gh', [
+          'pr', 'view', String(prNumber), '--repo', repositorySlug,
+          '--json', 'state,headRefOid,baseRefName',
+        ])) as {
+          state?: unknown;
+          headRefOid?: unknown;
+          baseRefName?: unknown;
+        };
+        if (typeof authority.headRefOid === 'string' && authority.headRefOid !== head) {
+          return { status: 'changed-head', head: gitOid(authority.headRefOid) };
+        }
+        if (
+          authority.state !== 'OPEN'
+          || authority.headRefOid !== head
+          || authority.baseRefName !== expectedBaseRefName
+        ) {
+          return {
+            status: 'rejected',
+            head,
+            reason: 'Merge base authority changed before the exact-head merge',
+          };
+        }
         try {
           const response = JSON.parse(await run('gh', [
             'api', '-X', 'PUT', `repos/${repositorySlug}/pulls/${prNumber}/merge`,
@@ -192,15 +219,17 @@ export function makeProductionMergeActionPort(
         }
         const readback = JSON.parse(await run('gh', [
           'pr', 'view', String(prNumber), '--repo', repositorySlug,
-          '--json', 'state,headRefOid,mergeCommit',
+          '--json', 'state,headRefOid,baseRefName,mergeCommit',
         ])) as {
           state?: unknown;
           headRefOid?: unknown;
+          baseRefName?: unknown;
           mergeCommit?: { oid?: unknown } | null;
         };
         if (
           readback.state === 'MERGED'
           && readback.headRefOid === head
+          && readback.baseRefName === expectedBaseRefName
           && typeof readback.mergeCommit?.oid === 'string'
         ) {
           return {

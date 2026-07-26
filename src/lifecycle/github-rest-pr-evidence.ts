@@ -165,18 +165,25 @@ function exactPullRequestDetail(
 
 function latestHuman(value: unknown, prNumber: number): {
   readonly issueNumber?: number;
+  readonly author?: string;
   readonly reason: NonNullable<PullRequestSnapshot['humanReason']>;
 } | null {
   const evidence = rows(value, 'PR comments').map((raw, index) => {
     const comment = record(raw, `PR comment ${index}`);
     const createdAt = exactTimestamp(comment.created_at, `PR comment ${index}.created_at`);
     const parsed = parseHumanCommentEvidence(string(comment.body, `PR comment ${index}.body`));
+    const user = typeof comment.user === 'object' && comment.user !== null
+      ? comment.user as Record<string, unknown>
+      : undefined;
+    const author = typeof user?.login === 'string' && user.login.length > 0
+      ? user.login
+      : undefined;
     if (parsed !== null && parsed.prNumber !== prNumber) {
       throw new GitHubRestSchemaError(
         `PR comment ${index} Human marker names PR #${parsed.prNumber}, expected #${prNumber}`,
       );
     }
-    return parsed === null ? null : { createdAt, parsed };
+    return parsed === null ? null : { createdAt, parsed, author };
   }).filter((entry): entry is NonNullable<typeof entry> => entry !== null)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
   if (evidence === undefined) return null;
@@ -184,6 +191,7 @@ function latestHuman(value: unknown, prNumber: number): {
     ...(evidence.parsed.issueNumber === undefined
       ? {}
       : { issueNumber: evidence.parsed.issueNumber }),
+    ...(evidence.author === undefined ? {} : { author: evidence.author }),
     reason: evidence.parsed.reason,
   };
 }
@@ -335,6 +343,7 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       ? null
       : {
           ...(pr.humanIssueNumber === undefined ? {} : { issueNumber: pr.humanIssueNumber }),
+          ...(pr.humanAuthor === undefined ? {} : { author: pr.humanAuthor }),
           reason: pr.humanReason,
         };
     const cachedDetail = {

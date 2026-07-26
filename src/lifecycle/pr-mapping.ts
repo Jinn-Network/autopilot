@@ -1,0 +1,308 @@
+import type { BlockedOn } from '../dispatcher/types.js';
+import type { GitOid } from './types.js';
+
+export interface StructuredMappingIssue {
+  readonly number: number;
+  readonly blockedOn: BlockedOn | null;
+  readonly blockedByIssues: readonly number[];
+}
+
+export interface StructuredMappingPullRequest {
+  readonly number: number;
+  readonly state: 'OPEN' | 'MERGED';
+  readonly head: GitOid;
+  readonly headRefName: string;
+  readonly baseRefName: string;
+  readonly closingIssueNumbers: readonly number[];
+  readonly body: string;
+  readonly humanIssueNumber?: number;
+}
+
+export interface StructuredMappingStableBranch {
+  readonly issueNumber: number;
+  readonly phase: 'implement' | 'fix' | 'reconcile';
+  readonly head: GitOid;
+  readonly headRefName: string;
+  readonly targetBase: string;
+}
+
+export interface StructuredMappingInput {
+  readonly defaultBranch: string;
+  readonly issues: readonly StructuredMappingIssue[];
+  readonly pullRequests: readonly StructuredMappingPullRequest[];
+  readonly stableBranches: readonly StructuredMappingStableBranch[];
+}
+
+export type StructuredPullRequestMapping =
+  | {
+      readonly status: 'resolved';
+      readonly prNumber: number;
+      readonly issueNumber: number;
+      readonly expectedBaseRefName: string;
+      readonly evidence: 'closing-reference' | 'stacked-empty-closing';
+    }
+  | {
+      readonly status: 'ambiguous';
+      readonly prNumber: number;
+      readonly issueNumbers: readonly number[];
+      readonly details: readonly string[];
+    };
+
+interface LifecycleMarker {
+  readonly issueNumber: number;
+  readonly headRefName: string;
+}
+
+const STABLE_BRANCH_PATTERN = /^autopilot\/([1-9][0-9]*)$/;
+const LIFECYCLE_MARKER_PATTERN =
+  /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/g;
+
+function stableBranchIssue(headRefName: string): number | undefined {
+  const match = STABLE_BRANCH_PATTERN.exec(headRefName);
+  if (match?.[1] === undefined) return undefined;
+  const number = Number(match[1]);
+  return Number.isSafeInteger(number) ? number : undefined;
+}
+
+function lifecycleMarkers(body: string): readonly LifecycleMarker[] {
+  return [...body.matchAll(LIFECYCLE_MARKER_PATTERN)].map((match) => ({
+    issueNumber: Number(match[1]),
+    headRefName: match[2]!,
+  }));
+}
+
+function inferredIssueNumbers(
+  pr: StructuredMappingPullRequest,
+  knownIssues: ReadonlySet<number>,
+): Set<number> {
+  const numbers = new Set<number>();
+  for (const issueNumber of pr.closingIssueNumbers) {
+    if (knownIssues.has(issueNumber)) numbers.add(issueNumber);
+  }
+  const branchIssue = stableBranchIssue(pr.headRefName);
+  if (branchIssue !== undefined && knownIssues.has(branchIssue)) numbers.add(branchIssue);
+  for (const marker of lifecycleMarkers(pr.body)) {
+    if (knownIssues.has(marker.issueNumber)) numbers.add(marker.issueNumber);
+  }
+  if (pr.humanIssueNumber !== undefined && knownIssues.has(pr.humanIssueNumber)) {
+    numbers.add(pr.humanIssueNumber);
+  }
+  return numbers;
+}
+
+export function resolveStructuredPullRequestMappings(
+  input: StructuredMappingInput,
+): readonly StructuredPullRequestMapping[] {
+  const issues = new Map(input.issues.map((issue) => [issue.number, issue]));
+  const knownIssues = new Set(issues.keys());
+  const inferredByPr = new Map(input.pullRequests.map((pr) => [
+    pr.number,
+    inferredIssueNumbers(pr, knownIssues),
+  ]));
+  const openPrsByIssue = new Map<number, Set<number>>();
+  for (const pr of input.pullRequests) {
+    if (pr.state !== 'OPEN') continue;
+    for (const issueNumber of inferredByPr.get(pr.number) ?? []) {
+      const prs = openPrsByIssue.get(issueNumber) ?? new Set<number>();
+      prs.add(pr.number);
+      openPrsByIssue.set(issueNumber, prs);
+    }
+  }
+  const exactParentDependency = (
+    issue: StructuredMappingIssue,
+    baseRefName: string,
+  ): number | undefined => {
+    if (issue.blockedOn !== 'Another issue') return undefined;
+    const candidates = input.pullRequests.filter((candidate) => {
+      if (
+        candidate.state !== 'OPEN'
+        || candidate.headRefName !== baseRefName
+        || candidate.closingIssueNumbers.length !== 1
+      ) {
+        return false;
+      }
+      const dependency = candidate.closingIssueNumbers[0]!;
+      if (!issue.blockedByIssues.includes(dependency)) return false;
+      const markers = lifecycleMarkers(candidate.body);
+      return markers.length === 0 || (
+        markers.length === 1
+        && markers[0]!.issueNumber === dependency
+        && markers[0]!.headRefName === candidate.headRefName
+      );
+    });
+    if (candidates.length !== 1) return undefined;
+    const dependency = candidates[0]!.closingIssueNumbers[0]!;
+    const contenders = input.pullRequests.filter((candidate) => (
+      candidate.state === 'OPEN'
+      && (
+        candidate.closingIssueNumbers.includes(dependency)
+        || lifecycleMarkers(candidate.body).some((marker) => (
+          marker.issueNumber === dependency
+        ))
+      )
+    ));
+    return contenders.length === 1 ? dependency : undefined;
+  };
+
+  return input.pullRequests.map((pr): StructuredPullRequestMapping => {
+    const details: string[] = [];
+    const inferred = inferredByPr.get(pr.number) ?? new Set<number>();
+    const closing = new Set(pr.closingIssueNumbers);
+    const markers = lifecycleMarkers(pr.body);
+    const branchIssue = stableBranchIssue(pr.headRefName);
+    const primaryIssue = closing.size === 1
+      ? [...closing][0]
+      : pr.closingIssueNumbers.length === 0 && markers.length === 1
+        ? markers[0]!.issueNumber
+        : branchIssue;
+    const issue = primaryIssue === undefined ? undefined : issues.get(primaryIssue);
+
+    if (closing.size !== pr.closingIssueNumbers.length || closing.size > 1) {
+      details.push('Closing-reference mapping is duplicated or names multiple issues.');
+    }
+    if (
+      pr.closingIssueNumbers.length > 0
+      && (primaryIssue === undefined || !knownIssues.has(primaryIssue))
+    ) {
+      details.push('Closing-reference mapping does not name one known lifecycle issue.');
+    }
+    if (
+      branchIssue !== undefined
+      && primaryIssue !== undefined
+      && branchIssue !== primaryIssue
+    ) {
+      details.push(
+        `Stable branch ${pr.headRefName} contradicts issue #${primaryIssue}.`,
+      );
+    }
+    if (markers.length > 1) {
+      details.push('PR body contains more than one lifecycle marker.');
+    } else if (
+      markers.length === 1
+      && primaryIssue !== undefined
+      && (
+        markers[0]!.issueNumber !== primaryIssue
+        || markers[0]!.headRefName !== pr.headRefName
+      )
+    ) {
+      details.push('Lifecycle marker contradicts the resolved issue or exact PR branch.');
+    }
+    if (
+      pr.humanIssueNumber !== undefined
+      && primaryIssue !== undefined
+      && pr.humanIssueNumber !== primaryIssue
+    ) {
+      details.push(
+        `Structured Human marker issue #${pr.humanIssueNumber} contradicts issue #${primaryIssue}.`,
+      );
+    }
+
+    const stableClaim = primaryIssue === undefined
+      ? undefined
+      : input.stableBranches.find((branch) => (
+          branch.issueNumber === primaryIssue
+          && branch.phase === 'implement'
+          && branch.headRefName === `autopilot/${primaryIssue}`
+        ));
+    if (
+      stableClaim !== undefined
+      && (
+        stableClaim.headRefName !== pr.headRefName
+        || stableClaim.head !== pr.head
+      )
+    ) {
+      details.push('stable branch claim does not match the exact PR branch and head.');
+    }
+
+    const emptyClosing = pr.closingIssueNumbers.length === 0;
+    let evidence: 'closing-reference' | 'stacked-empty-closing' = 'closing-reference';
+    if (emptyClosing) {
+      evidence = 'stacked-empty-closing';
+      if (pr.state !== 'OPEN') {
+        details.push('Empty closing references require the exact unique open PR.');
+      }
+      if (
+        markers.length !== 1
+        || markers[0]!.issueNumber !== primaryIssue
+        || markers[0]!.headRefName !== pr.headRefName
+      ) {
+        details.push('Empty closing references require one exact single lifecycle marker.');
+      }
+      if (
+        primaryIssue === undefined
+        || branchIssue !== primaryIssue
+        || stableClaim === undefined
+        || stableClaim.head !== pr.head
+        || stableClaim.headRefName !== pr.headRefName
+        || stableClaim.targetBase !== pr.baseRefName
+      ) {
+        details.push('Empty closing references require an exact stable branch claim and head.');
+      }
+    }
+
+    let expectedBaseRefName: string | undefined;
+    if (pr.baseRefName === input.defaultBranch) {
+      expectedBaseRefName = input.defaultBranch;
+    } else {
+      const namedDependency = stableBranchIssue(pr.baseRefName);
+      const exactDependency = issue === undefined
+        ? undefined
+        : exactParentDependency(issue, pr.baseRefName);
+      const dependency = exactDependency ?? namedDependency;
+      if (
+        issue !== undefined
+        && dependency !== undefined
+        && issue.blockedOn === 'Another issue'
+        && issue.blockedByIssues.includes(dependency)
+        && (
+          exactDependency !== undefined
+          || (
+            stableClaim !== undefined
+            && stableClaim.head === pr.head
+            && stableClaim.headRefName === pr.headRefName
+            && stableClaim.targetBase === pr.baseRefName
+          )
+        )
+      ) {
+        expectedBaseRefName = pr.baseRefName;
+      } else {
+        details.push(
+          `PR base ${pr.baseRefName} is not an authorized base from the configured default `
+          + 'branch or an exact issue dependency.',
+        );
+        if (dependency !== undefined) {
+          details.push(`Issue dependency evidence for parent #${dependency} is missing or contradictory.`);
+        }
+      }
+    }
+
+    if (
+      primaryIssue === undefined
+      || issue === undefined
+      || inferred.size !== 1
+    ) {
+      details.push('PR evidence does not resolve to one known lifecycle issue.');
+    } else if (
+      pr.state === 'OPEN'
+      && (openPrsByIssue.get(primaryIssue)?.size ?? 0) !== 1
+    ) {
+      details.push(`Issue #${primaryIssue} does not have one unique open PR.`);
+    }
+
+    if (details.length > 0 || primaryIssue === undefined || expectedBaseRefName === undefined) {
+      return {
+        status: 'ambiguous',
+        prNumber: pr.number,
+        issueNumbers: [...inferred].sort((left, right) => left - right),
+        details: [...new Set(details)],
+      };
+    }
+    return {
+      status: 'resolved',
+      prNumber: pr.number,
+      issueNumber: primaryIssue,
+      expectedBaseRefName,
+      evidence,
+    };
+  });
+}

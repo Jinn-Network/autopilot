@@ -8,7 +8,7 @@ import type {
   GitHubLifecycleSnapshot,
   NativeReviewSnapshot,
 } from '../../src/lifecycle/snapshot.js';
-import { gitOid, isoTimestamp } from '../../src/lifecycle/types.js';
+import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
 const OTHER_HEAD = gitOid('2'.repeat(40));
@@ -189,6 +189,7 @@ describe('production head-pinned merge port', () => {
     const result = await executeMergeAction({
       prNumber: 84,
       expectedHead: HEAD,
+      expectedBaseRefName: gitRefName('stack/base'),
     }, {
       ...port,
       credentials: new CredentialPool([{
@@ -236,6 +237,7 @@ describe('production head-pinned merge port', () => {
     const result = await executeMergeAction({
       prNumber: 84,
       expectedHead: HEAD,
+      expectedBaseRefName: gitRefName('stack/base'),
     }, {
       ...port,
       credentials: new CredentialPool([{
@@ -262,6 +264,13 @@ describe('production head-pinned merge port', () => {
       options?: { readonly env?: NodeJS.ProcessEnv },
     ): Promise<string> => {
       calls.push({ command, args, env: options?.env });
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+        return JSON.stringify({
+          state: 'OPEN',
+          headRefOid: HEAD,
+          baseRefName: 'next',
+        });
+      }
       if (command === 'gh' && args.includes('-X') && args.includes('PUT')) {
         return JSON.stringify({ merged: true, sha: '2'.repeat(40), message: 'merged' });
       }
@@ -285,6 +294,7 @@ describe('production head-pinned merge port', () => {
     await expect(port.mergeExactHead({
       prNumber: 84,
       head: HEAD,
+      expectedBaseRefName: gitRefName('next'),
       credential: selection.credential,
     })).resolves.toMatchObject({ status: 'merged', head: HEAD });
 
@@ -297,6 +307,53 @@ describe('production head-pinned merge port', () => {
     expect(merge?.env?.GITHUB_TOKEN).toBe('');
   });
 
+  it('rereads and rejects a retargeted base immediately before the merge PUT', async () => {
+    let mergeCalls = 0;
+    const runner = async (
+      command: string,
+      args: readonly string[],
+    ): Promise<string> => {
+      expect(command).toBe('gh');
+      if (args[0] === 'pr' && args[1] === 'view') {
+        return JSON.stringify({
+          state: 'OPEN',
+          headRefOid: HEAD,
+          baseRefName: 'attacker/base',
+        });
+      }
+      if (args.includes('-X') && args.includes('PUT')) {
+        mergeCalls += 1;
+        return JSON.stringify({ merged: true, sha: OTHER_HEAD });
+      }
+      throw new Error(`unexpected ${args.join(' ')}`);
+    };
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => {
+        throw new Error('unused');
+      },
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner,
+    });
+    const selection = selectCredential(new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+
+    await expect(port.mergeExactHead({
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: gitRefName('stack/base'),
+      credential: selection.credential,
+    })).resolves.toMatchObject({
+      status: 'rejected',
+      reason: expect.stringMatching(/base authority changed/i),
+    });
+    expect(mergeCalls).toBe(0);
+  });
+
   it.each([
     { name: 'REST total exceeds returned filenames', total: 2, files: ['src/a.ts'] },
     { name: 'GitHub file endpoint ceiling is exceeded', total: 3_001, files: ['src/a.ts'] },
@@ -305,6 +362,7 @@ describe('production head-pinned merge port', () => {
     const port = makeProductionMergeActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
       runner: candidateRunner(total, files),
     });
 
@@ -318,6 +376,7 @@ describe('production head-pinned merge port', () => {
     const port = makeProductionMergeActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
       runner: candidateRunner(2, ['src/a.ts', 'src/b.ts']),
     });
 
@@ -344,6 +403,7 @@ describe('production head-pinned merge port', () => {
     const port = makeProductionMergeActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
       runner,
     });
 

@@ -7,7 +7,7 @@ import {
   type GitHubLifecycleReader,
   type PullRequestPage,
 } from '../../src/lifecycle/snapshot.js';
-import { deriveLifecycle } from '../../src/lifecycle/lifecycle.js';
+import { deriveLifecycle, planCycle } from '../../src/lifecycle/lifecycle.js';
 import { FULL_SCAN_RESERVE } from '../../src/lifecycle/github-usage.js';
 
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -126,6 +126,187 @@ function reader(overrides: Partial<GitHubLifecycleReader> = {}): GitHubLifecycle
 }
 
 describe('buildGitHubLifecycleSnapshot', () => {
+  it('uses the canonical resolver to enroll the complete #2084 stacked mapping once', async () => {
+    const stackedIssue = {
+      ...issue(),
+      number: 2084,
+      blockedOn: 'Another issue' as const,
+      blockedByIssues: [2083],
+    };
+    const stackedPr = {
+      ...page('page-2').nodes[0]!,
+      number: 84,
+      body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+      baseRefName: 'autopilot/2083',
+      headRefName: 'autopilot/2084',
+      closingIssueNumbers: [],
+      reviews: [],
+      reviewClaim: null,
+      branchClaimTrailers: [
+        'Jinn-Autopilot-Protocol: 2',
+        'Jinn-Autopilot-Phase: implement',
+        'Jinn-Autopilot-Issue: 2084',
+        'Jinn-Autopilot-PR: 84',
+        'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
+        'Jinn-Autopilot-Runner: runner-a',
+        'Jinn-Autopilot-Login: trusted',
+        `Jinn-Autopilot-Expected-Head: ${HEAD}`,
+        'Jinn-Autopilot-Target-Base: autopilot/2083',
+        'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
+        'Jinn-Autopilot-Phase-Complete: true',
+      ].join('\n'),
+    };
+    const source = reader({
+      readProjectSnapshot: async () => ({
+        ...(await reader().readProjectSnapshot()),
+        items: [{
+          id: 'PVTI_2084',
+          number: 2084,
+          contentType: 'Issue' as const,
+          status: 'In Review' as const,
+          priority: 'P1' as const,
+          effort: 'Medium' as const,
+          blockedOn: 'Another issue' as const,
+          issueType: 'feat' as const,
+          blockedByIssues: [2083],
+          sprintIterationId: 'sprint',
+        }],
+      }),
+      readIssues: async () => [stackedIssue],
+      readPullRequests: async () => ({
+        nodes: [stackedPr],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readBranchClaims: async () => [{
+        issueNumber: 2084,
+        headRefName: 'autopilot/2084',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T09:00:00.000Z',
+        claimTrailers: [
+          'Jinn-Autopilot-Protocol: 2',
+          'Jinn-Autopilot-Phase: implement',
+          'Jinn-Autopilot-Issue: 2084',
+          'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
+          'Jinn-Autopilot-Runner: runner-a',
+          'Jinn-Autopilot-Login: trusted',
+          `Jinn-Autopilot-Expected-Head: ${HEAD}`,
+          'Jinn-Autopilot-Target-Base: autopilot/2083',
+          'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
+        ].join('\n'),
+      }],
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      defaultBranch: 'next',
+    });
+
+    expect(snapshot.diagnostics).toEqual([]);
+    expect(snapshot.pullRequestMappings).toEqual([{
+      status: 'resolved',
+      prNumber: 84,
+      issueNumber: 2084,
+      expectedBaseRefName: 'autopilot/2083',
+      evidence: 'stacked-empty-closing',
+    }]);
+    expect(snapshot.lifecycle.items).toEqual([
+      expect.objectContaining({
+        kind: 'pull-request',
+        issueNumber: 2084,
+        prNumber: 84,
+        expectedBaseRefName: 'autopilot/2083',
+      }),
+    ]);
+    const view = deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60 * 1_000,
+    );
+    expect(view.items).toHaveLength(1);
+    expect(view.items[0]).toMatchObject({ phase: 'awaiting-review' });
+    expect(planCycle(view, {
+      implementationSlots: 0,
+      reviewSlots: 1,
+      usableCredentialLanes: 1,
+    }, 'active')).toEqual([{
+      kind: 'claim-review',
+      issueNumber: 2084,
+      prNumber: 84,
+      head: HEAD,
+    }]);
+    const approved = snapshot.lifecycle.items[0];
+    if (approved?.kind !== 'pull-request') throw new Error('stacked fixture PR missing');
+    const mergeView = deriveLifecycle({
+      items: [{
+        ...approved,
+        needsReview: false,
+        approved: true,
+        mergeState: 'clean',
+        checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      }],
+    }, new Date('2026-07-20T12:00:00.000Z'), 2 * 60 * 60 * 1_000);
+    expect(planCycle(mergeView, {
+      implementationSlots: 0,
+      reviewSlots: 0,
+      usableCredentialLanes: 1,
+    }, 'active')).toEqual([{
+      kind: 'merge',
+      issueNumber: 2084,
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: 'autopilot/2083',
+    }]);
+  });
+
+  it('turns missing #2084 dependency evidence into a structured diagnostic', async () => {
+    const stacked = {
+      ...page('page-2').nodes[0]!,
+      number: 84,
+      body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+      baseRefName: 'autopilot/2083',
+      headRefName: 'autopilot/2084',
+      closingIssueNumbers: [],
+    };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), number: 2084 }],
+      readPullRequests: async () => ({
+        nodes: [stacked],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readBranchClaims: async () => [{
+        issueNumber: 2084,
+        headRefName: 'autopilot/2084',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T09:00:00.000Z',
+        claimTrailers: [
+          'Jinn-Autopilot-Protocol: 2',
+          'Jinn-Autopilot-Phase: implement',
+          'Jinn-Autopilot-Issue: 2084',
+          'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
+          'Jinn-Autopilot-Runner: runner-a',
+          'Jinn-Autopilot-Login: trusted',
+          `Jinn-Autopilot-Expected-Head: ${HEAD}`,
+          'Jinn-Autopilot-Target-Base: autopilot/2083',
+          'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
+        ].join('\n'),
+      }],
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      defaultBranch: 'next',
+    });
+
+    expect(snapshot.lifecycle.items).toEqual([]);
+    expect(snapshot.diagnostics).toEqual([
+      expect.objectContaining({
+        code: 'branch-mapping-ambiguous',
+        issueNumbers: [2084],
+        detail: expect.stringMatching(/dependency.*2083/i),
+      }),
+    ]);
+  });
+
   it('paginates PRs and preserves native review commit IDs exactly', async () => {
     const cursors: Array<string | null> = [];
     const source = reader({
@@ -759,6 +940,129 @@ describe('buildGitHubLifecycleSnapshot', () => {
         detail: 'Current-head Human review record',
       },
     });
+  });
+
+  it('identifies only an exact machine-authored obsolete mapping Human overlay for CAS repair', async () => {
+    const original = page('page-2').nodes[0]!;
+    const mappingReason = {
+      phase: 'implementing' as const,
+      code: 'branch-mapping-ambiguous' as const,
+      detail: 'Old evidence could not uniquely map this PR.',
+    };
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...original,
+          labels: ['engine:review', 'review:needs-human'],
+          humanIssueNumber: 42,
+          humanAuthor: 'maintenance-bot',
+          humanReason: mappingReason,
+          reviewClaim: {
+            ...original.reviewClaim!,
+            payload: JSON.stringify({
+              protocolVersion: 2,
+              prNumber: 101,
+              generation: '22222222-2222-4222-8222-222222222222',
+              attempt: '33333333-3333-4333-8333-333333333333',
+              reviewer: 'reviewer',
+              head: HEAD,
+              state: 'human',
+              recordedAt: '2026-07-20T09:00:00.000Z',
+            }),
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      machineAuthorLogins: new Set(['maintenance-bot']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({
+      humanHold: true,
+      obsoleteMachineMappingHuman: {
+        author: 'maintenance-bot',
+        generation: '22222222-2222-4222-8222-222222222222',
+        reason: mappingReason,
+      },
+    });
+  });
+
+  it.each([
+    {
+      name: 'maintainer-authored',
+      author: 'maintainer',
+      issueBlockedOn: 'Nothing' as const,
+      reasonCode: 'branch-mapping-ambiguous' as const,
+      claimHead: HEAD,
+    },
+    {
+      name: 'explicit issue Human hold',
+      author: 'maintenance-bot',
+      issueBlockedOn: 'Human' as const,
+      reasonCode: 'branch-mapping-ambiguous' as const,
+      claimHead: HEAD,
+    },
+    {
+      name: 'different structured reason code',
+      author: 'maintenance-bot',
+      issueBlockedOn: 'Nothing' as const,
+      reasonCode: 'implementation-escalation' as const,
+      claimHead: HEAD,
+    },
+    {
+      name: 'different review head',
+      author: 'maintenance-bot',
+      issueBlockedOn: 'Nothing' as const,
+      reasonCode: 'branch-mapping-ambiguous' as const,
+      claimHead: 'cccccccccccccccccccccccccccccccccccccccc',
+    },
+  ])('preserves a $name mapping Human overlay', async ({
+    author,
+    issueBlockedOn,
+    reasonCode,
+    claimHead,
+  }) => {
+    const original = page('page-2').nodes[0]!;
+    const source = reader({
+      readIssues: async () => [{ ...issue(), blockedOn: issueBlockedOn }],
+      readPullRequests: async () => ({
+        nodes: [{
+          ...original,
+          humanIssueNumber: 42,
+          humanAuthor: author,
+          humanReason: {
+            phase: 'implementing',
+            code: reasonCode,
+            detail: 'Hold this mapping.',
+          },
+          reviewClaim: {
+            ...original.reviewClaim!,
+            payload: JSON.stringify({
+              protocolVersion: 2,
+              prNumber: 101,
+              generation: '22222222-2222-4222-8222-222222222222',
+              attempt: '33333333-3333-4333-8333-333333333333',
+              reviewer: 'reviewer',
+              head: claimHead,
+              state: 'human',
+              recordedAt: '2026-07-20T09:00:00.000Z',
+            }),
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      machineAuthorLogins: new Set(['maintenance-bot']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({ humanHold: true });
+    expect(snapshot.lifecycle.items[0]).not.toHaveProperty('obsoleteMachineMappingHuman');
   });
 
   it('diagnoses a stable claim that contradicts an adopted PR for the same issue', async () => {

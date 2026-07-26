@@ -531,6 +531,7 @@ describe('targeted action reader', () => {
     const calls: string[] = [];
     const options = {
       authorAllowlist: new Set(['oaksprout']),
+      defaultBranch: 'main',
       rateLimitFloor: 500,
       readGraphQlRemaining: async () => 510,
       readPullRequest: async (number: number) => {

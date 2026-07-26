@@ -53,6 +53,8 @@ export interface IncrementalLifecycleSnapshotSourceOptions {
   readonly conditionalRest: ConditionalRestClient;
   readonly evidenceProbe: PullRequestEvidenceProbe;
   readonly authorAllowlist: ReadonlySet<string>;
+  readonly machineAuthorLogins?: ReadonlySet<string>;
+  readonly defaultBranch?: string;
   readonly cacheStore?: LifecycleDiscoveryStateStore;
   readonly stateDirectory?: string;
   readonly now?: () => Date;
@@ -452,6 +454,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
   private readonly conditionalRest: ConditionalRestClient;
   private readonly evidenceProbe: PullRequestEvidenceProbe;
   private readonly authorAllowlist: ReadonlySet<string>;
+  private readonly machineAuthorLogins: ReadonlySet<string>;
+  private readonly defaultBranch: string;
   private readonly cacheStore: LifecycleDiscoveryStateStore;
   private readonly now: () => Date;
   private readonly recentlyClosedOverlapMs: number;
@@ -464,6 +468,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     this.conditionalRest = options.conditionalRest;
     this.evidenceProbe = options.evidenceProbe;
     this.authorAllowlist = options.authorAllowlist;
+    this.machineAuthorLogins = options.machineAuthorLogins ?? new Set();
+    this.defaultBranch = options.defaultBranch ?? 'next';
     this.cacheStore = options.cacheStore ?? new LifecycleDiscoveryCacheStore({
       ...(options.stateDirectory === undefined ? {} : { stateDirectory: options.stateDirectory }),
     });
@@ -712,6 +718,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       terminalClaims,
     }, {
       authorAllowlist: this.authorAllowlist,
+      machineAuthorLogins: this.machineAuthorLogins,
+      defaultBranch: this.defaultBranch,
       capturedAt,
       snapshotMode: 'incremental',
       lastFullReconciliationAt: prior.evidence.lastFullReconciliationAt,
@@ -752,6 +760,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     const oracleGraphQlCostAtStart = this.fullReader.githubUsage().graphqlCost;
     const provisional = await buildGitHubLifecycleSnapshot(this.fullReader, {
       authorAllowlist: this.authorAllowlist,
+      machineAuthorLogins: this.machineAuthorLogins,
+      defaultBranch: this.defaultBranch,
       rateLimitFloor,
       now: () => new Date(cycleStartedAt),
     });
@@ -801,6 +811,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       terminalClaims,
     }, {
       authorAllowlist: this.authorAllowlist,
+      machineAuthorLogins: this.machineAuthorLogins,
+      defaultBranch: this.defaultBranch,
       capturedAt,
       snapshotMode: 'full',
       lastFullReconciliationAt: capturedAt,
@@ -822,6 +834,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         parityCandidate.snapshot,
         {
           authorAllowlist: this.authorAllowlist,
+          machineAuthorLogins: this.machineAuthorLogins,
+          defaultBranch: this.defaultBranch,
           capturedAt: full.capturedAt,
           snapshotMode: 'incremental',
           lastFullReconciliationAt: parityCandidate.snapshot.lastFullReconciliationAt!,
@@ -834,6 +848,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       ? full
       : composeGitHubLifecycleSnapshot(full, {
           authorAllowlist: this.authorAllowlist,
+          machineAuthorLogins: this.machineAuthorLogins,
+          defaultBranch: this.defaultBranch,
           capturedAt: full.capturedAt,
           snapshotMode: 'full',
           lastFullReconciliationAt: full.capturedAt,
@@ -1103,6 +1119,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         .sort((left, right) => left.issueNumber - right.issueNumber),
     }, {
       authorAllowlist: this.authorAllowlist,
+      machineAuthorLogins: this.machineAuthorLogins,
+      defaultBranch: this.defaultBranch,
       capturedAt,
       snapshotMode: 'incremental',
       lastFullReconciliationAt: lastFull,

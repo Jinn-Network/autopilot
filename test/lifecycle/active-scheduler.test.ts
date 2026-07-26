@@ -4,7 +4,7 @@ import {
   scheduleActiveActions,
   type ActiveSchedulingInput,
 } from '../../src/lifecycle/active-scheduler.js';
-import { gitOid } from '../../src/lifecycle/types.js';
+import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
 
@@ -14,7 +14,13 @@ function input(overrides: Partial<ActiveSchedulingInput> = {}): ActiveScheduling
       { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
       { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
       { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
-      { phase: 'merge', issueNumber: 5, prNumber: 50, head: HEAD },
+      {
+        phase: 'merge',
+        issueNumber: 5,
+        prNumber: 50,
+        head: HEAD,
+        expectedBaseRefName: gitRefName('autopilot/4'),
+      },
     ],
     remaining: { implementation: 1, review: 1 },
     availableLogins: [
@@ -95,7 +101,13 @@ describe('active local scheduler', () => {
         { phase: 'implementation', intent: 'fresh', issueNumber: 99, isChild: true },
         { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
         { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
-        { phase: 'merge', issueNumber: 5, prNumber: 50, head: HEAD },
+        {
+          phase: 'merge',
+          issueNumber: 5,
+          prNumber: 50,
+          head: HEAD,
+          expectedBaseRefName: gitRefName('autopilot/4'),
+        },
       ],
       openPipelineBacklog: 10,
       remaining: { implementation: 2, review: 1 },
@@ -108,7 +120,13 @@ describe('active local scheduler', () => {
         prNumber: 30,
         head: HEAD,
       },
-      { kind: 'merge', issueNumber: 5, prNumber: 50, head: HEAD },
+      {
+        kind: 'merge',
+        issueNumber: 5,
+        prNumber: 50,
+        head: HEAD,
+        expectedBaseRefName: gitRefName('autopilot/4'),
+      },
     ]);
     expect(plan.skips).toContainEqual({
       phase: 'implementation',

@@ -69,7 +69,7 @@ const PR_FIELDS = `
         }
         comments(last: 100) {
           pageInfo { hasPreviousPage }
-          nodes { body createdAt }
+          nodes { body createdAt author { login } }
         }
         statusCheckRollup {
           contexts(first: 100) {
@@ -414,7 +414,7 @@ interface GraphQlPr {
   };
   comments: {
     pageInfo: { hasPreviousPage: boolean };
-    nodes: Array<{ body: string; createdAt: string }>;
+    nodes: Array<{ body: string; createdAt: string; author?: { login?: string } | null }>;
   };
   statusCheckRollup: {
     contexts: {
@@ -599,6 +599,7 @@ function rawMergedPullRequest(pr: GraphQlMergedPr): RawPullRequest {
     branchClaimTrailers: null,
     reviewClaim: null,
     humanIssueNumber: null,
+    humanAuthor: null,
     humanReason: null,
     mergedAt: pr.mergedAt,
     mergeCommitOid: pr.mergeCommit?.oid ?? null,
@@ -626,6 +627,7 @@ function inconsistentPullRequest(pr: GraphQlPr, detail: string): RawPullRequest 
     branchClaimTrailers: null,
     reviewClaim: null,
     humanIssueNumber: null,
+    humanAuthor: null,
     humanReason: { phase: 'awaiting-review', code: 'review-escalation', detail },
     mergedAt: pr.mergedAt,
     mergeCommitOid: pr.mergeCommit?.oid ?? null,
@@ -1180,11 +1182,22 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         submittedAt: review.submittedAt,
       };
     });
-    let humanEvidence: ReturnType<typeof parseHumanCommentEvidence> | undefined;
+    let humanEvidence: (
+      ReturnType<typeof parseHumanCommentEvidence> & { readonly author?: string }
+    ) | undefined;
     try {
       humanEvidence = [...pr.comments.nodes]
         .reverse()
-        .map((comment) => parseHumanCommentEvidence(comment.body))
+        .map((comment) => {
+          const evidence = parseHumanCommentEvidence(comment.body);
+          if (evidence === null) return null;
+          return {
+            ...evidence,
+            ...(comment.author?.login === undefined
+              ? {}
+              : { author: comment.author.login }),
+          };
+        })
         .find((evidence) => evidence !== null);
     } catch (cause) {
       throw new PrEvidenceInconsistentError(
@@ -1221,6 +1234,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         ? await this.reviewClaim(pr.number, reviewClaimListing)
         : null,
       humanIssueNumber: humanEvidence?.issueNumber ?? null,
+      humanAuthor: humanEvidence?.author ?? null,
       humanReason: humanEvidence?.reason ?? null,
       mergedAt: pr.mergedAt,
       mergeCommitOid: pr.mergeCommit?.oid ?? null,

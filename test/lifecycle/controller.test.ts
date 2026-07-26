@@ -43,6 +43,7 @@ function implementation(
     projectStatus: 'Todo',
     labels: ['engine:review'],
     head: HEAD,
+    expectedBaseRefName: 'next',
     headChangedAt: '2026-07-20T11:00:00.000Z',
     isDraft: false,
     merged: false,
@@ -1281,6 +1282,7 @@ describe('lifecycle controller', () => {
       issueNumber: 42,
       prNumber: 101,
       head: HEAD,
+      expectedBaseRefName: 'next',
     }]);
   });
 

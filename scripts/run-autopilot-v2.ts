@@ -485,6 +485,10 @@ export async function runAutopilotV2(
       loaded.config.repository.slug,
     ),
     authorAllowlist: allowlist,
+    machineAuthorLogins: new Set(
+      (credentials?.logins() ?? []).map((login) => login.toLowerCase()),
+    ),
+    defaultBranch: loaded.config.repository.defaultBranch,
   }, stateDirectory);
   // A persistent observe loop is a runner and takes the same authoritative
   // startup full as recover/active. Only one-shot, read-only status may
@@ -513,6 +517,10 @@ export async function runAutopilotV2(
   };
   const targeted = makeTargetedActionReader({
     authorAllowlist: allowlist,
+    machineAuthorLogins: new Set(
+      (credentials?.logins() ?? []).map((login) => login.toLowerCase()),
+    ),
+    defaultBranch: loaded.config.repository.defaultBranch,
     rateLimitFloor: DEFAULT_FLOOR,
     readGraphQlRemaining: currentGraphQlRemaining,
     readPullRequest: (prNumber) => reader.readPullRequestForReconciliation(prNumber),

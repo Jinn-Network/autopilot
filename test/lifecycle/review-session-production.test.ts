@@ -302,6 +302,58 @@ describe('production review session port', () => {
     expect(pullRequest).not.toHaveProperty('mappingProblem');
   });
 
+  it('accepts an empty closing set only for the exact unique manifest-pinned stacked PR', async () => {
+    const stackedManifest: AttemptManifest = {
+      ...manifest(),
+      issueNumber: 2084,
+      branch: 'autopilot/2084',
+      targetBase: 'autopilot/2083',
+    };
+    const port = makeProductionReviewSessionPort({
+      environment: {
+        GH_TOKEN: 'selected-secret',
+        JINN_AUTOPILOT_SESSION_MANIFEST: '/attempt/manifest.json',
+      },
+      readManifest: () => stackedManifest,
+      runner: async (cmd, args) => {
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({
+            number: 84,
+            state: 'OPEN',
+            headRefOid: HEAD,
+            headRefName: 'autopilot/2084',
+            baseRefName: 'autopilot/2083',
+            baseRefOid: BASE,
+            isDraft: false,
+            body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+            author: { login: 'implementation-bot' },
+            labels: [{ name: 'engine:review' }],
+            closingIssuesReferences: [],
+            files: [],
+          });
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+          return JSON.stringify([{
+            number: 84,
+            headRefOid: HEAD,
+            headRefName: 'autopilot/2084',
+            closingIssuesReferences: [],
+          }]);
+        }
+        if (cmd === 'git' && args.includes('ls-tree')) return '';
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+
+    const pullRequest = await port.readPullRequest(84, HEAD);
+    expect(pullRequest).toMatchObject({
+      issueNumber: 2084,
+      headRefName: 'autopilot/2084',
+      baseRefName: 'autopilot/2083',
+    });
+    expect(pullRequest).not.toHaveProperty('mappingProblem');
+  });
+
   it('ignores a CODEOWNERS edit that only exists in the PR head tree', async () => {
     const port = makeProductionReviewSessionPort({
       environment: {

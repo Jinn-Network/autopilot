@@ -53,6 +53,8 @@ export interface TargetedIssueActionContext {
 
 export interface TargetedActionReaderOptions {
   readonly authorAllowlist: ReadonlySet<string>;
+  readonly machineAuthorLogins?: ReadonlySet<string>;
+  readonly defaultBranch?: string;
   readonly rateLimitFloor: number;
   readonly readGraphQlRemaining: () => Promise<number>;
   readonly readPullRequest: (prNumber: number) => Promise<RawPullRequest | null>;
@@ -199,6 +201,8 @@ function composeTargeted(
     readonly pullRequests?: GitHubLifecycleSnapshot['pullRequests'];
   },
   authorAllowlist: ReadonlySet<string>,
+  machineAuthorLogins: ReadonlySet<string>,
+  defaultBranch: string,
 ): GitHubLifecycleSnapshot {
   completeCycle(cycle);
   return composeGitHubLifecycleSnapshot({
@@ -209,6 +213,8 @@ function composeTargeted(
     terminalClaims: cycle.terminalClaims,
   }, {
     authorAllowlist,
+    machineAuthorLogins,
+    defaultBranch,
     capturedAt: cycle.capturedAt,
     snapshotMode: cycle.snapshotMode ?? 'incremental',
     lastFullReconciliationAt: cycle.lastFullReconciliationAt,
@@ -226,6 +232,8 @@ function composeTargeted(
 export function makeTargetedActionReader(
   options: TargetedActionReaderOptions,
 ): TargetedActionReader {
+  const defaultBranch = options.defaultBranch ?? 'next';
+  const machineAuthorLogins = options.machineAuthorLogins ?? new Set<string>();
   const reserve = async (points: number): Promise<void> => {
     assertRateLimitReserve(
       await options.readGraphQlRemaining(),
@@ -339,6 +347,8 @@ export function makeTargetedActionReader(
         cycleSnapshot,
         { project, issues, pullRequests },
         options.authorAllowlist,
+        machineAuthorLogins,
+        defaultBranch,
       );
     }
     const dependencySet = new Set(dependencies);
@@ -396,6 +406,8 @@ export function makeTargetedActionReader(
       cycleSnapshot,
       { project, issues, pullRequests },
       options.authorAllowlist,
+      machineAuthorLogins,
+      defaultBranch,
     );
   };
   return {
@@ -487,6 +499,8 @@ export function makeTargetedActionReader(
           cycleSnapshot,
           { project, issues, pullRequests },
           options.authorAllowlist,
+          machineAuthorLogins,
+          defaultBranch,
         ),
       };
     },

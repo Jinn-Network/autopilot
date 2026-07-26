@@ -99,7 +99,11 @@ describe('head-pinned merge executor', () => {
   it('rereads every gate and sends the exact head without bypass flags', async () => {
     const h = harness();
     await expect(
-      executeMergeAction({ prNumber: 84, expectedHead: HEAD }, h.deps),
+      executeMergeAction({
+        prNumber: 84,
+        expectedHead: HEAD,
+        expectedBaseRefName: gitRefName('next'),
+      }, h.deps),
     ).resolves.toEqual({
       status: 'merged',
       prNumber: 84,
@@ -116,8 +120,33 @@ describe('head-pinned merge executor', () => {
       readCandidate: async () => candidate({ head: reads++ === 0 ? HEAD : moved }),
     });
     await expect(
-      executeMergeAction({ prNumber: 84, expectedHead: HEAD }, h.deps),
+      executeMergeAction({
+        prNumber: 84,
+        expectedHead: HEAD,
+        expectedBaseRefName: gitRefName('next'),
+      }, h.deps),
     ).resolves.toEqual({ status: 'changed-head', prNumber: 84, head: moved });
+    expect(h.events).toEqual([]);
+  });
+
+  it('rejects a retargeted base on the immediate pre-merge reread', async () => {
+    let reads = 0;
+    const h = harness({
+      readCandidate: async () => candidate({
+        baseRefName: gitRefName(reads++ === 0 ? 'next' : 'autopilot/99'),
+      }),
+    });
+
+    await expect(executeMergeAction({
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedBaseRefName: gitRefName('next'),
+    }, h.deps)).resolves.toEqual({
+      status: 'ineligible',
+      prNumber: 84,
+      head: HEAD,
+      reasons: ['base'],
+    });
     expect(h.events).toEqual([]);
   });
 
@@ -131,8 +160,16 @@ describe('head-pinned merge executor', () => {
       },
     });
     const results = await Promise.all([
-      executeMergeAction({ prNumber: 84, expectedHead: HEAD }, h.deps),
-      executeMergeAction({ prNumber: 84, expectedHead: HEAD }, h.deps),
+      executeMergeAction({
+        prNumber: 84,
+        expectedHead: HEAD,
+        expectedBaseRefName: gitRefName('next'),
+      }, h.deps),
+      executeMergeAction({
+        prNumber: 84,
+        expectedHead: HEAD,
+        expectedBaseRefName: gitRefName('next'),
+      }, h.deps),
     ]);
     expect(results.every((result) => result.status === 'merged')).toBe(true);
   });
@@ -144,7 +181,11 @@ describe('head-pinned merge executor', () => {
       },
     });
     await expect(
-      executeMergeAction({ prNumber: 84, expectedHead: HEAD }, h.deps),
+      executeMergeAction({
+        prNumber: 84,
+        expectedHead: HEAD,
+        expectedBaseRefName: gitRefName('next'),
+      }, h.deps),
     ).resolves.toMatchObject({ status: 'merged-projection-pending' });
   });
 });

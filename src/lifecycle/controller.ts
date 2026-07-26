@@ -822,11 +822,13 @@ function activeCandidates(
         }
       }
     } else if (entry.phase === 'merge-ready') {
+      if (item.expectedBaseRefName === undefined) continue;
       other.push({
         phase: 'merge',
         issueNumber: item.issueNumber,
         prNumber: item.prNumber,
         head: item.head,
+        expectedBaseRefName: gitRefName(item.expectedBaseRefName),
       });
     } else if (entry.phase === 'blocked-by-child') {
       // No new work while a child is open or head-bound RC stands; child

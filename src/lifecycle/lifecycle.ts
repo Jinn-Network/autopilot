@@ -1,4 +1,5 @@
 import {
+  gitRefName,
   isoTimestamp,
   type AutopilotMode,
   type HumanReason,
@@ -476,11 +477,13 @@ export function planCycle(
 
   for (const candidate of view.items) {
     if (candidate.phase !== 'merge-ready' || candidate.item.kind !== 'pull-request') continue;
+    if (candidate.item.expectedBaseRefName === undefined) continue;
     planned.push({
       kind: 'merge',
       issueNumber: candidate.item.issueNumber,
       prNumber: candidate.item.prNumber,
       head: candidate.item.head,
+      expectedBaseRefName: gitRefName(candidate.item.expectedBaseRefName),
     });
   }
   return planned;

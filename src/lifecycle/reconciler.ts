@@ -12,6 +12,7 @@ export interface ReconciliationPullRequestState {
 export interface ReconciliationReviewRefState {
   readonly oid: GitOid;
   readonly head: GitOid;
+  readonly generation?: string;
   readonly state:
     | 'active'
     | 'verdict-intent'
@@ -73,6 +74,15 @@ export interface ReconciliationWriter {
   }): Promise<void>;
   readReviewRef(prNumber: number): Promise<ReconciliationReviewRefState | null>;
   markReviewStale(prNumber: number, expectedReviewRefOid: GitOid): Promise<void>;
+  repairObsoleteMappingHuman?(input: {
+    readonly issueNumber: number;
+    readonly prNumber: number;
+    readonly expectedHead: GitOid;
+    readonly expectedReviewRefOid: GitOid;
+    readonly expectedGeneration: string;
+    readonly expectedAuthor: string;
+    readonly marker: string;
+  }): Promise<void>;
   completeVerdictIntent(
     prNumber: number,
     expectedReviewRefOid: GitOid,
@@ -356,6 +366,41 @@ async function updateReviewRef(
   }
 }
 
+async function repairObsoleteMappingHuman(
+  action: Extract<ProjectionAction, { kind: 'repair-obsolete-mapping-human' }>,
+  writer: ReconciliationWriter,
+): Promise<ReconciliationResult> {
+  if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
+    return { action, outcome: 'changed-head' };
+  }
+  const before = await writer.readReviewRef(action.prNumber);
+  if (before?.head !== action.expectedHead) return { action, outcome: 'changed-head' };
+  if (
+    before.oid !== action.expectedReviewRefOid
+    || before.generation !== action.expectedGeneration
+    || (before.state !== 'human' && before.state !== 'stale')
+  ) {
+    return { action, outcome: 'lost-race' };
+  }
+  try {
+    if (writer.repairObsoleteMappingHuman === undefined) {
+      throw new Error('Obsolete mapping Human repair is unavailable');
+    }
+    await writer.repairObsoleteMappingHuman(action);
+    if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
+      return { action, outcome: 'changed-head' };
+    }
+    const after = await writer.readReviewRef(action.prNumber);
+    return after?.head === action.expectedHead
+      && after.generation === action.expectedGeneration
+      && after.state === 'stale'
+      ? { action, outcome: 'applied' }
+      : { action, outcome: 'lost-race' };
+  } catch (error) {
+    return { action, outcome: 'failed', detail: message(error) };
+  }
+}
+
 async function executeOne(
   action: ProjectionAction,
   writer: ReconciliationWriter,
@@ -371,6 +416,8 @@ async function executeOne(
       return ensureImplementationSummary(action, writer);
     case 'ensure-draft-pr':
       return ensureDraftPr(action, writer);
+    case 'repair-obsolete-mapping-human':
+      return repairObsoleteMappingHuman(action, writer);
     case 'mark-review-stale':
     case 'complete-verdict-intent':
       return updateReviewRef(action, writer);

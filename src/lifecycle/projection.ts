@@ -73,6 +73,15 @@ export type ProjectionAction =
       readonly summary: string;
     } & HeadPinned)
   | ({
+      readonly kind: 'repair-obsolete-mapping-human';
+      readonly issueNumber: number;
+      readonly prNumber: number;
+      readonly expectedReviewRefOid: GitOid;
+      readonly expectedGeneration: string;
+      readonly expectedAuthor: string;
+      readonly marker: string;
+    } & HeadPinned)
+  | ({
       readonly kind: 'mark-review-stale';
       readonly prNumber: number;
       readonly expectedReviewRefOid: GitOid;
@@ -147,6 +156,26 @@ function planItem(
     && item.branchClaim?.phase === 'implement'
     && item.branchClaim.phaseComplete === true;
   if (item.kind !== 'pull-request') return actions;
+  const obsoleteMapping = item.obsoleteMachineMappingHuman;
+  if (obsoleteMapping !== undefined) {
+    const refOid = reviewRefByPr.get(item.prNumber);
+    if (refOid !== undefined) {
+      return [{
+        kind: 'repair-obsolete-mapping-human',
+        issueNumber: item.issueNumber,
+        prNumber: item.prNumber,
+        expectedHead: item.head,
+        expectedReviewRefOid: refOid,
+        expectedGeneration: obsoleteMapping.generation,
+        expectedAuthor: obsoleteMapping.author,
+        marker: formatHumanCommentMarker({
+          issueNumber: item.issueNumber,
+          prNumber: item.prNumber,
+          reason: obsoleteMapping.reason,
+        }),
+      }];
+    }
+  }
 
   if (implementationComplete && item.implementationSummary !== undefined) {
     actions.push({

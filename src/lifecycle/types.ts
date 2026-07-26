@@ -205,6 +205,21 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   readonly kind: 'pull-request';
   readonly prNumber: number;
   readonly head: GitOid;
+  /** Base authority derived independently from configured default/dependency evidence. */
+  readonly expectedBaseRefName?: string;
+  /**
+   * Exact machine-authored mapping hold that may be repaired under review-ref
+   * CAS after the canonical mapping has become uniquely resolvable.
+   */
+  readonly obsoleteMachineMappingHuman?: {
+    readonly generation: string;
+    readonly author: string;
+    readonly reason: {
+      readonly phase: 'eligible' | 'implementing';
+      readonly code: 'branch-mapping-ambiguous';
+      readonly detail: string;
+    };
+  };
   readonly headChangedAt: string;
   readonly isDraft: boolean;
   readonly merged: boolean;
@@ -328,6 +343,7 @@ export type NewWorkAction =
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
     };
 
 export type RecoveryAction =

@@ -162,6 +162,48 @@ describe('planProjection', () => {
     ))).toBe(true);
   });
 
+  it('plans one CAS-fenced repair for an obsolete machine mapping Human overlay', () => {
+    const held = item({
+      labels: ['engine:review', 'review:needs-human'],
+      humanReason: {
+        phase: 'implementing',
+        code: 'branch-mapping-ambiguous',
+        detail: 'Old mapping evidence was ambiguous.',
+      },
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'reviewer',
+        head: HEAD,
+        state: 'human',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
+      obsoleteMachineMappingHuman: {
+        generation: '22222222-2222-4222-8222-222222222222',
+        author: 'maintenance-bot',
+        reason: {
+          phase: 'implementing',
+          code: 'branch-mapping-ambiguous',
+          detail: 'Old mapping evidence was ambiguous.',
+        },
+      },
+    });
+
+    expect(planProjection(context(held, REVIEW_OID)).actions).toEqual([{
+      kind: 'repair-obsolete-mapping-human',
+      issueNumber: 42,
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW_OID,
+      expectedGeneration: '22222222-2222-4222-8222-222222222222',
+      expectedAuthor: 'maintenance-bot',
+      marker: '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing code=branch-mapping-ambiguous -->',
+    }]);
+  });
+
   it('marks a stale review ref and completes recoverable APPROVE verdict intent', () => {
     const reviewBase = item({
       branchClaim: undefined,

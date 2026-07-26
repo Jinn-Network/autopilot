@@ -210,6 +210,7 @@ export function makeProductionReviewSessionPort(
     readonly number: number;
     readonly head: GitOid;
     readonly branch: string;
+    readonly body?: string;
     readonly closingIssueNumbers: readonly number[];
   }> => {
     let value: unknown;
@@ -245,6 +246,7 @@ export function makeProductionReviewSessionPort(
         number: record.number,
         head: gitOid(record.headRefOid),
         branch: record.headRefName,
+        ...(typeof record.body === 'string' ? { body: record.body } : {}),
         closingIssueNumbers,
       };
     });
@@ -274,18 +276,34 @@ export function makeProductionReviewSessionPort(
         : manifest.issueNumber);
     const openPullRequests = parseOpenPullRequests(await run(manifest, 'gh', [
       'pr', 'list', '--repo', REPO, '--state', 'open', '--limit', '1000',
-      '--json', 'number,headRefName,headRefOid,closingIssuesReferences',
+      '--json', 'number,headRefName,headRefOid,body,closingIssuesReferences',
     ]));
     const linked = openPullRequests.filter((candidate) => (
       candidate.branch === pullRequest.headRefName
       || candidate.closingIssueNumbers.includes(issueNumber)
+      || (
+        candidate.body !== undefined
+        && [...candidate.body.matchAll(
+          /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/g,
+        )].some((match) => Number(match[1]) === issueNumber)
+      )
     ));
+    const closingReferencesMatch = (
+      pullRequest.closingIssueNumbers.length === 1
+      && pullRequest.closingIssueNumbers[0] === issueNumber
+    ) || (
+      pullRequest.closingIssueNumbers.length === 0
+      && pullRequest.number === manifest.prNumber
+      && issueNumber === manifest.issueNumber
+      && pullRequest.head === manifest.expectedHead
+      && pullRequest.headRefName === manifest.branch
+      && pullRequest.baseRefName === manifest.targetBase
+    );
     const mappingProblem = (
       markerMatches.length !== 1
       || markerIssue !== issueNumber
       || markerBranch !== pullRequest.headRefName
-      || pullRequest.closingIssueNumbers.length !== 1
-      || pullRequest.closingIssueNumbers[0] !== issueNumber
+      || !closingReferencesMatch
       || linked.length !== 1
       || linked[0]?.number !== pullRequest.number
       || linked[0]?.head !== pullRequest.head

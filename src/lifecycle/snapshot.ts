@@ -31,6 +31,10 @@ import {
   assertRateLimitReserve,
   type GitHubUsage,
 } from './github-usage.js';
+import {
+  resolveStructuredPullRequestMappings,
+  type StructuredPullRequestMapping,
+} from './pr-mapping.js';
 
 export type SnapshotReadMode = 'incremental' | 'full';
 
@@ -119,6 +123,7 @@ export interface PullRequestSnapshot {
   readonly implementationCompletionSummary?: string;
   readonly reviewClaim?: ReviewClaimSnapshot;
   readonly humanIssueNumber?: number;
+  readonly humanAuthor?: string;
   readonly humanReason?: HumanReason;
   readonly mergedAt?: string;
   readonly mergeCommitOid?: GitOid;
@@ -155,6 +160,7 @@ export interface RawPullRequest {
   readonly implementationCompletionSummary?: string | null;
   readonly reviewClaim: { readonly oid: string; readonly payload: string } | null;
   readonly humanIssueNumber?: number | null;
+  readonly humanAuthor?: string | null;
   readonly humanReason: HumanReason | null;
   readonly mergedAt: string | null;
   readonly mergeCommitOid: string | null;
@@ -210,6 +216,7 @@ export interface GitHubLifecycleSnapshot {
   /** Narrow terminal proof for suppressing orphan recovery on retained implementation refs. */
   readonly terminalClaims?: readonly TerminalClaimEvidence[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
+  readonly pullRequestMappings?: readonly StructuredPullRequestMapping[];
   readonly lifecycle: LifecycleSnapshot;
   readonly capturedAt: string;
   /** Additive metadata; legacy/custom readers that omit it are treated as partial. */
@@ -356,6 +363,9 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       ...(raw.humanIssueNumber === undefined || raw.humanIssueNumber === null
         ? {}
         : { humanIssueNumber: raw.humanIssueNumber }),
+      ...(raw.humanAuthor === undefined || raw.humanAuthor === null
+        ? {}
+        : { humanAuthor: raw.humanAuthor }),
       ...(raw.humanReason === null ? {} : { humanReason: raw.humanReason }),
       ...(raw.mergedAt === null ? {} : { mergedAt: raw.mergedAt }),
       ...(raw.mergeCommitOid === null ? {} : { mergeCommitOid: gitOid(raw.mergeCommitOid) }),
@@ -448,6 +458,8 @@ LifecycleItem,
 function lifecyclePr(
   pr: PullRequestSnapshot,
   issue: PolledIssue,
+  expectedBaseRefName: string,
+  machineAuthorLogins: ReadonlySet<string>,
   openChildKinds: readonly ChildKind[] = [],
 ): Extract<LifecycleItem, { kind: 'pull-request' }> {
   const decisive = latestDecisiveReview(pr);
@@ -485,6 +497,28 @@ function lifecyclePr(
         };
   const humanReason = pr.humanReason ?? synthesizedHumanReason;
   const humanHold = humanReason !== undefined;
+  const obsoleteMachineMappingHuman = (
+    humanReason?.code === 'branch-mapping-ambiguous'
+    && pr.humanIssueNumber === issue.number
+    && pr.humanAuthor !== undefined
+    && machineAuthorLogins.has(pr.humanAuthor.toLowerCase())
+    && reviewClaim !== undefined
+    && reviewClaim.head === pr.headOid
+    && (reviewClaim.state === 'human' || reviewClaim.state === 'stale')
+    && issue.blockedOn !== 'Human'
+    && !issueLabels.includes('review:needs-human')
+    && !issueLabels.includes('autopilot:human')
+  )
+    ? {
+        generation: reviewClaim.generation,
+        author: pr.humanAuthor,
+        reason: {
+          phase: humanReason.phase,
+          code: 'branch-mapping-ambiguous' as const,
+          detail: humanReason.detail,
+        },
+      }
+    : undefined;
   return {
     kind: 'pull-request',
     issueNumber: issue.number,
@@ -501,6 +535,10 @@ function lifecyclePr(
     ...(humanHold ? { humanHold: true } : {}),
     ...(humanReason === undefined ? {} : { humanReason }),
     head: pr.headOid,
+    expectedBaseRefName,
+    ...(obsoleteMachineMappingHuman === undefined
+      ? {}
+      : { obsoleteMachineMappingHuman }),
     headChangedAt: pr.headCommittedAt,
     isDraft: pr.isDraft,
     merged: pr.state === 'MERGED',
@@ -530,68 +568,65 @@ function resolveMappings(
   prs: readonly PullRequestSnapshot[],
   branches: readonly BranchClaimSnapshot[],
   byIssue: ReadonlyMap<number, PolledIssue>,
+  defaultBranch: string,
 ): {
   readonly issueByPr: ReadonlyMap<number, number>;
+  readonly expectedBaseByPr: ReadonlyMap<number, string>;
+  readonly resolutions: readonly StructuredPullRequestMapping[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
   readonly affectedIssues: ReadonlySet<number>;
 } {
-  const candidatesByPr = new Map<number, Set<number>>();
+  const resolutions = resolveStructuredPullRequestMappings({
+    defaultBranch,
+    issues: [...byIssue.values()].map((issue) => ({
+      number: issue.number,
+      blockedOn: issue.blockedOn,
+      blockedByIssues: [...issue.blockedByIssues],
+    })),
+    pullRequests: prs.map((pr) => ({
+      number: pr.number,
+      state: pr.state,
+      head: pr.headOid,
+      headRefName: pr.headRefName,
+      baseRefName: pr.baseRefName,
+      closingIssueNumbers: [...pr.closingIssueNumbers],
+      body: pr.body,
+      ...(pr.humanIssueNumber === undefined
+        ? {}
+        : { humanIssueNumber: pr.humanIssueNumber }),
+    })),
+    stableBranches: branches.map((branch) => ({
+      issueNumber: branch.issueNumber,
+      phase: branch.claim.phase,
+      head: branch.headOid,
+      headRefName: branch.headRefName,
+      targetBase: branch.claim.targetBase,
+    })),
+  });
+  const candidatesByPr = new Map(resolutions.map((resolution) => [
+    resolution.prNumber,
+    new Set(
+      resolution.status === 'resolved'
+        ? [resolution.issueNumber]
+        : resolution.issueNumbers,
+    ),
+  ]));
   const prsByIssue = new Map<number, Set<number>>();
-  const intrinsicallyAmbiguous = new Set<number>();
-  const intrinsicDetails = new Map<number, string[]>();
-  const diagnosticExtraIssues = new Map<number, Set<number>>();
-  const stableClaims = new Map(
-    branches
-      .filter((branch) => (
-        branch.claim.phase === 'implement'
-        && branch.headRefName === `autopilot/${branch.issueNumber}`
-      ))
-      .map((branch) => [branch.issueNumber, branch]),
+  const intrinsicallyAmbiguous = new Set(
+    resolutions
+      .filter((resolution) => resolution.status === 'ambiguous')
+      .map((resolution) => resolution.prNumber),
   );
-  for (const pr of prs) {
-    const candidates = new Set<number>();
-    for (const issueNumber of pr.closingIssueNumbers) {
-      if (byIssue.has(issueNumber)) candidates.add(issueNumber);
-    }
-    const stableIssue = stableBranchIssue(pr.headRefName);
-    if (stableIssue !== undefined && byIssue.has(stableIssue)) candidates.add(stableIssue);
-    candidatesByPr.set(pr.number, candidates);
+  const intrinsicDetails = new Map<number, string[]>();
+  for (const resolution of resolutions) {
+    const candidates = candidatesByPr.get(resolution.prNumber) ?? new Set<number>();
     for (const issueNumber of candidates) {
       const issuePrs = prsByIssue.get(issueNumber) ?? new Set<number>();
-      issuePrs.add(pr.number);
+      issuePrs.add(resolution.prNumber);
       prsByIssue.set(issueNumber, issuePrs);
     }
-    const closing = new Set(pr.closingIssueNumbers);
-    const details: string[] = [];
-    if (
-      pr.humanIssueNumber !== undefined
-      && (candidates.size !== 1 || !candidates.has(pr.humanIssueNumber))
-    ) {
-      intrinsicallyAmbiguous.add(pr.number);
-      details.push(
-        `structured Human marker issue #${pr.humanIssueNumber} contradicts the resolved PR mapping`,
-      );
-      if (byIssue.has(pr.humanIssueNumber)) {
-        diagnosticExtraIssues.set(pr.number, new Set([pr.humanIssueNumber]));
-      }
-    }
-    const mappedIssue = candidates.size === 1 ? [...candidates][0] : undefined;
-    const stableClaim = mappedIssue === undefined ? undefined : stableClaims.get(mappedIssue);
-    if (stableClaim !== undefined && pr.headRefName !== stableClaim.headRefName) {
-      intrinsicallyAmbiguous.add(pr.number);
-      details.push(
-        `stable branch ${stableClaim.headRefName} claim contradicts adopted PR #${pr.number} branch ${pr.headRefName}`,
-      );
-    }
-    if (details.length > 0) intrinsicDetails.set(pr.number, details);
-    if (
-      candidates.size !== 1
-      || closing.size > 1
-      || (stableIssue !== undefined && closing.size > 0 && !closing.has(stableIssue))
-      || (pr.closingIssueNumbers.length > 0
-        && !pr.closingIssueNumbers.some((number) => byIssue.has(number)))
-    ) {
-      intrinsicallyAmbiguous.add(pr.number);
+    if (resolution.status === 'ambiguous') {
+      intrinsicDetails.set(resolution.prNumber, [...resolution.details]);
     }
   }
 
@@ -617,10 +652,7 @@ function resolveMappings(
       componentPrs.add(prNumber);
       ambiguousPrs.add(prNumber);
       seenPrs.add(prNumber);
-      const connectedIssues = new Set([
-        ...(candidatesByPr.get(prNumber) ?? []),
-        ...(diagnosticExtraIssues.get(prNumber) ?? []),
-      ]);
+      const connectedIssues = candidatesByPr.get(prNumber) ?? new Set<number>();
       for (const issueNumber of connectedIssues) {
         if (componentIssues.has(issueNumber)) continue;
         componentIssues.add(issueNumber);
@@ -660,12 +692,19 @@ function resolveMappings(
   }
 
   const issueByPr = new Map<number, number>();
-  for (const pr of prs) {
-    if (ambiguousPrs.has(pr.number)) continue;
-    const candidates = candidatesByPr.get(pr.number);
-    if (candidates?.size === 1) issueByPr.set(pr.number, [...candidates][0]!);
+  const expectedBaseByPr = new Map<number, string>();
+  for (const resolution of resolutions) {
+    if (resolution.status !== 'resolved' || ambiguousPrs.has(resolution.prNumber)) continue;
+    issueByPr.set(resolution.prNumber, resolution.issueNumber);
+    expectedBaseByPr.set(resolution.prNumber, resolution.expectedBaseRefName);
   }
-  return { issueByPr, diagnostics, affectedIssues };
+  return {
+    issueByPr,
+    expectedBaseByPr,
+    resolutions,
+    diagnostics,
+    affectedIssues,
+  };
 }
 
 function eligibilityEvidence(
@@ -731,10 +770,13 @@ function lifecycleItems(
   prs: readonly PullRequestSnapshot[],
   branches: readonly BranchClaimSnapshot[],
   authorAllowlist: ReadonlySet<string>,
+  machineAuthorLogins: ReadonlySet<string>,
   project: ProjectSnapshot,
+  defaultBranch: string,
 ): {
   readonly items: readonly LifecycleItem[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
+  readonly mappings: readonly StructuredPullRequestMapping[];
 } {
   const byIssue = new Map(issues.map((issue) => [issue.number, issue]));
   for (const entry of project.items) {
@@ -755,7 +797,7 @@ function lifecycleItems(
         && entry.sprintIterationId === project.currentSprintIterationId,
     });
   }
-  const mappings = resolveMappings(prs, branches, byIssue);
+  const mappings = resolveMappings(prs, branches, byIssue, defaultBranch);
   const links = prLinksByIssue(prs, mappings.issueByPr);
   const stackReady = resolveStackReady([...issues], links, authorAllowlist);
   const claimBranchIssues = new Set(
@@ -828,10 +870,20 @@ function lifecycleItems(
     if (issueNumber === undefined) continue;
     const issue = byIssue.get(issueNumber);
     if (issue !== undefined) {
-      out.push(lifecyclePr(pr, issue, childrenByParent.get(pr.number) ?? []));
+      out.push(lifecyclePr(
+        pr,
+        issue,
+        mappings.expectedBaseByPr.get(pr.number) ?? defaultBranch,
+        machineAuthorLogins,
+        childrenByParent.get(pr.number) ?? [],
+      ));
     }
   }
-  return { items: out, diagnostics: mappings.diagnostics };
+  return {
+    items: out,
+    diagnostics: mappings.diagnostics,
+    mappings: mappings.resolutions,
+  };
 }
 
 function deepFreeze<Value>(value: Value): Value {
@@ -853,6 +905,8 @@ export function composeGitHubLifecycleSnapshot(
   },
   options: {
     readonly authorAllowlist: ReadonlySet<string>;
+    readonly machineAuthorLogins?: ReadonlySet<string>;
+    readonly defaultBranch?: string;
     readonly capturedAt: string;
     readonly snapshotMode: SnapshotReadMode;
     readonly lastFullReconciliationAt: string;
@@ -880,7 +934,11 @@ export function composeGitHubLifecycleSnapshot(
     evidence.pullRequests,
     evidence.branches,
     options.authorAllowlist,
+    new Set(
+      [...(options.machineAuthorLogins ?? [])].map((login) => login.toLowerCase()),
+    ),
     evidence.project,
+    options.defaultBranch ?? 'next',
   );
   return deepFreeze({
     project: evidence.project,
@@ -889,6 +947,7 @@ export function composeGitHubLifecycleSnapshot(
     branches: [...evidence.branches],
     terminalClaims: [...(evidence.terminalClaims ?? [])],
     diagnostics: lifecycle.diagnostics,
+    pullRequestMappings: lifecycle.mappings,
     lifecycle: { items: lifecycle.items },
     capturedAt: options.capturedAt,
     snapshotMode: options.snapshotMode,
@@ -917,9 +976,11 @@ export async function buildGitHubLifecycleSnapshot(
   reader: GitHubLifecycleReader,
   options: {
     readonly authorAllowlist: ReadonlySet<string>;
+    readonly machineAuthorLogins?: ReadonlySet<string>;
     readonly now?: () => Date;
     readonly maxPages?: number;
     readonly rateLimitFloor?: number;
+    readonly defaultBranch?: string;
   },
 ): Promise<GitHubLifecycleSnapshot> {
   if (typeof reader.githubUsage !== 'function') {
@@ -1012,10 +1073,14 @@ export async function buildGitHubLifecycleSnapshot(
   }
   return composeGitHubLifecycleSnapshot({ project, issues, pullRequests, branches }, {
     authorAllowlist: options.authorAllowlist,
+    ...(options.machineAuthorLogins === undefined
+      ? {}
+      : { machineAuthorLogins: options.machineAuthorLogins }),
     capturedAt: now.toISOString(),
     snapshotMode: 'full',
     lastFullReconciliationAt: now.toISOString(),
     githubUsage,
+    ...(options.defaultBranch === undefined ? {} : { defaultBranch: options.defaultBranch }),
   });
 }
 

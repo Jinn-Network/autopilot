@@ -293,6 +293,7 @@ const pullRequestSchema = z.object({
   implementationCompletionSummary: z.string().optional(),
   reviewClaim: z.object({ oid, record: reviewClaimSchema }).strict().optional(),
   humanIssueNumber: positiveInteger.optional(),
+  humanAuthor: z.string().min(1).optional(),
   humanReason: humanReasonSchema.optional(),
   mergedAt: exactTimestamp.optional(),
   mergeCommitOid: oid.optional(),

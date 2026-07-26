@@ -558,11 +558,12 @@ export function makeProductionActiveRuntime(
       merge: (action, credentials, cycleSnapshot) => executeMergeAction({
         prNumber: action.prNumber,
         expectedHead: action.head,
+        expectedBaseRefName: action.expectedBaseRefName,
       }, {
         ...makeProductionMergeActionPort({
           readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
           authorAllowlist: options.authorAllowlist,
-          expectedBaseRefName: options.defaultBranch,
+          expectedBaseRefName: action.expectedBaseRefName,
           repositorySlug: options.repositorySlug,
           projectOwner: options.projectMapping?.owner,
           projectNumber: options.projectMapping?.number,
