@@ -1071,6 +1071,160 @@ describe('attempt workspace and manifest', () => {
     expect(readFileSync(mismatched.paths.manifest, 'utf8')).toBe(mismatchedOriginal);
   });
 
+  it('reserves every generic manifest writer for local and legacy marketplace attempts', async () => {
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const marketplaceExecution = (fixture: ReturnType<typeof repositoryFixture>) => ({
+      backend: 'marketplace' as const,
+      state: {
+        schemaVersion: 'marketplace-execution-v2' as const,
+        status: 'prepared' as const,
+        requestPath: join(fixture.root, 'marketplace-request.json'),
+        requestDigest,
+        solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+        preparedAt: '2026-07-20T00:01:00.000Z',
+        agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+        adoptionDeadline: '2026-07-20T01:30:00.000Z',
+      },
+    });
+    const writers: Array<readonly [
+      string,
+      Partial<CreateAttemptOptions>,
+      (manifest: AttemptManifest) => unknown,
+    ]> = [
+      ['updateAttemptManifest', {}, (manifest) => updateAttemptManifest(
+        manifest.paths.manifest,
+        (current) => current,
+      )],
+      ['markAttemptRunning', {}, (manifest) => markAttemptRunning(manifest.paths.manifest, 4242)],
+      ['markAttemptExited', {}, (manifest) => markAttemptExited(manifest.paths.manifest)],
+      ['advanceAttemptExpectedHead', {}, (manifest) => advanceAttemptExpectedHead(
+        manifest.paths.manifest,
+        manifest.expectedHead,
+        'a'.repeat(40),
+      )],
+      ['advanceAttemptReviewPair', {
+        phase: 'review',
+        subject: 'pr-7',
+        prNumber: 7,
+        reviewGeneration: UUID_C,
+        reviewRefOid: 'b'.repeat(40),
+        reviewApprovalPolicy: 'approve-eligible',
+      }, (manifest) => advanceAttemptReviewPair(
+        manifest.paths.manifest,
+        manifest.expectedHead,
+        manifest.reviewRefOid!,
+        'c'.repeat(40),
+        'd'.repeat(40),
+      )],
+    ];
+
+    for (const [name, overrides, writer] of writers) {
+      const fixture = repositoryFixture();
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        ...overrides,
+        ...(name === 'advanceAttemptReviewPair' ? { reviewRefOid: fixture.oid } : {}),
+        execution: marketplaceExecution(fixture),
+      }), defaultRunner);
+      const original = readFileSync(manifest.paths.manifest, 'utf8');
+      let error: unknown;
+      try {
+        writer(manifest);
+      } catch (caught) {
+        error = caught;
+      }
+      expect.soft(String(error), `${name} must direct v2 marketplace callers`).toMatch(
+        /marketplace execution v2 must use dedicated marketplace transition APIs/i,
+      );
+      expect.soft(readFileSync(manifest.paths.manifest, 'utf8'), `${name} must not rewrite`)
+        .toBe(original);
+    }
+
+    const localFixture = repositoryFixture();
+    const local = await createAttemptWorkspace(options(localFixture), defaultRunner);
+    expect(updateAttemptManifest(local.paths.manifest, (current) => current)).toEqual(local);
+    expect(markAttemptRunning(local.paths.manifest, 4242).processState).toBe('running');
+    expect(markAttemptExited(local.paths.manifest).processState).toBe('exited');
+
+    const localHead = await createAttemptWorkspace(options(localFixture, { attemptId: UUID_B }), defaultRunner);
+    expect(advanceAttemptExpectedHead(
+      localHead.paths.manifest,
+      localHead.expectedHead,
+      'a'.repeat(40),
+    ).expectedHead).toBe('a'.repeat(40));
+
+    const localReview = await createAttemptWorkspace(options(localFixture, {
+      attemptId: UUID_C,
+      phase: 'review',
+      subject: 'pr-7',
+      prNumber: 7,
+      reviewGeneration: UUID_C,
+      reviewRefOid: localFixture.oid,
+      reviewApprovalPolicy: 'approve-eligible',
+    }), defaultRunner);
+    expect(advanceAttemptReviewPair(
+      localReview.paths.manifest,
+      localReview.expectedHead,
+      localReview.reviewRefOid!,
+      'b'.repeat(40),
+      'c'.repeat(40),
+    ).expectedHead).toBe('b'.repeat(40));
+
+    const legacyFixture = repositoryFixture();
+    const legacy = await createAttemptWorkspace(options(legacyFixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'unsubmitted',
+          requestPath: join(legacyFixture.root, 'legacy-marketplace-request.json'),
+        },
+      },
+    }), defaultRunner);
+    expect(markAttemptRunning(legacy.paths.manifest, 4242).processState).toBe('running');
+  });
+
+  it('converges concurrent same-outcome marketplace transition writers on the durable winner', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+
+    const results = await Promise.all([
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'submitted', submission: SUBMISSION_RESULT },
+      }),
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'submitted', submission: SUBMISSION_RESULT },
+      }),
+    ]);
+
+    expect(results.map(({ result }) => result.ok)).toEqual([true, true]);
+    const winner = JSON.parse(readFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      'utf8',
+    )) as { readonly submission: unknown };
+    expect((readAttemptManifest(manifest.paths.manifest).execution as {
+      readonly state: { readonly submission: unknown };
+    }).state.submission).toEqual(winner.submission);
+  });
+
   it('rejects malformed execution discriminants and marketplace state records', async () => {
     const fixture = repositoryFixture();
     const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);

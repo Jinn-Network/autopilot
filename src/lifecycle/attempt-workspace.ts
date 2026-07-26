@@ -752,11 +752,21 @@ function sameRepositoryIdentity(
     && left.remoteUrlHash === right.remoteUrlHash;
 }
 
+function requireDedicatedMarketplaceExecutionTransition(manifest: AttemptManifest): void {
+  if (
+    manifest.execution.backend === 'marketplace'
+    && manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+  ) {
+    throw new Error('Marketplace execution v2 must use dedicated marketplace transition APIs');
+  }
+}
+
 export function updateAttemptManifest(
   path: string,
   update: (manifest: AttemptManifest) => AttemptManifest,
 ): AttemptManifest {
   const previous = readAttemptManifest(path);
+  requireDedicatedMarketplaceExecutionTransition(previous);
   const progressiveManifestFields = new Set([
     'processState',
     'pid',
@@ -1099,6 +1109,7 @@ export function advanceAttemptExpectedHead(
   now: () => Date = () => new Date(),
 ): AttemptManifest {
   const previous = readAttemptManifest(path);
+  requireDedicatedMarketplaceExecutionTransition(previous);
   const expected = gitOid(expectedHead);
   const next = gitOid(nextHead);
   if (previous.expectedHead !== expected) {
@@ -1130,6 +1141,7 @@ export function advanceAttemptReviewPair(
   now: () => Date = () => new Date(),
 ): AttemptManifest {
   const previous = readAttemptManifest(path);
+  requireDedicatedMarketplaceExecutionTransition(previous);
   const expectedBranch = gitOid(expectedHead);
   const expectedReview = gitOid(expectedReviewRefOid);
   const nextBranch = gitOid(nextHead);
