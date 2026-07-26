@@ -3,7 +3,7 @@
  */
 
 import { carryoverEnabled, childrenPathEnabled } from './child-issues.js';
-import type { GitOid } from './types.js';
+import type { CompareStatus, GitOid } from './types.js';
 
 export type IntegrationLadderAction =
   | { readonly kind: 'merge-ready' }
@@ -18,7 +18,7 @@ export interface IntegrationLadderInput {
   readonly humanHold: boolean;
   readonly mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' | string;
   readonly mergeStateStatus: string;
-  readonly compareStatus: 'ahead' | 'behind' | 'diverged' | 'identical' | 'unknown';
+  readonly compareStatus: CompareStatus;
   readonly openReconcileChild: boolean;
   readonly openFindingChild: boolean;
   readonly childrenEnabled?: boolean;

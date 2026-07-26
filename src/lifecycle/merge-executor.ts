@@ -4,6 +4,7 @@ import {
   type SelectedCredential,
 } from './credentials.js';
 import type {
+  CompareStatus,
   GitOid,
   GitRefName,
 } from './types.js';
@@ -42,7 +43,7 @@ export interface MergeCandidate {
   }[];
   readonly mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
-  readonly compareStatus: 'ahead' | 'identical' | 'behind' | 'diverged' | 'unknown';
+  readonly compareStatus: CompareStatus;
   readonly changedFilesComplete: boolean;
   readonly codeownersComplete: boolean;
   readonly codeownerSensitive: boolean;

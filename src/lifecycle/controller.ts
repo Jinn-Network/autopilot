@@ -43,9 +43,11 @@ import type {
   IssueEligibilityReason,
   LifecycleMappingDiagnostic,
   LifecyclePhase,
+  LifecycleSnapshot,
   LifecycleView,
   LifecycleViewItem,
   NewWorkAction,
+  CompareStatus,
 } from './types.js';
 import { gitRefName } from './types.js';
 import { EMPTY_GITHUB_USAGE, type GitHubUsage } from './github-usage.js';
@@ -698,6 +700,15 @@ function activeCandidates(
     if (item.kind !== 'pull-request' || item.humanHold || item.merged) continue;
     const pr = byPr.get(item.prNumber);
     if (pr === undefined) continue;
+    const compareStatus: CompareStatus = pr.compareStatus ?? (
+      item.mergeState === 'behind'
+        ? 'behind'
+        : item.mergeState === 'conflict'
+          ? 'diverged'
+          : item.mergeState === 'clean'
+            ? 'ahead'
+            : 'unknown'
+    );
     if (
       entry.phase === 'implementing'
       && entry.stale
@@ -748,10 +759,16 @@ function activeCandidates(
         author: pr.author,
       });
     } else if (
-      entry.phase === 'awaiting-review'
+      (entry.phase === 'awaiting-review' || entry.phase === 'merge-ready')
       && item.approved
       && !item.needsReview
-      && (item.mergeState === 'behind' || item.mergeState === 'conflict')
+      && (
+        item.mergeState === 'behind'
+        || item.mergeState === 'conflict'
+        || compareStatus === 'behind'
+        || compareStatus === 'diverged'
+        || compareStatus === 'unknown'
+      )
       && !(item.openChildKinds ?? []).includes('reconcile')
     ) {
       const childrenOn = childrenPathEnabled();
@@ -763,13 +780,7 @@ function activeCandidates(
         humanHold: false,
         mergeable: pr.mergeability,
         mergeStateStatus: pr.mergeStateStatus,
-        compareStatus: item.mergeState === 'behind'
-          ? 'behind'
-          : item.mergeState === 'conflict'
-            ? 'diverged'
-            : item.mergeState === 'clean'
-              ? 'ahead'
-              : 'unknown',
+        compareStatus,
         openReconcileChild: (item.openChildKinds ?? []).includes('reconcile'),
         openFindingChild: (item.openChildKinds ?? []).includes('review-finding'),
         childrenEnabled: childrenOn,
@@ -824,6 +835,28 @@ function activeCandidates(
   }
   // Children outrank fresh implementation claims for the remaining slots.
   return [...repair, ...childImplementation, ...freshImplementation, ...other];
+}
+
+/**
+ * Keep the scheduler fail-closed if a stale or custom snapshot projection
+ * retained GraphQL's false-clean state after exact REST compare evidence was
+ * already captured.
+ */
+function lifecycleWithExactCompareEvidence(
+  snapshot: GitHubLifecycleSnapshot,
+): LifecycleSnapshot {
+  const compareByPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr.compareStatus]));
+  return {
+    items: snapshot.lifecycle.items.map((item) => {
+      if (item.kind !== 'pull-request') return item;
+      const compareStatus = compareByPr.get(item.prNumber);
+      if (compareStatus === 'behind' || compareStatus === 'diverged') {
+        return { ...item, mergeState: 'behind' as const };
+      }
+      if (compareStatus === 'unknown') return { ...item, mergeState: 'blocked' as const };
+      return item;
+    }),
+  };
 }
 
 function phaseForAction(action: NewWorkAction): LifecyclePhase {
@@ -957,7 +990,11 @@ async function executeActivePass(
   cycleId: string,
   now: Date,
 ): Promise<ActivePassResult> {
-  const view = deriveLifecycle(snapshot.lifecycle, now, deps.staleAfterMs);
+  const view = deriveLifecycle(
+    lifecycleWithExactCompareEvidence(snapshot),
+    now,
+    deps.staleAfterMs,
+  );
   const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
   const plan = planProjection(context);
   const items = statusItems(view, plan.actions, now, context.orphanBranchClaims);

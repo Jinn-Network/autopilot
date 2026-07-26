@@ -4,6 +4,15 @@ export type GitOid = Brand<string, 'GitOid'>;
 export type GitRefName = Brand<string, 'GitRefName'>;
 export type IsoTimestamp = Brand<string, 'IsoTimestamp'>;
 
+export const COMPARE_STATUSES = ['ahead', 'identical', 'behind', 'diverged', 'unknown'] as const;
+export type CompareStatus = typeof COMPARE_STATUSES[number];
+
+export function decodeCompareStatus(value: unknown): CompareStatus {
+  return typeof value === 'string' && (COMPARE_STATUSES as readonly string[]).includes(value)
+    ? value as CompareStatus
+    : 'unknown';
+}
+
 const OID_PATTERN = /^[0-9a-f]{40}$/;
 const INVALID_REF_PATTERN = /[\u0000-\u0020\u007f~^:?*[\]\\]/;
 

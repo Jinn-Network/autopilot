@@ -31,6 +31,7 @@ import {
   terminalBranchClaimTrailers,
 } from './codecs.js';
 import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
+import { readExactCompareStatus } from './github-changed-files.js';
 import { gitOid, gitRefName, type GitOid, type GitRefName } from './types.js';
 import {
   GitHubUsageMeter,
@@ -631,6 +632,14 @@ function inconsistentPullRequest(pr: GraphQlPr, detail: string): RawPullRequest 
   };
 }
 
+function looksFalseCleanMergeState(
+  mergeability: RawPullRequest['mergeability'],
+  mergeStateStatus: string,
+): boolean {
+  return mergeability === 'MERGEABLE'
+    && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(mergeStateStatus);
+}
+
 function checks(pr: GraphQlPr): RawPullRequest['checks'] {
   return (pr.statusCheckRollup?.contexts.nodes ?? []).map((node) => (
     node.__typename === 'CheckRun'
@@ -1215,6 +1224,17 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       humanReason: humanEvidence?.reason ?? null,
       mergedAt: pr.mergedAt,
       mergeCommitOid: pr.mergeCommit?.oid ?? null,
+      ...(pr.state === 'OPEN' && looksFalseCleanMergeState(pr.mergeable, pr.mergeStateStatus)
+        ? {
+            compareStatus: await readExactCompareStatus({
+              run: this.run,
+              prNumber: pr.number,
+              expectedHead: gitOid(pr.headRefOid),
+              expectedBaseRefName: pr.baseRefName,
+              repositorySlug: this.repositorySlug,
+            }),
+          }
+        : {}),
     };
   }
 

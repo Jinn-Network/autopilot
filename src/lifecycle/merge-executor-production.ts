@@ -20,7 +20,7 @@ import type {
   NativeReviewSnapshot,
   PullRequestSnapshot,
 } from './snapshot.js';
-import { gitOid, gitRefName } from './types.js';
+import { decodeCompareStatus, gitOid, gitRefName } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 
 export interface ProductionMergeActionPortOptions {
@@ -107,10 +107,7 @@ export function makeProductionMergeActionPort(
       'api',
       `repos/${repositorySlug}/compare/${baseOid}...${pr.headOid}`,
     ])) as { status?: unknown };
-    const compareStatus = typeof compare.status === 'string'
-      && ['ahead', 'identical', 'behind', 'diverged'].includes(compare.status)
-      ? compare.status as 'ahead' | 'identical' | 'behind' | 'diverged'
-      : 'unknown';
+    const compareStatus = decodeCompareStatus(compare.status);
     const effectiveReviews = effectiveCurrentHeadReviews(pr);
     const reviewClaim = lifecycle.reviewClaim;
     const terminalReview = reviewClaim === undefined

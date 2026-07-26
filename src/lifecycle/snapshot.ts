@@ -15,6 +15,7 @@ import {
   gitOid,
   isoTimestamp,
   type BranchClaim,
+  type CompareStatus,
   type GitOid,
   type HumanReason,
   type IssueEligibilityReason,
@@ -110,6 +111,7 @@ export interface PullRequestSnapshot {
   readonly closingIssueNumbers: readonly number[];
   readonly mergeability: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
+  readonly compareStatus?: CompareStatus;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
   readonly reviews: readonly NativeReviewSnapshot[];
@@ -145,6 +147,7 @@ export interface RawPullRequest {
   readonly closingIssueNumbers: readonly number[];
   readonly mergeability: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
+  readonly compareStatus?: CompareStatus;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
   readonly reviews: readonly RawNativeReview[];
@@ -340,6 +343,7 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       closingIssueNumbers: [...raw.closingIssueNumbers],
       mergeability: raw.mergeability,
       mergeStateStatus: raw.mergeStateStatus,
+      ...(raw.compareStatus === undefined ? {} : { compareStatus: raw.compareStatus }),
       checks: raw.checks.map((check) => ({ ...check })),
       ...(raw.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
       reviews,
@@ -431,6 +435,8 @@ LifecycleItem,
 >['mergeState'] {
   if (pr.mergeability === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY') return 'conflict';
   if (pr.mergeStateStatus === 'BEHIND') return 'behind';
+  if (pr.compareStatus === 'behind' || pr.compareStatus === 'diverged') return 'behind';
+  if (pr.compareStatus === 'unknown') return 'blocked';
   if (pr.mergeability === 'MERGEABLE' && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(
     pr.mergeStateStatus,
   )) {
