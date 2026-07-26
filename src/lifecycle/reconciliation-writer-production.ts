@@ -32,6 +32,7 @@ import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import { withSelectedCredential } from './production-auth.js';
 import { resolveStructuredPullRequestMappings } from './pr-mapping.js';
 import type {
+  ReconciliationHumanCommentAuthority,
   ReconciliationPullRequestState,
   ReconciliationReviewRefState,
   ReconciliationWriter,
@@ -374,9 +375,46 @@ function makeProductionReconciliationWriterWithScope(
     }
     return selection.credential;
   };
+  const machineAuthorLogins = new Set([
+    options.credential.normalizedLogin,
+    ...(options.credentials?.logins().map((login) => login.toLowerCase()) ?? []),
+  ]);
+  const isRetiredMappingAudit = (
+    input: {
+      readonly issueNumber: number;
+      readonly prNumber: number;
+      readonly expectedHead: GitOid;
+      readonly expectedGeneration: string;
+    },
+    body: string,
+    author: unknown,
+  ): boolean => {
+    if (
+      typeof author !== 'string'
+      || !machineAuthorLogins.has(author.toLowerCase())
+    ) {
+      return false;
+    }
+    const evidence = parseHumanCommentEvidence(body);
+    return evidence?.reason.code === 'branch-mapping-ambiguous'
+      && evidence.issueNumber === input.issueNumber
+      && evidence.prNumber === input.prNumber
+      && evidence.head === input.expectedHead
+      && evidence.generation !== undefined
+      && evidence.generation !== input.expectedGeneration;
+  };
   type LiveMapping =
     | { readonly kind: 'normal'; readonly issueNumber: number }
-    | { readonly kind: 'diagnostic' };
+    | {
+        readonly kind: 'diagnostic';
+        readonly issueNumbers: readonly number[];
+        readonly details: readonly string[];
+      };
+  const sameList = <Value>(
+    left: readonly Value[],
+    right: readonly Value[],
+  ): boolean => left.length === right.length
+    && left.every((value, index) => value === right[index]);
   const validateLiveMapping = (
     prNumber: number,
     raw: ReconciliationPullRequestNode,
@@ -453,8 +491,14 @@ function makeProductionReconciliationWriterWithScope(
     if (
       live?.status === 'ambiguous'
       && cycle?.status === 'ambiguous'
+      && sameList(live.issueNumbers, cycle.issueNumbers)
+      && sameList(live.details, cycle.details)
     ) {
-      return { kind: 'diagnostic' };
+      return {
+        kind: 'diagnostic',
+        issueNumbers: [...live.issueNumbers],
+        details: [...live.details],
+      };
     }
     const detail = live?.status === 'ambiguous'
       ? live.details.join(' ')
@@ -472,6 +516,59 @@ function makeProductionReconciliationWriterWithScope(
     pullRequestStateFromRaw(await readMappedRawPr(prNumber));
   const readReview = async (prNumber: number) =>
     reviewRefStateFromRaw(await readMappedRawPr(prNumber));
+  const validateHumanCommentAuthority = (
+    prNumber: number,
+    raw: ReconciliationPullRequestNode,
+    mapping: LiveMapping,
+    authority: ReconciliationHumanCommentAuthority,
+  ): void => {
+    if (
+      raw.state !== 'OPEN'
+      || gitOid(raw.headOid) !== authority.expectedHead
+    ) {
+      throw new Error('Human comment reconciliation lost exact-head authority');
+    }
+    const claim = raw.reviewClaim;
+    if (claim === null) {
+      throw new Error('Human comment reconciliation review-ref authority is absent');
+    }
+    const record = decodeReviewClaimPayload(claim.payload);
+    if (
+      gitOid(claim.oid) !== authority.expectedReviewRefOid
+      || record.prNumber !== prNumber
+      || record.head !== authority.expectedHead
+      || record.generation !== authority.expectedGeneration
+      || record.state !== 'human'
+    ) {
+      throw new Error('Human comment reconciliation lost exact review-ref authority');
+    }
+    const diagnostic = options.cycleSnapshot.diagnostics.find((candidate) => (
+      candidate.pullRequests.some((pr) => (
+        pr.number === prNumber && pr.head === authority.expectedHead
+      ))
+    ));
+    if (
+      authority.expectedDiagnosticIssueNumbers !== undefined
+      || authority.expectedDiagnosticDetail !== undefined
+    ) {
+      if (
+        mapping.kind !== 'diagnostic'
+        || diagnostic === undefined
+        || authority.expectedDiagnosticDetail !== diagnostic.detail
+        || !sameList(
+          authority.expectedDiagnosticIssueNumbers ?? [],
+          diagnostic.issueNumbers,
+        )
+        || !diagnostic.issueNumbers.includes(authority.issueNumber)
+      ) {
+        throw new Error('Human comment reconciliation diagnostic authority changed');
+      }
+      return;
+    }
+    if (mapping.kind !== 'normal' || mapping.issueNumber !== authority.issueNumber) {
+      throw new Error('Human comment reconciliation issue mapping changed');
+    }
+  };
   const liveIssueHead = async (issueNumber: number): Promise<GitOid | null> => {
     const lifecyclePr = options.cycleSnapshot.lifecycle.items.find((item) => (
       item.kind === 'pull-request' && item.issueNumber === issueNumber
@@ -496,13 +593,36 @@ function makeProductionReconciliationWriterWithScope(
   const liveHumanDominatesPullRequest = async (
     prNumber: number,
     supplied?: ReconciliationPullRequestNode | null,
+    authoritativeReview?: ReviewClaimRecord,
   ): Promise<boolean> => {
     const raw = supplied === undefined ? await readMappedRawPr(prNumber) : supplied;
     const mapping = raw === null ? null : validateLiveMapping(prNumber, raw);
     if (mapping?.kind === 'diagnostic') return true;
     if (humanDominatesPullRequest(options.cycleSnapshot, prNumber)) return true;
     if (raw?.labels.includes(NEEDS_HUMAN_LABEL) === true) return true;
-    if (raw?.humanReason !== undefined && raw.humanReason !== null) return true;
+    if (raw?.humanReason !== undefined && raw.humanReason !== null) {
+      const retainedMachineMappingAudit = (
+        authoritativeReview !== undefined
+        && mapping?.kind === 'normal'
+        && raw.humanReason.code === 'branch-mapping-ambiguous'
+        && raw.humanIssueNumber === mapping.issueNumber
+        && raw.humanAuthor !== undefined
+        && raw.humanAuthor !== null
+        && machineAuthorLogins.has(raw.humanAuthor.toLowerCase())
+        && raw.humanHead === authoritativeReview.head
+        && raw.humanGeneration !== undefined
+        && raw.humanGeneration !== null
+        && authoritativeReview.head === gitOid(raw.headOid)
+        && (
+          raw.humanGeneration !== authoritativeReview.generation
+          || (
+            raw.humanGeneration === authoritativeReview.generation
+            && authoritativeReview.state === 'stale'
+          )
+        )
+      );
+      if (!retainedMachineMappingAudit) return true;
+    }
     const lifecycle = options.cycleSnapshot.lifecycle.items.find((item) => (
       item.kind === 'pull-request' && item.prNumber === prNumber
     ));
@@ -531,7 +651,7 @@ function makeProductionReconciliationWriterWithScope(
     // reads refresh the mutable Human-dominance evidence.
     if (
       !allowObsoleteMappingHuman
-      && await liveHumanDominatesPullRequest(prNumber, beforeRaw)
+      && await liveHumanDominatesPullRequest(prNumber, beforeRaw, beforeRecord)
     ) {
       throw new Error('Human is dominant over review-ref reconciliation');
     }
@@ -716,7 +836,13 @@ function makeProductionReconciliationWriterWithScope(
       ));
     },
 
-    async hasHumanComment(prNumber, marker) {
+    async hasHumanComment(prNumber, marker, authority) {
+      const raw = await readRawPr(prNumber);
+      if (raw === null) {
+        throw new Error('Human comment reconciliation pull request is absent');
+      }
+      const mapping = validateLiveMapping(prNumber, raw);
+      validateHumanCommentAuthority(prNumber, raw, mapping, authority);
       return selected(async ({ run }) => {
         const bodies = await readIssueCommentBodies(
           run,
@@ -727,15 +853,20 @@ function makeProductionReconciliationWriterWithScope(
       });
     },
 
-    async ensureHumanComment(prNumber, marker, body, expectedHead) {
+    async ensureHumanComment(prNumber, marker, body, authority) {
       if (!body.includes(marker)) {
         throw new Error('Human comment body is missing its exact marker');
       }
       const beforeRaw = await readMappedRawPr(prNumber);
-      const before = pullRequestStateFromRaw(beforeRaw);
-      if (expectedHead !== undefined && before?.head !== expectedHead) {
-        throw new Error('Human comment reconciliation lost exact-head authority');
+      if (beforeRaw === null) {
+        throw new Error('Human comment reconciliation pull request is absent');
       }
+      validateHumanCommentAuthority(
+        prNumber,
+        beforeRaw,
+        validateLiveMapping(prNumber, beforeRaw),
+        authority,
+      );
       await selected(async ({ run }) => {
         const hasMarker = async () => (
           await readIssueCommentBodies(run, prNumber, repositorySlug)
@@ -750,8 +881,15 @@ function makeProductionReconciliationWriterWithScope(
           },
           async () => {
             if (!await hasMarker()) return false;
-            const after = await readPr(prNumber);
-            return expectedHead === undefined || after?.head === expectedHead;
+            const after = await readRawPr(prNumber);
+            if (after === null) return false;
+            validateHumanCommentAuthority(
+              prNumber,
+              after,
+              validateLiveMapping(prNumber, after),
+              authority,
+            );
+            return true;
           },
           'Human comment reconciliation was ambiguous',
         );
@@ -1014,6 +1152,7 @@ function makeProductionReconciliationWriterWithScope(
             otherStructured = true;
             continue;
           }
+          if (isRetiredMappingAudit(input, comment.body, author)) continue;
           if (
             structured !== null
             || comment.body.includes('<!-- jinn-autopilot-human:')
@@ -1176,6 +1315,15 @@ function makeProductionReconciliationWriterWithScope(
           continue;
         }
         try {
+          if (
+            isRetiredMappingAudit(
+              input,
+              comment.body,
+              comment.user?.login,
+            )
+          ) {
+            continue;
+          }
           if (
             parseHumanCommentEvidence(comment.body) !== null
             || comment.body.includes('<!-- jinn-autopilot-human:')

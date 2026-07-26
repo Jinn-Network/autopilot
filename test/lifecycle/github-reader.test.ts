@@ -1341,7 +1341,7 @@ describe('GhLifecycleReader', () => {
       state: 'OPEN',
       head: 'a'.repeat(40),
       headRefName: 'feature/205',
-      comments: ['Human hold: do not merge this PR until I investigate.'],
+      comments: ['Please do not merge this PR until I investigate.'],
       commentAuthor: 'maintainer',
     });
 

@@ -503,6 +503,104 @@ export function parseHumanCommentEvidence(body: string): HumanCommentEvidence | 
  * comment author separately; this only identifies the hold instruction.
  */
 export function isUnstructuredHumanHoldComment(body: string): boolean {
-  return /(?:^|\n)\s*(?:human\s+(?:hold|review)\b|needs?\s+human\b|do\s+not\s+(?:merge|automate)\b)/i
-    .test(body);
+  const clauses: string[][] = [];
+  let fenced = false;
+  for (const rawLine of body.split('\n')) {
+    const line = rawLine.trim();
+    if (line.startsWith('```')) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced || line.startsWith('>')) continue;
+    for (const clause of line
+      .replaceAll(/[’‘]/g, "'")
+      .replaceAll(/\bdon't\b/gi, 'do not')
+      .split(/[.!?;]+/)) {
+      const tokens = clause.toLowerCase().match(/[a-z]+/g);
+      if (tokens !== null && tokens.length > 0) clauses.push(tokens);
+    }
+  }
+
+  const sequenceAt = (
+    tokens: readonly string[],
+    sequence: readonly string[],
+  ): number => {
+    for (let start = 0; start <= tokens.length - sequence.length; start += 1) {
+      if (sequence.every((token, offset) => tokens[start + offset] === token)) {
+        return start;
+      }
+    }
+    return -1;
+  };
+  const hasSequence = (
+    tokens: readonly string[],
+    sequence: readonly string[],
+  ): boolean => sequenceAt(tokens, sequence) >= 0;
+  const hasNear = (
+    tokens: readonly string[],
+    anchor: string,
+    candidates: ReadonlySet<string>,
+    distance: number,
+  ): boolean => tokens.some((token, index) => (
+    token === anchor
+    && tokens.slice(index + 1, index + 1 + distance).some(
+      (candidate) => candidates.has(candidate),
+    )
+  ));
+
+  for (const tokens of clauses) {
+    // Explicit releases win within their clause. This keeps common affirmative
+    // maintainer instructions from being mistaken for holds merely because
+    // they contain the words "merge" or "human review".
+    if (
+      hasSequence(tokens, ['do', 'not', 'block'])
+      || hasSequence(tokens, ['no', 'human', 'review'])
+      || hasSequence(tokens, ['please', 'merge'])
+      || hasSequence(tokens, ['ok', 'to', 'merge'])
+      || hasSequence(tokens, ['okay', 'to', 'merge'])
+      || hasSequence(tokens, ['safe', 'to', 'merge'])
+      || hasSequence(tokens, ['ready', 'to', 'merge'])
+    ) {
+      continue;
+    }
+
+    const doNotMerge = sequenceAt(tokens, ['do', 'not', 'merge']);
+    if (doNotMerge >= 0) {
+      const next = tokens[doNotMerge + 3];
+      if (
+        next === undefined
+        || new Set(['this', 'the', 'pr', 'pull', 'until', 'before', 'yet', 'while'])
+          .has(next)
+      ) {
+        return true;
+      }
+    }
+    if (hasSequence(tokens, ['do', 'not', 'automate'])) return true;
+    if (hasSequence(tokens, ['human', 'hold'])) return true;
+    if (
+      hasSequence(tokens, ['need', 'human'])
+      || hasSequence(tokens, ['needs', 'human'])
+      || hasSequence(tokens, ['require', 'human'])
+      || hasSequence(tokens, ['requires', 'human'])
+    ) {
+      return true;
+    }
+    if (
+      hasNear(tokens, 'hold', new Set(['this', 'the', 'pr', 'pull', 'merge', 'automation']), 4)
+      || hasNear(tokens, 'pause', new Set(['this', 'the', 'pr', 'pull', 'merge', 'automation']), 4)
+      || hasSequence(tokens, ['wait', 'before', 'merge'])
+      || hasSequence(tokens, ['wait', 'before', 'merging'])
+    ) {
+      return true;
+    }
+    const humanReview = sequenceAt(tokens, ['human', 'review']);
+    if (
+      humanReview >= 0
+      && tokens.some((token) => ['need', 'needed', 'require', 'required', 'request', 'requested']
+        .includes(token))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }

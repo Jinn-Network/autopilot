@@ -683,24 +683,58 @@ export function makeProductionReviewSessionPort(
       );
     },
 
-    async hasHumanComment(prNumber, expectedHead, body) {
+    async hasHumanComment(
+      prNumber,
+      expectedHead,
+      expectedReviewRefOid,
+      expectedGeneration,
+      body,
+    ) {
       const manifest = currentManifest();
       await requireHead(manifest, prNumber, expectedHead);
+      const authority = await readAuthority(manifest);
+      if (
+        authority.reviewRefOid !== expectedReviewRefOid
+        || authority.record.head !== expectedHead
+        || authority.record.generation !== expectedGeneration
+        || authority.record.state !== 'human'
+      ) {
+        throw new Error('Review Human comment lost exact review-ref authority');
+      }
       return (await readCommentBodies(manifest, prNumber)).includes(body);
     },
 
-    async ensureHumanComment(prNumber, expectedHead, marker, body) {
+    async ensureHumanComment(
+      prNumber,
+      expectedHead,
+      expectedReviewRefOid,
+      expectedGeneration,
+      marker,
+      body,
+    ) {
       const manifest = currentManifest();
       if (!body.includes(marker)) {
         throw new Error('Review Human comment body is missing its exact marker');
       }
-      await requireHead(manifest, prNumber, expectedHead);
+      const requireExactAuthority = async (): Promise<void> => {
+        await requireHead(manifest, prNumber, expectedHead);
+        const authority = await readAuthority(manifest);
+        if (
+          authority.reviewRefOid !== expectedReviewRefOid
+          || authority.record.head !== expectedHead
+          || authority.record.generation !== expectedGeneration
+          || authority.record.state !== 'human'
+        ) {
+          throw new Error('Review Human comment lost exact review-ref authority');
+        }
+      };
+      await requireExactAuthority();
       await mutateWithExactReadback(
         () => run(manifest, 'gh', [
           'pr', 'comment', String(prNumber), '--repo', REPO, '--body', body,
         ]),
         async () => {
-          await requireHead(manifest, prNumber, expectedHead);
+          await requireExactAuthority();
           return (await readCommentBodies(manifest, prNumber)).includes(body);
         },
         'Review Human comment was ambiguous',

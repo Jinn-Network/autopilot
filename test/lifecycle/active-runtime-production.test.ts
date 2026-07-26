@@ -16,6 +16,9 @@ import {
 } from '../../src/lifecycle/capability-attestation.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
 import {
+  encodeReviewClaimPayload,
+} from '../../src/lifecycle/codecs.js';
+import {
   gitOid,
   gitRefName,
 } from '../../src/lifecycle/types.js';
@@ -474,6 +477,192 @@ describe('production active runtime preflight', () => {
     expect(trackAttemptChild).toHaveBeenCalledTimes(1);
     expect(events[0]).toBe('spawn');
     expect(events.indexOf('pid')).toBeLessThan(events.indexOf('track'));
+  });
+
+  it('publishes mapping escalation as an exact Human ref plus bound comment only', async () => {
+    const head = gitOid('3'.repeat(40));
+    const humanOid = gitOid('4'.repeat(40));
+    const generation = '33333333-3333-4333-8333-333333333333';
+    const attempt = '44444444-4444-4444-8444-444444444444';
+    const mappingDetails = [
+      'Closing-reference mapping is duplicated or names multiple issues.',
+      'PR evidence does not resolve to one known lifecycle issue.',
+    ];
+    const diagnosticDetail =
+      'Ambiguous lifecycle mapping between issue(s) #42, #43 and PR(s) #84: '
+      + mappingDetails.join('; ');
+    const candidate = {
+      issueNumber: 42,
+      number: 84,
+      open: true,
+      head,
+      headChangedAt: '2026-07-20T08:00:00.000Z',
+      headRefName: gitRefName('autopilot/42'),
+      baseRefName: gitRefName('next'),
+      draft: false,
+      author: 'implementation-bot',
+      labels: ['engine:review'],
+      body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      humanHold: false,
+      approvalPolicy: 'approve-eligible',
+      nativeReviews: [],
+      mappingProblem: mappingDetails.join(' '),
+    };
+    let reviewClaim: { oid: string; payload: string } | null = null;
+    const comments: string[] = [];
+    const sharedMutations: string[] = [];
+    const cycleSnapshot = {
+      snapshotComplete: true,
+      capturedAt: '2026-07-20T12:00:00.000Z',
+      project: {
+        items: [],
+        rateLimit: { remaining: 4_000, used: 1, resetAt: '2026-07-20T13:00:00.000Z' },
+        currentSprintIterationId: null,
+      },
+      issues: [
+        {
+          number: 42,
+          title: 'first',
+          shape: 'feat',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Medium',
+          priority: 'P1',
+          status: 'In Review',
+          onBoard: true,
+          author: 'implementation-bot',
+          projectItemId: 'PVTI_42',
+          inCurrentSprint: false,
+        },
+        {
+          number: 43,
+          title: 'second',
+          shape: 'feat',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Medium',
+          priority: 'P1',
+          status: 'In Review',
+          onBoard: true,
+          author: 'implementation-bot',
+          projectItemId: 'PVTI_43',
+          inCurrentSprint: false,
+        },
+      ],
+      branches: [],
+      lifecycle: { items: [] },
+      pullRequests: [{
+        number: 84,
+        title: 'ambiguous',
+        body: candidate.body,
+        author: candidate.author,
+        baseRefName: candidate.baseRefName,
+        headRefName: candidate.headRefName,
+        headOid: head,
+        headCommittedAt: candidate.headChangedAt,
+        isDraft: false,
+        state: 'OPEN',
+        labels: ['engine:review'],
+        closingIssueNumbers: [42, 43],
+        mergeability: 'UNKNOWN',
+        mergeStateStatus: 'BLOCKED',
+        checks: [],
+        reviews: [],
+      }],
+      pullRequestMappings: [{
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [42, 43],
+        details: mappingDetails,
+      }],
+      diagnostics: [{
+        code: 'branch-mapping-ambiguous',
+        detail: diagnosticDetail,
+        issueNumbers: [42, 43],
+        issues: [
+          { number: 42, projectStatus: 'In Review' },
+          { number: 43, projectStatus: 'In Review' },
+        ],
+        pullRequests: [{
+          number: 84,
+          head,
+          draft: false,
+          labels: ['engine:review'],
+        }],
+      }],
+    };
+    const makeReviewActionPort = vi.fn(() => ({
+      readCandidate: async () => candidate,
+      createReviewRecord: async ({ record }) => {
+        reviewClaim = { oid: humanOid, payload: encodeReviewClaimPayload(record) };
+        return humanOid;
+      },
+      publishReviewClaim: async ({ recordOid }) => ({
+        status: 'won',
+        expected: null,
+        published: recordOid,
+        observed: recordOid,
+      }),
+    }));
+    const readPullRequestByNumber = async () => ({
+      state: 'OPEN',
+      headRefName: candidate.headRefName,
+      headOid: head,
+      baseRefName: candidate.baseRefName,
+      isDraft: false,
+      labels: ['engine:review'],
+      body: candidate.body,
+      closingIssueNumbers: [42, 43],
+      humanIssueNumber: null,
+      humanReason: null,
+      reviewClaim,
+    });
+    const active = marketplaceRuntime({
+      executionBackend: 'local',
+      environment: {},
+      credentials: new CredentialPool([{
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'implementation-secret',
+      }, {
+        login: 'review-bot',
+        normalizedLogin: 'review-bot',
+        reviewToken: 'review-secret',
+      }]),
+      makeReviewActionPort,
+      readPullRequestByNumber,
+      readReviewSnapshot: async () => cycleSnapshot,
+      nextId: vi.fn()
+        .mockReturnValueOnce(generation)
+        .mockReturnValueOnce(attempt),
+      runner: async (_command, args) => {
+        if (args[0] === 'api' && args.some((arg) => arg.includes('/comments'))) {
+          return JSON.stringify(comments.map((body) => ({ body })));
+        }
+        if (args[0] === 'pr' && args[1] === 'comment') {
+          comments.push(args[args.indexOf('--body') + 1]!);
+          return '';
+        }
+        if (args[0] === 'pr' && (args[1] === 'ready' || args[1] === 'edit')) {
+          sharedMutations.push(args.join(' '));
+          return '';
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, cycleSnapshot)).resolves.toEqual({ outcome: 'human' });
+
+    expect(reviewClaim).not.toBeNull();
+    expect(comments).toEqual([
+      expect.stringContaining(`head=${head} generation=${generation}`),
+    ]);
+    expect(sharedMutations).toEqual([]);
   });
 
   it('rejects active mode when no live capability attestation is configured', async () => {

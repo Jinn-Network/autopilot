@@ -279,6 +279,128 @@ describe('canonical structured PR-to-issue mapping', () => {
     );
   });
 
+  it('rejects a custom parent whose own canonical base is intrinsically ambiguous', () => {
+    const input = stackedInput({
+      issues: [
+        { number: 42, blockedOn: 'Another issue', blockedByIssues: [7] },
+        { number: 7, blockedOn: 'Nothing', blockedByIssues: [] },
+      ],
+      pullRequests: [{
+        number: 84,
+        state: 'OPEN',
+        head: HEAD,
+        headRefName: 'autopilot/42',
+        baseRefName: 'stack/live-blocker',
+        closingIssueNumbers: [42],
+        body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      }, {
+        number: 70,
+        state: 'OPEN',
+        head: OTHER_HEAD,
+        headRefName: 'stack/live-blocker',
+        baseRefName: 'attacker/retarget',
+        closingIssueNumbers: [7],
+        body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/live-blocker -->',
+      }],
+      stableBranches: [],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)[0]).toEqual(
+      expect.objectContaining({
+        status: 'ambiguous',
+        prNumber: 84,
+        details: expect.arrayContaining([
+          expect.stringMatching(/authorized base|parent.*ambiguous/i),
+        ]),
+      }),
+    );
+  });
+
+  it('rejects self-parent and cyclic custom-parent authority', () => {
+    const self = stackedInput({
+      issues: [{
+        number: 42,
+        blockedOn: 'Another issue',
+        blockedByIssues: [42],
+      }],
+      pullRequests: [{
+        number: 84,
+        state: 'OPEN',
+        head: HEAD,
+        headRefName: 'autopilot/42',
+        baseRefName: 'autopilot/42',
+        closingIssueNumbers: [42],
+        body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      }],
+      stableBranches: [],
+    });
+    expect(resolveStructuredPullRequestMappings(self)[0])
+      .toMatchObject({ status: 'ambiguous', prNumber: 84 });
+
+    const cycle = stackedInput({
+      issues: [
+        { number: 42, blockedOn: 'Another issue', blockedByIssues: [7] },
+        { number: 7, blockedOn: 'Another issue', blockedByIssues: [42] },
+      ],
+      pullRequests: [{
+        number: 84,
+        state: 'OPEN',
+        head: HEAD,
+        headRefName: 'stack/42',
+        baseRefName: 'stack/7',
+        closingIssueNumbers: [42],
+        body: '<!-- jinn-autopilot:v2 issue=42 branch=stack/42 -->',
+      }, {
+        number: 70,
+        state: 'OPEN',
+        head: OTHER_HEAD,
+        headRefName: 'stack/7',
+        baseRefName: 'stack/42',
+        closingIssueNumbers: [7],
+        body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/7 -->',
+      }],
+      stableBranches: [],
+    });
+    expect(resolveStructuredPullRequestMappings(cycle))
+      .toEqual([
+        expect.objectContaining({ status: 'ambiguous', prNumber: 84 }),
+        expect.objectContaining({ status: 'ambiguous', prNumber: 70 }),
+      ]);
+  });
+
+  it('preserves scoped custom-parent recovery when the parent issue is outside the input', () => {
+    const input = stackedInput({
+      issues: [
+        { number: 42, blockedOn: 'Another issue', blockedByIssues: [7] },
+      ],
+      pullRequests: [{
+        number: 84,
+        state: 'OPEN',
+        head: HEAD,
+        headRefName: 'autopilot/42',
+        baseRefName: 'stack/live-blocker',
+        closingIssueNumbers: [42],
+        body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      }, {
+        number: 70,
+        state: 'OPEN',
+        head: OTHER_HEAD,
+        headRefName: 'stack/live-blocker',
+        baseRefName: 'next',
+        closingIssueNumbers: [7],
+        body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/live-blocker -->',
+      }],
+      stableBranches: [],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)[0]).toMatchObject({
+      status: 'resolved',
+      prNumber: 84,
+      issueNumber: 42,
+      expectedBaseRefName: 'stack/live-blocker',
+    });
+  });
+
   it('does not let a non-default live base authorize itself', () => {
     const input = stackedInput({
       issues: [{ number: 42, blockedOn: 'Nothing', blockedByIssues: [] }],

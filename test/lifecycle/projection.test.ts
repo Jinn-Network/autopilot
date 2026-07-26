@@ -135,7 +135,7 @@ describe('planProjection', () => {
     ]);
   });
 
-  it('projects Human with label + comment and no Project Status write', () => {
+  it('does not convert an explicit shared Human hold into a machine comment or more shared state', () => {
     const held = item({
       headChangedAt: '2026-07-20T08:00:00.000Z',
       projectStatus: 'In Progress',
@@ -149,17 +149,46 @@ describe('planProjection', () => {
 
     const plan = planProjection(context(held));
 
-    expect(plan.actions).toContainEqual({
+    expect(plan.actions).toEqual([]);
+  });
+
+  it('projects a machine Human review ref as only an exact-generation audit comment', () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const held = item({
+      branchClaim: undefined,
+      isDraft: false,
+      labels: ['engine:review'],
+      humanReason: {
+        phase: 'reviewing',
+        code: 'review-escalation',
+        detail: 'Needs product judgment',
+      },
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation,
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'reviewer',
+        head: HEAD,
+        state: 'human',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
+    });
+
+    const plan = planProjection(context(held, REVIEW_OID));
+
+    expect(plan.actions).toEqual([{
       kind: 'ensure-human-comment',
       issueNumber: 42,
       prNumber: 101,
       expectedHead: HEAD,
-      marker: '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing code=implementation-escalation -->',
+      expectedReviewRefOid: REVIEW_OID,
+      expectedGeneration: generation,
+      marker: '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=reviewing '
+        + `code=review-escalation head=${HEAD} generation=${generation} -->`,
       body: expect.stringContaining('Needs product judgment'),
-    });
-    expect(plan.actions.some((action) => (
-      action.kind === 'ensure-human-comment' && action.prNumber === 101
-    ))).toBe(true);
+    }]);
   });
 
   it('plans one CAS-fenced repair for an obsolete machine mapping Human overlay', () => {
@@ -351,6 +380,7 @@ describe('planProjection', () => {
       view: { items: [] },
       pullRequests: [{
         number: 101,
+        reviewRefOid: REVIEW_OID,
         reviewClaim: {
           head: HEAD,
           generation,
@@ -380,6 +410,10 @@ describe('planProjection', () => {
       issueNumber: 42,
       prNumber: 101,
       expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW_OID,
+      expectedGeneration: generation,
+      expectedDiagnosticIssueNumbers: [42],
+      expectedDiagnosticDetail: 'Another open PR also maps issue #42',
       marker,
       body: `${marker}\n\nAutopilot parked this item for Human review.\n\n`
         + 'Another open PR also maps issue #42',

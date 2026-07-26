@@ -109,7 +109,12 @@ export function resolveStructuredPullRequestMappings(
       openPrsByIssue.set(issueNumber, prs);
     }
   }
+  const selectedParentByChild = new Map<number, {
+    readonly prNumber: number;
+    readonly issueNumber: number;
+  }>();
   const exactParentDependency = (
+    childPrNumber: number,
     issue: StructuredMappingIssue,
     baseRefName: string,
   ): number | undefined => {
@@ -138,14 +143,18 @@ export function resolveStructuredPullRequestMappings(
       candidate.state === 'OPEN'
       && evidencedIssueNumbers(candidate).has(dependency)
     ));
-    return parentEvidence.size === 1
+    const exact = parentEvidence.size === 1
       && parentEvidence.has(dependency)
-      && parentContenders.length === 1
-      ? dependency
-      : undefined;
+      && parentContenders.length === 1;
+    if (!exact) return undefined;
+    selectedParentByChild.set(childPrNumber, {
+      prNumber: candidates[0]!.number,
+      issueNumber: dependency,
+    });
+    return dependency;
   };
 
-  return input.pullRequests.map((pr): StructuredPullRequestMapping => {
+  const initial = input.pullRequests.map((pr): StructuredPullRequestMapping => {
     const details: string[] = [];
     const inferred = inferredByPr.get(pr.number) ?? new Set<number>();
     const closing = new Set(pr.closingIssueNumbers);
@@ -258,7 +267,7 @@ export function resolveStructuredPullRequestMappings(
       const namedDependency = stableBranchIssue(pr.baseRefName);
       const exactDependency = issue === undefined
         ? undefined
-        : exactParentDependency(issue, pr.baseRefName);
+        : exactParentDependency(pr.number, issue, pr.baseRefName);
       const dependency = exactDependency ?? namedDependency;
       if (
         issue !== undefined
@@ -314,6 +323,54 @@ export function resolveStructuredPullRequestMappings(
       issueNumber: primaryIssue,
       expectedBaseRefName,
       evidence,
+    };
+  });
+
+  const initialByPr = new Map(initial.map((mapping) => [
+    mapping.prNumber,
+    mapping,
+  ]));
+  const parentIsCanonical = (
+    prNumber: number,
+    visiting: ReadonlySet<number>,
+  ): boolean => {
+    const mapping = initialByPr.get(prNumber);
+    if (mapping?.status !== 'resolved') return false;
+    const parent = selectedParentByChild.get(prNumber);
+    if (parent === undefined) return true;
+    // A targeted/scoped recovery may carry the exact parent PR relation while
+    // omitting the parent's issue record. Preserve that bounded authority. A
+    // complete input that knows the parent issue must prove the parent's own
+    // canonical mapping recursively.
+    if (!knownIssues.has(parent.issueNumber)) return true;
+    if (parent.prNumber === prNumber || visiting.has(parent.prNumber)) return false;
+    const parentMapping = initialByPr.get(parent.prNumber);
+    if (
+      parentMapping?.status !== 'resolved'
+      || parentMapping.issueNumber !== parent.issueNumber
+    ) {
+      return false;
+    }
+    return parentIsCanonical(
+      parent.prNumber,
+      new Set([...visiting, parent.prNumber]),
+    );
+  };
+
+  return initial.map((mapping): StructuredPullRequestMapping => {
+    if (
+      mapping.status !== 'resolved'
+      || parentIsCanonical(mapping.prNumber, new Set([mapping.prNumber]))
+    ) {
+      return mapping;
+    }
+    return {
+      status: 'ambiguous',
+      prNumber: mapping.prNumber,
+      issueNumbers: [mapping.issueNumber],
+      details: [
+        'Selected custom parent PR is canonically ambiguous or cyclic.',
+      ],
     };
   });
 }

@@ -25,6 +25,30 @@ const BLOB_OID = gitOid('5'.repeat(40));
 const TREE_OID = gitOid('6'.repeat(40));
 const DRAFT_BRANCH_HEAD = gitOid('7'.repeat(40));
 const BLOCKER_HEAD = gitOid('8'.repeat(40));
+const HUMAN_GENERATION = '22222222-2222-4222-8222-222222222222';
+const HUMAN_COMMENT_AUTHORITY = {
+  issueNumber: 42,
+  expectedHead: HEAD,
+  expectedReviewRefOid: CLAIM_OID,
+  expectedGeneration: HUMAN_GENERATION,
+} as const;
+
+function humanReviewClaim() {
+  return {
+    oid: CLAIM_OID,
+    payload: encodeReviewClaimPayload({
+      kind: 'review-claim',
+      protocolVersion: 2,
+      prNumber: 84,
+      generation: HUMAN_GENERATION,
+      attempt: '33333333-3333-4333-8333-333333333333',
+      reviewer: 'jinn-reviewer',
+      head: HEAD,
+      state: 'human',
+      recordedAt: '2026-07-20T11:00:00.000Z',
+    }),
+  };
+}
 
 beforeEach(() => { resetFieldCache(); });
 afterEach(() => { resetFieldCache(); });
@@ -389,6 +413,7 @@ type ObsoleteMappingRepairChange =
   | 'contradictory-marker-after-cas'
   | 'unlabeled-duplicate-after-cas'
   | 'custom-parent-closed-after-cas'
+  | 'prior-machine-generation-audit'
   | 'duplicate-at-final-comment-boundary';
 
 function canonicalizeMappings(
@@ -544,9 +569,23 @@ function obsoleteMappingRepairSecurityHarness(change: ObsoleteMappingRepairChang
         exact,
         {
           id: 124,
-          body: 'Human hold: do not merge this PR until I investigate.',
+          body: 'Please do not merge this PR until I investigate.',
           user: { login: 'maintainer' },
         },
+      ];
+    }
+    if (change === 'prior-machine-generation-audit') {
+      const priorMarker =
+        '<!-- jinn-autopilot-human:v2 issue=42 pr=84 phase=implementing '
+        + 'code=branch-mapping-ambiguous '
+        + `head=${HEAD} generation=11111111-1111-4111-8111-111111111111 -->`;
+      return [
+        {
+          id: 122,
+          body: `${priorMarker}\n\nPrior diagnostic tuple.`,
+          user: { login: 'implementation-bot' },
+        },
+        exact,
       ];
     }
     if (duplicateAtBoundary) return [exact, { ...exact, id: 124 }];
@@ -825,17 +864,6 @@ describe('production reconciliation writer', () => {
       action: { kind: 'set-pr-draft', prNumber: 84, expectedHead: HEAD, draft: false },
     },
     {
-      name: 'Human comment',
-      action: {
-        kind: 'ensure-human-comment',
-        issueNumber: 42,
-        prNumber: 84,
-        expectedHead: HEAD,
-        marker: '<!-- human-marker -->',
-        body: '<!-- human-marker -->\nNeeds a Human decision.',
-      },
-    },
-    {
       name: 'implementation summary',
       action: {
         kind: 'ensure-implementation-summary',
@@ -906,8 +934,8 @@ describe('production reconciliation writer', () => {
       pullRequestMappings: [{
         status: 'ambiguous',
         prNumber: 84,
-        issueNumbers: [42, 43],
-        details: ['Closing-reference mapping names multiple issues'],
+        issueNumbers: [42],
+        details: ['Closing-reference mapping is duplicated or names multiple issues.'],
       }],
     };
     let draft = false;
@@ -926,6 +954,7 @@ describe('production reconciliation writer', () => {
           labels: [...labels],
           closingIssueNumbers: [42, 43],
           body: 'ambiguous mapping body',
+          reviewClaim: humanReviewClaim(),
         });
       },
       readProjectItemForReconciliation: async () => ({
@@ -1006,6 +1035,7 @@ describe('production reconciliation writer', () => {
       view: { items: [] },
       pullRequests: [{
         number: 84,
+        reviewRefOid: CLAIM_OID,
         reviewClaim: {
           head: HEAD,
           generation: '22222222-2222-4222-8222-222222222222',
@@ -1054,8 +1084,8 @@ describe('production reconciliation writer', () => {
       pullRequestMappings: [{
         status: 'ambiguous',
         prNumber: 84,
-        issueNumbers: [42, 43],
-        details: ['Closing-reference mapping names multiple issues'],
+        issueNumbers: [42],
+        details: ['Closing-reference mapping is duplicated or names multiple issues.'],
       }],
       pullRequests: base.pullRequests.map((pr) => ({
         ...pr,
@@ -1215,6 +1245,9 @@ describe('production reconciliation writer', () => {
     const writer = makeProductionReconciliationWriter({
       repositoryPath: '/repo',
       ...targetedWriterOptions(() => snapshot(false)),
+      readPullRequestByNumber: async () => reconciliationPr({
+        reviewClaim: humanReviewClaim(),
+      }),
       credential: selectedCredential(),
       environment: {},
       runner: async (_command, args) => {
@@ -1228,7 +1261,11 @@ describe('production reconciliation writer', () => {
       },
     });
 
-    await expect(writer.hasHumanComment(84, '<!-- human-marker -->')).resolves.toBe(true);
+    await expect(writer.hasHumanComment(
+      84,
+      '<!-- human-marker -->',
+      HUMAN_COMMENT_AUTHORITY,
+    )).resolves.toBe(true);
     expect(calls).toEqual([
       'repos/Jinn-Network/mono/issues/84/comments?per_page=100&page=1',
       'repos/Jinn-Network/mono/issues/84/comments?per_page=100&page=2',
@@ -1514,6 +1551,7 @@ describe('production reconciliation writer', () => {
           headRefName: 'autopilot/99',
           closingIssueNumbers: [99],
           body: 'Closes #99\n\n<!-- jinn-autopilot:v2 issue=99 branch=autopilot/99 -->',
+          reviewClaim: humanReviewClaim(),
         };
       },
       credential: selectedCredential(),
@@ -1527,8 +1565,57 @@ describe('production reconciliation writer', () => {
       84,
       '<!-- human-marker -->',
       '<!-- human-marker -->\nNeeds Human input.',
-      HEAD,
+      HUMAN_COMMENT_AUTHORITY,
     )).rejects.toThrow(/mapping|issue #42/i);
+    expect(commands).toBe(0);
+  });
+
+  it.each([
+    {
+      name: 'review-ref OID',
+      authority: {
+        ...HUMAN_COMMENT_AUTHORITY,
+        expectedReviewRefOid: RECORD_OID,
+      },
+    },
+    {
+      name: 'review generation',
+      authority: {
+        ...HUMAN_COMMENT_AUTHORITY,
+        expectedGeneration: '99999999-9999-4999-8999-999999999999',
+      },
+    },
+    {
+      name: 'canonical issue',
+      authority: {
+        ...HUMAN_COMMENT_AUTHORITY,
+        issueNumber: 43,
+      },
+    },
+  ])('publishes no Human audit comment when the planned $name changed', async ({
+    authority,
+  }) => {
+    let commands = 0;
+    const writer = makeProductionReconciliationWriter({
+      repositoryPath: '/repo',
+      ...targetedWriterOptions(() => snapshot(false)),
+      readPullRequestByNumber: async () => reconciliationPr({
+        isDraft: false,
+        reviewClaim: humanReviewClaim(),
+      }),
+      credential: selectedCredential(),
+      runner: async () => {
+        commands += 1;
+        return '[]';
+      },
+    });
+
+    await expect(writer.ensureHumanComment(
+      84,
+      '<!-- exact-human-marker -->',
+      '<!-- exact-human-marker -->\nNeeds Human input.',
+      authority,
+    )).rejects.toThrow(/review-ref|generation|issue mapping|authority/i);
     expect(commands).toBe(0);
   });
 
@@ -1889,6 +1976,112 @@ describe('production reconciliation writer', () => {
     expect(pushed).toBe(true);
   });
 
+  it('terminalizes a fresh verdict intent despite a retained prior-generation mapping audit', async () => {
+    const priorGeneration = '11111111-1111-4111-8111-111111111111';
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const intent = '44444444-4444-4444-8444-444444444444';
+    const before: ReviewClaimRecord = {
+      kind: 'review-claim',
+      protocolVersion: 2,
+      prNumber: 84,
+      generation,
+      attempt: '33333333-3333-4333-8333-333333333333',
+      reviewer: 'review-bot',
+      head: HEAD,
+      recordedAt: '2026-07-20T11:00:00.000Z',
+      state: 'verdict-intent',
+      verdict: { marker: intent, state: 'APPROVE' },
+    };
+    const after: ReviewClaimRecord = {
+      ...before,
+      state: 'terminal-approved',
+      recordedAt: '2026-07-20T12:00:00.000Z',
+      verdict: { marker: intent, state: 'APPROVE' },
+    };
+    const base = snapshot(false);
+    const cycle: GitHubLifecycleSnapshot = {
+      ...base,
+      pullRequests: base.pullRequests.map((pr) => ({
+        ...pr,
+        reviewClaim: { oid: CLAIM_OID, record: before },
+        humanIssueNumber: 42,
+        humanAuthor: 'implementation-bot',
+        humanHead: HEAD,
+        humanGeneration: priorGeneration,
+        humanReason: {
+          phase: 'implementing',
+          code: 'branch-mapping-ambiguous',
+          detail: 'Retained audit from a repaired mapping generation.',
+        },
+      })),
+      lifecycle: {
+        items: base.lifecycle.items.map((item) => item.kind === 'pull-request'
+          ? { ...item, reviewClaim: before }
+          : item),
+      },
+    };
+    let pushed = false;
+    const credentials = new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'implementation-secret',
+    }, {
+      login: 'review-bot',
+      normalizedLogin: 'review-bot',
+      reviewToken: 'review-secret',
+    }]);
+    const selection = selectCredential(credentials, {
+      phase: 'review',
+      prAuthor: 'implementation-bot',
+    });
+    if (selection.status !== 'selected') throw new Error('review credential missing');
+    const ref = reviewClaimRef(84);
+    const writer = makeProductionReconciliationWriter({
+      repositoryPath: '/repo',
+      ...targetedWriterOptions(() => cycle, cycle),
+      readPullRequestByNumber: async () => reconciliationPr({
+        isDraft: false,
+        labels: ['engine:review'],
+        humanIssueNumber: 42,
+        humanAuthor: 'implementation-bot',
+        humanHead: HEAD,
+        humanGeneration: priorGeneration,
+        humanReason: {
+          phase: 'implementing',
+          code: 'branch-mapping-ambiguous',
+          detail: 'Retained audit from a repaired mapping generation.',
+        },
+        reviewClaim: {
+          oid: pushed ? RECORD_OID : CLAIM_OID,
+          payload: encodeReviewClaimPayload(pushed ? after : before),
+        },
+      }),
+      credential: selection.credential,
+      credentials,
+      now: () => new Date('2026-07-20T12:00:00.000Z'),
+      runner: async (_command, args) => {
+        if (args.includes('hash-object')) return `${BLOB_OID}\n`;
+        if (args.includes('write-tree')) return `${TREE_OID}\n`;
+        if (args.includes('commit-tree')) return `${RECORD_OID}\n`;
+        if (args.includes('rev-list')) return `${RECORD_OID} ${CLAIM_OID}`;
+        if (args.includes('ls-remote')) return `${CLAIM_OID}\t${ref}\n`;
+        if (args.includes('push')) {
+          pushed = true;
+          return '';
+        }
+        if (args.includes('read-tree') || args.includes('update-index')) return '';
+        throw new Error(`unexpected git args ${args.join(' ')}`);
+      },
+    });
+
+    await expect(writer.completeVerdictIntent(
+      84,
+      CLAIM_OID,
+      'terminal-approved',
+    )).resolves.toBeUndefined();
+    expect(pushed).toBe(true);
+  });
+
   it('repairs an exact comment-only machine mapping overlay with only the review-ref CAS', async () => {
     const generation = '22222222-2222-4222-8222-222222222222';
     const marker =
@@ -2098,6 +2291,19 @@ describe('production reconciliation writer', () => {
     expect(harness.destructiveMutations()).toBe(0);
   });
 
+  it('retains but ignores an older machine diagnostic tuple during current-generation recovery', async () => {
+    const harness = obsoleteMappingRepairSecurityHarness(
+      'prior-machine-generation-audit',
+    );
+
+    await expect(harness.writer.repairObsoleteMappingHuman?.(harness.action))
+      .resolves.toBeUndefined();
+    await expect(harness.writer.readObsoleteMappingHumanRepairState?.(harness.action))
+      .resolves.toEqual({ complete: true });
+    expect(harness.pushed()).toBe(true);
+    expect(harness.destructiveMutations()).toBe(0);
+  });
+
   it.each([
     {
       name: 'the live legacy Human label is present',
@@ -2197,7 +2403,7 @@ describe('production reconciliation writer', () => {
       let draft = true;
       const labels = new Set(['engine:review']);
       let body = 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->';
-      let reviewState: 'active' | 'stale' = 'active';
+      let reviewState: 'active' | 'human' | 'stale' = 'active';
       let reviewOid: GitOid = CLAIM_OID;
       const comments: string[] = [];
       let commitCounter = 0;
@@ -2373,8 +2579,15 @@ describe('production reconciliation writer', () => {
       await writer.readPullRequest(84);
       await writer.setPullRequestDraft(84, false, HEAD);
       await writer.setPullRequestLabel(84, 'ready-for-review', true, HEAD);
-      await writer.hasHumanComment(84, '<!-- marker -->');
-      await writer.ensureHumanComment(84, '<!-- marker -->', '<!-- marker -->\nbody', HEAD);
+      reviewState = 'human';
+      await writer.hasHumanComment(84, '<!-- marker -->', HUMAN_COMMENT_AUTHORITY);
+      await writer.ensureHumanComment(
+        84,
+        '<!-- marker -->',
+        '<!-- marker -->\nbody',
+        HUMAN_COMMENT_AUTHORITY,
+      );
+      reviewState = 'active';
       await writer.ensureImplementationSummary(84, HEAD, 'Durable summary');
       await writer.readDraftPullRequestAuthority({
         issueNumber: 50,

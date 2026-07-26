@@ -9,6 +9,7 @@ import {
   extractMergePrepCompletionSummary,
   formatAutomatedReviewMarker,
   formatHumanCommentMarker,
+  isUnstructuredHumanHoldComment,
   parseAutomatedReviewMarker,
   parseHumanCommentEvidence,
   reviewClaimRef,
@@ -249,6 +250,27 @@ describe('lifecycle metadata codecs', () => {
       generation,
       reason,
     });
+  });
+
+  it.each([
+    'Please do not merge this PR until I investigate.',
+    "Don't merge this until I investigate.",
+    'Hold this PR for human review.',
+    'Please pause the merge while I check the migration.',
+    'Wait before merging; this needs a maintainer decision.',
+  ])('recognizes common explicit maintainer hold prose: %s', (body) => {
+    expect(isUnstructuredHumanHoldComment(body)).toBe(true);
+  });
+
+  it.each([
+    'Please merge this PR when CI passes.',
+    'Do not block the merge.',
+    'No human review is needed.',
+    'This fixes the docs phrase “do not merge arrays”.',
+    '> Please do not merge this PR until I investigate.',
+    '```text\nPlease do not merge this PR until I investigate.\n```',
+  ])('does not invent a Human hold from affirmative, quoted, or unrelated prose: %s', (body) => {
+    expect(isUnstructuredHumanHoldComment(body)).toBe(false);
   });
 
   it('rejects string numerics in runtime ref-name helpers', () => {

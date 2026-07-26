@@ -266,7 +266,7 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   it('detects an unstructured maintainer Human hold transition', async () => {
     const bodies = equalBodies();
     bodies.comments = [{
-      body: 'Human hold: do not merge this PR until I investigate.',
+      body: 'Please do not merge this PR until I investigate.',
       created_at: '2026-07-22T10:02:00.000Z',
       user: { login: 'maintainer' },
     }];

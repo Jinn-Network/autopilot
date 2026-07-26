@@ -236,8 +236,8 @@ function harness(options: {
       expect(body.length).toBeGreaterThan(0);
       return { number: 9001, created: true };
     },
-    hasHumanComment: async (_pr, _head, body) => comments.has(body),
-    ensureHumanComment: async (_pr, _head, _marker, body) => {
+    hasHumanComment: async (_pr, _head, _ref, _generation, body) => comments.has(body),
+    ensureHumanComment: async (_pr, _head, _ref, _generation, _marker, body) => {
       events.push('human-comment');
       comments.add(body);
     },
@@ -253,6 +253,7 @@ function harness(options: {
     set authority(next: ReviewSessionAuthority) { authority = next; },
     get draft() { return draft; },
     get labels() { return labels; },
+    get comments() { return comments; },
     get project() { return project; },
     get native() { return native; },
     set localHead(next: GitOid) { localHead = next; },
@@ -580,13 +581,19 @@ describe('review session protocol', () => {
     expect(h.events).toEqual([]);
   });
 
-  it('parks review attempts with structured Human evidence without clearing existing holds', async () => {
+  it('parks review attempts with only an exact-generation Human ref and audit comment', async () => {
     const h = harness({ state: 'active', draft: true });
     await expect(h.protocol.human(h.manifest, 'Needs architectural judgment.'))
       .resolves.toMatchObject({ status: 'human', head: HEAD });
     expect(h.events.slice(0, 2)).toEqual(['record:human', 'claim:human']);
     expect(h.events).toContain('human-comment');
-    expect(h.events).not.toContain('draft:false');
+    expect(h.events.some((event) => event.startsWith('draft:'))).toBe(false);
+    expect(h.events.some((event) => event.startsWith('label:'))).toBe(false);
+    expect([...h.comments]).toEqual([
+      expect.stringContaining(
+        `head=${HEAD} generation=22222222-2222-4222-8222-222222222222`,
+      ),
+    ]);
   });
 
   it('does not project Human until the exact-parent Human review record wins', async () => {

@@ -21,6 +21,15 @@ export interface ReconciliationReviewRefState {
     | 'stale';
 }
 
+export interface ReconciliationHumanCommentAuthority {
+  readonly issueNumber: number;
+  readonly expectedHead: GitOid;
+  readonly expectedReviewRefOid: GitOid;
+  readonly expectedGeneration: string;
+  readonly expectedDiagnosticIssueNumbers?: readonly number[];
+  readonly expectedDiagnosticDetail?: string;
+}
+
 export type ReconciliationDraftPullRequestAuthority =
   | { readonly kind: 'missing' }
   | {
@@ -48,12 +57,16 @@ export interface ReconciliationWriter {
     present: boolean,
     expectedHead?: GitOid,
   ): Promise<void>;
-  hasHumanComment(prNumber: number, marker: string): Promise<boolean>;
+  hasHumanComment(
+    prNumber: number,
+    marker: string,
+    authority: ReconciliationHumanCommentAuthority,
+  ): Promise<boolean>;
   ensureHumanComment(
     prNumber: number,
     marker: string,
     body: string,
-    expectedHead?: GitOid,
+    authority: ReconciliationHumanCommentAuthority,
   ): Promise<void>;
   ensureImplementationSummary(
     prNumber: number,
@@ -204,7 +217,7 @@ async function ensureComment(
   if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
     return { action, outcome: 'changed-head' };
   }
-  if (await writer.hasHumanComment(action.prNumber, action.marker)) {
+  if (await writer.hasHumanComment(action.prNumber, action.marker, action)) {
     return { action, outcome: 'already-applied' };
   }
   if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
@@ -215,12 +228,12 @@ async function ensureComment(
       action.prNumber,
       action.marker,
       action.body,
-      action.expectedHead,
+      action,
     );
     return { action, outcome: 'applied' };
   } catch (error) {
     try {
-      if (await writer.hasHumanComment(action.prNumber, action.marker)) {
+      if (await writer.hasHumanComment(action.prNumber, action.marker, action)) {
         return { action, outcome: 'already-applied' };
       }
     } catch {

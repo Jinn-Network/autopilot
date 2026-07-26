@@ -91,11 +91,15 @@ export interface ReviewSessionPort {
   hasHumanComment(
     prNumber: number,
     expectedHead: GitOid,
+    expectedReviewRefOid: GitOid,
+    expectedGeneration: string,
     body: string,
   ): Promise<boolean>;
   ensureHumanComment(
     prNumber: number,
     expectedHead: GitOid,
+    expectedReviewRefOid: GitOid,
+    expectedGeneration: string,
     marker: string,
     body: string,
   ): Promise<void>;
@@ -347,6 +351,9 @@ async function humanIsActive(
   manifest: AttemptManifest,
   port: ReviewSessionPort,
 ): Promise<boolean> {
+  if ((await requireAuthority(manifest, port)).record.state === 'human') {
+    return true;
+  }
   return port.hasHumanHold(
     manifest.issueNumber,
     manifest.prNumber!,
@@ -358,7 +365,7 @@ async function enterHuman(
   supplied: AttemptManifest,
   detail: string,
   port: ReviewSessionPort,
-  observedPullRequest?: ReviewSessionPullRequest,
+  _observedPullRequest?: ReviewSessionPullRequest,
 ): Promise<{ readonly status: 'human'; readonly head: GitOid }> {
   let manifest = requireReviewManifest(supplied, port);
   let authority = await requireAuthority(manifest, port);
@@ -380,29 +387,28 @@ async function enterHuman(
   const marker = formatHumanCommentMarker({
     issueNumber: manifest.issueNumber,
     prNumber: manifest.prNumber!,
+    head,
+    generation: manifest.reviewGeneration!,
     reason,
   });
   const commentBody =
     `${marker}\n\nAutopilot parked this review for Human judgment.\n\n${detail}`;
-  const pullRequest = observedPullRequest ?? await readExactPullRequest(manifest, port);
-  if (pullRequest.open && !pullRequest.draft) {
-    await port.setPullRequestDraft(manifest.prNumber!, head, true);
-  }
-  if (!pullRequest.labels.includes('engine:review')) {
-    await port.setPullRequestLabel(manifest.prNumber!, head, 'engine:review', true);
-  }
-  if (!pullRequest.labels.includes('review:needs-human')) {
-    await port.setPullRequestLabel(manifest.prNumber!, head, 'review:needs-human', true);
-  }
-  if (!await port.hasHumanComment(manifest.prNumber!, head, commentBody)) {
+  if (!await port.hasHumanComment(
+    manifest.prNumber!,
+    head,
+    authority.reviewRefOid,
+    manifest.reviewGeneration!,
+    commentBody,
+  )) {
     await port.ensureHumanComment(
       manifest.prNumber!,
       head,
+      authority.reviewRefOid,
+      manifest.reviewGeneration!,
       marker,
       commentBody,
     );
   }
-  // Stage 3: Human Status paint is painter-owned; label+marker are authority.
   return { status: 'human', head };
 }
 

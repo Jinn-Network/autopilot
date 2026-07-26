@@ -725,6 +725,19 @@ describe('production review session port', () => {
             }]);
           }
           if (cmd === 'git' && args.includes('ls-tree')) return '';
+          if (mutation === 'comment' && cmd === 'gh' && args.join(' ') === 'api user --jq .login') {
+            return 'review-bot\n';
+          }
+          if (mutation === 'comment' && cmd === 'git' && args.includes('get-url')) {
+            return 'https://github.com/Jinn-Network/mono.git\n';
+          }
+          if (mutation === 'comment' && cmd === 'git' && args.includes('ls-remote')) {
+            return `${REVIEW}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+          }
+          if (mutation === 'comment' && cmd === 'git' && args.includes('fetch')) return '';
+          if (mutation === 'comment' && cmd === 'git' && args.includes('show')) {
+            return `${encodeReviewClaimPayload(humanClaim())}\n`;
+          }
           if (
             mutation === 'ready'
             && cmd === 'gh'
@@ -798,7 +811,9 @@ describe('production review session port', () => {
           ? port.setPullRequestDraft(84, HEAD, false)
           : mutation === 'draft'
             ? port.setPullRequestDraft(84, HEAD, true)
-            : port.ensureHumanComment(84, HEAD, marker, marker);
+            : port.ensureHumanComment(
+                84, HEAD, REVIEW, GENERATION, marker, marker,
+              );
       await expect(operation).resolves.toBeUndefined();
     },
   );
@@ -837,6 +852,19 @@ describe('production review session port', () => {
           }]);
         }
         if (cmd === 'git' && args.includes('ls-tree')) return '';
+        if (cmd === 'gh' && args.join(' ') === 'api user --jq .login') {
+          return 'review-bot\n';
+        }
+        if (cmd === 'git' && args.includes('get-url')) {
+          return 'https://github.com/Jinn-Network/mono.git\n';
+        }
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          return `${REVIEW}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (cmd === 'git' && args.includes('fetch')) return '';
+        if (cmd === 'git' && args.includes('show')) {
+          return `${encodeReviewClaimPayload(humanClaim())}\n`;
+        }
         if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
           return projectSnapshot(status);
         }
@@ -888,6 +916,19 @@ describe('production review session port', () => {
           }]);
         }
         if (cmd === 'git' && args.includes('ls-tree')) return '';
+        if (cmd === 'gh' && args.join(' ') === 'api user --jq .login') {
+          return 'review-bot\n';
+        }
+        if (cmd === 'git' && args.includes('get-url')) {
+          return 'https://github.com/Jinn-Network/mono.git\n';
+        }
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          return `${REVIEW}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (cmd === 'git' && args.includes('fetch')) return '';
+        if (cmd === 'git' && args.includes('show')) {
+          return `${encodeReviewClaimPayload(humanClaim())}\n`;
+        }
         if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'comment') {
           throw new Error('accepted comment response lost');
         }
@@ -898,7 +939,9 @@ describe('production review session port', () => {
       },
     });
 
-    await expect(port.ensureHumanComment(84, HEAD, marker, `${marker}\n\nExact body.`))
+    await expect(port.ensureHumanComment(
+      84, HEAD, REVIEW, GENERATION, marker, `${marker}\n\nExact body.`,
+    ))
       .rejects.toThrow('accepted comment response lost');
   });
 
@@ -1327,10 +1370,25 @@ describe('production review session port', () => {
           return JSON.stringify([[{ body: `copied ${canonicalBody}` }]]);
         }
         if (cmd === 'git' && args.includes('ls-tree')) return '';
+        if (cmd === 'gh' && args.join(' ') === 'api user --jq .login') {
+          return 'review-bot\n';
+        }
+        if (cmd === 'git' && args.includes('get-url')) {
+          return 'https://github.com/Jinn-Network/mono.git\n';
+        }
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          return `${REVIEW}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (cmd === 'git' && args.includes('fetch')) return '';
+        if (cmd === 'git' && args.includes('show')) {
+          return `${encodeReviewClaimPayload(humanClaim())}\n`;
+        }
         throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
       },
     });
 
-    await expect(port.hasHumanComment(84, HEAD, canonicalBody)).resolves.toBe(false);
+    await expect(port.hasHumanComment(
+      84, HEAD, REVIEW, GENERATION, canonicalBody,
+    )).resolves.toBe(false);
   });
 });

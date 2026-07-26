@@ -21,7 +21,10 @@ import {
   type TrackableAttemptChild,
 } from './attempt-workspace.js';
 import { makeActiveRuntime } from './active-runtime.js';
-import { formatHumanCommentMarker } from './codecs.js';
+import {
+  decodeReviewClaimPayload,
+  formatHumanCommentMarker,
+} from './codecs.js';
 import {
   selectCredential,
   type CredentialPool,
@@ -67,7 +70,13 @@ import type {
   TargetedNativeIssue,
   TargetedOpenPullRequest,
 } from './targeted-action-reader.js';
-import type { GitOid, HumanReason, NewWorkAction } from './types.js';
+import type {
+  GitOid,
+  HumanReason,
+  NewWorkAction,
+  ReviewClaimRecord,
+} from './types.js';
+import { gitOid } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
 import {
@@ -386,8 +395,88 @@ export function makeProductionActiveRuntime(
     credentials: CredentialPool,
     cycleSnapshot: GitHubLifecycleSnapshot,
   ): Promise<void> => {
-    const selection = selectCredential(credentials, { phase: 'implement' });
+    const live = await options.readPullRequestByNumber(input.candidate.number);
+    if (
+      live === null
+      || live.state !== 'OPEN'
+      || live.headOid !== input.candidate.head
+    ) {
+      throw new Error('Review Human escalation lost exact-head authority');
+    }
+    const currentRefOid = live.reviewClaim === null
+      ? null
+      : gitOid(live.reviewClaim.oid);
+    const currentRecord = live.reviewClaim === null
+      ? undefined
+      : decodeReviewClaimPayload(live.reviewClaim.payload);
+    const currentHeadRecord = currentRecord?.head === input.candidate.head
+      ? currentRecord
+      : undefined;
+    const candidateAuthor = cycleSnapshot.pullRequests.find(
+      (pr) => pr.number === input.candidate.number,
+    )?.author;
+    const eligibleCredentials = currentHeadRecord === undefined
+      ? credentials
+      : credentials.restrictedTo([currentHeadRecord.reviewer]);
+    const selection = selectCredential(eligibleCredentials, {
+      phase: 'review',
+      ...(candidateAuthor === undefined ? {} : { prAuthor: candidateAuthor }),
+    });
     if (selection.status !== 'selected') throw new Error(selection.detail);
+    const generation = currentHeadRecord?.generation ?? nextId();
+    const attempt = currentHeadRecord?.attempt ?? nextId();
+    const reviewer = currentHeadRecord?.reviewer ?? selection.login;
+    const humanRecord: ReviewClaimRecord = {
+      kind: 'review-claim',
+      protocolVersion: 2,
+      prNumber: input.candidate.number,
+      generation,
+      attempt,
+      reviewer,
+      head: input.candidate.head,
+      state: 'human',
+      recordedAt: now().toISOString(),
+    };
+    let humanRefOid = currentRefOid;
+    if (
+      currentHeadRecord?.state !== 'human'
+      || currentRefOid === null
+    ) {
+      const port = reviewActionPort({
+        repositoryPath: options.repositoryPath,
+        worktreeBase: options.worktreeBase,
+        runnerId: options.runnerId,
+        remoteName,
+        readSnapshot: (prNumber) => options.readReviewSnapshot(cycleSnapshot, prNumber),
+        runner,
+        environment: ambient,
+        repositorySlug: options.repositorySlug,
+        repositoryUrl: options.repositoryUrl,
+        projectMapping: options.projectMapping,
+      });
+      const recordOid = await port.createReviewRecord({
+        record: humanRecord,
+        parent: currentRefOid,
+        credential: selection.credential,
+      });
+      const outcome = await port.publishReviewClaim({
+        prNumber: input.candidate.number,
+        recordParent: currentRefOid,
+        expectedRemoteRecordOid: currentRefOid,
+        recordOid,
+        credential: selection.credential,
+      });
+      if (
+        (outcome.status !== 'won' && outcome.status !== 'already-applied')
+        || outcome.observed !== recordOid
+      ) {
+        throw new Error('Review Human escalation did not win exact-parent authority');
+      }
+      humanRefOid = recordOid;
+    }
+    if (humanRefOid === null) {
+      throw new Error('Review Human escalation review-ref authority is absent');
+    }
     const writer = makeProductionReconciliationWriter({
       repositoryPath: options.repositoryPath,
       cycleSnapshot,
@@ -399,6 +488,7 @@ export function makeProductionActiveRuntime(
       readOpenPullRequestsByIssue: options.readOpenPullRequestsByIssue,
       readIssueActionContext: options.readIssueActionContext,
       credential: selection.credential,
+      credentials,
       runner,
       environment: ambient,
       repositorySlug: options.repositorySlug,
@@ -406,35 +496,43 @@ export function makeProductionActiveRuntime(
       defaultBranch: options.defaultBranch,
       now,
     });
-    const before = await writer.readPullRequest(input.candidate.number);
-    if (before?.head !== input.candidate.head) {
-      throw new Error('Review Human escalation lost exact-head authority');
-    }
+    const diagnostic = cycleSnapshot.diagnostics.find((candidate) => (
+      candidate.pullRequests.some((pr) => pr.number === input.candidate.number)
+    ));
+    const publicationReason: HumanReason = diagnostic === undefined
+      ? input.reason
+      : {
+          phase: 'implementing',
+          code: 'branch-mapping-ambiguous',
+          detail: diagnostic.detail,
+        };
     const marker = formatHumanCommentMarker({
       issueNumber: input.candidate.issueNumber,
       prNumber: input.candidate.number,
-      reason: input.reason,
+      head: input.candidate.head,
+      generation,
+      reason: publicationReason,
     });
-    // Authority order: draft → hold label → marker comment.
-    // Decision paths read label+marker; Status paint is painter-owned (Stage 3).
-    await writer.setPullRequestDraft(
-      input.candidate.number,
-      true,
-      input.candidate.head,
-    );
-    await writer.setPullRequestLabel(
-      input.candidate.number,
-      'review:needs-human',
-      true,
-      input.candidate.head,
-    );
-    await writer.ensureHumanComment(
-      input.candidate.number,
-      marker,
-      `${marker}\n\n${input.reason.detail}`,
-      input.candidate.head,
-    );
-    // Stage 3: Human Status paint is painter-owned; label+marker are authority.
+    const authority = {
+      issueNumber: input.candidate.issueNumber,
+      expectedHead: input.candidate.head,
+      expectedReviewRefOid: humanRefOid,
+      expectedGeneration: generation,
+      ...(diagnostic === undefined
+        ? {}
+        : {
+            expectedDiagnosticIssueNumbers: diagnostic.issueNumbers,
+            expectedDiagnosticDetail: diagnostic.detail,
+          }),
+    };
+    if (!await writer.hasHumanComment(input.candidate.number, marker, authority)) {
+      await writer.ensureHumanComment(
+        input.candidate.number,
+        marker,
+        `${marker}\n\nAutopilot parked this item for Human review.\n\n${publicationReason.detail}`,
+        authority,
+      );
+    }
   };
 
   const activeRuntime = makeActiveRuntime({
