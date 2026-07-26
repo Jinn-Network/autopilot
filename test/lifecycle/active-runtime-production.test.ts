@@ -425,6 +425,31 @@ describe('production active runtime preflight', () => {
     expect(trackAttemptChild).not.toHaveBeenCalled();
   });
 
+  it('returns one stable unavailable result per marketplace review before local capacity or quota reads', async () => {
+    const reserveReviewCohort = vi.fn(async () => {
+      throw new Error('review quota must remain untouched');
+    });
+    const active = marketplaceRuntime({
+      newWorkPaused: () => {
+        throw new Error('local capacity must remain untouched');
+      },
+      reserveReviewCohort,
+    });
+    const actions = [84, 85].map((prNumber, index) => ({
+      kind: 'claim-review' as const,
+      issueNumber: 42 + index,
+      prNumber,
+      head: '1'.repeat(40),
+    }));
+
+    await expect(active.executeReviewActions!(actions, {} as never))
+      .resolves.toEqual(actions.map(() => ({
+        outcome: 'unavailable',
+        reason: MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
+      })));
+    expect(reserveReviewCohort).not.toHaveBeenCalled();
+  });
+
   it('rejects an unsupported marketplace repository before implementation authority reads or claims', async () => {
     const readIssue = vi.fn(async () => {
       throw new Error('implementation authority must remain untouched');

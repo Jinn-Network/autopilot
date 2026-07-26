@@ -27,8 +27,13 @@ import {
   recoverPreparedMarketplaceAttempts,
 } from '../src/lifecycle/session-execution-backend.js';
 import {
+  MARKETPLACE_LANGUAGE,
+  MARKETPLACE_VERIFICATION_PROFILE,
   MarketplaceTaskCliAdapter,
 } from '../src/lifecycle/marketplace-task.js';
+import {
+  assertMarketplaceRuntimeProfile,
+} from '../src/lifecycle/active-runtime-production.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
 import {
   paintBoardOptionsFromConfig,
@@ -77,6 +82,7 @@ import {
   parseLifecycleCli,
   parseAutopilotStateDirectory,
   parseSnapshotRuntimeConfig,
+  recoverMarketplaceAttemptInitializations,
   renderLifecycleHuman,
   renderLifecycleJson,
   resolveCredentialPool,
@@ -87,6 +93,7 @@ import {
   sweepDeadAttempts,
   freeDiskBytes,
   type LifecycleCycleReport,
+  type CredentialPool,
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
 
@@ -224,6 +231,48 @@ export async function preflightProductionEntrypoint<Value>(
   setup: () => Promise<Value>,
 ): Promise<Value> {
   return setup();
+}
+
+export function makeMarketplaceRecoveryCallback(input: {
+  readonly mode: 'observe' | 'recover' | 'active';
+  readonly executionBackend: 'local' | 'marketplace';
+  readonly repositorySlug: string;
+  readonly language?: string;
+  readonly verificationProfile?: string;
+  readonly replay: () => Promise<unknown>;
+}): (() => Promise<void>) | undefined {
+  if (input.executionBackend !== 'marketplace' || input.mode === 'observe') {
+    return undefined;
+  }
+  return async (): Promise<void> => {
+    assertMarketplaceRuntimeProfile({
+      repository: input.repositorySlug,
+      language: input.language ?? MARKETPLACE_LANGUAGE,
+      verificationProfile:
+        input.verificationProfile ?? MARKETPLACE_VERIFICATION_PROFILE,
+    });
+    await input.replay();
+  };
+}
+
+export function makeMarketplaceRecoveryCredentialResolver(
+  credentials: CredentialPool,
+): (normalizedLogin: string) => SelectedCredential {
+  return (normalizedLogin: string): SelectedCredential => {
+    const selection = selectCredential(
+      credentials.restrictedTo([normalizedLogin]),
+      { phase: 'implement' },
+    );
+    if (
+      selection.status !== 'selected'
+      || selection.credential.normalizedLogin !== normalizedLogin
+    ) {
+      throw new Error(
+        `Marketplace recovery credential ${normalizedLogin} is unavailable`,
+      );
+    }
+    return selection.credential;
+  };
 }
 
 export function shouldSweepAttempts(input: {
@@ -576,12 +625,22 @@ export async function runAutopilotV2(
   const recoverMarketplaceAttempts =
     marketplaceExecutionBackend === undefined
       ? undefined
-      : async (): Promise<void> => {
-          await recoverPreparedMarketplaceAttempts(
-            v2AttemptsBase,
-            marketplaceExecutionBackend,
-          );
-        };
+      : makeMarketplaceRecoveryCallback({
+          mode: options.mode,
+          executionBackend,
+          repositorySlug: loaded.config.repository.slug,
+          replay: async (): Promise<void> => {
+            await recoverMarketplaceAttemptInitializations(
+              v2AttemptsBase,
+              runner,
+              makeMarketplaceRecoveryCredentialResolver(credentials!),
+            );
+            await recoverPreparedMarketplaceAttempts(
+              v2AttemptsBase,
+              marketplaceExecutionBackend,
+            );
+          },
+        });
   const cleanupEnabled = options.mode === 'active'
     && activeCleanupEnabled(
       env.JINN_AUTOPILOT_CLEANUP_ENABLED,

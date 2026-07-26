@@ -87,6 +87,7 @@ import {
 import {
   buildMarketplaceTaskRequest,
   MARKETPLACE_LANGUAGE,
+  MARKETPLACE_REPOSITORY,
   MARKETPLACE_VERIFICATION_PROFILE,
   MarketplaceTaskCliAdapter,
   persistMarketplaceTaskRequest,
@@ -98,6 +99,24 @@ type ProductionMarketplaceTaskAdapter = Pick<
 >;
 
 export const AUTOPILOT_V2_REMOTE = 'jinn-autopilot-v2';
+
+export function assertMarketplaceRuntimeProfile(input: {
+  readonly repository: string;
+  readonly language: string;
+  readonly verificationProfile: string;
+}): void {
+  if (
+    input.repository !== MARKETPLACE_REPOSITORY
+    || input.language !== MARKETPLACE_LANGUAGE
+    || input.verificationProfile !== MARKETPLACE_VERIFICATION_PROFILE
+  ) {
+    throw new Error(
+      `Marketplace Task submission supports only ${MARKETPLACE_REPOSITORY}, `
+      + `${MARKETPLACE_LANGUAGE}, and verification profile `
+      + MARKETPLACE_VERIFICATION_PROFILE,
+    );
+  }
+}
 
 export interface ProductionActiveRuntimeOptions {
   /**
@@ -263,13 +282,17 @@ export function makeProductionCapabilityPreflight(
         const createdAt = now().getTime();
         const attemptId = (options.nextId ?? randomUUID)();
         const baseOid = '0'.repeat(40);
-        const built = buildMarketplaceTaskRequest({
-          workflow: 'implementation',
+        const profile = {
           repository: options.repositorySlug ?? '',
           language: options.marketplaceLanguage ?? MARKETPLACE_LANGUAGE,
           verificationProfile:
             options.marketplaceVerificationProfile
               ?? MARKETPLACE_VERIFICATION_PROFILE,
+        };
+        assertMarketplaceRuntimeProfile(profile);
+        const built = buildMarketplaceTaskRequest({
+          workflow: 'implementation',
+          ...profile,
           issueNumber: 1,
           prNumber: 1,
           targetBase: options.defaultBranch ?? 'next',
@@ -815,5 +838,12 @@ export function makeProductionActiveRuntime(
       },
     },
   });
-  return activeRuntime;
+  if (executionBackend !== 'marketplace') return activeRuntime;
+  return {
+    ...activeRuntime,
+    executeReviewActions: async (actions) => actions.map(() => ({
+      outcome: 'unavailable',
+      reason: MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
+    })),
+  };
 }
