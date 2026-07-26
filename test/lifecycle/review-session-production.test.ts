@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AttemptManifest } from '../../src/lifecycle/attempt-workspace.js';
-import { encodeReviewClaimPayload } from '../../src/lifecycle/codecs.js';
+import {
+  encodeReviewClaimPayload,
+  formatAutomatedReviewMarker,
+} from '../../src/lifecycle/codecs.js';
 import {
   makeProductionReviewSessionPort,
 } from '../../src/lifecycle/review-session-production.js';
@@ -21,6 +24,10 @@ const TREE = gitOid('4'.repeat(40));
 const BLOB = gitOid('5'.repeat(40));
 const ATTEMPT = '11111111-1111-4111-8111-111111111111';
 const GENERATION = '22222222-2222-4222-8222-222222222222';
+const FIX_ONE = gitOid('2'.repeat(40));
+const PRIOR_ATTEMPT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const PRIOR_GENERATION = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const MARKER = '33333333-3333-4333-8333-333333333333';
 
 function claim() {
   return {
@@ -699,7 +706,20 @@ describe('production review session port', () => {
             && args[0] === 'api'
             && args[1]?.endsWith('/reviews')
           ) {
-            return '[[]]';
+            return JSON.stringify([[{
+              user: { login: 'review-bot' },
+              state: 'APPROVED',
+              commit_id: HEAD,
+              body: formatAutomatedReviewMarker({
+                generation: GENERATION,
+                attempt: ATTEMPT,
+                intent: MARKER,
+                reviewer: 'review-bot',
+                head: HEAD,
+                verdict: 'APPROVE',
+              }),
+              submitted_at: '2026-07-20T12:00:20.000Z',
+            }]]);
           }
           if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'edit') {
             labels = [...labels, 'review:approved'];
@@ -932,6 +952,218 @@ describe('production review session port', () => {
 
     await expect(port.setPullRequestDraft(84, HEAD, false)).rejects.toThrow(error);
     expect(readyCalls).toBe(0);
+  });
+
+  it('does not block draft-to-ready on a superseded owned REQUEST_CHANGES review', async () => {
+    let readyCalls = 0;
+    let reviewReads = 0;
+    let draft = true;
+    const port = makeProductionReviewSessionPort({
+      environment: {
+        GH_TOKEN: 'selected-secret',
+        JINN_AUTOPILOT_SESSION_MANIFEST: '/attempt/manifest.json',
+      },
+      readManifest: () => manifest(),
+      runner: async (cmd, args) => {
+        if (cmd === 'gh' && args.join(' ') === 'api user --jq .login') {
+          return 'review-bot\n';
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({
+            number: 84,
+            state: 'OPEN',
+            headRefOid: HEAD,
+            headRefName: 'autopilot/42',
+            baseRefName: 'next',
+            baseRefOid: BASE,
+            isDraft: draft,
+            body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+            author: { login: 'implementation-bot' },
+            labels: [{ name: 'engine:review' }],
+            closingIssuesReferences: [{ number: 42 }],
+            files: [],
+          });
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+          return JSON.stringify([{
+            number: 84,
+            headRefOid: HEAD,
+            headRefName: 'autopilot/42',
+            closingIssuesReferences: [{ number: 42 }],
+          }]);
+        }
+        if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+          return projectSnapshot('In Review');
+        }
+        if (cmd === 'gh' && args[0] === 'api' && args[1]?.endsWith('/reviews')) {
+          reviewReads += 1;
+          return JSON.stringify([[{
+            user: { login: 'review-bot' },
+            state: 'CHANGES_REQUESTED',
+            commit_id: FIX_ONE,
+            body: formatAutomatedReviewMarker({
+              generation: PRIOR_GENERATION,
+              attempt: PRIOR_ATTEMPT,
+              intent: MARKER,
+              reviewer: 'review-bot',
+              head: FIX_ONE,
+              verdict: 'REQUEST_CHANGES',
+            }),
+            submitted_at: '2026-07-20T12:00:10.000Z',
+          }, {
+            user: { login: 'review-bot' },
+            state: 'APPROVED',
+            commit_id: HEAD,
+            body: formatAutomatedReviewMarker({
+              generation: GENERATION,
+              attempt: ATTEMPT,
+              intent: MARKER,
+              reviewer: 'review-bot',
+              head: HEAD,
+              verdict: 'APPROVE',
+            }),
+            submitted_at: '2026-07-20T12:00:20.000Z',
+          }]]);
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'ready') {
+          readyCalls += 1;
+          draft = false;
+          return '';
+        }
+        if (cmd === 'git' && args.includes('get-url')) {
+          return 'https://github.com/Jinn-Network/mono.git\n';
+        }
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          return `${REVIEW}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (cmd === 'git' && args.includes('fetch')) return '';
+        if (cmd === 'git' && args.includes('show')) {
+          return `${encodeReviewClaimPayload(terminalClaim())}\n`;
+        }
+        if (cmd === 'git' && args.includes('ls-tree')) return '';
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.setPullRequestDraft(84, HEAD, false)).resolves.toBeUndefined();
+    expect(readyCalls).toBe(1);
+    expect(reviewReads).toBe(1);
+  });
+
+  it.each([
+    {
+      name: 'the current approval is missing',
+      currentState: undefined,
+      error: /current-head approval/i,
+    },
+    {
+      name: 'the current approval is dismissed',
+      currentState: 'DISMISSED',
+      error: /current-head approval/i,
+    },
+    {
+      name: 'the current approval marker is malformed',
+      currentState: 'APPROVED',
+      currentBody: '<!-- jinn-autopilot-review:v2 malformed -->',
+      error: /current-head approval/i,
+    },
+    {
+      name: 'another reviewer has an effective requested-changes blocker',
+      currentState: 'APPROVED',
+      foreignBlocker: true,
+      error: /requested changes.*block/i,
+    },
+  ])('does not ready when $name', async ({
+    currentState,
+    currentBody,
+    foreignBlocker,
+    error,
+  }) => {
+    let readyCalls = 0;
+    let reviewReads = 0;
+    let draft = true;
+    const reviews = [{
+      user: { login: 'review-bot' },
+      state: 'CHANGES_REQUESTED',
+      commit_id: FIX_ONE,
+      body: formatAutomatedReviewMarker({
+        generation: PRIOR_GENERATION,
+        attempt: PRIOR_ATTEMPT,
+        intent: MARKER,
+        reviewer: 'review-bot',
+        head: FIX_ONE,
+        verdict: 'REQUEST_CHANGES',
+      }),
+      submitted_at: '2026-07-20T12:00:10.000Z',
+    }];
+    if (currentState !== undefined) {
+      reviews.push({
+        user: { login: 'review-bot' },
+        state: currentState,
+        commit_id: HEAD,
+        body: currentBody ?? formatAutomatedReviewMarker({
+          generation: GENERATION,
+          attempt: ATTEMPT,
+          intent: MARKER,
+          reviewer: 'review-bot',
+          head: HEAD,
+          verdict: 'APPROVE',
+        }),
+        submitted_at: '2026-07-20T12:00:20.000Z',
+      });
+    }
+    if (foreignBlocker === true) {
+      reviews.push({
+        user: { login: 'oaksprout' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: HEAD,
+        body: 'Needs changes.',
+        submitted_at: '2026-07-20T12:00:30.000Z',
+      });
+    }
+    const port = makeProductionReviewSessionPort({
+      environment: {
+        GH_TOKEN: 'selected-secret',
+        JINN_AUTOPILOT_SESSION_MANIFEST: '/attempt/manifest.json',
+      },
+      readManifest: () => manifest(),
+      runner: async (cmd, args) => {
+        if (cmd === 'gh' && args.join(' ') === 'api user --jq .login') return 'review-bot\n';
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({
+            number: 84, state: 'OPEN', headRefOid: HEAD, headRefName: 'autopilot/42',
+            baseRefName: 'next', baseRefOid: BASE, isDraft: draft,
+            body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+            author: { login: 'implementation-bot' }, labels: [{ name: 'engine:review' }],
+            closingIssuesReferences: [{ number: 42 }], files: [],
+          });
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+          return JSON.stringify([{ number: 84, headRefOid: HEAD, headRefName: 'autopilot/42', closingIssuesReferences: [{ number: 42 }] }]);
+        }
+        if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') return projectSnapshot('In Review');
+        if (cmd === 'gh' && args[0] === 'api' && args[1]?.endsWith('/reviews')) {
+          reviewReads += 1;
+          return JSON.stringify([reviews]);
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'ready') {
+          readyCalls += 1;
+          draft = false;
+          return '';
+        }
+        if (cmd === 'git' && args.includes('get-url')) return 'https://github.com/Jinn-Network/mono.git\n';
+        if (cmd === 'git' && args.includes('ls-remote')) return `${REVIEW}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        if (cmd === 'git' && args.includes('fetch')) return '';
+        if (cmd === 'git' && args.includes('show')) return `${encodeReviewClaimPayload(terminalClaim())}\n`;
+        if (cmd === 'git' && args.includes('ls-tree')) return '';
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.setPullRequestDraft(84, HEAD, false))
+      .rejects.toThrow(error);
+    expect(readyCalls).toBe(0);
+    expect(reviewReads).toBe(1);
   });
 
   it('uses gh pagination slurp and exactly flattens every native-review page', async () => {
