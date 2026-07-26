@@ -485,8 +485,19 @@ function projectionContext(
     });
   return {
     view,
+    snapshotComplete: snapshot.snapshotComplete === true,
     pullRequests: snapshot.pullRequests.map((pr) => ({
       number: pr.number,
+      headRefName: pr.headRefName,
+      baseRefName: pr.baseRefName,
+      ...((() => {
+        const markers = [...pr.body.matchAll(
+          /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/g,
+        )].filter((match) => match[2] === pr.headRefName);
+        return markers.length === 1
+          ? { scheduledIssueNumber: Number(markers[0]![1]) }
+          : {};
+      })()),
       ...(pr.reviewClaim === undefined ? {} : { reviewRefOid: pr.reviewClaim.oid }),
       ...(pr.reviewClaim === undefined
         ? {}
@@ -495,6 +506,13 @@ function projectionContext(
               head: pr.reviewClaim.record.head,
               generation: pr.reviewClaim.record.generation,
               state: pr.reviewClaim.record.state,
+              ...('mappingRequest' in pr.reviewClaim.record
+                ? { mappingRequest: pr.reviewClaim.record.mappingRequest }
+                : {}),
+              ...('mappingDiagnostic' in pr.reviewClaim.record
+                && pr.reviewClaim.record.mappingDiagnostic !== undefined
+                ? { mappingDiagnostic: pr.reviewClaim.record.mappingDiagnostic }
+                : {}),
             },
           }),
     })),

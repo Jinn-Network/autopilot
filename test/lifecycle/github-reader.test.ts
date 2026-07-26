@@ -1004,6 +1004,51 @@ describe('GhLifecycleReader', () => {
     expect(calls.some((args) => args[1]?.includes('page=2'))).toBe(true);
   });
 
+  it('rereads one exact stable-branch claim for reconciliation', async () => {
+    const claimMessage = [
+      'claim',
+      '',
+      'Jinn-Autopilot-Protocol: 2',
+      'Jinn-Autopilot-Phase: implement',
+      'Jinn-Autopilot-Issue: 42',
+      'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
+      'Jinn-Autopilot-Runner: runner-a',
+      'Jinn-Autopilot-Login: trusted',
+      `Jinn-Autopilot-Expected-Head: ${OPEN_HEAD}`,
+      'Jinn-Autopilot-Target-Base: next',
+      'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
+    ].join('\n');
+    const run: CommandRunner = async (command, args) => {
+      if (command === 'git') {
+        expect(args.slice(-3)).toEqual([
+          'ls-remote',
+          'https://github.com/Jinn-Network/mono.git',
+          'refs/heads/autopilot/42',
+        ]);
+        return `${OPEN_HEAD}\trefs/heads/autopilot/42\n`;
+      }
+      if (args[1]?.includes('/commits?')) {
+        return JSON.stringify([{
+          sha: OPEN_HEAD,
+          commit: {
+            message: claimMessage,
+            committer: { date: '2026-07-20T09:00:00.000Z' },
+          },
+        }]);
+      }
+      throw new Error(`Unexpected call: ${args.join(' ')}`);
+    };
+
+    await expect(
+      new GhLifecycleReader(run).readBranchClaimForReconciliation('autopilot/42'),
+    ).resolves.toMatchObject({
+      issueNumber: 42,
+      headRefName: 'autopilot/42',
+      headOid: OPEN_HEAD,
+      claimTrailers: expect.stringContaining('Jinn-Autopilot-Target-Base: next'),
+    });
+  });
+
   it('discovers incremental Autopilot branch claims through git transport', async () => {
     const calls: Array<{ command: string; args: string[] }> = [];
     const claimMessage = [

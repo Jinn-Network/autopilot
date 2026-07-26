@@ -17,6 +17,8 @@ export interface ReconciliationReviewRefState {
     | 'active'
     | 'verdict-intent'
     | 'terminal-approved'
+    | 'mapping-reread'
+    | 'human-intent'
     | 'human'
     | 'stale';
 }
@@ -26,6 +28,7 @@ export interface ReconciliationHumanCommentAuthority {
   readonly expectedHead: GitOid;
   readonly expectedReviewRefOid: GitOid;
   readonly expectedGeneration: string;
+  readonly expectedReviewState?: ReconciliationReviewRefState['state'];
   readonly expectedDiagnosticIssueNumbers?: readonly number[];
   readonly expectedDiagnosticDetail?: string;
 }
@@ -67,6 +70,9 @@ export interface ReconciliationWriter {
     marker: string,
     body: string,
     authority: ReconciliationHumanCommentAuthority,
+  ): Promise<void>;
+  convergeMappingHuman?(
+    action: Extract<ProjectionAction, { kind: 'converge-mapping-human' }>,
   ): Promise<void>;
   ensureImplementationSummary(
     prNumber: number,
@@ -265,6 +271,42 @@ async function ensureImplementationSummary(
   }
 }
 
+async function convergeMappingHuman(
+  action: Extract<ProjectionAction, { kind: 'converge-mapping-human' }>,
+  writer: ReconciliationWriter,
+): Promise<ReconciliationResult> {
+  if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
+    return { action, outcome: 'changed-head' };
+  }
+  const before = await writer.readReviewRef(action.prNumber);
+  if (before?.head !== action.expectedHead) return { action, outcome: 'changed-head' };
+  if (
+    before === null
+    || before.generation !== action.expectedGeneration
+    || (
+      before.oid !== action.expectedReviewRefOid
+      && before.state !== 'human-intent'
+      && before.state !== 'human'
+    )
+  ) {
+    return { action, outcome: 'lost-race' };
+  }
+  try {
+    if (writer.convergeMappingHuman === undefined) {
+      throw new Error('Mapping Human convergence is unavailable');
+    }
+    await writer.convergeMappingHuman(action);
+    const after = await writer.readReviewRef(action.prNumber);
+    return after?.head === action.expectedHead
+      && after.generation === action.expectedGeneration
+      && after.state === 'human'
+      ? { action, outcome: 'applied' }
+      : { action, outcome: 'lost-race' };
+  } catch (error) {
+    return { action, outcome: 'failed', detail: message(error) };
+  }
+}
+
 async function ensureDraftPr(
   action: Extract<ProjectionAction, { kind: 'ensure-draft-pr' }>,
   writer: ReconciliationWriter,
@@ -438,6 +480,8 @@ async function executeOne(
       return setLabel(action, writer);
     case 'ensure-human-comment':
       return ensureComment(action, writer);
+    case 'converge-mapping-human':
+      return convergeMappingHuman(action, writer);
     case 'ensure-implementation-summary':
       return ensureImplementationSummary(action, writer);
     case 'ensure-draft-pr':

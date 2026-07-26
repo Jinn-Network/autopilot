@@ -861,6 +861,35 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     return gitOid(fields[0]);
   }
 
+  async readBranchClaimForReconciliation(
+    headRefName: string,
+  ): Promise<RawBranchClaim | null> {
+    const branch = gitRefName(headRefName);
+    const match = /^autopilot\/([1-9][0-9]*)$/.exec(branch);
+    if (match?.[1] === undefined) {
+      throw new Error(`Branch ${branch} is not a stable Autopilot issue branch`);
+    }
+    const head = await this.readBranchHeadForReconciliation(branch);
+    if (head === null) return null;
+    const claims = await this.branchClaimsFromRefs([{
+      name: `refs/heads/${branch}`,
+      oid: head,
+    }]);
+    if (claims.length > 1) {
+      throw new Error(`Branch ${branch} claim readback is ambiguous`);
+    }
+    const claim = claims[0];
+    if (
+      claim === undefined
+      || claim.issueNumber !== Number(match[1])
+      || claim.headRefName !== branch
+      || claim.headOid !== head
+    ) {
+      return null;
+    }
+    return claim;
+  }
+
   async readGraphQlRemaining(): Promise<number> {
     const raw = await this.run('gh', [
       'api',

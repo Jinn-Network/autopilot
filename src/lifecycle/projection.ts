@@ -8,15 +8,23 @@ import type {
   LifecyclePhase,
   LifecycleView,
   LifecycleViewItem,
+  MappingDiagnosticAuthority,
+  MappingRereadRequest,
+  ReviewClaimState,
 } from './types.js';
 
 export interface ProjectionPullRequest {
   readonly number: number;
+  readonly headRefName?: string;
+  readonly baseRefName?: string;
+  readonly scheduledIssueNumber?: number;
   readonly reviewRefOid?: GitOid;
   readonly reviewClaim?: {
     readonly head: GitOid;
     readonly generation: string;
-    readonly state: 'active' | 'verdict-intent' | 'terminal-approved' | 'human' | 'stale';
+    readonly state: ReviewClaimState;
+    readonly mappingRequest?: MappingRereadRequest;
+    readonly mappingDiagnostic?: MappingDiagnosticAuthority;
   };
 }
 
@@ -44,6 +52,7 @@ export interface ProjectionContext {
   readonly pullRequests: readonly ProjectionPullRequest[];
   readonly orphanBranchClaims: readonly OrphanBranchClaim[];
   readonly mappingDiagnostics?: readonly LifecycleMappingDiagnostic[];
+  readonly snapshotComplete?: boolean;
 }
 
 interface HeadPinned {
@@ -72,6 +81,24 @@ export type ProjectionAction =
       readonly expectedGeneration: string;
       readonly expectedDiagnosticIssueNumbers?: readonly number[];
       readonly expectedDiagnosticDetail?: string;
+      readonly marker: string;
+      readonly body: string;
+    } & HeadPinned)
+  | ({
+      readonly kind: 'converge-mapping-human';
+      readonly selectedIssueNumber: number;
+      readonly prNumber: number;
+      readonly expectedReviewRefOid: GitOid;
+      readonly expectedGeneration: string;
+      readonly expectedReviewState:
+        | 'active'
+        | 'verdict-intent'
+        | 'terminal-approved'
+        | 'mapping-reread'
+        | 'human-intent'
+        | 'human';
+      readonly mappingRequest?: MappingRereadRequest;
+      readonly mappingDiagnostic: MappingDiagnosticAuthority;
       readonly marker: string;
       readonly body: string;
     } & HeadPinned)
@@ -196,6 +223,14 @@ function planItem(
           head: item.head,
           generation: obsoleteMapping.generation,
           reason: obsoleteMapping.reason,
+          ...(obsoleteMapping.mappingDiagnostic === undefined
+            ? {}
+            : {
+                diagnosticIssueNumbers:
+                  obsoleteMapping.mappingDiagnostic.issueNumbers,
+                diagnosticSignature:
+                  obsoleteMapping.mappingDiagnostic.signature,
+              }),
         }),
       }];
     }
@@ -350,46 +385,118 @@ export function planProjection(
       baseRefName: claim.baseRefName,
     });
   }
+  const diagnosticByPr = new Map<number, LifecycleMappingDiagnostic>();
   for (const diagnostic of context.mappingDiagnostics ?? []) {
+    for (const pr of diagnostic.pullRequests) diagnosticByPr.set(pr.number, diagnostic);
+  }
+  for (const pullRequest of context.pullRequests) {
+    const claim = pullRequest.reviewClaim;
+    if (
+      claim === undefined
+      || pullRequest.reviewRefOid === undefined
+      || claim.state === 'stale'
+    ) {
+      continue;
+    }
+    const canonical = diagnosticByPr.get(pullRequest.number);
+    if (
+      canonical === undefined
+      && claim.state === 'mapping-reread'
+      && claim.mappingRequest !== undefined
+      && context.snapshotComplete === true
+      && pullRequest.headRefName === claim.mappingRequest.headRefName
+      && pullRequest.baseRefName === claim.mappingRequest.baseRefName
+    ) {
+      if (!actions.some((action) => (
+        action.kind === 'mark-review-stale'
+        && action.prNumber === pullRequest.number
+      ))) {
+        actions.push({
+          kind: 'mark-review-stale',
+          prNumber: pullRequest.number,
+          expectedHead: claim.head,
+          expectedReviewRefOid: pullRequest.reviewRefOid,
+        });
+      }
+      continue;
+    }
+    const selectedIssueNumber =
+      claim.mappingRequest?.selectedIssueNumber
+      ?? pullRequest.scheduledIssueNumber
+      ?? (canonical?.issueNumbers.length === 1
+        ? canonical.issueNumbers[0]
+        : undefined);
+    const diagnostic: MappingDiagnosticAuthority | undefined =
+      claim.mappingDiagnostic
+      ?? (
+        canonical === undefined || selectedIssueNumber === undefined
+          ? undefined
+          : {
+              selectedIssueNumber,
+              issueNumbers: [...canonical.issueNumbers],
+              detail: canonical.detail,
+              signature: canonical.signature,
+            }
+      );
+    if (
+      diagnostic === undefined
+      || !diagnostic.issueNumbers.includes(diagnostic.selectedIssueNumber)
+      || (
+        canonical !== undefined
+        && claim.state !== 'human-intent'
+        && claim.state !== 'human'
+        && (
+          canonical.signature !== diagnostic.signature
+          || canonical.detail !== diagnostic.detail
+        )
+      )
+      || (
+        claim.mappingRequest !== undefined
+        && (
+          pullRequest.headRefName !== claim.mappingRequest.headRefName
+          || pullRequest.baseRefName !== claim.mappingRequest.baseRefName
+        )
+      )
+      || claim.head !== (
+        canonical?.pullRequests.find((candidate) =>
+          candidate.number === pullRequest.number)?.head
+        ?? claim.head
+      )
+      // A legacy bare Human record has no signed intent authority and must
+      // remain fail-closed instead of adopting a newly observed diagnostic.
+      || (claim.state === 'human' && claim.mappingDiagnostic === undefined)
+    ) {
+      continue;
+    }
     const reason: HumanReason = {
-      phase: 'implementing',
+      phase: 'reviewing',
       code: 'branch-mapping-ambiguous',
       detail: diagnostic.detail,
     };
-    for (const pr of diagnostic.pullRequests) {
-      const pullRequest = context.pullRequests.find(
-        (candidate) => candidate.number === pr.number,
-      );
-      const claim = pullRequest?.reviewClaim;
-      const issueNumber = diagnostic.issueNumbers.length === 1
-        ? diagnostic.issueNumbers[0]
-        : undefined;
-      if (
-        issueNumber === undefined
-        || pullRequest?.reviewRefOid === undefined
-        || claim?.state !== 'human'
-        || claim.head !== pr.head
-      ) continue;
-      const marker = formatHumanCommentMarker({
-        issueNumber,
-        prNumber: pr.number,
-        head: pr.head,
-        generation: claim.generation,
-        reason,
-      });
-      actions.push({
-        kind: 'ensure-human-comment',
-        issueNumber,
-        prNumber: pr.number,
-        expectedHead: pr.head,
-        expectedReviewRefOid: pullRequest.reviewRefOid,
-        expectedGeneration: claim.generation,
-        expectedDiagnosticIssueNumbers: [...diagnostic.issueNumbers],
-        expectedDiagnosticDetail: diagnostic.detail,
-        marker,
-        body: `${marker}\n\nAutopilot parked this item for Human review.\n\n${reason.detail}`,
-      });
-    }
+    const marker = formatHumanCommentMarker({
+      issueNumber: diagnostic.selectedIssueNumber,
+      prNumber: pullRequest.number,
+      head: claim.head,
+      generation: claim.generation,
+      reason,
+      diagnosticIssueNumbers: diagnostic.issueNumbers,
+      diagnosticSignature: diagnostic.signature,
+    });
+    actions.push({
+      kind: 'converge-mapping-human',
+      selectedIssueNumber: diagnostic.selectedIssueNumber,
+      prNumber: pullRequest.number,
+      expectedHead: claim.head,
+      expectedReviewRefOid: pullRequest.reviewRefOid,
+      expectedGeneration: claim.generation,
+      expectedReviewState: claim.state,
+      ...(claim.mappingRequest === undefined
+        ? {}
+        : { mappingRequest: claim.mappingRequest }),
+      mappingDiagnostic: diagnostic,
+      marker,
+      body: `${marker}\n\nAutopilot parked this item for Human review.\n\n${reason.detail}`,
+    });
   }
   return { actions };
 }

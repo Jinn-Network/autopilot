@@ -9,6 +9,7 @@ import {
   decodeBranchClaimTrailers,
   decodeReviewClaimPayload,
   formatAutomatedReviewMarker,
+  mappingDiagnosticSignature,
 } from './codecs.js';
 import { parseChildMarker, isMachineChildIssue, type ChildKind } from './child-issues.js';
 import {
@@ -528,19 +529,16 @@ function lifecyclePr(
     && machineAuthorLogins.has(pr.humanAuthor.toLowerCase())
     && pr.humanHead === pr.headOid
     && pr.humanGeneration !== undefined;
-  const retiredMachineMappingComment = exactMachineMappingComment
-    && !pr.labels.includes('review:needs-human')
-    && !pr.isDraft
-    && reviewClaim !== undefined
-    && reviewClaim.head === pr.headOid
-    && (
-      (
-        reviewClaim.generation === pr.humanGeneration
-        && reviewClaim.state === 'stale'
-      )
-      || reviewClaim.generation !== pr.humanGeneration
-    );
-  const humanReason = retiredMachineMappingComment
+  const activeMachineMappingComment = exactMachineMappingComment
+    && reviewClaim?.head === pr.headOid
+    && reviewClaim.generation === pr.humanGeneration
+    && reviewClaim.state === 'human';
+  // Mapping audits are append-first: until the exact matching generation
+  // advances to Human they are provisional evidence, not Human authority.
+  // Older/stale audits remain retained history and are likewise inert.
+  const inactiveMachineMappingComment = exactMachineMappingComment
+    && !activeMachineMappingComment;
+  const humanReason = inactiveMachineMappingComment
     ? synthesizedHumanReason
     : pr.humanReason ?? synthesizedHumanReason;
   const humanHold = humanReason !== undefined;
@@ -559,6 +557,9 @@ function lifecyclePr(
     ? {
         generation: reviewClaim.generation,
         author: pr.humanAuthor,
+        ...(reviewClaim.mappingDiagnostic === undefined
+          ? {}
+          : { mappingDiagnostic: reviewClaim.mappingDiagnostic }),
         reason: {
           phase: pr.humanReason!.phase,
           code: 'branch-mapping-ambiguous' as const,
@@ -717,14 +718,16 @@ function resolveMappings(
     const details = [...new Set(diagnosticPrs.flatMap((pr) => (
       intrinsicDetails.get(pr.number) ?? []
     )))];
+    const detail = `Ambiguous lifecycle mapping between issue(s) ${
+      issueNumbers.length === 0 ? 'none' : issueNumbers.map((number) => `#${number}`).join(', ')
+    } and PR(s) ${prNumbers.map((number) => `#${number}`).join(', ')}${
+      details.length === 0 ? '' : `: ${details.join('; ')}`
+    }`;
     diagnostics.push({
       code: 'branch-mapping-ambiguous',
-      detail: `Ambiguous lifecycle mapping between issue(s) ${
-        issueNumbers.length === 0 ? 'none' : issueNumbers.map((number) => `#${number}`).join(', ')
-      } and PR(s) ${prNumbers.map((number) => `#${number}`).join(', ')}${
-        details.length === 0 ? '' : `: ${details.join('; ')}`
-      }`,
+      detail,
       issueNumbers,
+      signature: mappingDiagnosticSignature({ issueNumbers, detail }),
       issues: issueNumbers.map((number) => ({
         number,
         projectStatus: byIssue.get(number)?.status ?? null,

@@ -15,6 +15,7 @@ import {
   IMPLEMENTATION_SUMMARY_START,
 } from './implementation-session.js';
 import {
+  decodeBranchClaimTrailers,
   decodeReviewClaimPayload,
   encodeReviewClaimPayload,
   isUnstructuredHumanHoldComment,
@@ -86,6 +87,14 @@ export interface ReconciliationProjectItemNode {
   readonly blockedOn: BlockedOn | null;
 }
 
+/** Exact stable-branch ref plus the claim trailers at that ref's ancestry. */
+export interface ReconciliationBranchClaimNode {
+  readonly issueNumber: number;
+  readonly headRefName: string;
+  readonly headOid: string;
+  readonly claimTrailers: string;
+}
+
 export interface ProductionReconciliationWriterOptions {
   readonly repositoryPath: string;
   /** Immutable complete snapshot that produced this cycle's projection plan. */
@@ -112,6 +121,14 @@ export interface ProductionReconciliationWriterOptions {
   ) => Promise<ReconciliationProjectItemNode | null>;
   /** Exact git-transport branch/ref read. Never backed by a world snapshot. */
   readonly readBranchHeadByName: (headRefName: string) => Promise<GitOid | null>;
+  /**
+   * Exact stable-branch claim read. Mapping-Human publication revalidates
+   * claim identity as well as the ref OID so a same-head parent/base rewrite
+   * cannot satisfy stale diagnostic authority.
+   */
+  readonly readBranchClaimByName?: (
+    headRefName: string,
+  ) => Promise<ReconciliationBranchClaimNode | null>;
   readonly readIssueByNumber: (issueNumber: number) => Promise<TargetedNativeIssue | null>;
   readonly readBlockedByIssueNumbers: (issueNumber: number) => Promise<readonly number[]>;
   readonly readOpenPullRequestsByIssue: (
@@ -538,7 +555,7 @@ function makeProductionReconciliationWriterWithScope(
       || record.prNumber !== prNumber
       || record.head !== authority.expectedHead
       || record.generation !== authority.expectedGeneration
-      || record.state !== 'human'
+      || record.state !== (authority.expectedReviewState ?? 'human')
     ) {
       throw new Error('Human comment reconciliation lost exact review-ref authority');
     }
@@ -629,6 +646,300 @@ function makeProductionReconciliationWriterWithScope(
     if (lifecycle?.kind !== 'pull-request') return true;
     const project = await readProjectItem(lifecycle.issueNumber);
     return project === null || project.status === 'Human' || project.blockedOn === 'Human';
+  };
+  const sameMappingDiagnostic = (
+    left: import('./types.js').MappingDiagnosticAuthority,
+    right: import('./types.js').MappingDiagnosticAuthority,
+  ): boolean => left.selectedIssueNumber === right.selectedIssueNumber
+    && left.detail === right.detail
+    && left.signature === right.signature
+    && sameList(left.issueNumbers, right.issueNumbers);
+  const recordHasMappingDiagnostic = (
+    record: ReviewClaimRecord,
+    diagnostic: import('./types.js').MappingDiagnosticAuthority,
+  ): boolean => (
+    (record.state === 'human-intent' || record.state === 'human')
+    && record.mappingDiagnostic !== undefined
+    && sameMappingDiagnostic(record.mappingDiagnostic, diagnostic)
+  );
+  const credentialForReviewer = (reviewer: string): SelectedCredential => {
+    if (options.credential.normalizedLogin === reviewer.toLowerCase()) {
+      return options.credential;
+    }
+    return repairCredentialForAuthor(reviewer);
+  };
+  const publishExactReviewRecord = async (
+    prNumber: number,
+    expectedParent: GitOid,
+    record: ReviewClaimRecord,
+    credential: SelectedCredential,
+    equivalent: (candidate: ReviewClaimRecord) => boolean,
+  ): Promise<GitOid> => {
+    const authenticate = <Value>(
+      operation: Parameters<typeof withSelectedCredential<Value>>[2],
+    ) => withSelectedCredential(credential, ambient, operation, runner);
+    return authenticate(async ({ askpass, run }) => {
+      const directory = mkdtempSync(join(tmpdir(), 'jinn-reconcile-review-'));
+      const payloadPath = join(directory, 'jinn-autopilot-review.json');
+      const indexPath = join(directory, 'index');
+      const localEnvironment = { GIT_INDEX_FILE: indexPath };
+      const git = (args: readonly string[], env = localEnvironment) => run(
+        'git',
+        ['-C', options.repositoryPath, ...args],
+        { env },
+      );
+      try {
+        writeFileSync(
+          payloadPath,
+          `${encodeReviewClaimPayload(record)}\n`,
+          { mode: 0o600 },
+        );
+        await git(['read-tree', '--empty']);
+        const blob = gitOid((await git(['hash-object', '-w', payloadPath])).trim());
+        await git([
+          'update-index', '--add',
+          '--cacheinfo', `100644,${blob},jinn-autopilot-review.json`,
+        ]);
+        const tree = gitOid((await git(['write-tree'])).trim());
+        const recordOid = gitOid((await git([
+          'commit-tree', tree,
+          '-p', expectedParent,
+          '-m', 'Autopilot reconciliation review metadata',
+        ])).trim());
+        const secureGit = (
+          _command: 'git',
+          args: readonly string[],
+        ) => run('git', [
+          ...gitPublicationArgs(askpass, []),
+          '-C', options.repositoryPath,
+          ...args,
+        ]);
+        await mutateWithExactReadback(
+          async () => {
+            invalidateActionAuthority();
+            const outcome = await makeGitProtocolPort(secureGit, {
+              remote: repositoryUrl,
+            }).publishReviewClaim({
+              prNumber,
+              recordParent: expectedParent,
+              expectedRemoteRecordOid: expectedParent,
+              recordOid,
+            });
+            if (
+              outcome.status !== 'won'
+              && outcome.status !== 'already-applied'
+            ) {
+              throw new Error(`Review-ref reconciliation ${outcome.status}`);
+            }
+          },
+          async () => {
+            const raw = await options.readPullRequestByNumber(prNumber);
+            if (raw?.reviewClaim === null || raw?.reviewClaim === undefined) return false;
+            const observed = decodeReviewClaimPayload(raw.reviewClaim.payload);
+            return observed.prNumber === record.prNumber
+              && observed.head === record.head
+              && observed.generation === record.generation
+              && equivalent(observed);
+          },
+          'Review-ref reconciliation was ambiguous',
+        );
+        const raw = await options.readPullRequestByNumber(prNumber);
+        if (raw?.reviewClaim === null || raw?.reviewClaim === undefined) {
+          throw new Error('Review-ref reconciliation readback is absent');
+        }
+        const observed = decodeReviewClaimPayload(raw.reviewClaim.payload);
+        if (!equivalent(observed)) {
+          throw new Error('Review-ref reconciliation readback changed');
+        }
+        return gitOid(raw.reviewClaim.oid);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  };
+  const requireCanonicalMappingDiagnostic = async (
+    action: Extract<
+      import('./projection.js').ProjectionAction,
+      { kind: 'converge-mapping-human' }
+    >,
+  ): Promise<void> => {
+    if (options.readCanonicalSnapshot === undefined) {
+      throw new Error('Complete canonical mapping authority is unavailable');
+    }
+    const canonical = await options.readCanonicalSnapshot(action.prNumber);
+    const matches = canonical?.diagnostics.filter((diagnostic) => (
+      diagnostic.pullRequests.some((pr) => (
+        pr.number === action.prNumber && pr.head === action.expectedHead
+      ))
+    )) ?? [];
+    const diagnostic = matches[0];
+    const canonicalPr = canonical?.pullRequests.find(
+      (pr) => pr.number === action.prNumber,
+    );
+    if (
+      canonical?.snapshotComplete !== true
+      || matches.length !== 1
+      || diagnostic === undefined
+      || diagnostic.signature !== action.mappingDiagnostic.signature
+      || diagnostic.detail !== action.mappingDiagnostic.detail
+      || !sameList(diagnostic.issueNumbers, action.mappingDiagnostic.issueNumbers)
+      || !diagnostic.issueNumbers.includes(action.selectedIssueNumber)
+      || canonicalPr?.state !== 'OPEN'
+      || canonicalPr.headOid !== action.expectedHead
+    ) {
+      throw new Error('Canonical mapping diagnostic changed');
+    }
+    if (
+      action.mappingRequest !== undefined
+      && (
+        canonicalPr.headRefName !== action.mappingRequest.headRefName
+        || canonicalPr.baseRefName !== action.mappingRequest.baseRefName
+        || action.mappingRequest.selectedIssueNumber !== action.selectedIssueNumber
+      )
+    ) {
+      throw new Error('Canonical mapping request identity changed');
+    }
+    const closure = new Set(diagnostic.issueNumbers);
+    const pending = [...closure];
+    while (pending.length > 0) {
+      const issueNumber = pending.pop()!;
+      const issue = canonical.issues.find((candidate) => candidate.number === issueNumber);
+      if (issue === undefined) {
+        throw new Error(`Canonical mapping issue #${issueNumber} is absent`);
+      }
+      const [liveDependencies, project] = await Promise.all([
+        options.readBlockedByIssueNumbers(issueNumber),
+        options.readProjectItemForReconciliation(issueNumber),
+      ]);
+      const expectedDependencies = [...issue.blockedByIssues]
+        .sort((left, right) => left - right);
+      const observedDependencies = [...liveDependencies]
+        .sort((left, right) => left - right);
+      if (
+        !sameList(expectedDependencies, observedDependencies)
+        || project === null
+        || project.blockedOn !== issue.blockedOn
+      ) {
+        throw new Error(`Canonical mapping issue #${issueNumber} closure changed`);
+      }
+      for (const dependency of expectedDependencies) {
+        if (!closure.has(dependency)) {
+          closure.add(dependency);
+          pending.push(dependency);
+        }
+      }
+    }
+    for (const branch of canonical.branches) {
+      if (!closure.has(branch.issueNumber)) continue;
+      if (options.readBranchClaimByName === undefined) {
+        throw new Error('Complete canonical stable-branch authority is unavailable');
+      }
+      const live = await options.readBranchClaimByName(branch.headRefName);
+      if (
+        live === null
+        || live.issueNumber !== branch.issueNumber
+        || live.headRefName !== branch.headRefName
+        || gitOid(live.headOid) !== branch.headOid
+      ) {
+        throw new Error(`Canonical mapping branch ${branch.headRefName} changed`);
+      }
+      const claim = decodeBranchClaimTrailers(live.claimTrailers);
+      if (
+        claim.phase !== branch.claim.phase
+        || claim.issueNumber !== branch.claim.issueNumber
+        || claim.prNumber !== branch.claim.prNumber
+        || claim.attempt !== branch.claim.attempt
+        || claim.runner !== branch.claim.runner
+        || claim.login !== branch.claim.login
+        || claim.expectedHead !== branch.claim.expectedHead
+        || claim.targetBase !== branch.claim.targetBase
+        || claim.claimedAt !== branch.claim.claimedAt
+        || claim.phaseComplete !== branch.claim.phaseComplete
+      ) {
+        throw new Error(`Canonical mapping branch ${branch.headRefName} claim changed`);
+      }
+    }
+    for (const pr of diagnostic.pullRequests) {
+      const expected = canonical.pullRequests.find(
+        (candidate) => candidate.number === pr.number,
+      );
+      const live = await options.readPullRequestByNumber(pr.number);
+      if (
+        expected === undefined
+        || live === null
+        || live.state !== 'OPEN'
+        || gitOid(live.headOid) !== pr.head
+        || live.headRefName !== expected.headRefName
+        || live.baseRefName !== expected.baseRefName
+        || live.body !== expected.body
+        || !sameList(live.closingIssueNumbers, expected.closingIssueNumbers)
+      ) {
+        throw new Error(`Canonical mapping PR #${pr.number} closure changed`);
+      }
+    }
+  };
+  const canonicalMappingResolved = async (
+    action: Extract<
+      import('./projection.js').ProjectionAction,
+      { kind: 'converge-mapping-human' }
+    >,
+  ): Promise<boolean> => {
+    if (options.readCanonicalSnapshot === undefined) return false;
+    const canonical = await options.readCanonicalSnapshot(action.prNumber);
+    if (canonical?.snapshotComplete !== true) return false;
+    const pr = canonical.pullRequests.find(
+      (candidate) => candidate.number === action.prNumber,
+    );
+    const mapping = canonical.pullRequestMappings?.find(
+      (candidate) => candidate.prNumber === action.prNumber,
+    );
+    return pr?.state === 'OPEN'
+      && pr.headOid === action.expectedHead
+      && mapping?.status === 'resolved'
+      && mapping.issueNumber === action.selectedIssueNumber
+      && mapping.expectedBaseRefName === pr.baseRefName;
+  };
+  const canonicalMappingRereadRequest = async (
+    action: Extract<
+      import('./projection.js').ProjectionAction,
+      { kind: 'converge-mapping-human' }
+    >,
+  ): Promise<import('./types.js').MappingRereadRequest | null> => {
+    if (options.readCanonicalSnapshot === undefined) return null;
+    const canonical = await options.readCanonicalSnapshot(action.prNumber);
+    if (canonical?.snapshotComplete !== true) return null;
+    const pr = canonical.pullRequests.find(
+      (candidate) => candidate.number === action.prNumber,
+    );
+    const diagnostics = canonical.diagnostics.filter((diagnostic) => (
+      diagnostic.pullRequests.some((candidate) => (
+        candidate.number === action.prNumber
+        && candidate.head === action.expectedHead
+      ))
+    ));
+    const diagnostic = diagnostics[0];
+    if (
+      pr?.state !== 'OPEN'
+      || pr.headOid !== action.expectedHead
+      || diagnostics.length !== 1
+      || diagnostic === undefined
+      || !diagnostic.issueNumbers.includes(action.selectedIssueNumber)
+      || (
+        diagnostic.signature === action.mappingDiagnostic.signature
+        && diagnostic.detail === action.mappingDiagnostic.detail
+        && sameList(
+          diagnostic.issueNumbers,
+          action.mappingDiagnostic.issueNumbers,
+        )
+      )
+    ) {
+      return null;
+    }
+    return {
+      selectedIssueNumber: action.selectedIssueNumber,
+      headRefName: pr.headRefName,
+      baseRefName: pr.baseRefName,
+    };
   };
   const updateReviewRef = async (
     prNumber: number,
@@ -894,6 +1205,355 @@ function makeProductionReconciliationWriterWithScope(
           'Human comment reconciliation was ambiguous',
         );
       });
+    },
+
+    async convergeMappingHuman(action) {
+      interface MappingCommentState {
+        readonly exact: boolean;
+        readonly conflict: boolean;
+      }
+      const readMappingComments = async (
+        credential: SelectedCredential,
+      ): Promise<MappingCommentState> => withSelectedCredential(
+        credential,
+        ambient,
+        async ({ run }) => {
+          const raw = await run('gh', [
+            'api', `repos/${repositorySlug}/issues/${action.prNumber}/comments`,
+            '--paginate', '--slurp',
+          ]);
+          const parsed = JSON.parse(raw) as unknown;
+          if (!Array.isArray(parsed)) {
+            throw new Error('Malformed mapping Human comment readback');
+          }
+          const comments = parsed.every((entry) => Array.isArray(entry))
+            ? parsed.flat()
+            : parsed;
+          let exact = 0;
+          let conflict = false;
+          for (const entry of comments) {
+            if (typeof entry !== 'object' || entry === null) {
+              conflict = true;
+              continue;
+            }
+            const comment = entry as {
+              readonly body?: unknown;
+              readonly user?: { readonly login?: unknown } | null;
+            };
+            if (typeof comment.body !== 'string') {
+              conflict = true;
+              continue;
+            }
+            let evidence: ReturnType<typeof parseHumanCommentEvidence>;
+            try {
+              evidence = parseHumanCommentEvidence(comment.body);
+            } catch {
+              if (comment.body.includes('<!-- jinn-autopilot-human:')) conflict = true;
+              continue;
+            }
+            if (
+              evidence !== null
+              && evidence.prNumber === action.prNumber
+              && evidence.head === action.expectedHead
+              && evidence.generation === action.expectedGeneration
+            ) {
+              const exactEvidence =
+                comment.body === action.body
+                && typeof comment.user?.login === 'string'
+                && comment.user.login.toLowerCase() === credential.normalizedLogin
+                && evidence.issueNumber === action.selectedIssueNumber
+                && evidence.reason.code === 'branch-mapping-ambiguous'
+                && evidence.diagnosticSignature === action.mappingDiagnostic.signature
+                && sameList(
+                  evidence.diagnosticIssueNumbers ?? [],
+                  action.mappingDiagnostic.issueNumbers,
+                );
+              if (exactEvidence) exact += 1;
+              else conflict = true;
+              continue;
+            }
+            if (
+              isUnstructuredHumanHoldComment(comment.body)
+              || (
+                evidence === null
+                && comment.body.includes('<!-- jinn-autopilot-human:')
+              )
+            ) {
+              conflict = true;
+            }
+          }
+          // Identical concurrent appends are one semantic audit. A different
+          // tuple in the same immutable slot is a hard conflict.
+          return { exact: exact > 0, conflict };
+        },
+        runner,
+      );
+      const readAuthority = async (): Promise<{
+        readonly oid: GitOid;
+        readonly record: ReviewClaimRecord;
+        readonly raw: ReconciliationPullRequestNode;
+      }> => {
+        const raw = await options.readPullRequestByNumber(action.prNumber);
+        if (
+          raw === null
+          || raw.state !== 'OPEN'
+          || gitOid(raw.headOid) !== action.expectedHead
+          || raw.reviewClaim === null
+        ) {
+          throw new Error('Mapping Human convergence lost exact PR authority');
+        }
+        const record = decodeReviewClaimPayload(raw.reviewClaim.payload);
+        if (
+          record.prNumber !== action.prNumber
+          || record.head !== action.expectedHead
+          || record.generation !== action.expectedGeneration
+        ) {
+          throw new Error('Mapping Human convergence lost exact review authority');
+        }
+        return { oid: gitOid(raw.reviewClaim.oid), record, raw };
+      };
+      let authority = await readAuthority();
+      const credential = credentialForReviewer(authority.record.reviewer);
+      const initialState = authority.record.state === action.expectedReviewState
+        && authority.oid === action.expectedReviewRefOid;
+      const resumedIntent = authority.record.state === 'human-intent'
+        && recordHasMappingDiagnostic(authority.record, action.mappingDiagnostic);
+      const alreadyHuman = authority.record.state === 'human'
+        && recordHasMappingDiagnostic(authority.record, action.mappingDiagnostic);
+      if (!initialState && !resumedIntent && !alreadyHuman) {
+        throw new Error('Mapping Human convergence review-ref authority changed');
+      }
+      let comments = await readMappingComments(credential);
+      if (comments.conflict) {
+        throw new Error('Mapping Human convergence found conflicting Human evidence');
+      }
+      if (alreadyHuman) {
+        if (!comments.exact) {
+          throw new Error('Mapping Human record is missing its exact signed audit');
+        }
+        return;
+      }
+      if (!resumedIntent) {
+        await requireCanonicalMappingDiagnostic(action);
+        if (authority.record.state === 'mapping-reread') {
+          const request = authority.record.mappingRequest;
+          if (
+            action.mappingRequest === undefined
+            || request.selectedIssueNumber !== action.mappingRequest.selectedIssueNumber
+            || request.headRefName !== action.mappingRequest.headRefName
+            || request.baseRefName !== action.mappingRequest.baseRefName
+          ) {
+            throw new Error('Mapping Human convergence request identity changed');
+          }
+        } else if (
+          authority.record.state !== 'active'
+          && authority.record.state !== 'verdict-intent'
+          && authority.record.state !== 'terminal-approved'
+        ) {
+          throw new Error(
+            `Mapping Human convergence is invalid from ${authority.record.state}`,
+          );
+        }
+        const intent: ReviewClaimRecord = {
+          kind: 'review-claim',
+          protocolVersion: 2,
+          prNumber: authority.record.prNumber,
+          generation: authority.record.generation,
+          attempt: authority.record.attempt,
+          reviewer: authority.record.reviewer,
+          head: authority.record.head,
+          state: 'human-intent',
+          mappingDiagnostic: action.mappingDiagnostic,
+          recordedAt: now().toISOString(),
+        };
+        const parent = authority.oid;
+        await publishExactReviewRecord(
+          action.prNumber,
+          parent,
+          intent,
+          credential,
+          (candidate) => (
+            recordHasMappingDiagnostic(candidate, action.mappingDiagnostic)
+            && (
+              candidate.state === 'human-intent'
+              || candidate.state === 'human'
+            )
+          ),
+        );
+        authority = await readAuthority();
+      }
+      if (authority.record.state === 'human') {
+        comments = await readMappingComments(credential);
+        if (!comments.exact || comments.conflict) {
+          throw new Error('Mapping Human record is missing its exact signed audit');
+        }
+        return;
+      }
+      if (
+        authority.record.state !== 'human-intent'
+        || !recordHasMappingDiagnostic(authority.record, action.mappingDiagnostic)
+      ) {
+        throw new Error('Mapping Human intent authority changed');
+      }
+      comments = await readMappingComments(credential);
+      if (comments.conflict) {
+        throw new Error('Mapping Human convergence found conflicting Human evidence');
+      }
+      if (!comments.exact) {
+        // The complete closure is refreshed immediately before the only
+        // append-only shared mutation.
+        try {
+          await requireCanonicalMappingDiagnostic(action);
+        } catch (error) {
+          const reread = await canonicalMappingRereadRequest(action);
+          if (reread !== null) {
+            const request: ReviewClaimRecord = {
+              kind: 'review-claim',
+              protocolVersion: 2,
+              prNumber: authority.record.prNumber,
+              generation: authority.record.generation,
+              attempt: authority.record.attempt,
+              reviewer: authority.record.reviewer,
+              head: authority.record.head,
+              state: 'mapping-reread',
+              mappingRequest: reread,
+              recordedAt: now().toISOString(),
+            };
+            await publishExactReviewRecord(
+              action.prNumber,
+              authority.oid,
+              request,
+              credential,
+              (candidate) => (
+                candidate.state === 'mapping-reread'
+                && candidate.prNumber === request.prNumber
+                && candidate.generation === request.generation
+                && candidate.attempt === request.attempt
+                && candidate.reviewer === request.reviewer
+                && candidate.head === request.head
+                && candidate.mappingRequest.selectedIssueNumber
+                  === reread.selectedIssueNumber
+                && candidate.mappingRequest.headRefName === reread.headRefName
+                && candidate.mappingRequest.baseRefName === reread.baseRefName
+              ),
+            );
+            return;
+          }
+          if (!await canonicalMappingResolved(action)) throw error;
+          const stale: ReviewClaimRecord = {
+            kind: 'review-claim',
+            protocolVersion: 2,
+            prNumber: authority.record.prNumber,
+            generation: authority.record.generation,
+            attempt: authority.record.attempt,
+            reviewer: authority.record.reviewer,
+            head: authority.record.head,
+            state: 'stale',
+            recordedAt: now().toISOString(),
+          };
+          await publishExactReviewRecord(
+            action.prNumber,
+            authority.oid,
+            stale,
+            credential,
+            (candidate) => (
+              candidate.state === 'stale'
+              && candidate.prNumber === stale.prNumber
+              && candidate.generation === stale.generation
+              && candidate.attempt === stale.attempt
+              && candidate.reviewer === stale.reviewer
+              && candidate.head === stale.head
+            ),
+          );
+          return;
+        }
+        const fenced = await readAuthority();
+        if (
+          fenced.oid !== authority.oid
+          || fenced.record.state !== 'human-intent'
+          || !recordHasMappingDiagnostic(fenced.record, action.mappingDiagnostic)
+        ) {
+          throw new Error('Mapping Human intent changed before audit publication');
+        }
+        await withSelectedCredential(
+          credential,
+          ambient,
+          async ({ run }) => mutateWithExactReadback(
+            () => {
+              invalidateActionAuthority();
+              return run('gh', [
+                'pr', 'comment', String(action.prNumber),
+                '--repo', repositorySlug,
+                '--body', action.body,
+              ]);
+            },
+            async () => {
+              const observed = await readMappingComments(credential);
+              return observed.exact && !observed.conflict;
+            },
+            'Mapping Human audit publication was ambiguous',
+          ),
+          runner,
+        );
+      }
+      comments = await readMappingComments(credential);
+      if (!comments.exact || comments.conflict) {
+        throw new Error('Mapping Human exact signed audit readback failed');
+      }
+      authority = await readAuthority();
+      if (
+        authority.record.state !== 'human-intent'
+        || !recordHasMappingDiagnostic(authority.record, action.mappingDiagnostic)
+      ) {
+        if (
+          authority.record.state === 'human'
+          && recordHasMappingDiagnostic(authority.record, action.mappingDiagnostic)
+        ) {
+          return;
+        }
+        throw new Error('Mapping Human intent changed before terminal publication');
+      }
+      try {
+        await requireCanonicalMappingDiagnostic(action);
+      } catch (error) {
+        // A now-resolved mapping may finish the already-published exact audit
+        // into Human so obsolete-mapping recovery can retire it next cycle.
+        // Any changed or incomplete diagnostic closure remains fail-closed.
+        if (!await canonicalMappingResolved(action)) throw error;
+      }
+      const human: ReviewClaimRecord = {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: authority.record.prNumber,
+        generation: authority.record.generation,
+        attempt: authority.record.attempt,
+        reviewer: authority.record.reviewer,
+        head: authority.record.head,
+        state: 'human',
+        mappingDiagnostic: action.mappingDiagnostic,
+        recordedAt: now().toISOString(),
+      };
+      await publishExactReviewRecord(
+        action.prNumber,
+        authority.oid,
+        human,
+        credential,
+        (candidate) => (
+          candidate.state === 'human'
+          && recordHasMappingDiagnostic(candidate, action.mappingDiagnostic)
+        ),
+      );
+      const final = await readAuthority();
+      if (
+        final.record.state !== 'human'
+        || !recordHasMappingDiagnostic(final.record, action.mappingDiagnostic)
+      ) {
+        throw new Error('Mapping Human terminal readback changed');
+      }
+      comments = await readMappingComments(credential);
+      if (!comments.exact || comments.conflict) {
+        throw new Error('Mapping Human terminal audit readback changed');
+      }
     },
 
     async ensureImplementationSummary(prNumber, expectedHead, summary) {

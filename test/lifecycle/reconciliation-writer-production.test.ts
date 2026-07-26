@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { resetFieldCache } from '../../src/dispatcher/field-cache.js';
 import { CredentialPool, selectCredential } from '../../src/lifecycle/credentials.js';
-import { encodeReviewClaimPayload, reviewClaimRef } from '../../src/lifecycle/codecs.js';
+import {
+  encodeBranchClaimTrailers,
+  encodeReviewClaimPayload,
+  mappingDiagnosticSignature,
+  reviewClaimRef,
+} from '../../src/lifecycle/codecs.js';
 import {
   makeProductionReconciliationWriter,
   type ReconciliationPullRequestNode,
@@ -350,6 +355,18 @@ function targetedWriterOptions(
       return current.branches.find((entry) => entry.headRefName === headRefName)?.headOid
         ?? current.pullRequests.find((entry) => entry.headRefName === headRefName)?.headOid
         ?? null;
+    },
+    async readBranchClaimByName(headRefName: string) {
+      const current = await read();
+      const branch = current.branches.find((entry) => entry.headRefName === headRefName);
+      return branch === undefined
+        ? null
+        : {
+            issueNumber: branch.issueNumber,
+            headRefName: branch.headRefName,
+            headOid: branch.headOid,
+            claimTrailers: encodeBranchClaimTrailers(branch.claim),
+          };
     },
     async readIssueByNumber(issueNumber: number) {
       const current = await read();
@@ -894,7 +911,7 @@ describe('production reconciliation writer', () => {
     },
   );
 
-  it('executes the diagnostic Human plan with exact monotonic authority and ten-point scopes', async () => {
+  it('keeps a legacy bare diagnostic Human ref fail-closed', async () => {
     const base = snapshot(false);
     const diagnosticCycle: GitHubLifecycleSnapshot = {
       ...base,
@@ -928,6 +945,10 @@ describe('production reconciliation writer', () => {
         code: 'branch-mapping-ambiguous',
         detail: 'PR mapping was temporarily ambiguous',
         issueNumbers: [42],
+        signature: mappingDiagnosticSignature({
+          issueNumbers: [42],
+          detail: 'PR mapping was temporarily ambiguous',
+        }),
         issues: [{ number: 42, projectStatus: 'Todo' }],
         pullRequests: [{ number: 84, head: HEAD, draft: false, labels: [] }],
       }],
@@ -1051,17 +1072,12 @@ describe('production reconciliation writer', () => {
     expect(report.results.every((result) => (
       result.outcome === 'applied' || result.outcome === 'already-applied'
     ))).toBe(true);
-    // Status paint is painter-owned (Stage 3). Future mapping diagnostics
-    // preserve the exact audit comment without mutating shared label/draft surfaces.
+    // An unsigned legacy Human record cannot adopt a new canonical tuple.
     expect(projectStatus).toBe('Todo');
     expect(draft).toBe(false);
     expect([...labels].sort()).toEqual([]);
-    expect(comments).toHaveLength(1);
-    expect(comments[0]).toContain('issue=42');
-    expect(comments[0]).toContain(`head=${HEAD}`);
-    expect(comments[0]).toContain('generation=22222222-2222-4222-8222-222222222222');
-    expect(mutationCosts).toHaveLength(1);
-    expect(Math.max(...mutationCosts)).toBeLessThanOrEqual(10);
+    expect(comments).toEqual([]);
+    expect(mutationCosts).toEqual([]);
   });
 
   it('rejects every non-monotonic mutation for a diagnostic PR', async () => {
@@ -1073,6 +1089,10 @@ describe('production reconciliation writer', () => {
         code: 'branch-mapping-ambiguous',
         detail: 'PR maps ambiguously',
         issueNumbers: [42, 43],
+        signature: mappingDiagnosticSignature({
+          issueNumbers: [42, 43],
+          detail: 'PR maps ambiguously',
+        }),
         issues: [{ number: 42, projectStatus: 'Human' }],
         pullRequests: [{
           number: 84,
@@ -1270,6 +1290,383 @@ describe('production reconciliation writer', () => {
       'repos/Jinn-Network/mono/issues/84/comments?per_page=100&page=1',
       'repos/Jinn-Network/mono/issues/84/comments?per_page=100&page=2',
     ]);
+  });
+
+  it.each([
+    {
+      name: 'request published',
+      initialState: 'mapping-reread' as const,
+      exactComment: false,
+      expectedPushes: 2,
+      expectedComments: 1,
+    },
+    {
+      name: 'Human intent published',
+      initialState: 'human-intent' as const,
+      exactComment: false,
+      expectedPushes: 1,
+      expectedComments: 1,
+    },
+    {
+      name: 'signed comment published',
+      initialState: 'human-intent' as const,
+      exactComment: true,
+      expectedPushes: 1,
+      expectedComments: 0,
+    },
+    {
+      name: 'conflicting same-slot signature',
+      initialState: 'human-intent' as const,
+      exactComment: false,
+      conflictingComment: true,
+      expectedPushes: 0,
+      expectedComments: 0,
+      expectedFailure: /conflicting Human evidence/i,
+    },
+    {
+      name: 'changed dependency closure',
+      initialState: 'mapping-reread' as const,
+      exactComment: false,
+      dependencyChanged: true,
+      expectedPushes: 0,
+      expectedComments: 0,
+      expectedFailure: /closure changed/i,
+    },
+    {
+      name: 'new canonical contender',
+      initialState: 'mapping-reread' as const,
+      exactComment: false,
+      canonicalChanged: true,
+      expectedPushes: 0,
+      expectedComments: 0,
+      expectedFailure: /diagnostic changed/i,
+    },
+    {
+      name: 'same-head stable branch claim retargeted',
+      initialState: 'mapping-reread' as const,
+      exactComment: false,
+      branchClaimChanged: true,
+      expectedPushes: 0,
+      expectedComments: 0,
+      expectedFailure: /branch .* claim changed/i,
+    },
+    {
+      name: 'stable branch retargeted after signed audit',
+      initialState: 'human-intent' as const,
+      exactComment: true,
+      branchClaimChanged: true,
+      expectedPushes: 0,
+      expectedComments: 0,
+      expectedFailure: /branch .* claim changed/i,
+    },
+    {
+      name: 'ambiguity resolved before intent audit',
+      initialState: 'human-intent' as const,
+      exactComment: false,
+      canonicalResolved: true,
+      expectedPushes: 1,
+      expectedComments: 0,
+      expectedFinalState: 'stale' as const,
+    },
+    {
+      name: 'diagnostic rotated before intent audit',
+      initialState: 'human-intent' as const,
+      exactComment: false,
+      diagnosticRotated: true,
+      expectedPushes: 1,
+      expectedComments: 0,
+      expectedFinalState: 'mapping-reread' as const,
+    },
+  ])('converges mapping Human after crash with $name', async ({
+    initialState,
+    exactComment,
+    conflictingComment,
+    dependencyChanged,
+    canonicalChanged,
+    branchClaimChanged,
+    canonicalResolved,
+    diagnosticRotated,
+    expectedPushes,
+    expectedComments,
+    expectedFailure,
+    expectedFinalState,
+  }) => {
+    const generation = HUMAN_GENERATION;
+    const detail = 'PR #84 maps both issues #42 and #43.';
+    const signature = mappingDiagnosticSignature({
+      issueNumbers: [42, 43],
+      detail,
+    });
+    const mappingDiagnostic = {
+      selectedIssueNumber: 42,
+      issueNumbers: [42, 43],
+      detail,
+      signature,
+    };
+    const common = {
+      kind: 'review-claim' as const,
+      protocolVersion: 2 as const,
+      prNumber: 84,
+      generation,
+      attempt: '33333333-3333-4333-8333-333333333333',
+      reviewer: 'implementation-bot',
+      head: HEAD,
+      recordedAt: '2026-07-20T11:00:00.000Z',
+    };
+    const request = {
+      selectedIssueNumber: 42,
+      headRefName: 'autopilot/42',
+      baseRefName: 'next',
+    };
+    let currentRecord: ReviewClaimRecord = initialState === 'mapping-reread'
+      ? { ...common, state: 'mapping-reread', mappingRequest: request }
+      : { ...common, state: 'human-intent', mappingDiagnostic };
+    let currentOid = CLAIM_OID;
+    const diagnostic = {
+      code: 'branch-mapping-ambiguous' as const,
+      detail,
+      issueNumbers: [42, 43],
+      signature,
+      issues: [
+        { number: 42, projectStatus: 'In Review' as const },
+        { number: 43, projectStatus: 'Todo' as const },
+      ],
+      pullRequests: [{
+        number: 84,
+        head: HEAD,
+        draft: true,
+        labels: ['engine:review'],
+      }],
+    };
+    const cycleBase = snapshot(true);
+    const cycle: GitHubLifecycleSnapshot = {
+      ...cycleBase,
+      project: {
+        ...cycleBase.project,
+        items: [
+          ...cycleBase.project.items,
+          {
+            ...cycleBase.project.items[0]!,
+            id: 'PVTI_issue_43',
+            number: 43,
+            status: 'Todo',
+          },
+        ],
+      },
+      issues: [
+        ...cycleBase.issues,
+        {
+          ...cycleBase.issues[0]!,
+          number: 43,
+          title: 'feat: competing mapping',
+          projectItemId: 'PVTI_issue_43',
+        },
+      ],
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T10:00:00.000Z',
+        claim: {
+          kind: 'branch-claim',
+          protocolVersion: 2,
+          phase: 'implement',
+          issueNumber: 42,
+          attempt: '11111111-1111-4111-8111-111111111111',
+          runner: 'runner-a',
+          login: 'implementation-bot',
+          expectedHead: HEAD,
+          targetBase: gitRefName('next'),
+          claimedAt: '2026-07-20T10:00:00.000Z',
+          phaseComplete: true,
+        },
+      }],
+      diagnostics: [diagnostic],
+      pullRequestMappings: [{
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [42, 43],
+        details: [detail],
+      }],
+    };
+    const action = planProjection({
+      view: { items: [] },
+      pullRequests: [{
+        number: 84,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+        reviewRefOid: CLAIM_OID,
+        reviewClaim: {
+          head: HEAD,
+          generation,
+          state: currentRecord.state,
+          ...('mappingRequest' in currentRecord
+            ? { mappingRequest: currentRecord.mappingRequest }
+            : {}),
+          ...('mappingDiagnostic' in currentRecord
+            ? { mappingDiagnostic: currentRecord.mappingDiagnostic }
+            : {}),
+        },
+      }],
+      orphanBranchClaims: [],
+      mappingDiagnostics: [diagnostic],
+    }).actions[0] as Extract<ProjectionAction, { kind: 'converge-mapping-human' }>;
+    const comments: Array<{ body: string; user: { login: string } }> =
+      exactComment ? [{ body: action.body, user: { login: 'implementation-bot' } }] : [];
+    if (conflictingComment) {
+      comments.push({
+        body: action.body.replace(signature, 'f'.repeat(64)),
+        user: { login: 'implementation-bot' },
+      });
+    }
+    const recordOids = [RECORD_OID, gitOid('9'.repeat(40))];
+    let commitCount = 0;
+    let pushes = 0;
+    let commentMutations = 0;
+    const ref = reviewClaimRef(84);
+    const targeted = targetedWriterOptions(() => cycle, cycle);
+    const changedDetail = `${detail} A new contender also maps #44.`;
+    const rotatedDetail = `${detail} The competing relation changed.`;
+    const liveCanonical = canonicalResolved
+      ? {
+          ...cycle,
+          diagnostics: [],
+          pullRequestMappings: [{
+            status: 'resolved' as const,
+            prNumber: 84,
+            issueNumber: 42,
+            expectedBaseRefName: 'next',
+            evidence: 'closing-reference' as const,
+          }],
+        }
+      : diagnosticRotated
+        ? {
+            ...cycle,
+            diagnostics: [{
+              ...diagnostic,
+              detail: rotatedDetail,
+              signature: mappingDiagnosticSignature({
+                issueNumbers: [42, 43],
+                detail: rotatedDetail,
+              }),
+            }],
+          }
+      : canonicalChanged
+      ? {
+          ...cycle,
+          diagnostics: [{
+            ...diagnostic,
+            detail: changedDetail,
+            issueNumbers: [42, 43, 44],
+            signature: mappingDiagnosticSignature({
+              issueNumbers: [42, 43, 44],
+              detail: changedDetail,
+            }),
+          }],
+        }
+      : cycle;
+    const writer = makeProductionReconciliationWriter({
+      repositoryPath: '/repo',
+      ...targeted,
+      readCanonicalSnapshot: async () => liveCanonical,
+      readBlockedByIssueNumbers: async (issueNumber) => (
+        dependencyChanged && issueNumber === 42
+          ? [99]
+          : targeted.readBlockedByIssueNumbers(issueNumber)
+      ),
+      readBranchClaimByName: async (headRefName) => {
+        const claim = await targeted.readBranchClaimByName(headRefName);
+        if (claim === null || !branchClaimChanged) return claim;
+        const canonicalClaim = cycle.branches[0]!.claim;
+        return {
+          ...claim,
+          claimTrailers: encodeBranchClaimTrailers({
+            ...canonicalClaim,
+            targetBase: gitRefName('attacker/retarget'),
+          }),
+        };
+      },
+      readPullRequestByNumber: async () => reconciliationPr({
+        reviewClaim: {
+          oid: currentOid,
+          payload: encodeReviewClaimPayload(currentRecord),
+        },
+      }),
+      credential: selectedCredential(),
+      now: () => new Date('2026-07-20T12:00:00.000Z'),
+      runner: async (_command, args) => {
+        if (args.includes('hash-object')) return `${BLOB_OID}\n`;
+        if (args.includes('write-tree')) return `${TREE_OID}\n`;
+        if (args.includes('commit-tree')) return `${recordOids[commitCount++]!}\n`;
+        if (args.includes('rev-list')) return `${recordOids[commitCount - 1]} ${currentOid}`;
+        if (args.includes('ls-remote')) return `${currentOid}\t${ref}\n`;
+        if (args.includes('push')) {
+          const nextState = expectedFinalState === 'mapping-reread'
+            ? 'mapping-reread' as const
+            : canonicalResolved
+              ? 'stale' as const
+            : currentRecord.state === 'mapping-reread'
+              ? 'human-intent' as const
+              : 'human' as const;
+          currentOid = recordOids[pushes]!;
+          currentRecord = nextState === 'mapping-reread'
+            ? {
+                ...common,
+                recordedAt: '2026-07-20T12:00:00.000Z',
+                state: nextState,
+                mappingRequest: request,
+              }
+            : nextState === 'stale'
+            ? {
+                ...common,
+                recordedAt: '2026-07-20T12:00:00.000Z',
+                state: nextState,
+              }
+            : {
+                ...common,
+                recordedAt: '2026-07-20T12:00:00.000Z',
+                state: nextState,
+                mappingDiagnostic,
+              };
+          pushes += 1;
+          return '';
+        }
+        if (args.includes('read-tree') || args.includes('update-index')) return '';
+        if (args[0] === 'api') return JSON.stringify([comments]);
+        if (args[0] === 'pr' && args[1] === 'comment') {
+          commentMutations += 1;
+          comments.push({
+            body: args[args.indexOf('--body') + 1]!,
+            user: { login: 'implementation-bot' },
+          });
+          return '';
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    if (expectedFailure !== undefined) {
+      await expect(writer.convergeMappingHuman?.(action)).rejects.toThrow(expectedFailure);
+      expect(currentRecord.state).toBe(initialState);
+      expect(pushes).toBe(expectedPushes);
+      expect(commentMutations).toBe(expectedComments);
+      return;
+    }
+    await expect(writer.convergeMappingHuman?.(action)).resolves.toBeUndefined();
+    expect(currentRecord).toMatchObject(
+      expectedFinalState === 'stale'
+        ? { state: 'stale' }
+        : expectedFinalState === 'mapping-reread'
+          ? { state: 'mapping-reread', mappingRequest: request }
+          : { state: 'human', mappingDiagnostic },
+    );
+    expect(pushes).toBe(expectedPushes);
+    expect(commentMutations).toBe(expectedComments);
+    expect(comments).toEqual(
+      expectedFinalState === 'stale' || expectedFinalState === 'mapping-reread'
+        ? []
+        : [{ body: action.body, user: { login: 'implementation-bot' } }],
+    );
   });
 
   it('accepts a lost mutation response only after exact selected-identity readback', async () => {

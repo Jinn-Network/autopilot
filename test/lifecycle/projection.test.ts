@@ -5,6 +5,7 @@ import {
   planProjection,
   type ProjectionContext,
 } from '../../src/lifecycle/projection.js';
+import { mappingDiagnosticSignature } from '../../src/lifecycle/codecs.js';
 import { gitOid, gitRefName, type LifecycleItem } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
@@ -374,25 +375,42 @@ describe('planProjection', () => {
     expect(planProjection(ambiguous).actions).toEqual([]);
   });
 
-  it('projects a single-issue current-generation mapping diagnostic as an exact comment only', () => {
+  it('converges a durable mapping reread request with a signed multi-issue diagnostic', () => {
     const generation = '22222222-2222-4222-8222-222222222222';
+    const detail = 'PR #101 resolves issues #42 and #43';
+    const signature = mappingDiagnosticSignature({
+      issueNumbers: [42, 43],
+      detail,
+    });
     const diagnostic: ProjectionContext = {
       view: { items: [] },
       pullRequests: [{
         number: 101,
+        scheduledIssueNumber: 42,
         reviewRefOid: REVIEW_OID,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
         reviewClaim: {
           head: HEAD,
           generation,
-          state: 'human',
+          state: 'mapping-reread',
+          mappingRequest: {
+            selectedIssueNumber: 42,
+            headRefName: 'autopilot/42',
+            baseRefName: 'next',
+          },
         },
       }],
       orphanBranchClaims: [],
       mappingDiagnostics: [{
         code: 'branch-mapping-ambiguous',
-        detail: 'Another open PR also maps issue #42',
-        issueNumbers: [42],
-        issues: [{ number: 42, projectStatus: 'Human' }],
+        detail,
+        issueNumbers: [42, 43],
+        signature,
+        issues: [
+          { number: 42, projectStatus: 'In Review' },
+          { number: 43, projectStatus: 'Todo' },
+        ],
         pullRequests: [{
           number: 101,
           head: HEAD,
@@ -402,21 +420,112 @@ describe('planProjection', () => {
       }],
     };
     const marker =
-      '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing '
-      + `code=branch-mapping-ambiguous head=${HEAD} generation=${generation} -->`;
+      '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=reviewing '
+      + `code=branch-mapping-ambiguous head=${HEAD} generation=${generation} `
+      + `issues=42,43 diagnostic=${signature} -->`;
 
     expect(planProjection(diagnostic).actions).toEqual([{
-      kind: 'ensure-human-comment',
-      issueNumber: 42,
+      kind: 'converge-mapping-human',
+      selectedIssueNumber: 42,
       prNumber: 101,
       expectedHead: HEAD,
       expectedReviewRefOid: REVIEW_OID,
       expectedGeneration: generation,
-      expectedDiagnosticIssueNumbers: [42],
-      expectedDiagnosticDetail: 'Another open PR also maps issue #42',
+      expectedReviewState: 'mapping-reread',
+      mappingRequest: {
+        selectedIssueNumber: 42,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+      },
+      mappingDiagnostic: {
+        selectedIssueNumber: 42,
+        issueNumbers: [42, 43],
+        detail,
+        signature,
+      },
       marker,
       body: `${marker}\n\nAutopilot parked this item for Human review.\n\n`
-        + 'Another open PR also maps issue #42',
+        + detail,
+    }]);
+  });
+
+  it('resumes the exact signed Human intent after a coordinator crash', () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const detail = 'Another open PR also maps issue #42';
+    const signature = mappingDiagnosticSignature({ issueNumbers: [42], detail });
+    const mappingDiagnostic = {
+      selectedIssueNumber: 42,
+      issueNumbers: [42],
+      detail,
+      signature,
+    };
+    const diagnostic: ProjectionContext = {
+      view: { items: [] },
+      pullRequests: [{
+        number: 101,
+        scheduledIssueNumber: 42,
+        reviewRefOid: REVIEW_OID,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+        reviewClaim: {
+          head: HEAD,
+          generation,
+          state: 'human-intent',
+          mappingDiagnostic,
+        },
+      }],
+      orphanBranchClaims: [],
+      mappingDiagnostics: [{
+        code: 'branch-mapping-ambiguous',
+        detail,
+        issueNumbers: [42],
+        signature,
+        issues: [{ number: 42, projectStatus: 'In Review' }],
+        pullRequests: [{
+          number: 101,
+          head: HEAD,
+          draft: false,
+          labels: ['engine:review'],
+        }],
+      }],
+    };
+
+    expect(planProjection(diagnostic).actions).toEqual([
+      expect.objectContaining({
+        kind: 'converge-mapping-human',
+        expectedReviewState: 'human-intent',
+        mappingDiagnostic,
+      }),
+    ]);
+  });
+
+  it('releases a mapping reread request when the canonical ambiguity resolved', () => {
+    expect(planProjection({
+      view: { items: [] },
+      snapshotComplete: true,
+      pullRequests: [{
+        number: 101,
+        reviewRefOid: REVIEW_OID,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+        reviewClaim: {
+          head: HEAD,
+          generation: '22222222-2222-4222-8222-222222222222',
+          state: 'mapping-reread',
+          mappingRequest: {
+            selectedIssueNumber: 42,
+            headRefName: 'autopilot/42',
+            baseRefName: 'next',
+          },
+        },
+      }],
+      orphanBranchClaims: [],
+      mappingDiagnostics: [],
+    }).actions).toEqual([{
+      kind: 'mark-review-stale',
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW_OID,
     }]);
   });
 });

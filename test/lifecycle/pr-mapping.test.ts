@@ -401,6 +401,74 @@ describe('canonical structured PR-to-issue mapping', () => {
     });
   });
 
+  it('rejects a scoped custom parent whose visible PR is retargeted', () => {
+    const input = stackedInput({
+      issues: [
+        { number: 42, blockedOn: 'Another issue', blockedByIssues: [7] },
+      ],
+      pullRequests: [{
+        number: 84,
+        state: 'OPEN',
+        head: HEAD,
+        headRefName: 'autopilot/42',
+        baseRefName: 'stack/live-blocker',
+        closingIssueNumbers: [42],
+        body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      }, {
+        number: 70,
+        state: 'OPEN',
+        head: OTHER_HEAD,
+        headRefName: 'stack/live-blocker',
+        baseRefName: 'attacker/retarget',
+        closingIssueNumbers: [7],
+        body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/live-blocker -->',
+      }],
+      stableBranches: [],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)[0]).toMatchObject({
+      status: 'ambiguous',
+      prNumber: 84,
+      details: expect.arrayContaining([
+        expect.stringMatching(/parent.*ambiguous|authorized base/i),
+      ]),
+    });
+  });
+
+  it('rejects a scoped custom parent when the visible PR relation forms a cycle', () => {
+    const input = stackedInput({
+      issues: [
+        { number: 42, blockedOn: 'Another issue', blockedByIssues: [7] },
+      ],
+      pullRequests: [{
+        number: 84,
+        state: 'OPEN',
+        head: HEAD,
+        headRefName: 'stack/42',
+        baseRefName: 'stack/7',
+        closingIssueNumbers: [42],
+        body: '<!-- jinn-autopilot:v2 issue=42 branch=stack/42 -->',
+      }, {
+        number: 70,
+        state: 'OPEN',
+        head: OTHER_HEAD,
+        headRefName: 'stack/7',
+        baseRefName: 'stack/42',
+        closingIssueNumbers: [7],
+        body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/7 -->',
+      }],
+      stableBranches: [],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)[0]).toMatchObject({
+      status: 'ambiguous',
+      prNumber: 84,
+      details: expect.arrayContaining([
+        expect.stringMatching(/parent.*ambiguous|cyclic/i),
+      ]),
+    });
+  });
+
   it('does not let a non-default live base authorize itself', () => {
     const input = stackedInput({
       issues: [{ number: 42, blockedOn: 'Nothing', blockedByIssues: [] }],

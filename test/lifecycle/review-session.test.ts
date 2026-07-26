@@ -236,8 +236,23 @@ function harness(options: {
       expect(body.length).toBeGreaterThan(0);
       return { number: 9001, created: true };
     },
-    hasHumanComment: async (_pr, _head, _ref, _generation, body) => comments.has(body),
-    ensureHumanComment: async (_pr, _head, _ref, _generation, _marker, body) => {
+    hasHumanComment: async (
+      _pr,
+      _head,
+      _ref,
+      _generation,
+      _state,
+      body,
+    ) => comments.has(body),
+    ensureHumanComment: async (
+      _pr,
+      _head,
+      _ref,
+      _generation,
+      _state,
+      _marker,
+      body,
+    ) => {
       events.push('human-comment');
       comments.add(body);
     },
@@ -610,9 +625,64 @@ describe('review session protocol', () => {
     expect(h.events).toEqual(['record:human']);
   });
 
+  it('delegates a lost mapping to the coordinator without publishing Human state', async () => {
+    const h = harness({ state: 'active', draft: true });
+    const read = h.port.readPullRequest;
+    h.port.readPullRequest = async (...args) => ({
+      ...await read(...args),
+      mappingProblem: 'PR now maps to both issue #42 and issue #43.',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'mapping-pending', head: HEAD });
+
+    expect(h.events).toEqual(['record:mapping-reread', 'claim:mapping-reread']);
+    expect(h.authority.record).toMatchObject({
+      state: 'mapping-reread',
+      mappingRequest: {
+        selectedIssueNumber: 42,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+      },
+    });
+    expect([...h.comments]).toEqual([]);
+    expect(h.events.some((event) => event.startsWith('draft:'))).toBe(false);
+    expect(h.events.some((event) => event.startsWith('label:'))).toBe(false);
+  });
+
+  it('restarts idempotently from an already published mapping reread request', async () => {
+    const h = harness({
+      state: 'mapping-reread',
+      draft: true,
+    });
+    h.authority = {
+      ...h.authority,
+      record: record('mapping-reread', {
+        mappingRequest: {
+          selectedIssueNumber: 42,
+          headRefName: 'autopilot/42',
+          baseRefName: 'next',
+        },
+      }),
+    };
+    const read = h.port.readPullRequest;
+    h.port.readPullRequest = async (...args) => ({
+      ...await read(...args),
+      mappingProblem: 'PR now maps to both issue #42 and issue #43.',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'mapping-pending', head: HEAD });
+
+    expect(h.events).toEqual([]);
+    expect([...h.comments]).toEqual([]);
+  });
+
   it.each([
     {
       name: 'closed PR',
+      expectedStatus: 'human',
+      expectedState: 'human',
       mutate: (pullRequest: Awaited<ReturnType<ReviewSessionPort['readPullRequest']>>) => ({
         ...pullRequest,
         open: false,
@@ -620,6 +690,8 @@ describe('review session protocol', () => {
     },
     {
       name: 'changed issue mapping',
+      expectedStatus: 'mapping-pending',
+      expectedState: 'mapping-reread',
       mutate: (pullRequest: Awaited<ReturnType<ReviewSessionPort['readPullRequest']>>) => ({
         ...pullRequest,
         issueNumber: 43,
@@ -628,19 +700,25 @@ describe('review session protocol', () => {
     },
     {
       name: 'changed CODEOWNER policy',
+      expectedStatus: 'human',
+      expectedState: 'human',
       mutate: (pullRequest: Awaited<ReturnType<ReviewSessionPort['readPullRequest']>>) => ({
         ...pullRequest,
         approvalPolicy: 'human-codeowner' as const,
       }),
     },
-  ])('enters durable Human when verdict authority sees a $name', async ({ mutate }) => {
+  ])('parks safely when verdict authority sees a $name', async ({
+    mutate,
+    expectedStatus,
+    expectedState,
+  }) => {
     const h = harness({ draft: true });
     const read = h.port.readPullRequest;
     h.port.readPullRequest = async (...args) => mutate(await read(...args));
 
     await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
-      .resolves.toMatchObject({ status: 'human' });
-    expect(h.authority.record.state).toBe('human');
+      .resolves.toMatchObject({ status: expectedStatus });
+    expect(h.authority.record.state).toBe(expectedState);
     expect(h.events).not.toContain(`native:APPROVE:${HEAD}`);
   });
 

@@ -1,5 +1,13 @@
 // @ts-nocheck — Stage 5 leftover fixtures for deleted merge-prep/review-fix/project APIs.
-import { describe, expect, it, vi } from 'vitest';
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { PolledIssue } from '../../src/dispatcher/types.js';
 import {
   buildGitHubLifecycleSnapshot,
@@ -11,16 +19,17 @@ import { deriveLifecycle, planCycle } from '../../src/lifecycle/lifecycle.js';
 import { FULL_SCAN_RESERVE } from '../../src/lifecycle/github-usage.js';
 import { planProjection } from '../../src/lifecycle/projection.js';
 import { executeProjectionPlan } from '../../src/lifecycle/reconciler.js';
-import { executeReviewAction } from '../../src/lifecycle/review-executor.js';
 import { CredentialPool, selectCredential } from '../../src/lifecycle/credentials.js';
 import {
+  decodeReviewClaimPayload,
   formatAutomatedReviewMarker,
   parseHumanCommentEvidence,
 } from '../../src/lifecycle/codecs.js';
 import { makeProductionReconciliationWriter } from '../../src/lifecycle/reconciliation-writer-production.js';
 import { makeProductionReviewActionPort } from '../../src/lifecycle/review-executor-production.js';
-import { makeProductionMergeActionPort } from '../../src/lifecycle/merge-executor-production.js';
-import { executeMergeAction } from '../../src/lifecycle/merge-executor.js';
+import { makeReviewSessionProtocol } from '../../src/lifecycle/review-session.js';
+import { makeProductionReviewSessionPort } from '../../src/lifecycle/review-session-production.js';
+import { readAttemptManifest } from '../../src/lifecycle/attempt-workspace.js';
 import { makeProductionActiveRuntime } from '../../src/lifecycle/active-runtime-production.js';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
 import { runPaintBoard } from '../../scripts/paint-board.js';
@@ -279,29 +288,47 @@ describe('buildGitHubLifecycleSnapshot', () => {
     const newGeneration = '44444444-4444-4444-8444-444444444444';
     const newAttempt = '55555555-5555-4555-8555-555555555555';
     const newReviewOid = 'cccccccccccccccccccccccccccccccccccccccc';
+    const verdictIntentOid = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+    const mappingRequestOid = '9999999999999999999999999999999999999999';
+    const mappingIntentOid = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1';
     const humanReviewOid = '7777777777777777777777777777777777777777';
     const terminalReviewOid = '8888888888888888888888888888888888888888';
-    const intent = '66666666-6666-4666-8666-666666666666';
+    let intent = '66666666-6666-4666-8666-666666666666';
     const mappingReason = {
       phase: 'implementing' as const,
       code: 'branch-mapping-ambiguous' as const,
       detail: 'A competing PR made the #2084 mapping ambiguous.',
     };
-    let duplicatePresent = true;
+    const stableBranchTrailers = [
+      'Jinn-Autopilot-Protocol: 2',
+      'Jinn-Autopilot-Phase: implement',
+      'Jinn-Autopilot-Issue: 2084',
+      'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
+      'Jinn-Autopilot-Runner: runner-a',
+      'Jinn-Autopilot-Login: trusted',
+      `Jinn-Autopilot-Expected-Head: ${HEAD}`,
+      'Jinn-Autopilot-Target-Base: autopilot/2083',
+      'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
+    ].join('\n');
+    let duplicatePresent = false;
     let projectStatus: 'Human' | 'In Progress' | 'In Review' | 'Done' = 'In Progress';
     const draft = false;
     const humanComments = [];
     let reviewState:
       | 'human'
+      | 'human-intent'
+      | 'mapping-reread'
       | 'stale'
       | 'active'
       | 'verdict-intent'
-      | 'terminal-approved' = 'active';
+      | 'terminal-approved' = 'stale';
     let reviewOid = REVIEW_REF;
     let reviewGeneration = generation;
     let reviewAttempt = attempt;
     let reviewReviewer = 'maintenance-bot';
     let reviewVerdict: { marker: string; state: 'APPROVE' } | undefined;
+    let reviewMappingRequest;
+    let reviewMappingDiagnostic;
     let nativeReviews = [];
     let checks = [];
     let mergeability = 'UNKNOWN';
@@ -316,6 +343,12 @@ describe('buildGitHubLifecycleSnapshot', () => {
       state: reviewState,
       recordedAt: '2026-07-20T11:00:00.000Z',
       ...(reviewVerdict === undefined ? {} : { verdict: reviewVerdict }),
+      ...(reviewMappingRequest === undefined
+        ? {}
+        : { mappingRequest: reviewMappingRequest }),
+      ...(reviewMappingDiagnostic === undefined
+        ? {}
+        : { mappingDiagnostic: reviewMappingDiagnostic }),
     });
     const targetPr = () => ({
       ...page('page-2').nodes[0]!,
@@ -366,26 +399,51 @@ describe('buildGitHubLifecycleSnapshot', () => {
     const source = reader({
       readProjectSnapshot: async () => ({
         ...(await reader().readProjectSnapshot()),
-        items: [{
-          id: 'PVTI_2084',
-          number: 2084,
-          contentType: 'Issue',
-          status: projectStatus,
-          priority: 'P1',
-          effort: 'Medium',
-          blockedOn: 'Another issue',
-          issueType: 'feat',
-          blockedByIssues: [2083],
-          sprintIterationId: 'sprint',
-        }],
+        items: [
+          {
+            id: 'PVTI_2084',
+            number: 2084,
+            contentType: 'Issue',
+            status: projectStatus,
+            priority: 'P1',
+            effort: 'Medium',
+            blockedOn: 'Another issue',
+            issueType: 'feat',
+            blockedByIssues: [2083],
+            sprintIterationId: 'sprint',
+          },
+          {
+            id: 'PVTI_2083',
+            number: 2083,
+            contentType: 'Issue',
+            status: 'Done',
+            priority: 'P1',
+            effort: 'Medium',
+            blockedOn: 'Nothing',
+            issueType: 'feat',
+            blockedByIssues: [],
+            sprintIterationId: 'sprint',
+          },
+        ],
       }),
-      readIssues: async () => [{
-        ...issue(),
-        number: 2084,
-        status: projectStatus,
-        blockedOn: 'Another issue',
-        blockedByIssues: [2083],
-      }],
+      readIssues: async () => [
+        {
+          ...issue(),
+          number: 2084,
+          status: projectStatus,
+          blockedOn: 'Another issue',
+          blockedByIssues: [2083],
+        },
+        {
+          ...issue(),
+          number: 2083,
+          title: 'stack parent',
+          status: 'Done',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          projectItemId: 'PVTI_2083',
+        },
+      ],
       readPullRequests: async () => ({
         nodes: [
           targetPr(),
@@ -408,17 +466,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
         headRefName: 'autopilot/2084',
         headOid: HEAD,
         headCommittedAt: '2026-07-20T09:00:00.000Z',
-        claimTrailers: [
-          'Jinn-Autopilot-Protocol: 2',
-          'Jinn-Autopilot-Phase: implement',
-          'Jinn-Autopilot-Issue: 2084',
-          'Jinn-Autopilot-Attempt: 11111111-1111-4111-8111-111111111111',
-          'Jinn-Autopilot-Runner: runner-a',
-          'Jinn-Autopilot-Login: trusted',
-          `Jinn-Autopilot-Expected-Head: ${HEAD}`,
-          'Jinn-Autopilot-Target-Base: autopilot/2083',
-          'Jinn-Autopilot-Claimed-At: 2026-07-20T08:00:00.000Z',
-        ].join('\n'),
+        claimTrailers: stableBranchTrailers,
       }],
     });
     const build = () => buildGitHubLifecycleSnapshot(source, {
@@ -465,20 +513,51 @@ describe('buildGitHubLifecycleSnapshot', () => {
         reviewClaim: pr.reviewClaim,
       };
     };
+    const rawDuplicate = () => ({
+      ...rawTarget(),
+      headRefName: 'feature/duplicate-2084',
+      baseRefName: 'next',
+      body: 'Closes #2084',
+      closingIssueNumbers: [2084],
+      labels: [],
+      humanIssueNumber: null,
+      humanAuthor: null,
+      humanHead: null,
+      humanGeneration: null,
+      humanReason: null,
+      reviewClaim: null,
+    });
+    const rawPullRequest = (prNumber) => (
+      prNumber === 84
+        ? rawTarget()
+        : prNumber === 85 && duplicatePresent
+          ? rawDuplicate()
+          : null
+    );
     const writerFor = (cycleSnapshot) => makeProductionReconciliationWriter({
       repositoryPath: '/repo',
       cycleSnapshot,
       readCanonicalSnapshot: async () => build(),
-      readPullRequestByNumber: async (prNumber) => (
-        prNumber === 84 ? rawTarget() : null
-      ),
+      readPullRequestByNumber: async (prNumber) => rawPullRequest(prNumber),
       readProjectItemForReconciliation: async (issueNumber) => (
         issueNumber === 2084
           ? { id: 'PVTI_2084', status: projectStatus, blockedOn: 'Another issue' }
-          : null
+          : issueNumber === 2083
+            ? { id: 'PVTI_2083', status: 'Done', blockedOn: 'Nothing' }
+            : null
       ),
       readBranchHeadByName: async (headRefName) => (
         headRefName === 'autopilot/2084' ? HEAD : null
+      ),
+      readBranchClaimByName: async (headRefName) => (
+        headRefName === 'autopilot/2084'
+          ? {
+              issueNumber: 2084,
+              headRefName,
+              headOid: HEAD,
+              claimTrailers: stableBranchTrailers,
+            }
+          : null
       ),
       readIssueByNumber: async (issueNumber) => (
         issueNumber === 2084
@@ -489,7 +568,15 @@ describe('buildGitHubLifecycleSnapshot', () => {
               author: 'trusted',
               labels: [],
             }
-          : null
+          : issueNumber === 2083
+            ? {
+                number: 2083,
+                title: 'stack parent',
+                open: false,
+                author: 'trusted',
+                labels: [],
+              }
+            : null
       ),
       readBlockedByIssueNumbers: async (issueNumber) => (
         issueNumber === 2084 ? [2083] : []
@@ -540,6 +627,8 @@ describe('buildGitHubLifecycleSnapshot', () => {
           reviewRefPushes += 1;
           reviewState = nextReviewWriteState;
           reviewOid = nextReviewWriteOid;
+          reviewMappingRequest = undefined;
+          reviewMappingDiagnostic = undefined;
           if (reviewState === 'terminal-approved') {
             reviewVerdict = { marker: intent, state: 'APPROVE' };
           }
@@ -569,6 +658,26 @@ describe('buildGitHubLifecycleSnapshot', () => {
     });
 
     const preEscalation = await build();
+    const scheduledEscalation = planCycle(deriveLifecycle(
+      preEscalation.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60_000,
+    ), {
+      implementationSlots: 0,
+      reviewSlots: 1,
+      usableCredentialLanes: 1,
+    }, 'active');
+    expect(scheduledEscalation).toEqual([{
+      kind: 'claim-review',
+      issueNumber: 2084,
+      prNumber: 84,
+      head: HEAD,
+    }]);
+    duplicatePresent = true;
+    let merged = false;
+    let exactMergeCalls = 0;
+    const mergeCommitOid = 'f'.repeat(40);
+    let derivedMergeAction;
     let escalatedRecord;
     const makeReviewActionPort = vi.fn(() => ({
       readCandidate: async () => ({
@@ -590,23 +699,25 @@ describe('buildGitHubLifecycleSnapshot', () => {
           oid: reviewOid,
           record: JSON.parse(reviewPayload()),
         },
-        mappingProblem: preEscalation.pullRequestMappings
+        mappingProblem: (await build()).pullRequestMappings
           ?.find((mapping) => mapping.prNumber === 84)?.status === 'ambiguous'
-          ? preEscalation.pullRequestMappings
+          ? (await build()).pullRequestMappings
             .find((mapping) => mapping.prNumber === 84).details.join(' ')
           : undefined,
       }),
       createReviewRecord: async ({ record }) => {
         escalatedRecord = record;
-        return humanReviewOid;
+        return mappingRequestOid;
       },
       publishReviewClaim: async ({ recordOid }) => {
-        reviewState = 'human';
-        reviewOid = humanReviewOid;
+        reviewState = escalatedRecord.state;
+        reviewOid = recordOid;
         reviewGeneration = escalatedRecord.generation;
         reviewAttempt = escalatedRecord.attempt;
         reviewReviewer = escalatedRecord.reviewer;
         reviewVerdict = undefined;
+        reviewMappingRequest = escalatedRecord.mappingRequest;
+        reviewMappingDiagnostic = escalatedRecord.mappingDiagnostic;
         return {
           status: 'won',
           expected: REVIEW_REF,
@@ -626,15 +737,25 @@ describe('buildGitHubLifecycleSnapshot', () => {
       readReservedReviewSnapshot: async () => build(),
       readImplementationSnapshot: async () => build(),
       reserveReviewCohort: async () => {},
-      readPullRequestByNumber: async (prNumber) => (
-        prNumber === 84 ? rawTarget() : null
-      ),
+      readPullRequestByNumber: async (prNumber) => rawPullRequest(prNumber),
       readProjectItemForReconciliation: async (issueNumber) => (
         issueNumber === 2084
           ? { id: 'PVTI_2084', status: projectStatus, blockedOn: 'Another issue' }
+          : issueNumber === 2083
+            ? { id: 'PVTI_2083', status: 'Done', blockedOn: 'Nothing' }
           : null
       ),
       readBranchHeadByName: async () => HEAD,
+      readBranchClaimByName: async (headRefName) => (
+        headRefName === 'autopilot/2084'
+          ? {
+              issueNumber: 2084,
+              headRefName,
+              headOid: HEAD,
+              claimTrailers: stableBranchTrailers,
+            }
+          : null
+      ),
       readIssueByNumber: async (issueNumber) => (
         issueNumber === 2084
           ? {
@@ -644,17 +765,57 @@ describe('buildGitHubLifecycleSnapshot', () => {
               author: 'trusted',
               labels: [],
             }
-          : null
+          : issueNumber === 2083
+            ? {
+                number: 2083,
+                title: 'stack parent',
+                open: false,
+                author: 'trusted',
+                labels: [],
+              }
+            : null
       ),
-      readBlockedByIssueNumbers: async () => [2083],
-      readOpenPullRequestsByIssue: async () => [],
-      readIssueActionContext: async () => ({
-        projectItem: {
-          id: 'PVTI_2084',
-          status: projectStatus,
-          blockedOn: 'Another issue',
-        },
-        openPullRequests: [],
+      readBlockedByIssueNumbers: async (issueNumber) => (
+        issueNumber === 2084 ? [2083] : []
+      ),
+      readOpenPullRequestsByIssue: async (issueNumber) => (
+        issueNumber === 2084 && duplicatePresent
+          ? [{
+              number: 85,
+              headRefName: 'feature/duplicate-2084',
+              headOid: HEAD,
+              baseRefName: 'next',
+              draft: false,
+              labels: [],
+              body: 'Closes #2084',
+            }]
+          : []
+      ),
+      readIssueActionContext: async (issueNumber) => ({
+        projectItem: issueNumber === 2084
+          ? {
+              id: 'PVTI_2084',
+              status: projectStatus,
+              blockedOn: 'Another issue',
+            }
+          : issueNumber === 2083
+            ? {
+                id: 'PVTI_2083',
+                status: 'Done',
+                blockedOn: 'Nothing',
+              }
+            : null,
+        openPullRequests: issueNumber === 2084 && duplicatePresent
+          ? [{
+              number: 85,
+              headRefName: 'feature/duplicate-2084',
+              headOid: HEAD,
+              baseRefName: 'next',
+              draft: false,
+              labels: [],
+              body: 'Closes #2084',
+            }]
+          : [],
       }),
       config: DEFAULT_CONFIG,
       spawn: vi.fn(() => {
@@ -666,6 +827,120 @@ describe('buildGitHubLifecycleSnapshot', () => {
       makeReviewActionPort,
       now: () => new Date('2026-07-20T12:00:00.000Z'),
       runner: async (_command, args) => {
+        const endpoint = args.find((arg) => arg.startsWith('repos/'));
+        if (
+          derivedMergeAction !== undefined
+          && endpoint === `repos/Jinn-Network/mono/pulls/${derivedMergeAction.prNumber}`
+        ) {
+          return JSON.stringify({
+            changed_files: 1,
+            head: { sha: derivedMergeAction.head },
+            base: {
+              ref: derivedMergeAction.expectedBaseRefName,
+              sha: 'e'.repeat(40),
+            },
+          });
+        }
+        if (
+          derivedMergeAction !== undefined
+          && endpoint?.startsWith(
+            `repos/Jinn-Network/mono/pulls/${derivedMergeAction.prNumber}/files?`,
+          )
+        ) {
+          return JSON.stringify([[{ filename: 'README.md' }]]);
+        }
+        if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
+          return JSON.stringify({ content: Buffer.from('').toString('base64') });
+        }
+        if (
+          derivedMergeAction !== undefined
+          && endpoint?.startsWith('repos/Jinn-Network/mono/compare/')
+        ) {
+          expect(endpoint).toBe(
+            `repos/Jinn-Network/mono/compare/${'e'.repeat(40)}...`
+            + derivedMergeAction.head,
+          );
+          return JSON.stringify({ status: 'ahead' });
+        }
+        if (
+          derivedMergeAction !== undefined
+          && args[0] === 'pr'
+          && args[1] === 'view'
+        ) {
+          return JSON.stringify(merged
+            ? {
+                state: 'MERGED',
+                headRefOid: derivedMergeAction.head,
+                baseRefName: derivedMergeAction.expectedBaseRefName,
+                mergeCommit: { oid: mergeCommitOid },
+              }
+            : {
+                state: 'OPEN',
+                headRefOid: derivedMergeAction.head,
+                baseRefName: derivedMergeAction.expectedBaseRefName,
+              });
+        }
+        if (
+          derivedMergeAction !== undefined
+          && args[0] === 'api'
+          && args.includes('PUT')
+          && args.includes(
+            `repos/Jinn-Network/mono/pulls/${derivedMergeAction.prNumber}/merge`,
+          )
+        ) {
+          exactMergeCalls += 1;
+          expect(args).toContain(`sha=${derivedMergeAction.head}`);
+          merged = true;
+          projectStatus = 'Done';
+          return JSON.stringify({ merged: true, sha: mergeCommitOid });
+        }
+        if (
+          derivedMergeAction !== undefined
+          && args[0] === 'api'
+          && args[1] === 'graphql'
+        ) {
+          return projectGraphQl();
+        }
+        if (args.includes('hash-object')) return `${'1'.repeat(40)}\n`;
+        if (args.includes('write-tree')) return `${'2'.repeat(40)}\n`;
+        if (args.includes('commit-tree')) {
+          return `${
+            reviewState === 'mapping-reread' ? mappingIntentOid : humanReviewOid
+          }\n`;
+        }
+        if (args.includes('rev-list')) {
+          return `${args.at(-1)} ${reviewOid}`;
+        }
+        if (args.includes('ls-remote')) {
+          return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (args.includes('push')) {
+          reviewRefPushes += 1;
+          const canonical = await build();
+          const diagnostic = canonical.diagnostics.find((entry) =>
+            entry.code === 'branch-mapping-ambiguous'
+            && entry.pullRequests.some((pr) => pr.number === 84)
+          );
+          if (diagnostic === undefined) throw new Error('mapping diagnostic missing');
+          reviewMappingDiagnostic = {
+            selectedIssueNumber: 2084,
+            issueNumbers: [...diagnostic.issueNumbers],
+            detail: diagnostic.detail,
+            signature: diagnostic.signature,
+          };
+          reviewMappingRequest = undefined;
+          if (reviewState === 'mapping-reread') {
+            reviewState = 'human-intent';
+            reviewOid = mappingIntentOid;
+          } else if (reviewState === 'human-intent') {
+            reviewState = 'human';
+            reviewOid = humanReviewOid;
+          } else {
+            throw new Error(`unexpected mapping claim transition from ${reviewState}`);
+          }
+          return '';
+        }
+        if (args.includes('read-tree') || args.includes('update-index')) return '';
         if (args[0] === 'api' && args.some((arg) => arg.includes('/comments'))) {
           return JSON.stringify(humanComments);
         }
@@ -684,12 +959,10 @@ describe('buildGitHubLifecycleSnapshot', () => {
         throw new Error(`unexpected production escalation command: ${args.join(' ')}`);
       },
     });
-    await expect(escalationRuntime.executeAction({
-      kind: 'claim-review',
-      issueNumber: 2084,
-      prNumber: 84,
-      head: HEAD,
-    }, preEscalation)).resolves.toEqual({ outcome: 'human' });
+    await expect(escalationRuntime.executeAction(
+      scheduledEscalation[0],
+      preEscalation,
+    )).resolves.toEqual({ outcome: 'human' });
     expect(reviewState).toBe('human');
     expect(reviewOid).toBe(humanReviewOid);
     expect(humanComments).toHaveLength(1);
@@ -706,12 +979,21 @@ describe('buildGitHubLifecycleSnapshot', () => {
       ),
       pullRequests: ambiguous.pullRequests.map((pr) => ({
         number: pr.number,
+        headRefName: pr.headRefName,
+        baseRefName: pr.baseRefName,
+        scheduledIssueNumber: pr.number === 84 ? 2084 : undefined,
         reviewRefOid: pr.reviewClaim?.oid,
         ...(pr.reviewClaim === undefined ? {} : {
           reviewClaim: {
             head: pr.reviewClaim.record.head,
             generation: pr.reviewClaim.record.generation,
             state: pr.reviewClaim.record.state,
+            ...(pr.reviewClaim.record.mappingRequest === undefined
+              ? {}
+              : { mappingRequest: pr.reviewClaim.record.mappingRequest }),
+            ...(pr.reviewClaim.record.mappingDiagnostic === undefined
+              ? {}
+              : { mappingDiagnostic: pr.reviewClaim.record.mappingDiagnostic }),
           },
         }),
       })),
@@ -719,8 +1001,8 @@ describe('buildGitHubLifecycleSnapshot', () => {
       mappingDiagnostics: ambiguous.diagnostics,
     });
     expect(diagnosticPlan.actions).toEqual([expect.objectContaining({
-      kind: 'ensure-human-comment',
-      issueNumber: 2084,
+      kind: 'converge-mapping-human',
+      selectedIssueNumber: 2084,
       prNumber: 84,
       expectedHead: HEAD,
     })]);
@@ -730,15 +1012,17 @@ describe('buildGitHubLifecycleSnapshot', () => {
     );
     expect(diagnosticResult.results).toEqual([{
       action: diagnosticPlan.actions[0],
-      outcome: 'already-applied',
+      outcome: 'applied',
     }]);
     expect(humanComments).toHaveLength(1);
     expect(humanComments[0].body).toContain('issue=2084');
     expect(humanComments[0].body).toContain(`head=${HEAD}`);
     expect(humanComments[0].body).toContain(`generation=${generation}`);
+    expect(reviewRefPushes).toBe(2);
     expect(sharedMutations).toBe(0);
 
     duplicatePresent = false;
+    reviewRefPushes = 0;
     const repairable = await build();
     const repairPlan = planProjection({
       view: deriveLifecycle(
@@ -908,6 +1192,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
     }]);
 
     let spawned = 0;
+    let startedSessionRequest;
     const projectGraphQl = () => JSON.stringify({
       data: {
         rateLimit: {
@@ -940,106 +1225,296 @@ describe('buildGitHubLifecycleSnapshot', () => {
         },
       },
     });
-    const reviewPort = makeProductionReviewActionPort({
-      repositoryPath: '/repo',
-      worktreeBase: '/worktrees',
-      runnerId: 'runner-a',
-      readSnapshot: async () => build(),
-      changedFiles: async () => [],
-      codeownersText: () => '',
-      createWorkspace: async (input) => ({
+    const scheduledReview = scheduled[0];
+    const reviewAttemptRoot = mkdtempSync(join(tmpdir(), 'jinn-review-seam-'));
+    onTestFinished(() => rmSync(reviewAttemptRoot, { recursive: true, force: true }));
+    let reviewManifestPath;
+    const createReviewWorkspace = async (input) => {
+      const attemptDir = join(reviewAttemptRoot, input.attemptId);
+      const paths = {
+        attemptDir,
+        worktree: join(attemptDir, 'worktree'),
+        manifest: join(attemptDir, 'manifest.json'),
+        log: join(attemptDir, 'session.log'),
+        ghConfigDir: join(attemptDir, 'gh-config'),
+        askpass: join(attemptDir, 'askpass'),
+        tokenFile: join(attemptDir, 'gh-token'),
+      };
+      mkdirSync(paths.worktree, { recursive: true });
+      mkdirSync(paths.ghConfigDir, { recursive: true });
+      const manifest = {
+        version: 2,
         attemptId: input.attemptId,
-        paths: {
-          worktree: '/tmp/review/worktree',
-          manifest: '/tmp/review/manifest.json',
-          log: '/tmp/review/session.log',
-          ghConfigDir: '/tmp/review/gh-config',
-          askpass: '/tmp/review/askpass',
+        runnerId: 'runner-a',
+        host: 'host-a',
+        phase: 'review',
+        execution: { backend: 'local' },
+        subject: `pr-${input.prNumber}`,
+        issueNumber: input.issueNumber,
+        prNumber: input.prNumber,
+        branch: input.branch,
+        targetBase: input.targetBase,
+        expectedHead: input.expectedHead,
+        claimOid: input.claimOid,
+        reviewGeneration: input.reviewGeneration,
+        reviewRefOid: input.reviewRefOid,
+        reviewApprovalPolicy: input.reviewApprovalPolicy,
+        selectedLogin: input.selectedLogin,
+        repository: {
+          root: '/repo',
+          gitCommonDir: '/repo/.git',
+          remoteName: 'jinn-autopilot-v2',
+          remoteUrlHash: 'a'.repeat(64),
         },
-      }),
-      runner: async (_command, args) => {
-        if (args.some((arg) => arg.endsWith('/pulls/84'))) {
-          return JSON.stringify({
-            changed_files: 0,
-            head: { sha: HEAD },
-            base: { ref: 'autopilot/2083', sha: 'e'.repeat(40) },
-          });
-        }
-        if (args.includes('hash-object')) return `${'3'.repeat(40)}\n`;
-        if (args.includes('write-tree')) return `${'4'.repeat(40)}\n`;
-        if (args.includes('commit-tree')) return `${newReviewOid}\n`;
-        if (args.includes('rev-list')) return `${newReviewOid} ${staleReviewOid}`;
-        if (args.includes('ls-remote')) {
-          return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
-        }
-        if (args.includes('push')) {
-          reviewState = 'active';
-          reviewOid = newReviewOid;
-          reviewGeneration = newGeneration;
-          reviewAttempt = newAttempt;
-          reviewReviewer = 'review-bot';
-          reviewVerdict = undefined;
-          return '';
-        }
-        if (args.includes('read-tree') || args.includes('update-index')) return '';
-        if (args[0] === 'pr' && args[1] === 'view') {
-          return JSON.stringify({
-            headRefOid: HEAD,
-            labels: [{ name: 'engine:review' }],
-            isDraft: false,
-          });
-        }
-        if (args[0] === 'api' && args[1] === 'graphql') return projectGraphQl();
-        throw new Error(`unexpected production review command: ${args.join(' ')}`);
-      },
-    });
-    const reviewResult = await executeReviewAction({
-      prNumber: 84,
-      expectedHead: HEAD,
-    }, {
-      ...reviewPort,
-      credentials,
-      startSession: async () => {
-        spawned += 1;
-        return { status: 'started', backend: 'local', pid: 42 };
-      },
-      escalateHuman: async () => {
-        throw new Error('fresh repaired review must not escalate');
-      },
-      ambientEnvironment: {},
-      nextAttemptId: () => newAttempt,
-      nextGeneration: () => newGeneration,
+        processState: 'preparing',
+        pid: null,
+        paths,
+        timestamps: {
+          createdAt: '2026-07-20T12:00:00.000Z',
+          updatedAt: '2026-07-20T12:00:00.000Z',
+        },
+      };
+      writeFileSync(paths.manifest, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+      writeFileSync(paths.tokenFile, 'review-secret\n', { mode: 0o600 });
+      reviewManifestPath = paths.manifest;
+      return { attemptId: input.attemptId, paths };
+    };
+    const reviewActionRunner = async (_command, args) => {
+      if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+        return JSON.stringify({
+          changed_files: 0,
+          head: { sha: HEAD },
+          base: { ref: 'autopilot/2083', sha: 'e'.repeat(40) },
+        });
+      }
+      if (args.includes('hash-object')) return `${'3'.repeat(40)}\n`;
+      if (args.includes('write-tree')) return `${'4'.repeat(40)}\n`;
+      if (args.includes('commit-tree')) return `${newReviewOid}\n`;
+      if (args.includes('rev-list')) return `${newReviewOid} ${staleReviewOid}`;
+      if (args.includes('ls-remote')) {
+        return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+      }
+      if (args.includes('push')) {
+        reviewState = 'active';
+        reviewOid = newReviewOid;
+        reviewGeneration = newGeneration;
+        reviewAttempt = newAttempt;
+        reviewReviewer = 'review-bot';
+        reviewVerdict = undefined;
+        return '';
+      }
+      if (args.includes('read-tree') || args.includes('update-index')) return '';
+      if (args[0] === 'pr' && args[1] === 'view') {
+        return JSON.stringify({
+          headRefOid: HEAD,
+          labels: [{ name: 'engine:review' }],
+          isDraft: false,
+        });
+      }
+      if (args[0] === 'api' && args[1] === 'graphql') return projectGraphQl();
+      throw new Error(`unexpected production review command: ${args.join(' ')}`);
+    };
+    const productionReviewActionFactory = vi.fn((options) =>
+      makeProductionReviewActionPort({
+        ...options,
+        changedFiles: async () => [],
+        codeownersText: () => '',
+        createWorkspace: createReviewWorkspace,
+      }));
+    const reviewRuntime = makeProductionActiveRuntime({
+      executionBackend: 'local',
+      repositoryPath: '/repo',
+      worktreeBase: reviewAttemptRoot,
       runnerId: 'runner-a',
-      now: () => new Date('2026-07-20T12:00:00.000Z'),
+      credentials,
+      authorAllowlist: new Set(['trusted']),
+      readReviewSnapshot: async () => build(),
+      readReservedReviewSnapshot: async () => build(),
+      readImplementationSnapshot: async () => {
+        throw new Error('review seam must not read implementation authority');
+      },
+      reserveReviewCohort: async () => {},
+      readPullRequestByNumber: async (prNumber) => rawPullRequest(prNumber),
+      readProjectItemForReconciliation: async () => null,
+      readBranchHeadByName: async () => HEAD,
+      readBranchClaimByName: async () => null,
+      readIssueByNumber: async () => null,
+      readBlockedByIssueNumbers: async () => [],
+      readOpenPullRequestsByIssue: async () => [],
+      readIssueActionContext: async () => ({
+        projectItem: null,
+        openPullRequests: [],
+      }),
+      config: DEFAULT_CONFIG,
+      spawn: vi.fn(() => {
+        spawned += 1;
+        return {
+          pid: 42,
+          exitCode: null,
+          once: vi.fn(),
+        };
+      }),
+      caps: { implementation: 0, review: 1 },
+      implementationBackpressureThreshold: 30,
       staleAfterMs: 2 * 60 * 60_000,
-      sleep: async () => {},
+      makeReviewActionPort: productionReviewActionFactory,
+      nextId: vi.fn()
+        .mockReturnValueOnce(newAttempt)
+        .mockReturnValueOnce(newGeneration),
+      now: () => new Date('2026-07-20T12:00:00.000Z'),
+      runner: reviewActionRunner,
+      environment: {},
     });
-    expect(reviewResult).toMatchObject({
-      status: 'spawned',
-      prNumber: 84,
-      head: HEAD,
-      generation: newGeneration,
-    });
+    await expect(reviewRuntime.executeAction(
+      scheduledReview,
+      repainted,
+    )).resolves.toEqual({ outcome: 'spawned' });
+    expect(productionReviewActionFactory).toHaveBeenCalledOnce();
     expect(spawned).toBe(1);
+    expect(reviewState).toBe('active');
+    expect(reviewOid).toBe(newReviewOid);
+    expect(reviewManifestPath).toBeTypeOf('string');
 
-    // Simulate the durable crash boundary: the session published its exact
-    // verdict intent and native review, then died before the terminal ref CAS.
-    reviewState = 'verdict-intent';
-    reviewVerdict = { marker: intent, state: 'APPROVE' };
-    nativeReviews = [{
+    // Drive the durable crash boundary through the production session port:
+    // intent publication and native approval succeed, while the terminal CAS
+    // reports ambiguity and is recovered by projection below.
+    let pendingSessionRecord;
+    const reviewSessionRunner = async (command, args) => {
+      if (command === 'gh' && args.join(' ') === 'api user --jq .login') {
+        return 'review-bot\n';
+      }
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+        return JSON.stringify({
+          number: 84,
+          state: 'OPEN',
+          headRefOid: HEAD,
+          headRefName: 'autopilot/2084',
+          baseRefName: 'autopilot/2083',
+          baseRefOid: 'e'.repeat(40),
+          isDraft: false,
+          body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+          author: { login: 'trusted' },
+          labels: [{ name: 'engine:review' }],
+          closingIssuesReferences: [],
+          files: [],
+        });
+      }
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+        return JSON.stringify([{
+          number: 84,
+          headRefOid: HEAD,
+          headRefName: 'autopilot/2084',
+          body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+          closingIssuesReferences: [],
+        }]);
+      }
+      if (
+        command === 'gh'
+        && args[0] === 'api'
+        && args.includes('repos/Jinn-Network/mono/pulls/84/reviews')
+        && args.includes('--method')
+      ) {
+        const state = args.find((arg) => arg.startsWith('event='))?.slice('event='.length);
+        const body = args.find((arg) => arg.startsWith('body='))?.slice('body='.length);
+        nativeReviews = [{
+          reviewer: 'review-bot',
+          state: state === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED',
+          commitId: HEAD,
+          body,
+          submittedAt: '2026-07-20T12:10:00.000Z',
+        }];
+        return '';
+      }
+      if (
+        command === 'gh'
+        && args[0] === 'api'
+        && args.includes('repos/Jinn-Network/mono/pulls/84/reviews')
+      ) {
+        return JSON.stringify([nativeReviews.map((review) => ({
+          user: { login: review.reviewer },
+          state: review.state,
+          commit_id: review.commitId,
+          body: review.body,
+          submitted_at: review.submittedAt,
+        }))]);
+      }
+      if (command === 'git' && args.includes('get-url')) {
+        return 'https://github.com/Jinn-Network/mono.git\n';
+      }
+      if (command === 'git' && args.includes('ls-tree')) return '';
+      if (command === 'git' && args.includes('ls-remote')) {
+        return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+      }
+      if (command === 'git' && args.includes('fetch')) return '';
+      if (command === 'git' && args.includes('show')) return `${reviewPayload()}\n`;
+      if (command === 'git' && args.includes('hash-object')) return `${'3'.repeat(40)}\n`;
+      if (command === 'git' && args.includes('write-tree')) return `${'4'.repeat(40)}\n`;
+      if (command === 'git' && args.includes('commit-tree')) {
+        return `${
+          pendingSessionRecord.state === 'verdict-intent'
+            ? verdictIntentOid
+            : terminalReviewOid
+        }\n`;
+      }
+      if (command === 'git' && args.includes('rev-list')) {
+        return `${args.at(-1)} ${reviewOid}`;
+      }
+      if (command === 'git' && args.includes('push')) {
+        if (pendingSessionRecord.state === 'terminal-approved') {
+          throw new Error('simulated crash before terminal review-ref CAS');
+        }
+        reviewState = pendingSessionRecord.state;
+        reviewOid = verdictIntentOid;
+        reviewGeneration = pendingSessionRecord.generation;
+        reviewAttempt = pendingSessionRecord.attempt;
+        reviewReviewer = pendingSessionRecord.reviewer;
+        reviewVerdict = pendingSessionRecord.verdict;
+        intent = pendingSessionRecord.verdict.marker;
+        return '';
+      }
+      if (
+        command === 'git'
+        && (args.includes('read-tree') || args.includes('update-index'))
+      ) {
+        return '';
+      }
+      throw new Error(`unexpected production session command: ${command} ${args.join(' ')}`);
+    };
+    const productionSessionPort = makeProductionReviewSessionPort({
+      environment: {
+        GH_TOKEN: 'review-secret',
+        JINN_AUTOPILOT_SESSION_MANIFEST: reviewManifestPath,
+      },
+      now: () => new Date('2026-07-20T12:10:00.000Z'),
+      writeMetadataFile: (payload) => {
+        pendingSessionRecord = decodeReviewClaimPayload(payload);
+        return join(reviewAttemptRoot, 'review-metadata.json');
+      },
+      removeMetadataFile: () => {},
+      runner: reviewSessionRunner,
+    });
+    const sessionProtocol = makeReviewSessionProtocol(productionSessionPort);
+    const sessionManifest = readAttemptManifest(reviewManifestPath);
+    await expect(sessionProtocol.reviewVerdict(
+      sessionManifest,
+      'APPROVE',
+      'Approved.',
+    )).resolves.toEqual({ status: 'ambiguous', head: HEAD });
+    expect(reviewState).toBe('verdict-intent');
+    expect(reviewOid).toBe(verdictIntentOid);
+    expect(nativeReviews).toEqual([expect.objectContaining({
       reviewer: 'review-bot',
       state: 'APPROVED',
       commitId: HEAD,
-      body: formatAutomatedReviewMarker({
+      body: expect.stringContaining(formatAutomatedReviewMarker({
         generation: newGeneration,
         attempt: newAttempt,
         intent,
         reviewer: 'review-bot',
         head: HEAD,
         verdict: 'APPROVE',
-      }),
-      submittedAt: '2026-07-20T12:10:00.000Z',
-    }];
+      })),
+    })]);
     checks = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
     mergeability = 'MERGEABLE';
     mergeStateStatus = 'CLEAN';
@@ -1061,9 +1536,9 @@ describe('buildGitHubLifecycleSnapshot', () => {
       kind: 'complete-verdict-intent',
       prNumber: 84,
       expectedHead: HEAD,
-      expectedReviewRefOid: newReviewOid,
+      expectedReviewRefOid: verdictIntentOid,
     })]);
-    nextReviewWriteParentOid = newReviewOid;
+    nextReviewWriteParentOid = verdictIntentOid;
     nextReviewWriteOid = terminalReviewOid;
     nextReviewWriteState = 'terminal-approved';
     const terminalRecovery = await executeProjectionPlan(
@@ -1095,77 +1570,11 @@ describe('buildGitHubLifecycleSnapshot', () => {
       head: HEAD,
       expectedBaseRefName: 'autopilot/2083',
     }]);
-    let merged = false;
-    let exactMergeCalls = 0;
-    const mergeCommitOid = 'f'.repeat(40);
-    const mergePort = makeProductionMergeActionPort({
-      readSnapshot: async () => build(),
-      authorAllowlist: new Set(['trusted']),
-      expectedBaseRefName: 'autopilot/2083',
-      runner: async (_command, args) => {
-        const endpoint = args.find((arg) => arg.startsWith('repos/'));
-        if (endpoint === 'repos/Jinn-Network/mono/pulls/84') {
-          return JSON.stringify({
-            changed_files: 1,
-            head: { sha: HEAD },
-            base: { ref: 'autopilot/2083', sha: 'e'.repeat(40) },
-          });
-        }
-        if (endpoint?.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
-          return JSON.stringify([[{ filename: 'README.md' }]]);
-        }
-        if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
-          return JSON.stringify({ content: Buffer.from('').toString('base64') });
-        }
-        if (endpoint?.startsWith('repos/Jinn-Network/mono/compare/')) {
-          expect(endpoint).toBe(
-            `repos/Jinn-Network/mono/compare/${'e'.repeat(40)}...${HEAD}`,
-          );
-          return JSON.stringify({ status: 'ahead' });
-        }
-        if (args[0] === 'pr' && args[1] === 'view') {
-          return JSON.stringify(merged
-            ? {
-                state: 'MERGED',
-                headRefOid: HEAD,
-                baseRefName: 'autopilot/2083',
-                mergeCommit: { oid: mergeCommitOid },
-              }
-            : {
-                state: 'OPEN',
-                headRefOid: HEAD,
-                baseRefName: 'autopilot/2083',
-              });
-        }
-        if (
-          args[0] === 'api'
-          && args.includes('PUT')
-          && args.includes('repos/Jinn-Network/mono/pulls/84/merge')
-        ) {
-          exactMergeCalls += 1;
-          expect(args).toContain(`sha=${HEAD}`);
-          merged = true;
-          projectStatus = 'Done';
-          return JSON.stringify({ merged: true, sha: mergeCommitOid });
-        }
-        if (args[0] === 'api' && args[1] === 'graphql') return projectGraphQl();
-        throw new Error(`unexpected production merge command: ${args.join(' ')}`);
-      },
-    });
-    const mergeResult = await executeMergeAction({
-      prNumber: 84,
-      expectedHead: HEAD,
-      expectedBaseRefName: 'autopilot/2083',
-    }, {
-      ...mergePort,
-      credentials,
-    });
-    expect(mergeResult).toEqual({
-      status: 'merged',
-      prNumber: 84,
-      head: HEAD,
-      mergeCommitOid,
-    });
+    derivedMergeAction = mergeActions[0];
+    await expect(escalationRuntime.executeAction(
+      derivedMergeAction,
+      terminal,
+    )).resolves.toEqual({ outcome: 'merged' });
     expect(exactMergeCalls).toBe(1);
   });
 
@@ -2088,6 +2497,54 @@ describe('buildGitHubLifecycleSnapshot', () => {
     });
 
     expect(snapshot.lifecycle.items[0]).not.toHaveProperty('obsoleteMachineMappingHuman');
+  });
+
+  it('treats a pre-CAS machine mapping audit as inert while its exact review claim is active', async () => {
+    const original = page('page-2').nodes[0]!;
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...original,
+          humanIssueNumber: 42,
+          humanAuthor: 'maintenance-bot',
+          humanHead: HEAD,
+          humanGeneration: generation,
+          humanReason: {
+            phase: 'implementing',
+            code: 'branch-mapping-ambiguous',
+            detail: 'A live contender made the mapping ambiguous.',
+          },
+          reviewClaim: {
+            ...original.reviewClaim!,
+            payload: JSON.stringify({
+              protocolVersion: 2,
+              prNumber: 101,
+              generation,
+              attempt: '33333333-3333-4333-8333-333333333333',
+              reviewer: 'reviewer',
+              head: HEAD,
+              state: 'active',
+              recordedAt: '2026-07-20T09:00:00.000Z',
+            }),
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      machineAuthorLogins: new Set(['maintenance-bot']),
+    });
+    const item = snapshot.lifecycle.items[0];
+    expect(item).not.toHaveProperty('humanHold');
+    expect(item).not.toHaveProperty('obsoleteMachineMappingHuman');
+    expect(deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T09:01:00.000Z'),
+      2 * 60 * 60 * 1_000,
+    ).items[0]).toMatchObject({ phase: 'reviewing' });
   });
 
   it.each([

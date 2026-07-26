@@ -25,6 +25,7 @@ import {
   decodeReviewClaimPayload,
   formatHumanCommentMarker,
 } from './codecs.js';
+import { planProjection } from './projection.js';
 import {
   selectCredential,
   type CredentialPool,
@@ -62,6 +63,7 @@ import { withSelectedCredential } from './production-auth.js';
 import {
   makeProductionReconciliationWriter,
   type ReconciliationProjectItemNode,
+  type ReconciliationBranchClaimNode,
   type ReconciliationPullRequestNode,
 } from './reconciliation-writer-production.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
@@ -123,6 +125,9 @@ export interface ProductionActiveRuntimeOptions {
     issueNumber: number,
   ) => Promise<ReconciliationProjectItemNode | null>;
   readonly readBranchHeadByName: (headRefName: string) => Promise<GitOid | null>;
+  readonly readBranchClaimByName: (
+    headRefName: string,
+  ) => Promise<ReconciliationBranchClaimNode | null>;
   readonly readIssueByNumber: (issueNumber: number) => Promise<TargetedNativeIssue | null>;
   readonly readBlockedByIssueNumbers: (issueNumber: number) => Promise<readonly number[]>;
   readonly readOpenPullRequestsByIssue: (
@@ -395,6 +400,25 @@ export function makeProductionActiveRuntime(
     credentials: CredentialPool,
     cycleSnapshot: GitHubLifecycleSnapshot,
   ): Promise<void> => {
+    const authoritySnapshot = await options.readReviewSnapshot(
+      cycleSnapshot,
+      input.candidate.number,
+    );
+    if (authoritySnapshot === null || authoritySnapshot.snapshotComplete !== true) {
+      throw new Error('Review Human escalation live mapping authority is unavailable');
+    }
+    const diagnostic = authoritySnapshot.diagnostics.find((candidate) => (
+      candidate.pullRequests.some((pr) => (
+        pr.number === input.candidate.number
+        && pr.head === input.candidate.head
+      ))
+    ));
+    if (
+      diagnostic !== undefined
+      && !diagnostic.issueNumbers.includes(input.candidate.issueNumber)
+    ) {
+      throw new Error('Review Human escalation selected issue is outside the live diagnostic');
+    }
     const live = await options.readPullRequestByNumber(input.candidate.number);
     if (
       live === null
@@ -403,7 +427,7 @@ export function makeProductionActiveRuntime(
     ) {
       throw new Error('Review Human escalation lost exact-head authority');
     }
-    const currentRefOid = live.reviewClaim === null
+    let currentRefOid = live.reviewClaim === null
       ? null
       : gitOid(live.reviewClaim.oid);
     const currentRecord = live.reviewClaim === null
@@ -412,7 +436,7 @@ export function makeProductionActiveRuntime(
     const currentHeadRecord = currentRecord?.head === input.candidate.head
       ? currentRecord
       : undefined;
-    const candidateAuthor = cycleSnapshot.pullRequests.find(
+    const candidateAuthor = authoritySnapshot.pullRequests.find(
       (pr) => pr.number === input.candidate.number,
     )?.author;
     const eligibleCredentials = currentHeadRecord === undefined
@@ -426,43 +450,32 @@ export function makeProductionActiveRuntime(
     const generation = currentHeadRecord?.generation ?? nextId();
     const attempt = currentHeadRecord?.attempt ?? nextId();
     const reviewer = currentHeadRecord?.reviewer ?? selection.login;
-    const humanRecord: ReviewClaimRecord = {
-      kind: 'review-claim',
-      protocolVersion: 2,
-      prNumber: input.candidate.number,
-      generation,
-      attempt,
-      reviewer,
-      head: input.candidate.head,
-      state: 'human',
-      recordedAt: now().toISOString(),
-    };
-    let humanRefOid = currentRefOid;
-    if (
-      currentHeadRecord?.state !== 'human'
-      || currentRefOid === null
-    ) {
-      const port = reviewActionPort({
-        repositoryPath: options.repositoryPath,
-        worktreeBase: options.worktreeBase,
-        runnerId: options.runnerId,
-        remoteName,
-        readSnapshot: (prNumber) => options.readReviewSnapshot(cycleSnapshot, prNumber),
-        runner,
-        environment: ambient,
-        repositorySlug: options.repositorySlug,
-        repositoryUrl: options.repositoryUrl,
-        projectMapping: options.projectMapping,
-      });
+    const port = reviewActionPort({
+      repositoryPath: options.repositoryPath,
+      worktreeBase: options.worktreeBase,
+      runnerId: options.runnerId,
+      remoteName,
+      readSnapshot: (prNumber) => options.readReviewSnapshot(authoritySnapshot, prNumber),
+      runner,
+      environment: ambient,
+      repositorySlug: options.repositorySlug,
+      repositoryUrl: options.repositoryUrl,
+      projectMapping: options.projectMapping,
+    });
+    const publishRecord = async (
+      record: ReviewClaimRecord,
+      parent: GitOid | null,
+      failure: string,
+    ): Promise<GitOid> => {
       const recordOid = await port.createReviewRecord({
-        record: humanRecord,
-        parent: currentRefOid,
+        record,
+        parent,
         credential: selection.credential,
       });
       const outcome = await port.publishReviewClaim({
         prNumber: input.candidate.number,
-        recordParent: currentRefOid,
-        expectedRemoteRecordOid: currentRefOid,
+        recordParent: parent,
+        expectedRemoteRecordOid: parent,
         recordOid,
         credential: selection.credential,
       });
@@ -470,23 +483,45 @@ export function makeProductionActiveRuntime(
         (outcome.status !== 'won' && outcome.status !== 'already-applied')
         || outcome.observed !== recordOid
       ) {
-        throw new Error('Review Human escalation did not win exact-parent authority');
+        throw new Error(failure);
       }
-      humanRefOid = recordOid;
+      return recordOid;
+    };
+    let authorityRecord = currentHeadRecord;
+    if (authorityRecord === undefined || currentRefOid === null) {
+      authorityRecord = {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: input.candidate.number,
+        generation,
+        attempt,
+        reviewer,
+        head: input.candidate.head,
+        state: 'active',
+        recordedAt: now().toISOString(),
+      };
+      currentRefOid = await publishRecord(
+        authorityRecord,
+        currentRefOid,
+        'Review escalation did not establish exact non-Human authority',
+      );
     }
-    if (humanRefOid === null) {
+    if (currentRefOid === null) {
       throw new Error('Review Human escalation review-ref authority is absent');
     }
     const writer = makeProductionReconciliationWriter({
       repositoryPath: options.repositoryPath,
-      cycleSnapshot,
+      cycleSnapshot: authoritySnapshot,
       readPullRequestByNumber: options.readPullRequestByNumber,
       readProjectItemForReconciliation: options.readProjectItemForReconciliation,
       readBranchHeadByName: options.readBranchHeadByName,
+      readBranchClaimByName: options.readBranchClaimByName,
       readIssueByNumber: options.readIssueByNumber,
       readBlockedByIssueNumbers: options.readBlockedByIssueNumbers,
       readOpenPullRequestsByIssue: options.readOpenPullRequestsByIssue,
       readIssueActionContext: options.readIssueActionContext,
+      readCanonicalSnapshot: (prNumber) =>
+        options.readReviewSnapshot(authoritySnapshot, prNumber),
       credential: selection.credential,
       credentials,
       runner,
@@ -496,16 +531,86 @@ export function makeProductionActiveRuntime(
       defaultBranch: options.defaultBranch,
       now,
     });
-    const diagnostic = cycleSnapshot.diagnostics.find((candidate) => (
-      candidate.pullRequests.some((pr) => pr.number === input.candidate.number)
-    ));
-    const publicationReason: HumanReason = diagnostic === undefined
-      ? input.reason
-      : {
-          phase: 'implementing',
-          code: 'branch-mapping-ambiguous',
-          detail: diagnostic.detail,
+    if (diagnostic !== undefined) {
+      const canonicalPr = authoritySnapshot.pullRequests.find(
+        (pr) => pr.number === input.candidate.number,
+      );
+      if (canonicalPr === undefined) {
+        throw new Error('Review mapping escalation canonical PR is absent');
+      }
+      const mappingRequest = {
+        selectedIssueNumber: input.candidate.issueNumber,
+        headRefName: canonicalPr.headRefName,
+        baseRefName: canonicalPr.baseRefName,
+      };
+      if (
+        authorityRecord.state !== 'mapping-reread'
+        && authorityRecord.state !== 'human-intent'
+        && authorityRecord.state !== 'human'
+      ) {
+        const requestRecord: ReviewClaimRecord = {
+          kind: 'review-claim',
+          protocolVersion: 2,
+          prNumber: input.candidate.number,
+          generation,
+          attempt,
+          reviewer,
+          head: input.candidate.head,
+          state: 'mapping-reread',
+          mappingRequest,
+          recordedAt: now().toISOString(),
         };
+        currentRefOid = await publishRecord(
+          requestRecord,
+          currentRefOid,
+          'Review mapping reread request did not win exact-parent authority',
+        );
+        authorityRecord = requestRecord;
+      }
+      if (
+        authorityRecord.state === 'mapping-reread'
+        && (
+          authorityRecord.mappingRequest.selectedIssueNumber
+            !== mappingRequest.selectedIssueNumber
+          || authorityRecord.mappingRequest.headRefName !== mappingRequest.headRefName
+          || authorityRecord.mappingRequest.baseRefName !== mappingRequest.baseRefName
+        )
+      ) {
+        throw new Error('Review mapping reread request identity changed');
+      }
+      const action = planProjection({
+        view: { items: [] },
+        pullRequests: [{
+          number: input.candidate.number,
+          headRefName: canonicalPr.headRefName,
+          baseRefName: canonicalPr.baseRefName,
+          scheduledIssueNumber: input.candidate.issueNumber,
+          reviewRefOid: currentRefOid,
+          reviewClaim: {
+            head: authorityRecord.head,
+            generation: authorityRecord.generation,
+            state: authorityRecord.state,
+            ...('mappingRequest' in authorityRecord
+              ? { mappingRequest: authorityRecord.mappingRequest }
+              : {}),
+            ...('mappingDiagnostic' in authorityRecord
+              && authorityRecord.mappingDiagnostic !== undefined
+              ? { mappingDiagnostic: authorityRecord.mappingDiagnostic }
+              : {}),
+          },
+        }],
+        orphanBranchClaims: [],
+        mappingDiagnostics: authoritySnapshot.diagnostics,
+      }).actions.find(
+        (candidate) => candidate.kind === 'converge-mapping-human',
+      );
+      if (action === undefined || action.kind !== 'converge-mapping-human') {
+        throw new Error('Review mapping escalation could not derive canonical convergence');
+      }
+      await writer.convergeMappingHuman?.(action);
+      return;
+    }
+    const publicationReason: HumanReason = input.reason;
     const marker = formatHumanCommentMarker({
       issueNumber: input.candidate.issueNumber,
       prNumber: input.candidate.number,
@@ -513,26 +618,56 @@ export function makeProductionActiveRuntime(
       generation,
       reason: publicationReason,
     });
-    const authority = {
+    const commentBody =
+      `${marker}\n\nAutopilot parked this item for Human review.\n\n${publicationReason.detail}`;
+    const commentAuthority = (
+      expectedReviewRefOid: GitOid,
+      expectedReviewState: ReviewClaimRecord['state'],
+    ) => ({
       issueNumber: input.candidate.issueNumber,
       expectedHead: input.candidate.head,
-      expectedReviewRefOid: humanRefOid,
+      expectedReviewRefOid,
       expectedGeneration: generation,
-      ...(diagnostic === undefined
-        ? {}
-        : {
-            expectedDiagnosticIssueNumbers: diagnostic.issueNumbers,
-            expectedDiagnosticDetail: diagnostic.detail,
-          }),
-    };
-    if (!await writer.hasHumanComment(input.candidate.number, marker, authority)) {
+      expectedReviewState,
+    });
+    const ensureComment = async (
+      expectedReviewRefOid: GitOid,
+      expectedReviewState: ReviewClaimRecord['state'],
+    ): Promise<void> => {
+      const authority = commentAuthority(expectedReviewRefOid, expectedReviewState);
+      if (await writer.hasHumanComment(input.candidate.number, marker, authority)) return;
       await writer.ensureHumanComment(
         input.candidate.number,
         marker,
-        `${marker}\n\nAutopilot parked this item for Human review.\n\n${publicationReason.detail}`,
+        commentBody,
         authority,
       );
+    };
+    // Mapping diagnostics are append-first. A failed or ambiguous comment
+    // publication therefore leaves only non-Human review-ref authority.
+    if (diagnostic !== undefined && authorityRecord.state !== 'human') {
+      await ensureComment(currentRefOid, authorityRecord.state);
     }
+    if (authorityRecord.state !== 'human') {
+      const humanRecord: ReviewClaimRecord = {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: input.candidate.number,
+        generation,
+        attempt,
+        reviewer,
+        head: input.candidate.head,
+        state: 'human',
+        recordedAt: now().toISOString(),
+      };
+      currentRefOid = await publishRecord(
+        humanRecord,
+        currentRefOid,
+        'Review Human escalation did not win exact-parent authority',
+      );
+      authorityRecord = humanRecord;
+    }
+    await ensureComment(currentRefOid, 'human');
   };
 
   const activeRuntime = makeActiveRuntime({

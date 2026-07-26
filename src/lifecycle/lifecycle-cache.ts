@@ -179,6 +179,7 @@ const humanReasonSchema = z.union([
     phase: z.enum(['awaiting-review', 'reviewing', 'review-fixing']),
     code: z.enum([
       'review-escalation',
+      'branch-mapping-ambiguous',
       'reviewer-identity-unavailable',
       'invalid-review-progress-time',
     ]),
@@ -229,6 +230,17 @@ const approvedVerdictSchema = z.object({
   marker: z.string().min(1),
   state: z.literal('APPROVE'),
 }).strict();
+const mappingRequestSchema = z.object({
+  selectedIssueNumber: positiveInteger,
+  headRefName: z.string().min(1),
+  baseRefName: z.string().min(1),
+}).strict();
+const mappingDiagnosticSchema = z.object({
+  selectedIssueNumber: positiveInteger,
+  issueNumbers: z.array(positiveInteger).min(1),
+  detail: z.string().min(1),
+  signature: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
 const reviewClaimBase = {
   kind: z.literal('review-claim'),
   protocolVersion: z.literal(2),
@@ -242,7 +254,22 @@ const reviewClaimBase = {
 const reviewClaimSchema = z.union([
   z.object({
     ...reviewClaimBase,
-    state: z.enum(['active', 'fixing', 'human', 'stale']),
+    state: z.enum(['active', 'fixing', 'stale']),
+  }).strict(),
+  z.object({
+    ...reviewClaimBase,
+    state: z.literal('mapping-reread'),
+    mappingRequest: mappingRequestSchema,
+  }).strict(),
+  z.object({
+    ...reviewClaimBase,
+    state: z.literal('human-intent'),
+    mappingDiagnostic: mappingDiagnosticSchema,
+  }).strict(),
+  z.object({
+    ...reviewClaimBase,
+    state: z.literal('human'),
+    mappingDiagnostic: mappingDiagnosticSchema.optional(),
   }).strict(),
   z.object({
     ...reviewClaimBase,

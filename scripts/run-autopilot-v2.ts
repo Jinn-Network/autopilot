@@ -561,6 +561,8 @@ export async function runAutopilotV2(
       ),
     readBranchHeadByName: (headRefName: string) =>
       reader.readBranchHeadForReconciliation(headRefName),
+    readBranchClaimByName: (headRefName: string) =>
+      reader.readBranchClaimForReconciliation(headRefName),
     readIssueByNumber: (issueNumber: number) => restDiscovery.readIssueForAction(issueNumber),
     readBlockedByIssueNumbers: (issueNumber: number) =>
       restDiscovery.readBlockedByIssueNumbersForAction(issueNumber),

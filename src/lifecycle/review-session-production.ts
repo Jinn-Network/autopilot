@@ -299,6 +299,8 @@ export function makeProductionReviewSessionPort(
       && pullRequest.headRefName === manifest.branch
       && pullRequest.baseRefName === manifest.targetBase
     );
+    const mappingDetail =
+      'The current PR does not have a unique open PR, issue, and branch mapping.';
     const mappingProblem = (
       markerMatches.length !== 1
       || markerIssue !== issueNumber
@@ -308,7 +310,7 @@ export function makeProductionReviewSessionPort(
       || linked[0]?.number !== pullRequest.number
       || linked[0]?.head !== pullRequest.head
     )
-      ? 'The current PR does not have a unique open PR, issue, and branch mapping.'
+      ? mappingDetail
       : undefined;
     const treePaths = (await runGit(manifest, [
       'ls-tree', '-r', '--name-only', pullRequest.base,
@@ -688,6 +690,7 @@ export function makeProductionReviewSessionPort(
       expectedHead,
       expectedReviewRefOid,
       expectedGeneration,
+      expectedReviewState,
       body,
     ) {
       const manifest = currentManifest();
@@ -697,7 +700,7 @@ export function makeProductionReviewSessionPort(
         authority.reviewRefOid !== expectedReviewRefOid
         || authority.record.head !== expectedHead
         || authority.record.generation !== expectedGeneration
-        || authority.record.state !== 'human'
+        || authority.record.state !== expectedReviewState
       ) {
         throw new Error('Review Human comment lost exact review-ref authority');
       }
@@ -709,6 +712,7 @@ export function makeProductionReviewSessionPort(
       expectedHead,
       expectedReviewRefOid,
       expectedGeneration,
+      expectedReviewState,
       marker,
       body,
     ) {
@@ -723,7 +727,7 @@ export function makeProductionReviewSessionPort(
           authority.reviewRefOid !== expectedReviewRefOid
           || authority.record.head !== expectedHead
           || authority.record.generation !== expectedGeneration
-          || authority.record.state !== 'human'
+          || authority.record.state !== expectedReviewState
         ) {
           throw new Error('Review Human comment lost exact review-ref authority');
         }

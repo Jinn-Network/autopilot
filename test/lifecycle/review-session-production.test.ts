@@ -449,9 +449,11 @@ describe('production review session port', () => {
       },
     });
 
-    await expect(port.readPullRequest(84, HEAD)).resolves.toMatchObject({
+    const pullRequest = await port.readPullRequest(84, HEAD);
+    expect(pullRequest).toMatchObject({
       mappingProblem: expect.stringMatching(/unique|duplicate|mapping/i),
     });
+    expect(pullRequest).not.toHaveProperty('mappingDiagnostic');
   });
 
   it('uses only the selected credential and explicit review commit_id/event/body', async () => {
@@ -812,7 +814,7 @@ describe('production review session port', () => {
           : mutation === 'draft'
             ? port.setPullRequestDraft(84, HEAD, true)
             : port.ensureHumanComment(
-                84, HEAD, REVIEW, GENERATION, marker, marker,
+                84, HEAD, REVIEW, GENERATION, 'human', marker, marker,
               );
       await expect(operation).resolves.toBeUndefined();
     },
@@ -940,7 +942,7 @@ describe('production review session port', () => {
     });
 
     await expect(port.ensureHumanComment(
-      84, HEAD, REVIEW, GENERATION, marker, `${marker}\n\nExact body.`,
+      84, HEAD, REVIEW, GENERATION, 'human', marker, `${marker}\n\nExact body.`,
     ))
       .rejects.toThrow('accepted comment response lost');
   });
@@ -1388,7 +1390,7 @@ describe('production review session port', () => {
     });
 
     await expect(port.hasHumanComment(
-      84, HEAD, REVIEW, GENERATION, canonicalBody,
+      84, HEAD, REVIEW, GENERATION, 'human', canonicalBody,
     )).resolves.toBe(false);
   });
 });

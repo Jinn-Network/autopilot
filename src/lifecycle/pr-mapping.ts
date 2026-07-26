@@ -338,12 +338,19 @@ export function resolveStructuredPullRequestMappings(
     if (mapping?.status !== 'resolved') return false;
     const parent = selectedParentByChild.get(prNumber);
     if (parent === undefined) return true;
-    // A targeted/scoped recovery may carry the exact parent PR relation while
-    // omitting the parent's issue record. Preserve that bounded authority. A
-    // complete input that knows the parent issue must prove the parent's own
-    // canonical mapping recursively.
-    if (!knownIssues.has(parent.issueNumber)) return true;
     if (parent.prNumber === prNumber || visiting.has(parent.prNumber)) return false;
+    const parentPr = input.pullRequests.find(
+      (candidate) => candidate.number === parent.prNumber,
+    );
+    if (parentPr === undefined) return false;
+    // A targeted/scoped recovery may carry the exact parent PR relation while
+    // omitting the parent's issue record. Only the visible parent's configured
+    // default base is self-contained in that scoped evidence; a custom base,
+    // self relation, or cycle needs the omitted issue authority and fails
+    // closed instead of treating omission as permission.
+    if (!knownIssues.has(parent.issueNumber)) {
+      return parentPr.baseRefName === input.defaultBranch;
+    }
     const parentMapping = initialByPr.get(parent.prNumber);
     if (
       parentMapping?.status !== 'resolved'
