@@ -246,6 +246,7 @@ export function makeProductionImplementationActionPort(
     return {
       number: source.number,
       title: source.title,
+      body: source.body ?? '',
       open: true,
       eligible,
       ...(eligibilityDetail === undefined ? {} : { eligibilityDetail }),
@@ -534,10 +535,16 @@ export function makeProductionImplementationActionPort(
         prNumber: input.prNumber,
         branch: input.branch,
         targetBase: input.targetBase,
+        ...(input.targetBaseOid === undefined
+          ? {}
+          : { targetBaseOid: input.targetBaseOid }),
         expectedHead: input.expectedHead,
         claimOid: input.claimOid,
         selectedLogin: input.selectedLogin,
         credential: input.credential,
+        ...(input.marketplacePreparation === undefined
+          ? {}
+          : { marketplacePreparation: input.marketplacePreparation }),
         attemptId: input.attemptId,
         remoteName: options.remoteName ?? 'jinn-autopilot-v2',
       }, runner);

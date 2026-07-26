@@ -10,6 +10,14 @@ await build({
   platform: 'node',
   format: 'esm',
   target: 'node22',
+  // Keep the exact published wire contracts as a runtime dependency. Bundling
+  // them would embed their fixed profile literals into the standalone binary,
+  // where the distribution verifier correctly treats such literals as local
+  // repository fallbacks.
+  external: [
+    '@jinn-network/sdk/autopilot',
+    '@jinn-network/sdk/solvernets/jinn-repo',
+  ],
   sourcemap: false,
   legalComments: 'none',
 });

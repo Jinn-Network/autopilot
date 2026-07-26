@@ -1,4 +1,5 @@
 import type { DispatcherConfig, Effort } from '../dispatcher/types.js';
+import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import {
   spawnCoordinatorSession,
@@ -17,8 +18,19 @@ import {
 import type { HumanReason, ImplementationClaimAction } from './types.js';
 import type {
   LocalImplementationSessionExecutionRequest,
+  MarketplaceSessionExecutionRequest,
   SessionExecutionResult,
 } from './session-execution-backend.js';
+import {
+  buildMarketplaceTaskRequest,
+  MARKETPLACE_LANGUAGE,
+  MARKETPLACE_REPOSITORY,
+  MARKETPLACE_VERIFICATION_PROFILE,
+  type MarketplaceMutationWorkflow,
+} from './marketplace-task.js';
+import type {
+  MarketplaceAttemptPreparation,
+} from './attempt-workspace.js';
 import {
   gitOid,
   gitRefName,
@@ -48,6 +60,7 @@ export async function runCanonicalImplementationRealityCheck(
 export interface ImplementationIssue {
   readonly number: number;
   readonly title: string;
+  readonly body: string;
   readonly open: boolean;
   readonly eligible: boolean;
   readonly eligibilityDetail?: string;
@@ -119,11 +132,13 @@ interface CreateAttemptInput {
   readonly issueNumber: number;
   readonly branch: GitRefName;
   readonly targetBase: GitRefName;
+  readonly targetBaseOid?: GitOid;
   readonly expectedHead: GitOid;
   readonly claimOid: GitOid;
   readonly prNumber: number;
   readonly selectedLogin: string;
   readonly credential: SelectedCredential;
+  readonly marketplacePreparation?: MarketplaceAttemptPreparation;
 }
 
 export interface SpawnImplementationInput {
@@ -138,6 +153,12 @@ export interface SpawnImplementationInput {
 }
 
 export interface ImplementationExecutorDeps {
+  readonly executionBackend?: AutopilotExecutionBackend;
+  readonly marketplace?: {
+    readonly repository: string;
+    readonly language: string;
+    readonly verificationProfile: string;
+  };
   readIssue(issueNumber: number): Promise<ImplementationIssue | null>;
   readStaleRecovery(
     issueNumber: number,
@@ -165,7 +186,12 @@ export interface ImplementationExecutorDeps {
   ): Promise<void>;
   createAttempt(input: CreateAttemptInput): Promise<ImplementationAttemptBinding>;
   startSession(
-    request: LocalImplementationSessionExecutionRequest<SpawnImplementationInput>,
+    request:
+      | LocalImplementationSessionExecutionRequest<SpawnImplementationInput>
+      | Extract<
+          MarketplaceSessionExecutionRequest,
+          { readonly kind: 'implementation' }
+        >,
   ): Promise<SessionExecutionResult>;
   escalateHuman(input: {
     readonly issueNumber: number;
@@ -217,6 +243,77 @@ function positiveIssueNumber(issueNumber: number): number {
     throw new Error('Implementation action requires a positive issue number');
   }
   return issueNumber;
+}
+
+function marketplaceProfile(
+  deps: ImplementationExecutorDeps,
+): NonNullable<ImplementationExecutorDeps['marketplace']> {
+  const profile = deps.marketplace;
+  if (
+    profile === undefined
+    || profile.repository !== MARKETPLACE_REPOSITORY
+    || profile.language !== MARKETPLACE_LANGUAGE
+    || profile.verificationProfile !== MARKETPLACE_VERIFICATION_PROFILE
+  ) {
+    throw new Error(
+      `Marketplace Task submission supports only ${MARKETPLACE_REPOSITORY}, `
+      + `${MARKETPLACE_LANGUAGE}, and verification profile `
+      + MARKETPLACE_VERIFICATION_PROFILE,
+    );
+  }
+  return profile;
+}
+
+function marketplacePreparation(input: {
+  readonly workflow: MarketplaceMutationWorkflow;
+  readonly issue: ImplementationIssue;
+  readonly pullRequest: ImplementationPullRequest;
+  readonly branch: GitRefName;
+  readonly targetBase: GitRefName;
+  readonly targetBaseOid: GitOid;
+  readonly baseSha: GitOid;
+  readonly claimOid: GitOid;
+  readonly expectedHead: GitOid;
+  readonly attemptId: string;
+  readonly deps: ImplementationExecutorDeps;
+}): MarketplaceAttemptPreparation {
+  const profile = marketplaceProfile(input.deps);
+  const built = buildMarketplaceTaskRequest({
+    workflow: input.workflow,
+    repository: profile.repository,
+    language: profile.language,
+    verificationProfile: profile.verificationProfile,
+    issueNumber: input.issue.number,
+    ...(input.workflow === 'implementation'
+      ? {}
+      : {
+          childIssueNumber: input.issue.number,
+          parentPrNumber: input.pullRequest.number,
+        }),
+    prNumber: input.pullRequest.number,
+    targetBase: input.targetBase,
+    branch: input.branch,
+    claimOid: input.claimOid,
+    expectedHead: input.expectedHead,
+    v2AttemptId: input.attemptId,
+    runnerId: input.deps.runnerId,
+    taskSnapshot: {
+      title: input.issue.title,
+      body: input.issue.body,
+      prBody: input.pullRequest.body,
+      baseSha: input.baseSha,
+      targetBaseOid: input.targetBaseOid,
+    },
+    receiptAuthors: input.deps.credentials.logins(),
+    createdAt: input.deps.now().getTime(),
+  });
+  return {
+    workflow: input.workflow,
+    baseSha: input.baseSha,
+    request: built.request,
+    agentSoftDeadline: built.agentSoftDeadline,
+    adoptionDeadline: built.adoptionDeadline,
+  };
 }
 
 export function validateCanonicalGitHubHttpsRemote(remoteUrl: string): string {
@@ -457,6 +554,8 @@ export async function executeImplementationAction(
       'Implementation action requires an explicit fresh or stale-recovery intent',
     );
   }
+  const executionBackend = deps.executionBackend ?? 'local';
+  if (executionBackend === 'marketplace') marketplaceProfile(deps);
   const issueNumber = positiveIssueNumber(action.issueNumber);
   const isStaleRecovery = action.intent === 'stale-recovery';
   const recovery = isStaleRecovery
@@ -542,7 +641,11 @@ export async function executeImplementationAction(
   const remoteUrl = validateCanonicalGitHubHttpsRemote(deps.remoteUrl);
   const adopted = openPullRequests[0];
   const branch = adopted?.headRefName ?? gitRefName(`autopilot/${issueNumber}`);
+  const targetBaseOid = executionBackend === 'marketplace'
+    ? await deps.readTargetBaseHead(issue.targetBase, selection.credential)
+    : undefined;
   const candidateParent = adopted?.head
+    ?? targetBaseOid
     ?? await deps.readTargetBaseHead(issue.targetBase, selection.credential);
   const expectedRemoteHead = adopted?.head ?? null;
   const attemptId = deps.nextAttemptId();
@@ -619,54 +722,86 @@ export async function executeImplementationAction(
   }
   await deps.setProjectInProgress(issueNumber, claimOid, selection.credential);
 
+  const preparation = executionBackend === 'marketplace'
+    ? marketplacePreparation({
+        workflow: 'implementation',
+        issue,
+        pullRequest,
+        branch,
+        targetBase: issue.targetBase,
+        targetBaseOid: targetBaseOid!,
+        baseSha: candidateParent,
+        claimOid,
+        expectedHead: claimOid,
+        attemptId,
+        deps,
+      })
+    : undefined;
   const attempt = await deps.createAttempt({
     attemptId,
     issueNumber,
     branch,
     targetBase: issue.targetBase,
+    ...(targetBaseOid === undefined ? {} : { targetBaseOid }),
     expectedHead: claimOid,
     claimOid,
     prNumber: pullRequest.number,
     selectedLogin: selection.login,
     credential: selection.credential,
+    ...(preparation === undefined
+      ? {}
+      : { marketplacePreparation: preparation }),
   });
   if (attempt.attemptId !== attemptId) {
     throw new Error('Detached implementation attempt does not match its claim');
   }
-  const environment = buildSanitizedChildEnv(
-    deps.ambientEnvironment,
-    selection.credential,
-    {
-      ghConfigDir: attempt.paths.ghConfigDir,
-      askpassPath: attempt.paths.askpass,
-      manifestPath: attempt.paths.manifest,
-    },
-  );
-  const started = await deps.startSession({
-    kind: 'implementation',
-    workflow: 'implementation',
-    backend: 'local',
-    manifestPath: attempt.paths.manifest,
-    attemptId,
-    issueNumber,
-    prNumber: pullRequest.number,
-    branch,
-    targetBase: issue.targetBase,
-    worktreePath: attempt.paths.worktree,
-    logPath: attempt.paths.log,
-    local: {
-      spawnInput: {
+  const started = executionBackend === 'marketplace'
+    ? await deps.startSession({
+        kind: 'implementation',
+        workflow: 'implementation',
+        backend: 'marketplace',
+        manifestPath: attempt.paths.manifest,
         attemptId,
-        issue,
+        issueNumber,
         prNumber: pullRequest.number,
         branch,
         targetBase: issue.targetBase,
-        environment,
         worktreePath: attempt.paths.worktree,
         logPath: attempt.paths.log,
-      },
-    },
-  });
+      })
+    : await deps.startSession({
+        kind: 'implementation',
+        workflow: 'implementation',
+        backend: 'local',
+        manifestPath: attempt.paths.manifest,
+        attemptId,
+        issueNumber,
+        prNumber: pullRequest.number,
+        branch,
+        targetBase: issue.targetBase,
+        worktreePath: attempt.paths.worktree,
+        logPath: attempt.paths.log,
+        local: {
+          spawnInput: {
+            attemptId,
+            issue,
+            prNumber: pullRequest.number,
+            branch,
+            targetBase: issue.targetBase,
+            environment: buildSanitizedChildEnv(
+              deps.ambientEnvironment,
+              selection.credential,
+              {
+                ghConfigDir: attempt.paths.ghConfigDir,
+                askpassPath: attempt.paths.askpass,
+                manifestPath: attempt.paths.manifest,
+              },
+            ),
+            worktreePath: attempt.paths.worktree,
+            logPath: attempt.paths.log,
+          },
+        },
+      });
   if (started.status !== 'started') {
     throw new Error('Implementation session execution did not start');
   }
@@ -687,6 +822,7 @@ async function executeChildImplementationAction(
   deps: ImplementationExecutorDeps,
 ): Promise<ImplementationExecutionResult> {
   const issueNumber = issue.number;
+  const executionBackend = deps.executionBackend ?? 'local';
   if (!issue.eligible) {
     return {
       status: 'ineligible',
@@ -717,6 +853,9 @@ async function executeChildImplementationAction(
   const remoteUrl = validateCanonicalGitHubHttpsRemote(deps.remoteUrl);
   const branch = parent.headRefName;
   const candidateParent = parent.head;
+  const targetBaseOid = executionBackend === 'marketplace'
+    ? await deps.readTargetBaseHead(issue.targetBase, selection.credential)
+    : undefined;
   const attemptId = deps.nextAttemptId();
   const claimedAt = deps.now().toISOString();
   const phase = issue.child.kind === 'reconcile' ? 'reconcile' as const : 'fix' as const;
@@ -755,54 +894,86 @@ async function executeChildImplementationAction(
     return { status: 'ambiguous', issueNumber };
   }
 
+  const preparation = executionBackend === 'marketplace'
+    ? marketplacePreparation({
+        workflow: issue.child.kind,
+        issue,
+        pullRequest: parent,
+        branch,
+        targetBase: issue.targetBase,
+        targetBaseOid: targetBaseOid!,
+        baseSha: candidateParent,
+        claimOid,
+        expectedHead: claimOid,
+        attemptId,
+        deps,
+      })
+    : undefined;
   const attempt = await deps.createAttempt({
     attemptId,
     issueNumber,
     branch,
     targetBase: issue.targetBase,
+    ...(targetBaseOid === undefined ? {} : { targetBaseOid }),
     expectedHead: claimOid,
     claimOid,
     prNumber: parent.number,
     selectedLogin: selection.login,
     credential: selection.credential,
+    ...(preparation === undefined
+      ? {}
+      : { marketplacePreparation: preparation }),
   });
   if (attempt.attemptId !== attemptId) {
     throw new Error('Detached child attempt does not match its claim');
   }
-  const environment = buildSanitizedChildEnv(
-    deps.ambientEnvironment,
-    selection.credential,
-    {
-      ghConfigDir: attempt.paths.ghConfigDir,
-      askpassPath: attempt.paths.askpass,
-      manifestPath: attempt.paths.manifest,
-    },
-  );
-  const started = await deps.startSession({
-    kind: 'implementation',
-    workflow: issue.child.kind,
-    backend: 'local',
-    manifestPath: attempt.paths.manifest,
-    attemptId,
-    issueNumber,
-    prNumber: parent.number,
-    branch,
-    targetBase: issue.targetBase,
-    worktreePath: attempt.paths.worktree,
-    logPath: attempt.paths.log,
-    local: {
-      spawnInput: {
+  const started = executionBackend === 'marketplace'
+    ? await deps.startSession({
+        kind: 'implementation',
+        workflow: issue.child.kind,
+        backend: 'marketplace',
+        manifestPath: attempt.paths.manifest,
         attemptId,
-        issue,
+        issueNumber,
         prNumber: parent.number,
         branch,
         targetBase: issue.targetBase,
-        environment,
         worktreePath: attempt.paths.worktree,
         logPath: attempt.paths.log,
-      },
-    },
-  });
+      })
+    : await deps.startSession({
+        kind: 'implementation',
+        workflow: issue.child.kind,
+        backend: 'local',
+        manifestPath: attempt.paths.manifest,
+        attemptId,
+        issueNumber,
+        prNumber: parent.number,
+        branch,
+        targetBase: issue.targetBase,
+        worktreePath: attempt.paths.worktree,
+        logPath: attempt.paths.log,
+        local: {
+          spawnInput: {
+            attemptId,
+            issue,
+            prNumber: parent.number,
+            branch,
+            targetBase: issue.targetBase,
+            environment: buildSanitizedChildEnv(
+              deps.ambientEnvironment,
+              selection.credential,
+              {
+                ghConfigDir: attempt.paths.ghConfigDir,
+                askpassPath: attempt.paths.askpass,
+                manifestPath: attempt.paths.manifest,
+              },
+            ),
+            worktreePath: attempt.paths.worktree,
+            logPath: attempt.paths.log,
+          },
+        },
+      });
   if (started.status !== 'started') {
     throw new Error('Child session execution did not start');
   }

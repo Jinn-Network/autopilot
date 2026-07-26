@@ -23,8 +23,17 @@ import {
   parseAutopilotExecutionBackend,
 } from '../src/config/execution-backend.js';
 import {
-  MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+  MarketplaceSessionExecutionBackend,
+  recoverPreparedMarketplaceAttempts,
 } from '../src/lifecycle/session-execution-backend.js';
+import {
+  MARKETPLACE_LANGUAGE,
+  MARKETPLACE_VERIFICATION_PROFILE,
+  MarketplaceTaskCliAdapter,
+} from '../src/lifecycle/marketplace-task.js';
+import {
+  assertMarketplaceRuntimeProfile,
+} from '../src/lifecycle/active-runtime-production.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
 import {
   paintBoardOptionsFromConfig,
@@ -73,6 +82,7 @@ import {
   parseLifecycleCli,
   parseAutopilotStateDirectory,
   parseSnapshotRuntimeConfig,
+  recoverMarketplaceAttemptInitializations,
   renderLifecycleHuman,
   renderLifecycleJson,
   resolveCredentialPool,
@@ -83,6 +93,7 @@ import {
   sweepDeadAttempts,
   freeDiskBytes,
   type LifecycleCycleReport,
+  type CredentialPool,
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
 
@@ -215,17 +226,53 @@ export function executionBackendForEnvironment(
 }
 
 export async function preflightProductionEntrypoint<Value>(
-  mode: 'observe' | 'recover' | 'active',
-  environment: NodeJS.ProcessEnv,
+  _mode: 'observe' | 'recover' | 'active',
+  _environment: NodeJS.ProcessEnv,
   setup: () => Promise<Value>,
 ): Promise<Value> {
-  if (
-    mode === 'active'
-    && executionBackendForEnvironment(environment) === 'marketplace'
-  ) {
-    throw new Error(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
-  }
   return setup();
+}
+
+export function makeMarketplaceRecoveryCallback(input: {
+  readonly mode: 'observe' | 'recover' | 'active';
+  readonly executionBackend: 'local' | 'marketplace';
+  readonly repositorySlug: string;
+  readonly language?: string;
+  readonly verificationProfile?: string;
+  readonly replay: () => Promise<unknown>;
+}): (() => Promise<void>) | undefined {
+  if (input.executionBackend !== 'marketplace' || input.mode === 'observe') {
+    return undefined;
+  }
+  return async (): Promise<void> => {
+    assertMarketplaceRuntimeProfile({
+      repository: input.repositorySlug,
+      language: input.language ?? MARKETPLACE_LANGUAGE,
+      verificationProfile:
+        input.verificationProfile ?? MARKETPLACE_VERIFICATION_PROFILE,
+    });
+    await input.replay();
+  };
+}
+
+export function makeMarketplaceRecoveryCredentialResolver(
+  credentials: CredentialPool,
+): (normalizedLogin: string) => SelectedCredential {
+  return (normalizedLogin: string): SelectedCredential => {
+    const selection = selectCredential(
+      credentials.restrictedTo([normalizedLogin]),
+      { phase: 'implement' },
+    );
+    if (
+      selection.status !== 'selected'
+      || selection.credential.normalizedLogin !== normalizedLogin
+    ) {
+      throw new Error(
+        `Marketplace recovery credential ${normalizedLogin} is unavailable`,
+      );
+    }
+    return selection.credential;
+  };
 }
 
 export function shouldSweepAttempts(input: {
@@ -367,9 +414,9 @@ export async function runAutopilotV2(
   }
 
   const options = parseLifecycleCli(arguments_);
-  // `configuredEnvironment` preserves this process-local selector unchanged.
-  // Check it before repository/config/credential setup so the foundation
-  // marketplace lane always fails with its stable outcome.
+  // Repository/config setup is shared by both execution backends. Marketplace
+  // capability validation runs later through the active controller's
+  // mutation-free preflight boundary.
   const repositoryPath = (await preflightProductionEntrypoint(
     options.mode,
     env,
@@ -565,6 +612,35 @@ export async function runAutopilotV2(
   const worktreeBase =
     env.JINN_AUTOPILOT_WORKTREE_BASE ?? loaded.paths.attempts;
   const v2AttemptsBase = join(worktreeBase, 'v2');
+  const marketplaceTaskAdapter =
+    executionBackend === 'marketplace' && options.mode !== 'observe'
+      ? new MarketplaceTaskCliAdapter({ environment: runtimeEnvironment })
+      : undefined;
+  const marketplaceExecutionBackend = marketplaceTaskAdapter === undefined
+    ? undefined
+    : new MarketplaceSessionExecutionBackend({
+        adapter: marketplaceTaskAdapter,
+        now: () => new Date(),
+      });
+  const recoverMarketplaceAttempts =
+    marketplaceExecutionBackend === undefined
+      ? undefined
+      : makeMarketplaceRecoveryCallback({
+          mode: options.mode,
+          executionBackend,
+          repositorySlug: loaded.config.repository.slug,
+          replay: async (): Promise<void> => {
+            await recoverMarketplaceAttemptInitializations(
+              v2AttemptsBase,
+              runner,
+              makeMarketplaceRecoveryCredentialResolver(credentials!),
+            );
+            await recoverPreparedMarketplaceAttempts(
+              v2AttemptsBase,
+              marketplaceExecutionBackend,
+            );
+          },
+        });
   const cleanupEnabled = options.mode === 'active'
     && activeCleanupEnabled(
       env.JINN_AUTOPILOT_CLEANUP_ENABLED,
@@ -656,6 +732,12 @@ export async function runAutopilotV2(
         defaultBranch: loaded.config.repository.defaultBranch,
         projectMapping: loaded.config.project,
         newWorkPaused: diskBelowFloor,
+        ...(marketplaceTaskAdapter === undefined
+          ? {}
+          : { marketplaceTaskAdapter }),
+        ...(marketplaceExecutionBackend === undefined
+          ? {}
+          : { marketplaceExecutionBackend }),
       });
 
   const runOnce = async (): Promise<void> => {
@@ -673,6 +755,9 @@ export async function runAutopilotV2(
         readGitHubUsage: () => reader.githubUsage(),
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
         ...(active === undefined ? {} : { active }),
+        ...(recoverMarketplaceAttempts === undefined
+          ? {}
+          : { recoverMarketplaceAttempts }),
         now: () => new Date(),
         staleAfterMs,
         runnerId,

@@ -1,4 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import {
+  mkdtempSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DispatcherConfig } from '../dispatcher/types.js';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
@@ -73,11 +78,45 @@ import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
 import {
   LocalSessionExecutionBackend,
   MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+  MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
+  MarketplaceSessionExecutionBackend,
   type LocalExactHeadReviewSessionExecutionRequest,
   type LocalImplementationSessionExecutionRequest,
+  type MarketplaceSessionExecutionRequest,
 } from './session-execution-backend.js';
+import {
+  buildMarketplaceTaskRequest,
+  MARKETPLACE_LANGUAGE,
+  MARKETPLACE_REPOSITORY,
+  MARKETPLACE_VERIFICATION_PROFILE,
+  MarketplaceTaskCliAdapter,
+  persistMarketplaceTaskRequest,
+} from './marketplace-task.js';
+
+type ProductionMarketplaceTaskAdapter = Pick<
+  MarketplaceTaskCliAdapter,
+  'dryRun' | 'submit' | 'recover'
+>;
 
 export const AUTOPILOT_V2_REMOTE = 'jinn-autopilot-v2';
+
+export function assertMarketplaceRuntimeProfile(input: {
+  readonly repository: string;
+  readonly language: string;
+  readonly verificationProfile: string;
+}): void {
+  if (
+    input.repository !== MARKETPLACE_REPOSITORY
+    || input.language !== MARKETPLACE_LANGUAGE
+    || input.verificationProfile !== MARKETPLACE_VERIFICATION_PROFILE
+  ) {
+    throw new Error(
+      `Marketplace Task submission supports only ${MARKETPLACE_REPOSITORY}, `
+      + `${MARKETPLACE_LANGUAGE}, and verification profile `
+      + MARKETPLACE_VERIFICATION_PROFILE,
+    );
+  }
+}
 
 export interface ProductionActiveRuntimeOptions {
   /**
@@ -159,6 +198,13 @@ export interface ProductionActiveRuntimeOptions {
    */
   readonly sleep?: (ms: number) => Promise<void>;
   readonly newWorkPaused?: () => boolean;
+  readonly marketplaceTaskAdapter?: ProductionMarketplaceTaskAdapter;
+  readonly marketplaceExecutionBackend?: Pick<
+    MarketplaceSessionExecutionBackend,
+    'start'
+  >;
+  readonly marketplaceLanguage?: string;
+  readonly marketplaceVerificationProfile?: string;
 }
 
 function defaultSleep(ms: number): Promise<void> {
@@ -209,8 +255,15 @@ export function makeProductionCapabilityPreflight(
   | 'remoteName'
   | 'environment'
   | 'now'
+  | 'nextId'
+  | 'runnerId'
   | 'readCapabilityAttestation'
+  | 'repositorySlug'
   | 'repositoryUrl'
+  | 'defaultBranch'
+  | 'marketplaceTaskAdapter'
+  | 'marketplaceLanguage'
+  | 'marketplaceVerificationProfile'
   >,
 ): () => Promise<{ readonly ok: boolean; readonly detail?: string }> {
   const executionBackend = options.executionBackend ?? 'local';
@@ -224,10 +277,61 @@ export function makeProductionCapabilityPreflight(
     options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE;
   return async () => {
     if (executionBackend === 'marketplace') {
-      return {
-        ok: false,
-        detail: MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
-      };
+      let preflightDirectory: string | undefined;
+      try {
+        const createdAt = now().getTime();
+        const attemptId = (options.nextId ?? randomUUID)();
+        const baseOid = '0'.repeat(40);
+        const profile = {
+          repository: options.repositorySlug ?? '',
+          language: options.marketplaceLanguage ?? MARKETPLACE_LANGUAGE,
+          verificationProfile:
+            options.marketplaceVerificationProfile
+              ?? MARKETPLACE_VERIFICATION_PROFILE,
+        };
+        assertMarketplaceRuntimeProfile(profile);
+        const built = buildMarketplaceTaskRequest({
+          workflow: 'implementation',
+          ...profile,
+          issueNumber: 1,
+          prNumber: 1,
+          targetBase: options.defaultBranch ?? 'next',
+          branch: `autopilot/marketplace-preflight-${attemptId}`,
+          claimOid: baseOid,
+          expectedHead: baseOid,
+          v2AttemptId: attemptId,
+          runnerId: options.runnerId,
+          taskSnapshot: {
+            title: 'Autopilot marketplace capability preflight',
+            body: 'Validate the installed marketplace Task submission capability.',
+            prBody: 'Synthetic dry-run request; no GitHub mutation is performed.',
+            baseSha: baseOid,
+            targetBaseOid: baseOid,
+          },
+          receiptAuthors: options.credentials.logins(),
+          createdAt,
+        });
+        preflightDirectory = mkdtempSync(
+          join(tmpdir(), 'jinn-autopilot-marketplace-preflight-'),
+        );
+        const persisted = persistMarketplaceTaskRequest(
+          join(preflightDirectory, 'marketplace-request.json'),
+          built.request,
+        );
+        const adapter = options.marketplaceTaskAdapter
+          ?? new MarketplaceTaskCliAdapter({ environment: ambient });
+        await adapter.dryRun(persisted.requestPath);
+        return { ok: true };
+      } catch (error) {
+        return {
+          ok: false,
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      } finally {
+        if (preflightDirectory !== undefined) {
+          rmSync(preflightDirectory, { recursive: true, force: true });
+        }
+      }
     }
     try {
       if (options.credentials.logins().length === 0) {
@@ -313,17 +417,14 @@ export function makeProductionActiveRuntime(
   const track = (manifestPath: string, child: SpawnResult): void => {
     trackAttempt(manifestPath, requireTrackable(child), { now });
   };
-  const implementationPreferredLogin = executionBackend === 'marketplace'
-    ? ''
-    : (() => {
-        const implementationPreferred = selectCredential(
-          options.credentials,
-          { phase: 'implement' },
-        );
-        return implementationPreferred.status === 'selected'
-          ? implementationPreferred.login
-          : options.credentials.logins()[0] ?? '';
-      })();
+  const implementationPreferred = selectCredential(
+    options.credentials,
+    { phase: 'implement' },
+  );
+  const implementationPreferredLogin =
+    implementationPreferred.status === 'selected'
+      ? implementationPreferred.login
+      : options.credentials.logins()[0] ?? '';
   const implementationSpawner = makeCanonicalImplementationSpawner(
     options.config,
     options.spawn,
@@ -362,6 +463,15 @@ export function makeProductionActiveRuntime(
           trackChild: track,
         })
       : undefined;
+  const marketplaceExecutionBackend = executionBackend === 'marketplace'
+    ? options.marketplaceExecutionBackend
+      ?? new MarketplaceSessionExecutionBackend({
+        ...(options.marketplaceTaskAdapter === undefined
+          ? {}
+          : { adapter: options.marketplaceTaskAdapter }),
+        now,
+      })
+    : undefined;
   const requireLocalExecutionBackend = (): ProductionLocalExecutionBackend => {
     if (localExecutionBackend === undefined) {
       throw new Error(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
@@ -369,8 +479,15 @@ export function makeProductionActiveRuntime(
     return localExecutionBackend;
   };
   const startImplementationSession = (
-    request: LocalImplementationSessionExecutionRequest<SpawnImplementationInput>,
-  ) => requireLocalExecutionBackend().start(request);
+    request:
+      | LocalImplementationSessionExecutionRequest<SpawnImplementationInput>
+      | Extract<
+          MarketplaceSessionExecutionRequest,
+          { readonly kind: 'implementation' }
+        >,
+  ) => request.backend === 'local'
+    ? requireLocalExecutionBackend().start(request)
+    : marketplaceExecutionBackend!.start(request);
   const startExactHeadReviewSession = (
     request: LocalExactHeadReviewSessionExecutionRequest<SpawnExactHeadReviewInput>,
   ) => requireLocalExecutionBackend().start(request);
@@ -477,7 +594,6 @@ export function makeProductionActiveRuntime(
       },
 
       implementation: (action, credentials, cycleSnapshot) => {
-        requireLocalExecutionBackend();
         const port = implementationActionPort({
           repositoryPath: options.repositoryPath,
           worktreeBase: options.worktreeBase,
@@ -496,6 +612,18 @@ export function makeProductionActiveRuntime(
         });
         return executeImplementationAction(action, {
           ...port,
+          executionBackend,
+          ...(executionBackend === 'marketplace'
+            ? {
+                marketplace: {
+                  repository: options.repositorySlug ?? '',
+                  language: options.marketplaceLanguage ?? MARKETPLACE_LANGUAGE,
+                  verificationProfile:
+                    options.marketplaceVerificationProfile
+                      ?? MARKETPLACE_VERIFICATION_PROFILE,
+                },
+              }
+            : {}),
           credentials,
           remoteUrl:
             options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE,
@@ -508,6 +636,12 @@ export function makeProductionActiveRuntime(
       },
 
       review: (action, credentials, cycleSnapshot, context) => {
+        if (executionBackend === 'marketplace') {
+          return Promise.resolve({
+            status: 'unavailable',
+            detail: MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
+          });
+        }
         requireLocalExecutionBackend();
         const productionPort = reviewActionPort({
           repositoryPath: options.repositoryPath,
@@ -704,15 +838,12 @@ export function makeProductionActiveRuntime(
       },
     },
   });
-  if (executionBackend === 'marketplace') {
-    const unavailable = async (): Promise<never> => {
-      throw new Error(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
-    };
-    return {
-      ...activeRuntime,
-      executeAction: unavailable,
-      executeReviewActions: unavailable,
-    };
-  }
-  return activeRuntime;
+  if (executionBackend !== 'marketplace') return activeRuntime;
+  return {
+    ...activeRuntime,
+    executeReviewActions: async (actions) => actions.map(() => ({
+      outcome: 'unavailable',
+      reason: MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
+    })),
+  };
 }

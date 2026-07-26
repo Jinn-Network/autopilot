@@ -1,14 +1,17 @@
 // @ts-nocheck — Stage 5: deleted merge-prep/review-fix/project-status fixtures.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -16,7 +19,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultRunner, type CommandRunner } from '../../src/dispatcher/issue-source.js';
 import { SelectedCredential } from '../../src/lifecycle/credentials.js';
@@ -33,17 +36,39 @@ import {
   markAttemptExited,
   markAttemptRunning,
   readAttemptManifest,
+  recoverMarketplaceAttemptInitializations,
   sweepDeadAttempts,
   trackAttemptChild,
+  transitionMarketplaceExecution,
   updateAttemptManifest,
   type AttemptManifest,
   type CreateAttemptOptions,
 } from '../../src/lifecycle/attempt-workspace.js';
+import {
+  buildMarketplaceTaskRequest,
+  persistMarketplaceTaskRequest,
+  verifyMarketplaceTaskRequest,
+} from '../../src/lifecycle/marketplace-task.js';
 
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
 const UUID_C = '33333333-3333-4333-8333-333333333333';
 const NOW = '2026-07-20T00:00:00.000Z';
+const MARKETPLACE_TERMINAL_RECORD_SUFFIX = '.marketplace-terminal.json';
+const SUBMISSION_RESULT = {
+  schemaVersion: 1,
+  generatedAt: '2026-07-20T00:01:30.000Z',
+  verb: 'tasks submit',
+  id: `autopilot:${UUID_A}`,
+  creatorMultisig: `0x${'a'.repeat(40)}`,
+  taskId: 'task-42',
+  taskCid: 'bafybeigdyrzt5m6u2r3o4exampletaskcid',
+  creationTx: `0x${'b'.repeat(64)}`,
+  creationBlock: 123,
+  solverNetManifestCid: 'bafybeigdyrzt5m6u2r3o4examplesolvercid',
+  status: 'submitted',
+  idempotent: false,
+} as const;
 const roots: string[] = [];
 
 afterEach(() => {
@@ -122,6 +147,76 @@ function options(
   };
 }
 
+function marketplacePreparation(
+  fixture: ReturnType<typeof repositoryFixture>,
+  workflow: 'implementation' | 'review-finding' | 'reconcile' | 'ci-failure' =
+    'implementation',
+  body = 'The authoritative issue body.',
+) {
+  const built = buildMarketplaceTaskRequest({
+    workflow,
+    repository: 'Jinn-Network/mono',
+    language: 'typescript',
+    verificationProfile: 'jinn-mono.v1',
+    issueNumber: 42,
+    ...(workflow === 'implementation'
+      ? {}
+      : { childIssueNumber: 42, parentPrNumber: 84 }),
+    prNumber: 84,
+    targetBase: 'main',
+    branch: 'autopilot/42',
+    claimOid: fixture.oid,
+    expectedHead: fixture.oid,
+    v2AttemptId: UUID_A,
+    runnerId: 'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    taskSnapshot: {
+      title: 'Publish one durable marketplace task',
+      body,
+      prBody: 'Closes #42',
+      baseSha: fixture.oid,
+      targetBaseOid: fixture.oid,
+    },
+    receiptAuthors: ['impl-bot'],
+    createdAt: Date.parse(NOW),
+  });
+  return {
+    workflow,
+    baseSha: fixture.oid,
+    request: built.request,
+    agentSoftDeadline: built.agentSoftDeadline,
+    adoptionDeadline: built.adoptionDeadline,
+  };
+}
+
+function marketplaceInitializationJournal(
+  fixture: ReturnType<typeof repositoryFixture>,
+): string {
+  const phaseDir = join(
+    fixture.base,
+    'v2',
+    'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    'implement',
+  );
+  const journals = existsSync(phaseDir)
+    ? readdirSync(phaseDir)
+      .filter((name) => name.endsWith('.marketplace-initialization.json'))
+    : [];
+  expect(journals).toHaveLength(1);
+  return join(phaseDir, journals[0]!);
+}
+
+function marketplaceInitializationJournalPathForTest(
+  fixture: ReturnType<typeof repositoryFixture>,
+): string {
+  return join(
+    fixture.base,
+    'v2',
+    'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    'implement',
+    `.issue-42-${UUID_A}.marketplace-initialization.json`,
+  );
+}
+
 function terminalAttempt(manifest: AttemptManifest): AttemptManifest {
   markAttemptRunning(manifest.paths.manifest, 4242, () =>
     new Date('2026-07-20T00:01:00.000Z'));
@@ -130,6 +225,63 @@ function terminalAttempt(manifest: AttemptManifest): AttemptManifest {
     () => new Date('2026-07-20T00:02:00.000Z'),
     manifest.expectedHead,
   );
+}
+
+function deferred(): {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+} {
+  let resolvePromise!: () => void;
+  return {
+    promise: new Promise<void>((resolve) => {
+      resolvePromise = resolve;
+    }),
+    resolve: () => resolvePromise(),
+  };
+}
+
+async function withTimeout<T>(promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('timed out waiting for initialization barrier'));
+    }, 1_000);
+    timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function transitionInWorker(input: Record<string, unknown>): Promise<{
+  readonly code: number | null;
+  readonly result: { readonly ok: boolean; readonly error?: string };
+}> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'),
+      join(process.cwd(), 'test/lifecycle/attempt-transition-worker.ts'),
+      JSON.stringify(input),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      try {
+        resolve({ code, result: JSON.parse(stdout) as { readonly ok: boolean; readonly error?: string } });
+      } catch {
+        reject(new Error(`Marketplace transition worker did not return JSON: ${stderr}`));
+      }
+    });
+  });
 }
 
 describe('attempt workspace and manifest', () => {
@@ -397,6 +549,1739 @@ describe('attempt workspace and manifest', () => {
 
     expect(manifest.execution).toEqual(execution);
     expect(readAttemptManifest(manifest.paths.manifest).execution).toEqual(execution);
+  });
+
+  it('round-trips a version-2 prepared marketplace execution with immutable request metadata', async () => {
+    const fixture = repositoryFixture();
+    const execution = {
+      backend: 'marketplace',
+      state: {
+        schemaVersion: 'marketplace-execution-v2',
+        status: 'prepared',
+        requestPath: join(fixture.root, 'marketplace-request.json'),
+        requestDigest: `sha256:${'a'.repeat(64)}`,
+        solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+        preparedAt: '2026-07-20T00:01:00.000Z',
+        agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+        adoptionDeadline: '2026-07-20T01:30:00.000Z',
+      },
+    } as const;
+
+    const manifest = await createAttemptWorkspace(options(fixture, { execution }), defaultRunner);
+
+    expect(manifest.execution).toEqual(execution);
+    expect(readAttemptManifest(manifest.paths.manifest).execution).toEqual(execution);
+  });
+
+  it('durably writes and verifies the immutable request before installing its prepared manifest', async () => {
+    const fixture = repositoryFixture();
+    const events: string[] = [];
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      persistMarketplaceTaskRequest(requestPath, request) {
+        events.push('persist-request');
+        expect(existsSync(join(dirname(requestPath), 'manifest.json'))).toBe(false);
+        return persistMarketplaceTaskRequest(requestPath, request);
+      },
+      verifyMarketplaceTaskRequest(requestPath, requestDigest) {
+        events.push('verify-request');
+        expect(existsSync(join(dirname(requestPath), 'manifest.json'))).toBe(false);
+        return verifyMarketplaceTaskRequest(requestPath, requestDigest);
+      },
+      afterMarketplaceManifestInstalled(_path, prepared) {
+        events.push('write-manifest');
+        expect(verifyMarketplaceTaskRequest(
+          prepared.execution.state.requestPath,
+          prepared.execution.state.requestDigest,
+        ).id).toBe(`autopilot:${UUID_A}`);
+      },
+    });
+
+    expect(events).toEqual([
+      'persist-request',
+      'verify-request',
+      'write-manifest',
+    ]);
+    expect(manifest).toMatchObject({
+      targetBaseOid: fixture.oid,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(manifest.paths.attemptDir, 'marketplace-request.json'),
+          preparedAt: NOW,
+        },
+      },
+    });
+    expect(statSync(manifest.execution.state.requestPath).mode & 0o777).toBe(0o600);
+    expect(readAttemptManifest(manifest.paths.manifest)).toEqual(manifest);
+  });
+
+  it('installs a non-secret sibling journal before creating the marketplace attempt directory and recovers it', async () => {
+    const fixture = repositoryFixture();
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const credential =
+      new SelectedCredential('Impl-Bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      selectedLogin: 'Impl-Bot',
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      afterMarketplaceJournalInstalled(journalPath) {
+        expect(existsSync(attemptDir)).toBe(false);
+        expect(statSync(journalPath).mode & 0o777).toBe(0o600);
+        const journal = readFileSync(journalPath, 'utf8');
+        expect(journal).not.toContain('selected-secret');
+        expect(journal).toContain('"selectedLogin": "Impl-Bot"');
+        throw new Error('injected crash after journal installation');
+      },
+    })).rejects.toThrow('injected crash after journal installation');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    expect(existsSync(attemptDir)).toBe(false);
+    const resolveCredential = vi.fn((normalizedLogin: string) => {
+      expect(normalizedLogin).toBe('impl-bot');
+      return credential;
+    });
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      resolveCredential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(resolveCredential).toHaveBeenCalledOnce();
+    expect(existsSync(journalPath)).toBe(false);
+    expect(readAttemptManifest(join(attemptDir, 'manifest.json')))
+      .toEqual(recovered[0]);
+    expect(git(join(attemptDir, 'worktree'), ['rev-parse', 'HEAD']))
+      .toBe(fixture.oid);
+  });
+
+  it('does not install a new initialization journal over an unrelated preexisting attempt directory', async () => {
+    const fixture = repositoryFixture();
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    mkdirSync(attemptDir, { recursive: true });
+    writeFileSync(join(attemptDir, 'sentinel'), 'unrelated\n');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner)).rejects.toThrow(/attempt directory.*already exists/i);
+
+    expect(readFileSync(join(attemptDir, 'sentinel'), 'utf8'))
+      .toBe('unrelated\n');
+    expect(readdirSync(dirname(attemptDir))
+      .some((name) => name.endsWith('.marketplace-initialization.json')))
+      .toBe(false);
+  });
+
+  it('recovers the exact journal-owned request after a crash before worktree creation', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      persistMarketplaceTaskRequest(requestPath, request) {
+        const persisted = persistMarketplaceTaskRequest(requestPath, request);
+        throw new Error(`injected request-only crash:${persisted.requestDigest}`);
+      },
+    })).rejects.toThrow('injected request-only crash');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const journalBefore = readFileSync(journalPath);
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const requestPath = join(attemptDir, 'marketplace-request.json');
+    const requestBefore = readFileSync(requestPath);
+
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(existsSync(journalPath)).toBe(false);
+    expect(readFileSync(requestPath)).toEqual(requestBefore);
+    expect(journalBefore.toString('utf8')).not.toContain('selected-secret');
+    expect(git(join(attemptDir, 'worktree'), ['rev-parse', 'HEAD']))
+      .toBe(fixture.oid);
+  });
+
+  it('repairs only an interrupted journal-owned worktree and converges to the recorded head', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+    let interrupted = false;
+    const runner: CommandRunner = async (command, args, runnerOptions) => {
+      const result = await defaultRunner(command, args, runnerOptions);
+      if (
+        !interrupted
+        && command === 'git'
+        && args.includes('worktree')
+        && args.includes('add')
+      ) {
+        interrupted = true;
+        throw new Error('injected crash after worktree registration');
+      }
+      return result;
+    };
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), runner)).rejects.toThrow('injected crash after worktree registration');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const sibling = join(dirname(journalPath), 'keep-me');
+    mkdirSync(sibling);
+    writeFileSync(join(sibling, 'sentinel'), 'preserve\n');
+
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(existsSync(journalPath)).toBe(false);
+    expect(readFileSync(join(sibling, 'sentinel'), 'utf8')).toBe('preserve\n');
+    expect(git(recovered[0]!.paths.worktree, ['rev-parse', 'HEAD']))
+      .toBe(fixture.oid);
+    expect(git(fixture.repo, ['worktree', 'list', '--porcelain']))
+      .toContain(recovered[0]!.paths.worktree);
+  });
+
+  it('retires a surviving initialization journal when its exact prepared manifest and worktree are already durable', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      afterMarketplaceManifestInstalled() {
+        throw new Error('injected crash after prepared manifest installation');
+      },
+    })).rejects.toThrow('injected crash after prepared manifest installation');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const manifestPath = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+      'manifest.json',
+    );
+    const preparedBefore = readFileSync(manifestPath);
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(readFileSync(manifestPath)).toEqual(preparedBefore);
+    expect(existsSync(journalPath)).toBe(false);
+  });
+
+  it.each(['submitted', 'cancelled'] as const)(
+    'retires a stale initialization journal around an agreeing %s terminal manifest without touching credentials or Git',
+    async (terminal) => {
+      const fixture = repositoryFixture();
+      const credential =
+        new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+      await expect(createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        credential,
+        marketplacePreparation: marketplacePreparation(fixture),
+      }), defaultRunner, {
+        afterMarketplaceManifestInstalled() {
+          throw new Error('injected crash after prepared manifest installation');
+        },
+      })).rejects.toThrow('injected crash after prepared manifest installation');
+
+      const journalPath = marketplaceInitializationJournal(fixture);
+      const manifestPath = join(
+        fixture.base,
+        'v2',
+        'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'implement',
+        `issue-42-${UUID_A}`,
+        'manifest.json',
+      );
+      const prepared = readAttemptManifest(manifestPath);
+      if (
+        prepared.execution.backend !== 'marketplace'
+        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v2'
+      ) {
+        throw new Error('expected prepared marketplace execution');
+      }
+      transitionMarketplaceExecution(
+        manifestPath,
+        prepared.execution.state.requestDigest,
+        terminal === 'submitted'
+          ? { status: 'submitted', submission: SUBMISSION_RESULT }
+          : { status: 'cancelled', reason: 'operator-cancelled' },
+        () => new Date('2026-07-20T00:02:00.000Z'),
+      );
+      const terminalBytes = readFileSync(manifestPath);
+      const resolveCredential = vi.fn(() => {
+        throw new Error('terminal recovery must not resolve credentials');
+      });
+      const runner = vi.fn(async () => {
+        throw new Error('terminal recovery must not inspect or repair Git');
+      });
+
+      const recovered = await recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        runner,
+        resolveCredential,
+      );
+
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0]!.execution).toMatchObject({
+        backend: 'marketplace',
+        state: { status: terminal },
+      });
+      expect(resolveCredential).not.toHaveBeenCalled();
+      expect(runner).not.toHaveBeenCalled();
+      expect(readFileSync(manifestPath)).toEqual(terminalBytes);
+      expect(existsSync(journalPath)).toBe(false);
+    },
+  );
+
+  it.each(['digest', 'submission-identity'] as const)(
+    'retains the initialization journal and terminal bytes when the %s contradicts it',
+    async (contradiction) => {
+      const fixture = repositoryFixture();
+      const credential =
+        new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+      await expect(createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        credential,
+        marketplacePreparation: marketplacePreparation(fixture),
+      }), defaultRunner, {
+        afterMarketplaceManifestInstalled() {
+          throw new Error('injected crash after prepared manifest installation');
+        },
+      })).rejects.toThrow('injected crash after prepared manifest installation');
+
+      const journalPath = marketplaceInitializationJournal(fixture);
+      const manifestPath = join(
+        fixture.base,
+        'v2',
+        'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'implement',
+        `issue-42-${UUID_A}`,
+        'manifest.json',
+      );
+      const prepared = readAttemptManifest(manifestPath);
+      if (
+        prepared.execution.backend !== 'marketplace'
+        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v2'
+      ) {
+        throw new Error('expected prepared marketplace execution');
+      }
+      transitionMarketplaceExecution(
+        manifestPath,
+        prepared.execution.state.requestDigest,
+        { status: 'submitted', submission: SUBMISSION_RESULT },
+        () => new Date('2026-07-20T00:02:00.000Z'),
+      );
+      const raw = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+        execution: {
+          state: {
+            requestDigest: string;
+            submission: { id: string };
+          };
+        };
+      };
+      if (contradiction === 'digest') {
+        raw.execution.state.requestDigest = `sha256:${'f'.repeat(64)}`;
+      } else {
+        raw.execution.state.submission.id =
+          'autopilot:22222222-2222-4222-8222-222222222222';
+      }
+      writeFileSync(manifestPath, `${JSON.stringify(raw, null, 2)}\n`, {
+        mode: 0o600,
+      });
+      const terminalBytes = readFileSync(manifestPath);
+      const resolveCredential = vi.fn(() => credential);
+      const runner = vi.fn(async () => '');
+
+      await expect(recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        runner,
+        resolveCredential,
+      )).rejects.toThrow(/terminal.*journal|conflicts.*journal/i);
+
+      expect(resolveCredential).not.toHaveBeenCalled();
+      expect(runner).not.toHaveBeenCalled();
+      expect(readFileSync(manifestPath)).toEqual(terminalBytes);
+      expect(existsSync(journalPath)).toBe(true);
+    },
+  );
+
+  it('accepts an agreeing terminal transition between prepared-manifest installation and readback', async () => {
+    const fixture = repositoryFixture();
+    const preparation = marketplacePreparation(fixture);
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: preparation,
+    }), defaultRunner, {
+      afterMarketplaceManifestInstalled(path, prepared) {
+        transitionMarketplaceExecution(
+          path,
+          prepared.execution.state.requestDigest,
+          { status: 'submitted', submission: SUBMISSION_RESULT },
+          () => new Date('2026-07-20T00:02:00.000Z'),
+        );
+      },
+    });
+
+    expect(manifest.execution).toMatchObject({
+      backend: 'marketplace',
+      state: { status: 'submitted' },
+    });
+    expect(existsSync(marketplaceInitializationJournalPathForTest(
+      fixture,
+    ))).toBe(false);
+  });
+
+  it.each(['submitted', 'cancelled'] as const)(
+    'preserves a %s winner when two stale initializers both observed no prepared manifest',
+    async (terminal) => {
+      const fixture = repositoryFixture();
+      const credential =
+        new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+      await expect(createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        credential,
+        marketplacePreparation: marketplacePreparation(fixture),
+      }), defaultRunner, {
+        beforeMarketplaceManifestInstall() {
+          throw new Error('injected crash immediately before manifest install');
+        },
+      })).rejects.toThrow('injected crash immediately before manifest install');
+
+      const journalPath = marketplaceInitializationJournal(fixture);
+      const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as {
+        manifest: AttemptManifest;
+      };
+      const manifestPath = journal.manifest.paths.manifest;
+      expect(existsSync(manifestPath)).toBe(false);
+      const firstRelease = deferred();
+      const secondRelease = deferred();
+      const bothAtBarrier = deferred();
+      const terminalInstalled = deferred();
+      let barrierCalls = 0;
+      let installCalls = 0;
+      const runtime = {
+        beforeMarketplaceManifestInstall() {
+          barrierCalls += 1;
+          if (barrierCalls === 2) bothAtBarrier.resolve();
+          return barrierCalls === 1
+            ? firstRelease.promise
+            : secondRelease.promise;
+        },
+        afterMarketplaceManifestInstalled(path: string, prepared: AttemptManifest) {
+          installCalls += 1;
+          if (
+            prepared.execution.backend !== 'marketplace'
+            || prepared.execution.state.schemaVersion
+              !== 'marketplace-execution-v2'
+          ) {
+            throw new Error('expected prepared marketplace manifest');
+          }
+          transitionMarketplaceExecution(
+            path,
+            prepared.execution.state.requestDigest,
+            terminal === 'submitted'
+              ? { status: 'submitted', submission: SUBMISSION_RESULT }
+              : { status: 'cancelled', reason: 'operator-cancelled' },
+            () => new Date('2026-07-20T00:02:00.000Z'),
+          );
+          terminalInstalled.resolve();
+        },
+      };
+      const resolveCredential = vi.fn(() => credential);
+      const first = recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        defaultRunner,
+        resolveCredential,
+        runtime,
+      );
+      const second = recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        defaultRunner,
+        resolveCredential,
+        runtime,
+      );
+
+      await withTimeout(bothAtBarrier.promise);
+      firstRelease.resolve();
+      await withTimeout(terminalInstalled.promise);
+      const terminalBytes = readFileSync(manifestPath);
+      secondRelease.resolve();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+
+      expect(firstResult[0]!.execution).toMatchObject({
+        backend: 'marketplace',
+        state: { status: terminal },
+      });
+      expect(secondResult[0]!.execution).toMatchObject({
+        backend: 'marketplace',
+        state: { status: terminal },
+      });
+      expect(installCalls).toBe(1);
+      expect(readFileSync(manifestPath)).toEqual(terminalBytes);
+      expect(existsSync(journalPath)).toBe(false);
+    },
+  );
+
+  it('retains the journal when a concurrent manifest-install winner contradicts its request identity', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      beforeMarketplaceManifestInstall() {
+        throw new Error('injected crash immediately before manifest install');
+      },
+    })).rejects.toThrow('injected crash immediately before manifest install');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as {
+      manifest: AttemptManifest;
+    };
+    const manifestPath = journal.manifest.paths.manifest;
+    const firstRelease = deferred();
+    const secondRelease = deferred();
+    const bothAtBarrier = deferred();
+    const contradictoryInstalled = deferred();
+    let barrierCalls = 0;
+    const runtime = {
+      beforeMarketplaceManifestInstall() {
+        barrierCalls += 1;
+        if (barrierCalls === 2) bothAtBarrier.resolve();
+        return barrierCalls === 1
+          ? firstRelease.promise
+          : secondRelease.promise;
+      },
+      afterMarketplaceManifestInstalled(path: string, prepared: AttemptManifest) {
+        if (
+          prepared.execution.backend !== 'marketplace'
+          || prepared.execution.state.schemaVersion
+            !== 'marketplace-execution-v2'
+        ) {
+          throw new Error('expected prepared marketplace manifest');
+        }
+        transitionMarketplaceExecution(
+          path,
+          prepared.execution.state.requestDigest,
+          { status: 'submitted', submission: SUBMISSION_RESULT },
+          () => new Date('2026-07-20T00:02:00.000Z'),
+        );
+        const raw = JSON.parse(readFileSync(path, 'utf8')) as {
+          execution: { state: { submission: { id: string } } };
+        };
+        raw.execution.state.submission.id =
+          'autopilot:22222222-2222-4222-8222-222222222222';
+        writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
+        contradictoryInstalled.resolve();
+      },
+    };
+    const first = recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+      runtime,
+    );
+    const second = recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+      runtime,
+    );
+
+    await withTimeout(bothAtBarrier.promise);
+    firstRelease.resolve();
+    await withTimeout(contradictoryInstalled.promise);
+    const contradictoryBytes = readFileSync(manifestPath);
+    secondRelease.resolve();
+    const outcomes = await Promise.allSettled([first, second]);
+
+    expect(outcomes.every((outcome) =>
+      outcome.status === 'rejected'
+      && /identity.*journal/i.test(String(outcome.reason)))).toBe(true);
+    expect(readFileSync(manifestPath)).toEqual(contradictoryBytes);
+    expect(existsSync(journalPath)).toBe(true);
+  });
+
+  it('fails closed when initialization cannot resolve the exact recorded login', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      afterMarketplaceJournalInstalled() {
+        throw new Error('injected crash after journal installation');
+      },
+    })).rejects.toThrow('injected crash after journal installation');
+
+    await expect(recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => new SelectedCredential('other-bot', 'implementation', 'other-secret'),
+    )).rejects.toThrow(/credential.*recorded login/i);
+    expect(existsSync(marketplaceInitializationJournal(fixture))).toBe(true);
+  });
+
+  it('rejects a journal whose arbitrary direct-child path is not its subject and attempt identity before any side effect', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      afterMarketplaceJournalInstalled() {
+        throw new Error('injected journal-only crash');
+      },
+    })).rejects.toThrow('injected journal-only crash');
+
+    const originalJournal = marketplaceInitializationJournal(fixture);
+    const raw = JSON.parse(readFileSync(originalJournal, 'utf8')) as {
+      manifest: AttemptManifest;
+    };
+    const arbitraryAttemptDir = join(dirname(originalJournal), 'arbitrary-child');
+    raw.manifest.paths = {
+      attemptDir: arbitraryAttemptDir,
+      worktree: join(arbitraryAttemptDir, 'worktree'),
+      manifest: join(arbitraryAttemptDir, 'manifest.json'),
+      log: join(arbitraryAttemptDir, 'session.log'),
+      ghConfigDir: join(arbitraryAttemptDir, 'gh-config'),
+      askpass: join(arbitraryAttemptDir, 'askpass'),
+      tokenFile: join(arbitraryAttemptDir, 'gh-token'),
+    };
+    if (
+      raw.manifest.execution.backend !== 'marketplace'
+      || raw.manifest.execution.state.schemaVersion
+        !== 'marketplace-execution-v2'
+    ) {
+      throw new Error('expected marketplace journal');
+    }
+    raw.manifest.execution.state.requestPath =
+      join(arbitraryAttemptDir, 'marketplace-request.json');
+    raw.manifest.execution.state.solverNetSelectionPath =
+      `${raw.manifest.execution.state.requestPath}.solvernet-selection.json`;
+    const tamperedJournal = join(
+      dirname(originalJournal),
+      '.arbitrary-child.marketplace-initialization.json',
+    );
+    renameSync(originalJournal, tamperedJournal);
+    writeFileSync(tamperedJournal, `${JSON.stringify(raw, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    const resolveCredential = vi.fn(() => credential);
+    const runner = vi.fn(async () => '');
+
+    await expect(recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      runner,
+      resolveCredential,
+    )).rejects.toThrow(/subject.*attempt|attempt.*identity/i);
+
+    expect(resolveCredential).not.toHaveBeenCalled();
+    expect(runner).not.toHaveBeenCalled();
+    expect(existsSync(arbitraryAttemptDir)).toBe(false);
+    expect(existsSync(tamperedJournal)).toBe(true);
+  });
+
+  it('re-establishes repository identity before repairing an interrupted worktree', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+    let interrupted = false;
+    const crashRunner: CommandRunner = async (command, args, runnerOptions) => {
+      const result = await defaultRunner(command, args, runnerOptions);
+      if (
+        !interrupted
+        && command === 'git'
+        && args.includes('worktree')
+        && args.includes('add')
+      ) {
+        interrupted = true;
+        throw new Error('injected crash after worktree registration');
+      }
+      return result;
+    };
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), crashRunner)).rejects.toThrow('injected crash after worktree registration');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as {
+      manifest: AttemptManifest;
+    };
+    writeFileSync(
+      join(journal.manifest.paths.worktree, 'partial-checkout'),
+      'dirty\n',
+    );
+    git(fixture.repo, ['remote', 'set-url', 'origin', join(fixture.root, 'other.git')]);
+    let removeCalls = 0;
+    const recoveryRunner: CommandRunner = async (command, args, runnerOptions) => {
+      if (
+        command === 'git'
+        && args.includes('worktree')
+        && args.includes('remove')
+      ) {
+        removeCalls += 1;
+      }
+      return defaultRunner(command, args, runnerOptions);
+    };
+
+    await expect(recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      recoveryRunner,
+      () => credential,
+    )).rejects.toThrow(/repository identity.*match/i);
+
+    expect(removeCalls).toBe(0);
+    expect(readFileSync(
+      join(journal.manifest.paths.worktree, 'partial-checkout'),
+      'utf8',
+    )).toBe('dirty\n');
+    expect(existsSync(journalPath)).toBe(true);
+  });
+
+  it('accepts a bodyless task snapshot whose required problem statement falls back to its title', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(
+        fixture,
+        'implementation',
+        '',
+      ),
+    }), defaultRunner);
+    if (
+      manifest.execution.backend !== 'marketplace'
+      || manifest.execution.state.schemaVersion !== 'marketplace-execution-v2'
+    ) {
+      throw new Error('expected a version-2 marketplace execution');
+    }
+
+    const request = verifyMarketplaceTaskRequest(
+      manifest.execution.state.requestPath,
+      manifest.execution.state.requestDigest,
+    );
+    expect(request.spec.session.taskSnapshot.body).toBe('');
+    expect(request.spec.problem_statement)
+      .toBe('Publish one durable marketplace task');
+  });
+
+  it('retains only the exact journal-owned attempt when marketplace initialization is interrupted before worktree creation', async () => {
+    const fixture = repositoryFixture();
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const sibling = join(dirname(attemptDir), 'keep-me');
+    mkdirSync(sibling, { recursive: true });
+    writeFileSync(join(sibling, 'sentinel'), 'preserve\n');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      persistMarketplaceTaskRequest(requestPath, request) {
+        persistMarketplaceTaskRequest(requestPath, request);
+        throw new Error('injected post-request initialization failure');
+      },
+    })).rejects.toThrow('injected post-request initialization failure');
+
+    expect(existsSync(attemptDir)).toBe(true);
+    expect(existsSync(marketplaceInitializationJournal(fixture))).toBe(true);
+    expect(readFileSync(join(sibling, 'sentinel'), 'utf8')).toBe('preserve\n');
+    expect(git(fixture.repo, ['worktree', 'list', '--porcelain']))
+      .not.toContain(join(attemptDir, 'worktree'));
+  });
+
+  it('rejects a schema-valid marketplace capsule that contradicts its attempt binding before side effects', async () => {
+    const fixture = repositoryFixture();
+    const preparation = marketplacePreparation(fixture);
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const request = structuredClone(preparation.request);
+    request.spec.session.branch = 'autopilot/wrong-issue';
+    let worktreeAdds = 0;
+    const runner: CommandRunner = async (command, args, runnerOptions) => {
+      if (command === 'git' && args.includes('worktree') && args.includes('add')) {
+        worktreeAdds += 1;
+      }
+      return defaultRunner(command, args, runnerOptions);
+    };
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: {
+        ...preparation,
+        request,
+      },
+    }), runner)).rejects.toThrow(/marketplace preparation.*branch/i);
+
+    expect(existsSync(attemptDir)).toBe(false);
+    expect(worktreeAdds).toBe(0);
+  });
+
+  it.each([
+    ['implementation', 'implement'],
+    ['review-finding', 'fix-child'],
+    ['reconcile', 'reconcile'],
+    ['ci-failure', 'ci-failure'],
+  ] as const)(
+    'accepts the canonical %s workflow discriminator as %s',
+    async (workflow, expectedSessionWorkflow) => {
+      const fixture = repositoryFixture();
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        marketplacePreparation: marketplacePreparation(fixture, workflow),
+      }), defaultRunner);
+      if (
+        manifest.execution.backend !== 'marketplace'
+        || manifest.execution.state.schemaVersion !== 'marketplace-execution-v2'
+      ) {
+        throw new Error('expected a version-2 marketplace execution');
+      }
+
+      expect(verifyMarketplaceTaskRequest(
+        manifest.execution.state.requestPath,
+        manifest.execution.state.requestDigest,
+      ).spec.session.workflow).toBe(expectedSessionWorkflow);
+    },
+  );
+
+  it('atomically transitions a prepared marketplace execution to submitted for its expected digest', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+
+    const transitioned = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:02:00.000Z'),
+    );
+
+    expect(transitioned.execution).toEqual({
+      backend: 'marketplace',
+      state: {
+        schemaVersion: 'marketplace-execution-v2',
+        status: 'submitted',
+        requestPath: join(fixture.root, 'marketplace-request.json'),
+        requestDigest,
+        solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+        preparedAt: '2026-07-20T00:01:00.000Z',
+        agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+        adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        submission: SUBMISSION_RESULT,
+        submittedAt: '2026-07-20T00:02:00.000Z',
+      },
+    });
+    expect(transitioned.timestamps.updatedAt).toBe('2026-07-20T00:02:00.000Z');
+    expect(readAttemptManifest(manifest.paths.manifest)).toEqual(transitioned);
+  });
+
+  it('atomically transitions a prepared marketplace execution to cancelled with its stable reason', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+
+    const cancelled = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'cancelled', reason: 'operator-cancelled' },
+      () => new Date('2026-07-20T00:02:00.000Z'),
+    );
+
+    expect(cancelled.execution).toMatchObject({
+      backend: 'marketplace',
+      state: {
+        schemaVersion: 'marketplace-execution-v2',
+        status: 'cancelled',
+        requestDigest,
+        cancelledAt: '2026-07-20T00:02:00.000Z',
+        reason: 'operator-cancelled',
+      },
+    });
+    expect(cancelled.timestamps.updatedAt).toBe('2026-07-20T00:02:00.000Z');
+  });
+
+  it('rejects local and stale-digest transitions before an atomic manifest rewrite', async () => {
+    const fixture = repositoryFixture();
+    const local = await createAttemptWorkspace(options(fixture), defaultRunner);
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    expect(() => transitionMarketplaceExecution(
+      local.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+    )).toThrow(/Only marketplace attempts/i);
+
+    const marketplace = await createAttemptWorkspace(options(fixture, {
+      attemptId: UUID_B,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const original = readFileSync(marketplace.paths.manifest, 'utf8');
+
+    expect(() => transitionMarketplaceExecution(
+      marketplace.paths.manifest,
+      `sha256:${'b'.repeat(64)}`,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+    )).toThrow(/request digest changed/i);
+    expect(readFileSync(marketplace.paths.manifest, 'utf8')).toBe(original);
+  });
+
+  it('makes matching marketplace resubmission idempotent and rejects contradictory resubmission', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const submitted = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:02:00.000Z'),
+    );
+    const persisted = readFileSync(manifest.paths.manifest, 'utf8');
+    expect(existsSync(`${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`)).toBe(true);
+
+    expect(transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:03:00.000Z'),
+    )).toEqual(submitted);
+    expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(persisted);
+    expect(() => transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: { ...SUBMISSION_RESULT, taskId: 'task-43' } },
+    )).toThrow(/contradictory submission/i);
+    expect(() => transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'cancelled', reason: 'operator-cancelled' },
+    )).toThrow(/Only a prepared/i);
+    expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(persisted);
+  });
+
+  it('strictly decodes version-2 state fields and the complete SDK submission result', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    const requestPath = join(fixture.root, 'marketplace-request.json');
+    const selectionPath = join(fixture.root, 'solvernet-selection.json');
+    const prepared = {
+      schemaVersion: 'marketplace-execution-v2',
+      status: 'prepared',
+      requestPath,
+      requestDigest: `sha256:${'a'.repeat(64)}`,
+      solverNetSelectionPath: selectionPath,
+      preparedAt: '2026-07-20T00:01:00.000Z',
+      agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+      adoptionDeadline: '2026-07-20T01:30:00.000Z',
+    };
+    const invalidExecutions = [
+      { backend: 'marketplace', state: { ...prepared, requestDigest: 'sha256:short' } },
+      { backend: 'marketplace', state: { ...prepared, unexpected: true } },
+      {
+        backend: 'marketplace',
+        state: {
+          ...prepared,
+          status: 'submitted',
+          submission: { ...SUBMISSION_RESULT, unexpected: true },
+          submittedAt: '2026-07-20T00:02:00.000Z',
+        },
+      },
+      {
+        backend: 'marketplace',
+        state: {
+          ...prepared,
+          status: 'cancelled',
+          cancelledAt: 'not-a-timestamp',
+          reason: 'operator-cancelled',
+        },
+      },
+    ];
+
+    for (const execution of invalidExecutions) {
+      expect(() => decodeAttemptManifest({ ...raw, execution })).toThrow();
+    }
+  });
+
+  it('rejects terminal marketplace timestamps and transition clocks that predate durable state', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      now: () => new Date('2026-07-20T00:03:00.000Z'),
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    const state = (raw.execution as { state: Record<string, unknown> }).state;
+    const submittedBeforePrepared = {
+      backend: 'marketplace',
+      state: {
+        ...state,
+        status: 'submitted',
+        submission: SUBMISSION_RESULT,
+        submittedAt: '2026-07-20T00:00:00.000Z',
+      },
+    };
+    const cancelledBeforePrepared = {
+      backend: 'marketplace',
+      state: {
+        ...state,
+        status: 'cancelled',
+        cancelledAt: '2026-07-20T00:00:00.000Z',
+        reason: 'operator-cancelled',
+      },
+    };
+    const submittedAfterOuterUpdate = {
+      backend: 'marketplace',
+      state: {
+        ...state,
+        status: 'submitted',
+        submission: SUBMISSION_RESULT,
+        submittedAt: '2026-07-20T00:04:00.000Z',
+      },
+    };
+    const cancelledAfterOuterUpdate = {
+      backend: 'marketplace',
+      state: {
+        ...state,
+        status: 'cancelled',
+        cancelledAt: '2026-07-20T00:04:00.000Z',
+        reason: 'operator-cancelled',
+      },
+    };
+    const original = readFileSync(manifest.paths.manifest, 'utf8');
+
+    expect(() => decodeAttemptManifest({ ...raw, execution: submittedBeforePrepared })).toThrow(
+      /submitted timestamp.*preparation/i,
+    );
+    expect(() => decodeAttemptManifest({ ...raw, execution: cancelledBeforePrepared })).toThrow(
+      /cancelled timestamp.*preparation/i,
+    );
+    expect(() => decodeAttemptManifest({ ...raw, execution: submittedAfterOuterUpdate })).toThrow(
+      /submitted timestamp.*manifest updated/i,
+    );
+    expect(() => decodeAttemptManifest({ ...raw, execution: cancelledAfterOuterUpdate })).toThrow(
+      /cancelled timestamp.*manifest updated/i,
+    );
+    expect(() => transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:02:00.000Z'),
+    )).toThrow(/transition timestamp.*updated/i);
+    expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(original);
+  });
+
+  it('rejects an invalid runtime transition status without rewriting the prepared manifest', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const original = readFileSync(manifest.paths.manifest, 'utf8');
+
+    expect(() => transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'invalid', reason: 'must-not-cancel' } as unknown as {
+        status: 'cancelled'; reason: string;
+      },
+    )).toThrow(/invalid marketplace execution transition/i);
+    expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(original);
+  });
+
+  it('preserves the exact manifest bytes when a cancelled marketplace transition is replayed', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const cancelled = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'cancelled', reason: 'operator-cancelled' },
+      () => new Date('2026-07-20T00:02:00.000Z'),
+    );
+    const persisted = readFileSync(manifest.paths.manifest, 'utf8');
+
+    expect(transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'cancelled', reason: 'operator-cancelled' },
+      () => new Date('2026-07-20T00:03:00.000Z'),
+    )).toEqual(cancelled);
+    expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(persisted);
+  });
+
+  it('uses one durable terminal winner when submitted and cancelled workers race', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+
+    const [submitted, cancelled] = await Promise.all([
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'submitted', submission: SUBMISSION_RESULT },
+      }),
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'cancelled', reason: 'operator-cancelled' },
+      }),
+    ]);
+
+    expect([submitted.result.ok, cancelled.result.ok].filter(Boolean)).toHaveLength(1);
+    const terminal = JSON.parse(readFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      'utf8',
+    )) as Record<string, unknown>;
+    const terminalMetadata = lstatSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+    );
+    const current = readAttemptManifest(manifest.paths.manifest);
+    expect(terminalMetadata.isFile()).toBe(true);
+    expect(terminalMetadata.isSymbolicLink()).toBe(false);
+    expect(terminalMetadata.mode & 0o777).toBe(0o600);
+    expect(current.execution).toMatchObject({
+      backend: 'marketplace',
+      state: { status: terminal.status },
+    });
+    expect((current.execution as { state: Record<string, unknown> }).state.requestDigest)
+      .toBe(terminal.requestDigest);
+  });
+
+  it('repairs a prepared manifest from committed terminal evidence after a crash before rename', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    writeFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      JSON.stringify({
+        schemaVersion: 'marketplace-terminal-v1',
+        requestDigest,
+        status: 'submitted',
+        submission: SUBMISSION_RESULT,
+        submittedAt: '2026-07-20T00:02:00.000Z',
+      }),
+      { mode: 0o600 },
+    );
+
+    const repaired = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:03:00.000Z'),
+    );
+
+    expect(repaired.execution).toMatchObject({
+      backend: 'marketplace',
+      state: {
+        status: 'submitted',
+        submittedAt: '2026-07-20T00:02:00.000Z',
+      },
+    });
+    expect(repaired.timestamps.updatedAt).toBe('2026-07-20T00:02:00.000Z');
+  });
+
+  it('keeps a newer manifest update timestamp while repairing committed terminal evidence', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    writeFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      JSON.stringify({
+        schemaVersion: 'marketplace-terminal-v1',
+        requestDigest,
+        status: 'submitted',
+        submission: SUBMISSION_RESULT,
+        submittedAt: '2026-07-20T00:02:00.000Z',
+      }),
+      { mode: 0o600 },
+    );
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    writeFileSync(manifest.paths.manifest, JSON.stringify({
+      ...raw,
+      timestamps: { ...(raw.timestamps as Record<string, unknown>), updatedAt: '2026-07-20T00:03:00.000Z' },
+    }));
+
+    const repaired = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+      () => new Date('2026-07-20T00:04:00.000Z'),
+    );
+
+    expect((repaired.execution as { state: Record<string, unknown> }).state.submittedAt)
+      .toBe('2026-07-20T00:02:00.000Z');
+    expect(repaired.timestamps.updatedAt).toBe('2026-07-20T00:03:00.000Z');
+  });
+
+  it('accepts an equivalent SDK submit replay but persists the terminal winner wrapper', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const winner = {
+      ...SUBMISSION_RESULT,
+      attemptId: 'solver-attempt-42',
+      attemptNumber: 7,
+    };
+    const replay = {
+      ...winner,
+      generatedAt: '2026-07-20T00:03:00.000Z',
+      status: 'already_submitted',
+      idempotent: true,
+    } as const;
+
+    const submitted = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: winner },
+      () => new Date('2026-07-20T00:02:00.000Z'),
+    );
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+    const execution = raw.execution as { readonly state: Record<string, unknown> };
+    writeFileSync(manifest.paths.manifest, JSON.stringify({
+      ...raw,
+      execution: {
+        backend: 'marketplace',
+        state: { ...execution.state, submission: replay },
+      },
+    }));
+    const replayed = transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: replay },
+      () => new Date('2026-07-20T00:04:00.000Z'),
+    );
+
+    expect(replayed).toEqual(submitted);
+    expect((replayed.execution as { state: Record<string, unknown> }).state.submission)
+      .toEqual(winner);
+    expect(() => transitionMarketplaceExecution(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: { ...replay, taskId: 'task-43' } },
+    )).toThrow(/contradictory submission/i);
+  });
+
+  it('fails closed without rewriting when terminal evidence is malformed or bound to another digest', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const malformed = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const malformedOriginal = readFileSync(malformed.paths.manifest, 'utf8');
+    writeFileSync(
+      `${malformed.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      '{bad json',
+      { mode: 0o600 },
+    );
+    expect(() => transitionMarketplaceExecution(
+      malformed.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+    )).toThrow(/terminal evidence/i);
+    expect(readFileSync(malformed.paths.manifest, 'utf8')).toBe(malformedOriginal);
+
+    const mismatched = await createAttemptWorkspace(options(fixture, {
+      attemptId: UUID_B,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    const mismatchedOriginal = readFileSync(mismatched.paths.manifest, 'utf8');
+    writeFileSync(
+      `${mismatched.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      JSON.stringify({
+        schemaVersion: 'marketplace-terminal-v1',
+        requestDigest: `sha256:${'b'.repeat(64)}`,
+        status: 'cancelled',
+        reason: 'operator-cancelled',
+        cancelledAt: '2026-07-20T00:02:00.000Z',
+      }),
+      { mode: 0o600 },
+    );
+    expect(() => transitionMarketplaceExecution(
+      mismatched.paths.manifest,
+      requestDigest,
+      { status: 'submitted', submission: SUBMISSION_RESULT },
+    )).toThrow(/terminal evidence.*digest/i);
+    expect(readFileSync(mismatched.paths.manifest, 'utf8')).toBe(mismatchedOriginal);
+  });
+
+  it.each(['permissive-mode', 'symlink'] as const)(
+    'rejects %s terminal evidence without rewriting the prepared manifest',
+    async (kind) => {
+      const fixture = repositoryFixture();
+      const requestDigest = `sha256:${'a'.repeat(64)}`;
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        execution: {
+          backend: 'marketplace',
+          state: {
+            schemaVersion: 'marketplace-execution-v2',
+            status: 'prepared',
+            requestPath: join(fixture.root, 'marketplace-request.json'),
+            requestDigest,
+            solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+            preparedAt: '2026-07-20T00:01:00.000Z',
+            agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+            adoptionDeadline: '2026-07-20T01:30:00.000Z',
+          },
+        },
+      }), defaultRunner);
+      const preparedBytes = readFileSync(manifest.paths.manifest);
+      transitionMarketplaceExecution(
+        manifest.paths.manifest,
+        requestDigest,
+        { status: 'cancelled', reason: 'operator-cancelled' },
+        () => new Date('2026-07-20T00:02:00.000Z'),
+      );
+      writeFileSync(manifest.paths.manifest, preparedBytes);
+      const terminalPath =
+        `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`;
+      if (kind === 'permissive-mode') {
+        chmodSync(terminalPath, 0o644);
+      } else {
+        const targetPath = `${terminalPath}.target`;
+        renameSync(terminalPath, targetPath);
+        symlinkSync(targetPath, terminalPath);
+      }
+
+      expect(() => transitionMarketplaceExecution(
+        manifest.paths.manifest,
+        requestDigest,
+        { status: 'cancelled', reason: 'operator-cancelled' },
+      )).toThrow(/terminal evidence/i);
+      expect(readFileSync(manifest.paths.manifest)).toEqual(preparedBytes);
+    },
+  );
+
+  it('reserves every generic manifest writer for local and legacy marketplace attempts', async () => {
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const marketplaceExecution = (fixture: ReturnType<typeof repositoryFixture>) => ({
+      backend: 'marketplace' as const,
+      state: {
+        schemaVersion: 'marketplace-execution-v2' as const,
+        status: 'prepared' as const,
+        requestPath: join(fixture.root, 'marketplace-request.json'),
+        requestDigest,
+        solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+        preparedAt: '2026-07-20T00:01:00.000Z',
+        agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+        adoptionDeadline: '2026-07-20T01:30:00.000Z',
+      },
+    });
+    const writers: Array<readonly [
+      string,
+      Partial<CreateAttemptOptions>,
+      (manifest: AttemptManifest) => unknown,
+    ]> = [
+      ['updateAttemptManifest', {}, (manifest) => updateAttemptManifest(
+        manifest.paths.manifest,
+        (current) => current,
+      )],
+      ['markAttemptRunning', {}, (manifest) => markAttemptRunning(manifest.paths.manifest, 4242)],
+      ['markAttemptExited', {}, (manifest) => markAttemptExited(manifest.paths.manifest)],
+      ['advanceAttemptExpectedHead', {}, (manifest) => advanceAttemptExpectedHead(
+        manifest.paths.manifest,
+        manifest.expectedHead,
+        'a'.repeat(40),
+      )],
+      ['advanceAttemptReviewPair', {
+        phase: 'review',
+        subject: 'pr-7',
+        prNumber: 7,
+        reviewGeneration: UUID_C,
+        reviewRefOid: 'b'.repeat(40),
+        reviewApprovalPolicy: 'approve-eligible',
+      }, (manifest) => advanceAttemptReviewPair(
+        manifest.paths.manifest,
+        manifest.expectedHead,
+        manifest.reviewRefOid!,
+        'c'.repeat(40),
+        'd'.repeat(40),
+      )],
+    ];
+
+    for (const [name, overrides, writer] of writers) {
+      const fixture = repositoryFixture();
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        ...overrides,
+        ...(name === 'advanceAttemptReviewPair' ? { reviewRefOid: fixture.oid } : {}),
+        execution: marketplaceExecution(fixture),
+      }), defaultRunner);
+      const original = readFileSync(manifest.paths.manifest, 'utf8');
+      let error: unknown;
+      try {
+        writer(manifest);
+      } catch (caught) {
+        error = caught;
+      }
+      expect.soft(String(error), `${name} must direct v2 marketplace callers`).toMatch(
+        /marketplace execution v2 must use dedicated marketplace transition APIs/i,
+      );
+      expect.soft(readFileSync(manifest.paths.manifest, 'utf8'), `${name} must not rewrite`)
+        .toBe(original);
+    }
+
+    const localFixture = repositoryFixture();
+    const local = await createAttemptWorkspace(options(localFixture), defaultRunner);
+    expect(updateAttemptManifest(local.paths.manifest, (current) => current)).toEqual(local);
+    expect(markAttemptRunning(local.paths.manifest, 4242).processState).toBe('running');
+    expect(markAttemptExited(local.paths.manifest).processState).toBe('exited');
+
+    const localHead = await createAttemptWorkspace(options(localFixture, { attemptId: UUID_B }), defaultRunner);
+    expect(advanceAttemptExpectedHead(
+      localHead.paths.manifest,
+      localHead.expectedHead,
+      'a'.repeat(40),
+    ).expectedHead).toBe('a'.repeat(40));
+
+    const localReview = await createAttemptWorkspace(options(localFixture, {
+      attemptId: UUID_C,
+      phase: 'review',
+      subject: 'pr-7',
+      prNumber: 7,
+      reviewGeneration: UUID_C,
+      reviewRefOid: localFixture.oid,
+      reviewApprovalPolicy: 'approve-eligible',
+    }), defaultRunner);
+    expect(advanceAttemptReviewPair(
+      localReview.paths.manifest,
+      localReview.expectedHead,
+      localReview.reviewRefOid!,
+      'b'.repeat(40),
+      'c'.repeat(40),
+    ).expectedHead).toBe('b'.repeat(40));
+
+    const legacyFixture = repositoryFixture();
+    const legacy = await createAttemptWorkspace(options(legacyFixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v1',
+          status: 'unsubmitted',
+          requestPath: join(legacyFixture.root, 'legacy-marketplace-request.json'),
+        },
+      },
+    }), defaultRunner);
+    expect(markAttemptRunning(legacy.paths.manifest, 4242).processState).toBe('running');
+  });
+
+  it('converges concurrent same-outcome marketplace transition writers on the durable winner', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: '2026-07-20T00:01:00.000Z',
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+        },
+      },
+    }), defaultRunner);
+
+    const results = await Promise.all([
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'submitted', submission: SUBMISSION_RESULT },
+      }),
+      transitionInWorker({
+        manifestPath: manifest.paths.manifest,
+        requestDigest,
+        transition: { status: 'submitted', submission: SUBMISSION_RESULT },
+      }),
+    ]);
+
+    expect(results.map(({ result }) => result.ok)).toEqual([true, true]);
+    const winner = JSON.parse(readFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      'utf8',
+    )) as { readonly submission: unknown };
+    expect((readAttemptManifest(manifest.paths.manifest).execution as {
+      readonly state: { readonly submission: unknown };
+    }).state.submission).toEqual(winner.submission);
   });
 
   it('rejects malformed execution discriminants and marketplace state records', async () => {
@@ -772,6 +2657,58 @@ describe('attempt workspace and manifest', () => {
       one.runnerId,
       (pid) => pid === 100 || pid === 200,
     ).map((attempt) => attempt.attemptId).sort()).toEqual([UUID_A, UUID_C]);
+  });
+
+  it('counts prepared and submitted marketplace attempts without a live local PID but excludes cancelled ones', async () => {
+    const fixture = repositoryFixture();
+    const runnerId = 'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const common = {
+      schemaVersion: 'marketplace-execution-v2' as const,
+      requestPath: join(fixture.root, 'marketplace-request.json'),
+      requestDigest,
+      solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+      preparedAt: '2026-07-20T00:01:00.000Z',
+      agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+      adoptionDeadline: '2026-07-20T01:30:00.000Z',
+    };
+    await createAttemptWorkspace(options(fixture, {
+      execution: { backend: 'marketplace', state: { ...common, status: 'prepared' } },
+    }), defaultRunner);
+    await createAttemptWorkspace(options(fixture, {
+      attemptId: UUID_B,
+      pid: 200,
+      now: () => new Date('2026-07-20T00:02:00.000Z'),
+      execution: {
+        backend: 'marketplace',
+        state: {
+          ...common,
+          status: 'submitted',
+          submission: SUBMISSION_RESULT,
+          submittedAt: '2026-07-20T00:02:00.000Z',
+        },
+      },
+    }), defaultRunner);
+    await createAttemptWorkspace(options(fixture, {
+      attemptId: UUID_C,
+      pid: 300,
+      now: () => new Date('2026-07-20T00:02:00.000Z'),
+      execution: {
+        backend: 'marketplace',
+        state: {
+          ...common,
+          status: 'cancelled',
+          cancelledAt: '2026-07-20T00:02:00.000Z',
+          reason: 'operator-cancelled',
+        },
+      },
+    }), defaultRunner);
+
+    expect(listRunnerLiveAttempts(
+      join(fixture.base, 'v2'),
+      runnerId,
+      (pid) => pid === 300,
+    ).map((attempt) => attempt.attemptId).sort()).toEqual([UUID_A, UUID_B]);
   });
 });
 
