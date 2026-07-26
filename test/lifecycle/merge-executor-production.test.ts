@@ -9,6 +9,7 @@ import type {
   NativeReviewSnapshot,
 } from '../../src/lifecycle/snapshot.js';
 import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
+import { resolveStructuredPullRequestMappings } from '../../src/lifecycle/pr-mapping.js';
 
 const HEAD = gitOid('1'.repeat(40));
 const OTHER_HEAD = gitOid('2'.repeat(40));
@@ -372,23 +373,83 @@ describe('production head-pinned merge port', () => {
   });
 
   it.each([
-    'a newly opened unlabeled duplicate',
-    'a closed custom parent',
-  ])('rejects %s from the final complete canonical snapshot before merge', async () => {
+    {
+      name: 'a newly opened unlabeled duplicate',
+      livePullRequests: [
+        {
+          number: 84,
+          state: 'OPEN' as const,
+          head: HEAD,
+          headRefName: 'autopilot/84',
+          baseRefName: 'stack/base',
+          closingIssueNumbers: [84],
+          body: '',
+        },
+        {
+          number: 83,
+          state: 'OPEN' as const,
+          head: BASE,
+          headRefName: 'stack/base',
+          baseRefName: 'next',
+          closingIssueNumbers: [83],
+          body: 'Closes #83',
+        },
+        {
+          number: 85,
+          state: 'OPEN' as const,
+          head: OTHER_HEAD,
+          headRefName: 'feature/retry-84',
+          baseRefName: 'next',
+          closingIssueNumbers: [84],
+          body: 'Closes #84',
+        },
+      ],
+    },
+    {
+      name: 'a custom parent that disappeared from the complete open-PR world',
+      livePullRequests: [{
+        number: 84,
+        state: 'OPEN' as const,
+        head: HEAD,
+        headRefName: 'autopilot/84',
+        baseRefName: 'stack/base',
+        closingIssueNumbers: [84],
+        body: '',
+      }],
+    },
+  ])(
+    'rejects $name from a distinctly recomputed final canonical snapshot before merge',
+    async ({ livePullRequests }) => {
     let mergeCalls = 0;
+    const current = snapshot();
+    const mappings = resolveStructuredPullRequestMappings({
+      defaultBranch: 'next',
+      issues: [
+        { number: 84, blockedOn: 'Another issue', blockedByIssues: [83] },
+        { number: 83, blockedOn: 'Nothing', blockedByIssues: [] },
+      ],
+      pullRequests: livePullRequests,
+      stableBranches: [],
+    });
+    expect(mappings.find((mapping) => mapping.prNumber === 84)?.status).toBe('ambiguous');
     const ambiguous: GitHubLifecycleSnapshot = {
-      ...snapshot(),
-      diagnostics: [{
-        issueNumber: 84,
-        pullRequests: [{ number: 84, head: HEAD }],
-        reason: 'ambiguous',
-      }],
-      pullRequestMappings: [{
-        status: 'ambiguous',
-        prNumber: 84,
-        issueNumbers: [84],
-        details: ['Live canonical relation evidence changed'],
-      }],
+      ...current,
+      pullRequests: [
+        current.pullRequests[0]!,
+        ...livePullRequests
+          .filter((pr) => pr.number !== 84)
+          .map((pr) => ({
+            ...current.pullRequests[0]!,
+            number: pr.number,
+            headOid: pr.head,
+            headRefName: pr.headRefName,
+            baseRefName: pr.baseRefName,
+            closingIssueNumbers: pr.closingIssueNumbers,
+            body: pr.body,
+            labels: [],
+          })),
+      ],
+      pullRequestMappings: mappings,
     } as unknown as GitHubLifecycleSnapshot;
     const port = makeProductionMergeActionPort({
       readSnapshot: async () => ambiguous,

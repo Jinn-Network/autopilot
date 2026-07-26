@@ -6,6 +6,7 @@ import {
   makeProductionReconciliationWriter,
   type ReconciliationPullRequestNode,
 } from '../../src/lifecycle/reconciliation-writer-production.js';
+import { resolveStructuredPullRequestMappings } from '../../src/lifecycle/pr-mapping.js';
 import { executeProjectionPlan } from '../../src/lifecycle/reconciler.js';
 import { planProjection, type ProjectionAction } from '../../src/lifecycle/projection.js';
 import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
@@ -379,14 +380,53 @@ function targetedWriterOptions(
   };
 }
 
-function obsoleteMappingRepairSecurityHarness(
-  change:
-    | 'maintainer-label'
-    | 'changed-head-after-cas'
-    | 'new-generation-after-cas'
-    | 'ambiguous-after-cas'
-    | 'duplicate-comment-after-cas',
-) {
+type ObsoleteMappingRepairChange =
+  | 'maintainer-label-after-cas'
+  | 'maintainer-draft-after-cas'
+  | 'unstructured-maintainer-comment-after-cas'
+  | 'changed-head-after-cas'
+  | 'new-generation-after-cas'
+  | 'contradictory-marker-after-cas'
+  | 'unlabeled-duplicate-after-cas'
+  | 'custom-parent-closed-after-cas'
+  | 'duplicate-at-final-comment-boundary';
+
+function canonicalizeMappings(
+  current: GitHubLifecycleSnapshot,
+): GitHubLifecycleSnapshot {
+  return {
+    ...current,
+    pullRequestMappings: resolveStructuredPullRequestMappings({
+      defaultBranch: 'next',
+      issues: current.issues.map((issue) => ({
+        number: issue.number,
+        blockedOn: issue.blockedOn,
+        blockedByIssues: issue.blockedByIssues,
+      })),
+      pullRequests: current.pullRequests.map((pr) => ({
+        number: pr.number,
+        state: pr.state,
+        head: pr.headOid,
+        headRefName: pr.headRefName,
+        baseRefName: pr.baseRefName,
+        closingIssueNumbers: pr.closingIssueNumbers,
+        body: pr.body,
+        ...(pr.humanIssueNumber === undefined
+          ? {}
+          : { humanIssueNumber: pr.humanIssueNumber }),
+      })),
+      stableBranches: current.branches.map((branch) => ({
+        issueNumber: branch.issueNumber,
+        phase: branch.claim.phase,
+        head: branch.headOid,
+        headRefName: branch.headRefName,
+        targetBase: branch.claim.targetBase,
+      })),
+    }),
+  };
+}
+
+function obsoleteMappingRepairSecurityHarness(change: ObsoleteMappingRepairChange) {
   const generation = '22222222-2222-4222-8222-222222222222';
   const newerGeneration = '99999999-9999-4999-8999-999999999999';
   const marker =
@@ -418,72 +458,177 @@ function obsoleteMappingRepairSecurityHarness(
     ...stale,
     generation: newerGeneration,
   };
-  const cycleBase = snapshot(true, { projectStatus: 'Human' });
-  const cycle: GitHubLifecycleSnapshot = {
+  const cycleBase = snapshot(false, { projectStatus: 'Human' });
+  let cycle: GitHubLifecycleSnapshot = canonicalizeMappings({
     ...cycleBase,
     pullRequests: cycleBase.pullRequests.map((pr) => ({
       ...pr,
-      labels: ['engine:review', 'review:needs-human'],
+      labels: ['engine:review'],
       humanIssueNumber: 42,
       humanAuthor: 'implementation-bot',
       humanHead: HEAD,
       humanGeneration: generation,
-      humanLabelActor: change === 'maintainer-label'
-        ? 'maintainer'
-        : 'implementation-bot',
-      draftActor: 'implementation-bot',
+      humanLabelActor: undefined,
+      draftActor: undefined,
       humanReason: reason,
       reviewClaim: { oid: CLAIM_OID, record: before },
     })),
-  };
+  });
+  if (change === 'custom-parent-closed-after-cas') {
+    const parentIssue = {
+      ...cycle.issues[0]!,
+      number: 7,
+      title: 'feat: custom parent',
+      blockedOn: 'Nothing' as const,
+      blockedByIssues: [],
+      projectItemId: 'PVTI_issue_7',
+    };
+    const parentItem = {
+      ...cycle.project.items[0]!,
+      id: 'PVTI_issue_7',
+      number: 7,
+      status: 'In Review' as const,
+      blockedOn: 'Nothing' as const,
+      blockedByIssues: [],
+    };
+    const parentPr = {
+      ...cycle.pullRequests[0]!,
+      number: 70,
+      title: 'feat: custom parent',
+      body: 'Closes #7',
+      baseRefName: 'next',
+      headRefName: 'stack/custom-parent',
+      headOid: BLOCKER_HEAD,
+      closingIssueNumbers: [7],
+      humanIssueNumber: undefined,
+      humanAuthor: undefined,
+      humanHead: undefined,
+      humanGeneration: undefined,
+      humanReason: undefined,
+      reviewClaim: undefined,
+    };
+    cycle = canonicalizeMappings({
+      ...cycle,
+      project: {
+        ...cycle.project,
+        items: [
+          { ...cycle.project.items[0]!, blockedOn: 'Another issue', blockedByIssues: [7] },
+          parentItem,
+        ],
+      },
+      issues: [
+        { ...cycle.issues[0]!, blockedOn: 'Another issue', blockedByIssues: [7] },
+        parentIssue,
+      ],
+      pullRequests: [
+        { ...cycle.pullRequests[0]!, baseRefName: 'stack/custom-parent' },
+        parentPr,
+      ],
+    });
+  }
   let pushed = false;
   let destructiveMutations = 0;
+  let commentReads = 0;
+  let duplicateAtBoundary = false;
   const comments = () => {
     const exact = {
       id: 123,
       body: `${marker}\n\nOld mapping evidence was ambiguous.`,
       user: { login: 'implementation-bot' },
     };
-    return pushed && change === 'duplicate-comment-after-cas'
-      ? [exact, { ...exact, id: 124 }]
-      : [exact];
+    if (
+      pushed
+      && change === 'unstructured-maintainer-comment-after-cas'
+    ) {
+      return [
+        exact,
+        {
+          id: 124,
+          body: 'Human hold: do not merge this PR until I investigate.',
+          user: { login: 'maintainer' },
+        },
+      ];
+    }
+    if (duplicateAtBoundary) return [exact, { ...exact, id: 124 }];
+    return [exact];
   };
-  const ambiguous: GitHubLifecycleSnapshot = {
-    ...cycle,
-    pullRequestMappings: [{
-      status: 'ambiguous',
-      prNumber: 84,
-      issueNumbers: [42],
-      details: ['Live canonical relation evidence changed'],
-    }],
+  const liveSnapshot = (): GitHubLifecycleSnapshot => {
+    let current: GitHubLifecycleSnapshot = {
+      ...cycle,
+      pullRequests: cycle.pullRequests.map((pr) => (
+        pr.number !== 84
+          ? pr
+          : {
+              ...pr,
+              headOid: pushed && change === 'changed-head-after-cas'
+                ? CHANGED_HEAD
+                : HEAD,
+              labels: pushed && change === 'maintainer-label-after-cas'
+                ? ['engine:review', 'review:needs-human']
+                : ['engine:review'],
+              isDraft: pushed && change === 'maintainer-draft-after-cas',
+              humanLabelActor: pushed && change === 'maintainer-label-after-cas'
+                ? 'maintainer'
+                : undefined,
+              draftActor: pushed && change === 'maintainer-draft-after-cas'
+                ? 'maintainer'
+                : undefined,
+              body: pushed && change === 'contradictory-marker-after-cas'
+                ? 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=43 branch=autopilot/42 -->'
+                : pr.body,
+              reviewClaim: {
+                oid: pushed ? RECORD_OID : CLAIM_OID,
+                record: pushed && change === 'new-generation-after-cas'
+                  ? newer
+                  : pushed ? stale : before,
+              },
+            }
+      )),
+    };
+    if (pushed && change === 'contradictory-marker-after-cas') {
+      current = {
+        ...current,
+        issues: [
+          ...current.issues,
+          { ...current.issues[0]!, number: 43, projectItemId: 'PVTI_issue_43' },
+        ],
+      };
+    }
+    if (pushed && change === 'unlabeled-duplicate-after-cas') {
+      current = {
+        ...current,
+        pullRequests: [
+          ...current.pullRequests,
+          {
+            ...current.pullRequests[0]!,
+            number: 85,
+            title: 'feat: unlabeled competing PR',
+            body: 'Closes #42',
+            headRefName: 'feature/retry-42',
+            headOid: gitOid('9'.repeat(40)),
+            labels: [],
+            humanIssueNumber: undefined,
+            humanAuthor: undefined,
+            humanHead: undefined,
+            humanGeneration: undefined,
+            humanReason: undefined,
+            reviewClaim: undefined,
+          },
+        ],
+      };
+    }
+    if (pushed && change === 'custom-parent-closed-after-cas') {
+      current = {
+        ...current,
+        pullRequests: current.pullRequests.filter((pr) => pr.number !== 70),
+      };
+    }
+    return canonicalizeMappings(current);
   };
-  const targeted = targetedWriterOptions(() => cycle, cycle);
+  const targeted = targetedWriterOptions(liveSnapshot, cycle);
   const writer = makeProductionReconciliationWriter({
     repositoryPath: '/repo',
     ...targeted,
-    readCanonicalSnapshot: async () => (
-      pushed && change === 'ambiguous-after-cas' ? ambiguous : cycle
-    ),
-    readPullRequestByNumber: async () => reconciliationPr({
-      headOid: pushed && change === 'changed-head-after-cas' ? CHANGED_HEAD : HEAD,
-      isDraft: true,
-      labels: ['engine:review', 'review:needs-human'],
-      humanIssueNumber: 42,
-      humanAuthor: 'implementation-bot',
-      humanHead: HEAD,
-      humanGeneration: generation,
-      humanLabelActor: change === 'maintainer-label'
-        ? 'maintainer'
-        : 'implementation-bot',
-      draftActor: 'implementation-bot',
-      humanReason: reason,
-      reviewClaim: {
-        oid: pushed ? RECORD_OID : CLAIM_OID,
-        payload: encodeReviewClaimPayload(
-          pushed && change === 'new-generation-after-cas' ? newer : pushed ? stale : before,
-        ),
-      },
-    }),
     credential: selectedCredential(),
     now: () => new Date('2026-07-20T12:00:00.000Z'),
     runner: async (_command, args) => {
@@ -507,7 +652,16 @@ function obsoleteMappingRepairSecurityHarness(
         return '';
       }
       if (args[0] === 'api' && args[1]?.endsWith('/comments')) {
-        return JSON.stringify(comments());
+        commentReads += 1;
+        const response = JSON.stringify(comments());
+        if (
+          pushed
+          && change === 'duplicate-at-final-comment-boundary'
+          && commentReads === 2
+        ) {
+          duplicateAtBoundary = true;
+        }
+        return response;
       }
       throw new Error(`unexpected ${args.join(' ')}`);
     },
@@ -525,6 +679,7 @@ function obsoleteMappingRepairSecurityHarness(
     },
     destructiveMutations: () => destructiveMutations,
     pushed: () => pushed,
+    duplicateAtBoundary: () => duplicateAtBoundary,
   };
 }
 
@@ -724,13 +879,27 @@ describe('production reconciliation writer', () => {
         ...pr,
         isDraft: false,
         labels: [],
-        closingIssueNumbers: [42, 43],
+        closingIssueNumbers: [42],
         body: 'ambiguous mapping body',
+        reviewClaim: {
+          oid: CLAIM_OID,
+          record: {
+            kind: 'review-claim',
+            protocolVersion: 2,
+            prNumber: 84,
+            generation: '22222222-2222-4222-8222-222222222222',
+            attempt: '33333333-3333-4333-8333-333333333333',
+            reviewer: 'jinn-reviewer',
+            head: HEAD,
+            recordedAt: '2026-07-20T11:00:00.000Z',
+            state: 'human',
+          },
+        },
       })),
       diagnostics: [{
         code: 'branch-mapping-ambiguous',
-        detail: 'PR maps to two issues',
-        issueNumbers: [42, 43],
+        detail: 'PR mapping was temporarily ambiguous',
+        issueNumbers: [42],
         issues: [{ number: 42, projectStatus: 'Todo' }],
         pullRequests: [{ number: 84, head: HEAD, draft: false, labels: [] }],
       }],
@@ -835,7 +1004,14 @@ describe('production reconciliation writer', () => {
     };
     const plan = planProjection({
       view: { items: [] },
-      pullRequests: [{ number: 84 }],
+      pullRequests: [{
+        number: 84,
+        reviewClaim: {
+          head: HEAD,
+          generation: '22222222-2222-4222-8222-222222222222',
+          state: 'human',
+        },
+      }],
       orphanBranchClaims: [],
       mappingDiagnostics: diagnosticCycle.diagnostics,
     });
@@ -845,13 +1021,16 @@ describe('production reconciliation writer', () => {
     expect(report.results.every((result) => (
       result.outcome === 'applied' || result.outcome === 'already-applied'
     ))).toBe(true);
-    // Status paint is painter-owned (Stage 3); the diagnostic plan holds via
-    // draft + labels + marker comment only.
+    // Status paint is painter-owned (Stage 3). Future mapping diagnostics
+    // preserve the exact audit comment without mutating shared label/draft surfaces.
     expect(projectStatus).toBe('Todo');
-    expect(draft).toBe(true);
-    expect([...labels].sort()).toEqual(['engine:review', 'review:needs-human']);
+    expect(draft).toBe(false);
+    expect([...labels].sort()).toEqual([]);
     expect(comments).toHaveLength(1);
-    expect(mutationCosts).toHaveLength(4);
+    expect(comments[0]).toContain('issue=42');
+    expect(comments[0]).toContain(`head=${HEAD}`);
+    expect(comments[0]).toContain('generation=22222222-2222-4222-8222-222222222222');
+    expect(mutationCosts).toHaveLength(1);
     expect(Math.max(...mutationCosts)).toBeLessThanOrEqual(10);
   });
 
@@ -1710,7 +1889,7 @@ describe('production reconciliation writer', () => {
     expect(pushed).toBe(true);
   });
 
-  it('repairs only the exact machine mapping Human overlay under review-ref CAS', async () => {
+  it('repairs an exact comment-only machine mapping overlay with only the review-ref CAS', async () => {
     const generation = '22222222-2222-4222-8222-222222222222';
     const marker =
       '<!-- jinn-autopilot-human:v2 issue=42 pr=84 phase=implementing '
@@ -1737,10 +1916,10 @@ describe('production reconciliation writer', () => {
       state: 'stale',
       recordedAt: '2026-07-20T12:00:00.000Z',
     };
-    const labels = new Set(['engine:review', 'review:needs-human']);
-    let draft = true;
+    const labels = new Set(['engine:review']);
+    const draft = false;
     let pushed = false;
-    let comments = [{
+    const comments = [{
       id: 123,
       body: `${marker}\n\nOld mapping evidence was ambiguous.`,
       user: { login: 'implementation-bot' },
@@ -1755,8 +1934,8 @@ describe('production reconciliation writer', () => {
         humanAuthor: 'implementation-bot',
         humanHead: HEAD,
         humanGeneration: generation,
-        humanLabelActor: 'implementation-bot',
-        draftActor: 'implementation-bot',
+        humanLabelActor: undefined,
+        draftActor: undefined,
         humanReason: reason,
         reviewClaim: { oid: CLAIM_OID, record: before },
       })),
@@ -1788,9 +1967,9 @@ describe('production reconciliation writer', () => {
         humanAuthor: comments.length === 0 ? null : 'implementation-bot',
         humanHead: comments.length === 0 ? null : HEAD,
         humanGeneration: comments.length === 0 ? null : generation,
-        humanLabelActor: labels.has('review:needs-human') ? 'implementation-bot' : null,
-        draftActor: draft ? 'implementation-bot' : null,
-        humanReason: comments.length === 0 ? null : reason,
+        humanLabelActor: null,
+        draftActor: null,
+        humanReason: reason,
         reviewClaim: {
           oid: pushed ? RECORD_OID : CLAIM_OID,
           payload: encodeReviewClaimPayload(pushed ? after : before),
@@ -1812,12 +1991,10 @@ describe('production reconciliation writer', () => {
         if (args.includes('read-tree') || args.includes('update-index')) return '';
         if (args[0] === 'pr' && args[1] === 'edit') {
           mutationTokens.push(options?.env?.GH_TOKEN ?? '');
-          labels.delete('review:needs-human');
           return '';
         }
         if (args[0] === 'pr' && args[1] === 'ready') {
           mutationTokens.push(options?.env?.GH_TOKEN ?? '');
-          draft = false;
           return '';
         }
         if (
@@ -1826,7 +2003,6 @@ describe('production reconciliation writer', () => {
           && args.includes('DELETE')
         ) {
           mutationTokens.push(options?.env?.GH_TOKEN ?? '');
-          comments = [];
           return '';
         }
         if (args[0] === 'api' && args[1]?.endsWith('/comments')) {
@@ -1846,65 +2022,160 @@ describe('production reconciliation writer', () => {
       marker,
     })).resolves.toBeUndefined();
 
+    await expect(writer.readObsoleteMappingHumanRepairState?.({
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedReviewRefOid: CLAIM_OID,
+      expectedGeneration: generation,
+      expectedAuthor: 'implementation-bot',
+      marker,
+    })).resolves.toEqual({ complete: true });
+
     expect(pushed).toBe(true);
     expect(labels.has('review:needs-human')).toBe(false);
     expect(draft).toBe(false);
-    expect(comments).toEqual([]);
-    expect(mutationTokens).toEqual([
-      'selected-secret',
-      'selected-secret',
-      'selected-secret',
-    ]);
+    expect(comments).toHaveLength(1);
+    expect(mutationTokens).toEqual([]);
   });
 
   it.each([
     {
-      name: 'the current Human label belongs to a maintainer',
-      change: 'maintainer-label' as const,
-      casExpected: false,
+      name: 'a maintainer adds the Human label after the review-ref CAS',
+      change: 'maintainer-label-after-cas' as const,
     },
     {
-      name: 'the head changes after the review-ref CAS',
+      name: 'a maintainer converts the PR to draft after the review-ref CAS',
+      change: 'maintainer-draft-after-cas' as const,
+    },
+    {
+      name: 'a maintainer adds an unstructured Human hold after the review-ref CAS',
+      change: 'unstructured-maintainer-comment-after-cas' as const,
+    },
+    {
+      name: 'the exact PR head changes after the review-ref CAS',
       change: 'changed-head-after-cas' as const,
-      casExpected: true,
     },
     {
-      name: 'a new review generation appears after the review-ref CAS',
+      name: 'the exact review ref advances to a new generation after the CAS',
       change: 'new-generation-after-cas' as const,
-      casExpected: true,
     },
     {
-      name: 'canonical mapping becomes newly ambiguous after the review-ref CAS',
-      change: 'ambiguous-after-cas' as const,
-      casExpected: true,
+      name: 'the PR gains a contradictory lifecycle marker after the review-ref CAS',
+      change: 'contradictory-marker-after-cas' as const,
     },
     {
       name: 'an unlabeled duplicate invalidates canonical uniqueness after the CAS',
-      change: 'ambiguous-after-cas' as const,
-      casExpected: true,
+      change: 'unlabeled-duplicate-after-cas' as const,
     },
     {
       name: 'the custom parent closes after the review-ref CAS',
-      change: 'ambiguous-after-cas' as const,
-      casExpected: true,
-    },
-    {
-      name: 'a duplicate matching machine comment appears after the CAS',
-      change: 'duplicate-comment-after-cas' as const,
-      casExpected: true,
+      change: 'custom-parent-closed-after-cas' as const,
     },
   ])(
-    'does not delete label or comment when $name',
-    async ({ change, casExpected }) => {
+    'performs no shared-surface mutation when $name',
+    async ({ change }) => {
       const harness = obsoleteMappingRepairSecurityHarness(change);
 
       await expect(harness.writer.repairObsoleteMappingHuman?.(harness.action))
         .rejects.toThrow(/authority|provenance|changed|absent or ambiguous/i);
 
-      expect(harness.pushed()).toBe(casExpected);
+      expect(harness.pushed()).toBe(true);
       expect(harness.destructiveMutations()).toBe(0);
     },
   );
+
+  it('detects an exact-comment duplicate introduced at the final comment boundary without deleting either audit comment', async () => {
+    const harness = obsoleteMappingRepairSecurityHarness('duplicate-at-final-comment-boundary');
+
+    await expect(harness.writer.repairObsoleteMappingHuman?.(harness.action))
+      .resolves.toBeUndefined();
+    await expect(harness.writer.readObsoleteMappingHumanRepairState?.(harness.action))
+      .resolves.toEqual({ complete: false });
+
+    expect(harness.pushed()).toBe(true);
+    expect(harness.duplicateAtBoundary()).toBe(true);
+    expect(harness.destructiveMutations()).toBe(0);
+  });
+
+  it.each([
+    {
+      name: 'the live legacy Human label is present',
+      raw: { labels: ['engine:review', 'review:needs-human'] },
+    },
+    {
+      name: 'the live legacy machine draft is present',
+      raw: { isDraft: true, draftActor: 'implementation-bot' },
+    },
+    {
+      name: 'a live maintainer draft is present',
+      raw: { isDraft: true, draftActor: 'maintainer' },
+    },
+  ])('leaves shared legacy state fail-closed when $name', async ({ raw }) => {
+    const harness = obsoleteMappingRepairSecurityHarness('changed-head-after-cas');
+    let mutations = 0;
+    let pushes = 0;
+    const writer = makeProductionReconciliationWriter({
+      repositoryPath: '/repo',
+      ...targetedWriterOptions(() => snapshot(false, { projectStatus: 'Human' })),
+      readCanonicalSnapshot: async () => snapshot(false, { projectStatus: 'Human' }),
+      readPullRequestByNumber: async () => reconciliationPr({
+        isDraft: false,
+        labels: ['engine:review'],
+        humanIssueNumber: 42,
+        humanAuthor: 'implementation-bot',
+        humanHead: HEAD,
+        humanGeneration: harness.action.expectedGeneration,
+        humanReason: {
+          phase: 'implementing',
+          code: 'branch-mapping-ambiguous',
+          detail: 'Old mapping evidence was ambiguous.',
+        },
+        reviewClaim: {
+          oid: CLAIM_OID,
+          payload: encodeReviewClaimPayload({
+            kind: 'review-claim',
+            protocolVersion: 2,
+            prNumber: 84,
+            generation: harness.action.expectedGeneration,
+            attempt: '33333333-3333-4333-8333-333333333333',
+            reviewer: 'jinn-reviewer',
+            head: HEAD,
+            recordedAt: '2026-07-20T11:00:00.000Z',
+            state: 'human',
+          }),
+        },
+        ...raw,
+      }),
+      credential: selectedCredential(),
+      runner: async (_command, args) => {
+        if (args[0] === 'api' && args[1]?.endsWith('/comments')) {
+          return JSON.stringify([{
+            id: 123,
+            body: `${harness.action.marker}\n\nOld mapping evidence was ambiguous.`,
+            user: { login: 'implementation-bot' },
+          }]);
+        }
+        if (
+          (args[0] === 'pr' && (args[1] === 'edit' || args[1] === 'ready'))
+          || (args[0] === 'api' && args.includes('DELETE'))
+        ) {
+          mutations += 1;
+          return '';
+        }
+        if (args.includes('push')) {
+          pushes += 1;
+          return '';
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(writer.repairObsoleteMappingHuman?.(harness.action))
+      .rejects.toThrow(/provenance/i);
+    expect(pushes).toBe(0);
+    expect(mutations).toBe(0);
+  });
 
   // jinn-mono#1883 follow-up: the first pass converted the three named
   // helpers but left several writer methods (readIssueHead, readBranchHead,

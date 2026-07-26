@@ -152,6 +152,33 @@ describe('canonical structured PR-to-issue mapping', () => {
     ]);
   });
 
+  it('rejects empty closing references on the default branch despite otherwise-valid dependency shape', () => {
+    const input = stackedInput({
+      issues: [{
+        number: 2084,
+        blockedOn: 'Another issue',
+        blockedByIssues: [2083],
+      }],
+      pullRequests: [{
+        ...stackedInput().pullRequests[0]!,
+        baseRefName: 'next',
+      }],
+      stableBranches: [{
+        ...stackedInput().stableBranches[0]!,
+        targetBase: 'next',
+      }],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)).toEqual([
+      expect.objectContaining({
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [2084],
+        details: [expect.stringMatching(/empty closing references.*dependency/i)],
+      }),
+    ]);
+  });
+
   it('rejects a normal closing-reference PR retargeted away from its exact stable claim base', () => {
     const input = stackedInput({
       pullRequests: [{
@@ -204,6 +231,52 @@ describe('canonical structured PR-to-issue mapping', () => {
       expectedBaseRefName: 'stack/live-blocker',
       evidence: 'closing-reference',
     });
+  });
+
+  it('rejects a custom parent when another open stable-name PR makes the parent mapping ambiguous', () => {
+    const input = stackedInput({
+      issues: [
+        { number: 42, blockedOn: 'Another issue', blockedByIssues: [7] },
+        { number: 7, blockedOn: 'Nothing', blockedByIssues: [] },
+      ],
+      pullRequests: [{
+        number: 84,
+        state: 'OPEN',
+        head: HEAD,
+        headRefName: 'autopilot/42',
+        baseRefName: 'stack/live-blocker',
+        closingIssueNumbers: [42],
+        body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      }, {
+        number: 70,
+        state: 'OPEN',
+        head: OTHER_HEAD,
+        headRefName: 'stack/live-blocker',
+        baseRefName: 'next',
+        closingIssueNumbers: [7],
+        body: '<!-- jinn-autopilot:v2 issue=7 branch=stack/live-blocker -->',
+      }, {
+        number: 71,
+        state: 'OPEN',
+        head: gitOid('3'.repeat(40)),
+        headRefName: 'autopilot/7',
+        baseRefName: 'next',
+        closingIssueNumbers: [],
+        body: '',
+      }],
+      stableBranches: [],
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)[0]).toEqual(
+      expect.objectContaining({
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [42],
+        details: expect.arrayContaining([
+          expect.stringMatching(/authorized base|parent.*ambiguous/i),
+        ]),
+      }),
+    );
   });
 
   it('does not let a non-default live base authorize itself', () => {

@@ -263,6 +263,17 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(true);
   });
 
+  it('detects an unstructured maintainer Human hold transition', async () => {
+    const bodies = equalBodies();
+    bodies.comments = [{
+      body: 'Human hold: do not merge this PR until I investigate.',
+      created_at: '2026-07-22T10:02:00.000Z',
+      user: { login: 'maintainer' },
+    }];
+
+    await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(true);
+  });
+
   it('detects a changed current Human label actor even when the label remains present', async () => {
     const generation = '22222222-2222-4222-8222-222222222222';
     const marker = '<!-- jinn-autopilot-human:v2 issue=42 pr=101 '

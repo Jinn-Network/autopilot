@@ -17,6 +17,7 @@ import {
 import {
   decodeReviewClaimPayload,
   encodeReviewClaimPayload,
+  isUnstructuredHumanHoldComment,
   parseHumanCommentEvidence,
 } from './codecs.js';
 import {
@@ -1016,6 +1017,7 @@ function makeProductionReconciliationWriterWithScope(
           if (
             structured !== null
             || comment.body.includes('<!-- jinn-autopilot-human:')
+            || isUnstructuredHumanHoldComment(comment.body)
           ) {
             otherStructured = true;
           }
@@ -1023,9 +1025,7 @@ function makeProductionReconciliationWriterWithScope(
         return { exactIds, otherStructured };
       };
 
-      type FenceMode = 'overlay' | 'comment-only' | 'clean';
       const fence = async (
-        mode: FenceMode,
         expectedReviewState: 'human' | 'stale',
         requireInitialOid = false,
       ): Promise<ReconciliationPullRequestNode> => {
@@ -1097,59 +1097,25 @@ function makeProductionReconciliationWriterWithScope(
         }
         const labelPresent = raw.labels.includes(NEEDS_HUMAN_LABEL);
         if (
-          mode === 'overlay'
-          && (
-            raw.humanIssueNumber !== input.issueNumber
+          (
+            labelPresent
+            || raw.isDraft
+            || raw.humanIssueNumber !== input.issueNumber
             || raw.humanAuthor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
             || raw.humanHead !== input.expectedHead
             || raw.humanGeneration !== input.expectedGeneration
             || raw.humanReason?.code !== 'branch-mapping-ambiguous'
-            || (labelPresent && (
-              raw.humanLabelActor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
-            ))
-            || (raw.isDraft && (
-              raw.draftActor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
-            ))
             || commentRead.exactIds.length !== 1
             || commentRead.otherStructured
           )
         ) {
           throw new Error('Obsolete mapping Human overlay provenance changed');
         }
-        if (
-          mode === 'comment-only'
-          && (
-            labelPresent
-            || raw.humanIssueNumber !== input.issueNumber
-            || raw.humanAuthor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
-            || raw.humanHead !== input.expectedHead
-            || raw.humanGeneration !== input.expectedGeneration
-            || raw.humanReason?.code !== 'branch-mapping-ambiguous'
-            || (raw.isDraft && (
-              raw.draftActor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
-            ))
-            || commentRead.exactIds.length !== 1
-            || commentRead.otherStructured
-          )
-        ) {
-          throw new Error('Obsolete mapping Human cleanup authority changed');
-        }
-        if (
-          mode === 'clean'
-          && (
-            labelPresent
-            || raw.isDraft
-            || commentRead.exactIds.length !== 0
-            || commentRead.otherStructured
-          )
-        ) {
-          throw new Error('Obsolete mapping Human cleanup is incomplete');
-        }
         return raw;
       };
 
-      const before = await fence('overlay', 'human', true).catch(async (error) => {
-        const retry = await fence('overlay', 'stale', true).catch(() => null);
+      const before = await fence('human', true).catch(async (error) => {
+        const retry = await fence('stale', true).catch(() => null);
         if (retry !== null) return retry;
         throw error;
       });
@@ -1163,68 +1129,7 @@ function makeProductionReconciliationWriterWithScope(
           repairCredential,
         );
       }
-      let current = await fence('overlay', 'stale');
-      if (current.labels.includes(NEEDS_HUMAN_LABEL)) {
-        await runAsRepairAuthor(async ({ run }) => {
-          await mutateWithExactReadback(
-            () => {
-              invalidateActionAuthority();
-              return run('gh', [
-                'pr', 'edit', String(input.prNumber), '--repo', repositorySlug,
-                '--remove-label', NEEDS_HUMAN_LABEL,
-              ]);
-            },
-            async () => {
-              const after = await options.readPullRequestByNumber(input.prNumber);
-              return after !== null
-                && gitOid(after.headOid) === input.expectedHead
-                && !after.labels.includes(NEEDS_HUMAN_LABEL);
-            },
-            'Obsolete mapping Human label repair was ambiguous',
-          );
-        });
-      }
-      current = await fence('comment-only', 'stale');
-      if (current.isDraft) {
-        await runAsRepairAuthor(async ({ run }) => {
-          await mutateWithExactReadback(
-            () => {
-              invalidateActionAuthority();
-              return run('gh', [
-                'pr', 'ready', String(input.prNumber), '--repo', repositorySlug,
-              ]);
-            },
-            async () => {
-              const after = await options.readPullRequestByNumber(input.prNumber);
-              return after !== null
-                && gitOid(after.headOid) === input.expectedHead
-                && !after.isDraft
-                && !after.labels.includes(NEEDS_HUMAN_LABEL);
-            },
-            'Obsolete mapping Human draft repair was ambiguous',
-          );
-        });
-      }
-      await fence('comment-only', 'stale');
-      await runAsRepairAuthor(async ({ run }) => {
-        const comments = await readHumanComments(run);
-        if (comments.exactIds.length !== 1 || comments.otherStructured) {
-          throw new Error('Obsolete mapping Human comment is absent or ambiguous');
-        }
-        const commentId = comments.exactIds[0]!;
-        await mutateWithExactReadback(
-          () => run('gh', [
-            'api', '--method', 'DELETE',
-            `repos/${repositorySlug}/issues/comments/${commentId}`,
-          ]),
-          async () => {
-            const after = await readHumanComments(run);
-            return after.exactIds.length === 0 && !after.otherStructured;
-          },
-          'Obsolete mapping Human comment repair was ambiguous',
-        );
-      });
-      await fence('clean', 'stale');
+      await fence('stale');
     },
 
     async readObsoleteMappingHumanRepairState(input) {
@@ -1248,17 +1153,40 @@ function makeProductionReconciliationWriterWithScope(
       const parsed = JSON.parse(commentsRaw) as unknown;
       if (!Array.isArray(parsed)) return { complete: false };
       const rows = parsed.every((entry) => Array.isArray(entry)) ? parsed.flat() : parsed;
-      const humanComments = rows.filter((entry) => {
-        if (typeof entry !== 'object' || entry === null) return true;
-        const body = (entry as { body?: unknown }).body;
-        if (typeof body !== 'string') return true;
-        try {
-          return parseHumanCommentEvidence(body) !== null
-            || body.includes('<!-- jinn-autopilot-human:');
-        } catch {
-          return true;
+      let exactComments = 0;
+      let otherStructuredComments = 0;
+      for (const entry of rows) {
+        if (typeof entry !== 'object' || entry === null) {
+          otherStructuredComments += 1;
+          continue;
         }
-      });
+        const comment = entry as {
+          body?: unknown;
+          user?: { login?: unknown } | null;
+        };
+        if (typeof comment.body !== 'string') {
+          otherStructuredComments += 1;
+          continue;
+        }
+        const exact = comment.body.includes(input.marker)
+          && typeof comment.user?.login === 'string'
+          && comment.user.login.toLowerCase() === input.expectedAuthor.toLowerCase();
+        if (exact) {
+          exactComments += 1;
+          continue;
+        }
+        try {
+          if (
+            parseHumanCommentEvidence(comment.body) !== null
+            || comment.body.includes('<!-- jinn-autopilot-human:')
+            || isUnstructuredHumanHoldComment(comment.body)
+          ) {
+            otherStructuredComments += 1;
+          }
+        } catch {
+          otherStructuredComments += 1;
+        }
+      }
       return {
         complete: canonical?.snapshotComplete === true
           && mapping?.status === 'resolved'
@@ -1270,7 +1198,8 @@ function makeProductionReconciliationWriterWithScope(
           && claim?.head === input.expectedHead
           && claim.generation === input.expectedGeneration
           && claim.state === 'stale'
-          && humanComments.length === 0,
+          && exactComments === 1
+          && otherStructuredComments === 0,
       };
     },
 

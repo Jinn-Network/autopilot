@@ -1,5 +1,8 @@
 import { REPO } from '../dispatcher/constants.js';
-import { parseHumanCommentEvidence } from './codecs.js';
+import {
+  isUnstructuredHumanHoldComment,
+  parseHumanCommentEvidence,
+} from './codecs.js';
 import { GitHubRestSchemaError } from './github-rest-discovery.js';
 import type { ConditionalRestClient, ConditionalRestResponse } from './github-rest.js';
 import type { PullRequestEvidenceProbe } from './incremental-snapshot-source.js';
@@ -173,7 +176,20 @@ function latestHuman(value: unknown, prNumber: number): {
   const evidence = rows(value, 'PR comments').map((raw, index) => {
     const comment = record(raw, `PR comment ${index}`);
     const createdAt = exactTimestamp(comment.created_at, `PR comment ${index}.created_at`);
-    const parsed = parseHumanCommentEvidence(string(comment.body, `PR comment ${index}.body`));
+    const body = string(comment.body, `PR comment ${index}.body`);
+    const structured = parseHumanCommentEvidence(body);
+    const parsed = structured ?? (
+      isUnstructuredHumanHoldComment(body)
+        ? {
+            prNumber,
+            reason: {
+              phase: 'reviewing' as const,
+              code: 'review-escalation' as const,
+              detail: 'Unstructured Human hold comment on the pull request.',
+            },
+          }
+        : null
+    );
     const user = typeof comment.user === 'object' && comment.user !== null
       ? comment.user as Record<string, unknown>
       : undefined;

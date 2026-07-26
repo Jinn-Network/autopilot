@@ -1335,6 +1335,31 @@ describe('GhLifecycleReader', () => {
     expect(page.nodes[1]?.humanReason).toBeNull();
   });
 
+  it('preserves an unstructured maintainer Human hold as dominant review evidence', async () => {
+    const held = graphQlPr({
+      number: 205,
+      state: 'OPEN',
+      head: 'a'.repeat(40),
+      headRefName: 'feature/205',
+      comments: ['Human hold: do not merge this PR until I investigate.'],
+      commentAuthor: 'maintainer',
+    });
+
+    const page = await new GhLifecycleReader(pageOf(held)).readPullRequests(null);
+
+    expect(page.nodes[0]).toMatchObject({
+      humanAuthor: 'maintainer',
+      humanIssueNumber: null,
+      humanHead: null,
+      humanGeneration: null,
+      humanReason: {
+        phase: 'reviewing',
+        code: 'review-escalation',
+        detail: 'Unstructured Human hold comment on the pull request.',
+      },
+    });
+  });
+
   it('degrades a PR whose Human marker pr= field contradicts its own PR number', async () => {
     const hostile = graphQlPr({
       number: 203,

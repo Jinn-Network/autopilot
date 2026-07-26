@@ -522,26 +522,36 @@ function lifecyclePr(
           code: 'review-escalation',
           detail: humanSource,
         };
-  const humanReason = pr.humanReason ?? synthesizedHumanReason;
-  const humanHold = humanReason !== undefined;
-  const obsoleteMachineMappingHuman = (
-    humanReason?.code === 'branch-mapping-ambiguous'
+  const exactMachineMappingComment = pr.humanReason?.code === 'branch-mapping-ambiguous'
     && pr.humanIssueNumber === issue.number
     && pr.humanAuthor !== undefined
     && machineAuthorLogins.has(pr.humanAuthor.toLowerCase())
     && pr.humanHead === pr.headOid
-    && pr.humanGeneration === reviewClaim?.generation
-    && (
-      !pr.labels.includes('review:needs-human')
-      || pr.humanLabelActor?.toLowerCase() === pr.humanAuthor.toLowerCase()
-    )
-    && (
-      !pr.isDraft
-      || pr.draftActor?.toLowerCase() === pr.humanAuthor.toLowerCase()
-    )
+    && pr.humanGeneration !== undefined;
+  const retiredMachineMappingComment = exactMachineMappingComment
+    && !pr.labels.includes('review:needs-human')
+    && !pr.isDraft
     && reviewClaim !== undefined
     && reviewClaim.head === pr.headOid
-    && (reviewClaim.state === 'human' || reviewClaim.state === 'stale')
+    && (
+      (
+        reviewClaim.generation === pr.humanGeneration
+        && reviewClaim.state === 'stale'
+      )
+      || reviewClaim.generation !== pr.humanGeneration
+    );
+  const humanReason = retiredMachineMappingComment
+    ? synthesizedHumanReason
+    : pr.humanReason ?? synthesizedHumanReason;
+  const humanHold = humanReason !== undefined;
+  const obsoleteMachineMappingHuman = (
+    exactMachineMappingComment
+    && pr.humanGeneration === reviewClaim?.generation
+    && !pr.labels.includes('review:needs-human')
+    && !pr.isDraft
+    && reviewClaim !== undefined
+    && reviewClaim.head === pr.headOid
+    && reviewClaim.state === 'human'
     && issue.blockedOn !== 'Human'
     && !issueLabels.includes('review:needs-human')
     && !issueLabels.includes('autopilot:human')
@@ -550,9 +560,9 @@ function lifecyclePr(
         generation: reviewClaim.generation,
         author: pr.humanAuthor,
         reason: {
-          phase: humanReason.phase,
+          phase: pr.humanReason!.phase,
           code: 'branch-mapping-ambiguous' as const,
-          detail: humanReason.detail,
+          detail: pr.humanReason!.detail,
         },
       }
     : undefined;

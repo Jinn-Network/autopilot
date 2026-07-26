@@ -320,7 +320,7 @@ describe('planProjection', () => {
     expect(planProjection(orphanContext).actions).toEqual([]);
   });
 
-  it('projects every resolvable side of an ambiguous issue-to-PR mapping to Human labels', () => {
+  it('does not create a destructive or unbound overlay for a multi-issue diagnostic', () => {
     const ambiguous: ProjectionContext = {
       view: { items: [] },
       pullRequests: [],
@@ -342,33 +342,47 @@ describe('planProjection', () => {
       }],
     };
 
-    expect(planProjection(ambiguous).actions).toEqual(expect.arrayContaining([
-      {
-        kind: 'set-pr-draft',
-        prNumber: 101,
-        expectedHead: HEAD,
-        draft: true,
-      },
-      {
-        kind: 'set-pr-label',
-        prNumber: 101,
-        expectedHead: HEAD,
-        label: 'engine:review',
-        present: true,
-      },
-      {
-        kind: 'set-pr-label',
-        prNumber: 101,
-        expectedHead: HEAD,
-        label: 'review:needs-human',
-        present: true,
-      },
-      expect.objectContaining({
-        kind: 'ensure-human-comment',
-        prNumber: 101,
-        expectedHead: HEAD,
-        body: expect.stringContaining('PR #101 resolves issues #42 and #43'),
-      }),
-    ]));
+    expect(planProjection(ambiguous).actions).toEqual([]);
+  });
+
+  it('projects a single-issue current-generation mapping diagnostic as an exact comment only', () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const diagnostic: ProjectionContext = {
+      view: { items: [] },
+      pullRequests: [{
+        number: 101,
+        reviewClaim: {
+          head: HEAD,
+          generation,
+          state: 'human',
+        },
+      }],
+      orphanBranchClaims: [],
+      mappingDiagnostics: [{
+        code: 'branch-mapping-ambiguous',
+        detail: 'Another open PR also maps issue #42',
+        issueNumbers: [42],
+        issues: [{ number: 42, projectStatus: 'Human' }],
+        pullRequests: [{
+          number: 101,
+          head: HEAD,
+          draft: false,
+          labels: ['engine:review'],
+        }],
+      }],
+    };
+    const marker =
+      '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing '
+      + `code=branch-mapping-ambiguous head=${HEAD} generation=${generation} -->`;
+
+    expect(planProjection(diagnostic).actions).toEqual([{
+      kind: 'ensure-human-comment',
+      issueNumber: 42,
+      prNumber: 101,
+      expectedHead: HEAD,
+      marker,
+      body: `${marker}\n\nAutopilot parked this item for Human review.\n\n`
+        + 'Another open PR also maps issue #42',
+    }]);
   });
 });

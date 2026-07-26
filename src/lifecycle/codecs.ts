@@ -496,3 +496,13 @@ export function parseHumanCommentEvidence(body: string): HumanCommentEvidence | 
     reason: humanReason(phase, code, detail),
   };
 }
+
+/**
+ * Conservatively recognizes explicit maintainer-authored Human hold prose
+ * when no machine-readable Human marker is present. Callers must retain the
+ * comment author separately; this only identifies the hold instruction.
+ */
+export function isUnstructuredHumanHoldComment(body: string): boolean {
+  return /(?:^|\n)\s*(?:human\s+(?:hold|review)\b|needs?\s+human\b|do\s+not\s+(?:merge|automate)\b)/i
+    .test(body);
+}

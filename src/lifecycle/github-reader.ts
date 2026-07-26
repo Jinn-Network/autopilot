@@ -26,6 +26,7 @@ import type {
 import {
   decodeBranchClaimTrailers,
   extractImplementationCompletionSummary,
+  isUnstructuredHumanHoldComment,
   parseHumanCommentEvidence,
   reviewClaimRef,
   terminalBranchClaimTrailers,
@@ -1217,7 +1218,20 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         .reverse()
         .map((comment) => {
           const evidence = parseHumanCommentEvidence(comment.body);
-          if (evidence === null) return null;
+          if (evidence === null) {
+            if (!isUnstructuredHumanHoldComment(comment.body)) return null;
+            return {
+              prNumber: pr.number,
+              ...(comment.author?.login === undefined
+                ? {}
+                : { author: comment.author.login }),
+              reason: {
+                phase: 'reviewing' as const,
+                code: 'review-escalation' as const,
+                detail: 'Unstructured Human hold comment on the pull request.',
+              },
+            };
+          }
           return {
             ...evidence,
             ...(comment.author?.login === undefined

@@ -488,6 +488,15 @@ function projectionContext(
     pullRequests: snapshot.pullRequests.map((pr) => ({
       number: pr.number,
       ...(pr.reviewClaim === undefined ? {} : { reviewRefOid: pr.reviewClaim.oid }),
+      ...(pr.reviewClaim === undefined
+        ? {}
+        : {
+            reviewClaim: {
+              head: pr.reviewClaim.record.head,
+              generation: pr.reviewClaim.record.generation,
+              state: pr.reviewClaim.record.state,
+            },
+          }),
     })),
     orphanBranchClaims,
     mappingDiagnostics: snapshot.diagnostics,

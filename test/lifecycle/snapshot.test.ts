@@ -12,8 +12,16 @@ import { FULL_SCAN_RESERVE } from '../../src/lifecycle/github-usage.js';
 import { planProjection } from '../../src/lifecycle/projection.js';
 import { executeProjectionPlan } from '../../src/lifecycle/reconciler.js';
 import { executeReviewAction } from '../../src/lifecycle/review-executor.js';
-import { CredentialPool } from '../../src/lifecycle/credentials.js';
-import { formatAutomatedReviewMarker } from '../../src/lifecycle/codecs.js';
+import { CredentialPool, selectCredential } from '../../src/lifecycle/credentials.js';
+import {
+  formatAutomatedReviewMarker,
+  parseHumanCommentEvidence,
+} from '../../src/lifecycle/codecs.js';
+import { makeProductionReconciliationWriter } from '../../src/lifecycle/reconciliation-writer-production.js';
+import { makeProductionReviewActionPort } from '../../src/lifecycle/review-executor-production.js';
+import { makeProductionMergeActionPort } from '../../src/lifecycle/merge-executor-production.js';
+import { executeMergeAction } from '../../src/lifecycle/merge-executor.js';
+import { derivePaintedStatus } from '../../src/lifecycle/board-painter.js';
 
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const REVIEW_REF = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -263,7 +271,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
     }]);
   });
 
-  it('runs #2084 from ambiguous machine Human through one repair and fresh review to its pinned parent merge', async () => {
+  it('runs future #2084 comment-only recovery through production write, review, and exact pinned-base merge seams', async () => {
     const generation = '22222222-2222-4222-8222-222222222222';
     const attempt = '33333333-3333-4333-8333-333333333333';
     const newGeneration = '44444444-4444-4444-8444-444444444444';
@@ -276,10 +284,11 @@ describe('buildGitHubLifecycleSnapshot', () => {
       detail: 'A competing PR made the #2084 mapping ambiguous.',
     };
     let duplicatePresent = true;
-    let projectStatus: 'Human' | 'In Review' = 'Human';
-    let draft = true;
-    let humanOverlay = true;
-    let reviewState: 'human' | 'stale' | 'terminal-approved' = 'human';
+    let projectStatus: 'Human' | 'In Review' | 'Done' = 'In Review';
+    const draft = false;
+    const humanComments = [];
+    let reviewState: 'human' | 'stale' | 'active' | 'terminal-approved' = 'human';
+    let reviewOid = REVIEW_REF;
     let nativeReviews = [];
     let checks = [];
     let mergeability = 'UNKNOWN';
@@ -287,9 +296,15 @@ describe('buildGitHubLifecycleSnapshot', () => {
     const reviewPayload = () => JSON.stringify({
       protocolVersion: 2,
       prNumber: 84,
-      generation: reviewState === 'terminal-approved' ? newGeneration : generation,
-      attempt: reviewState === 'terminal-approved' ? newAttempt : attempt,
-      reviewer: reviewState === 'terminal-approved' ? 'review-bot' : 'maintenance-bot',
+      generation: reviewState === 'active' || reviewState === 'terminal-approved'
+        ? newGeneration
+        : generation,
+      attempt: reviewState === 'active' || reviewState === 'terminal-approved'
+        ? newAttempt
+        : attempt,
+      reviewer: reviewState === 'active' || reviewState === 'terminal-approved'
+        ? 'review-bot'
+        : 'maintenance-bot',
       head: HEAD,
       state: reviewState,
       recordedAt: '2026-07-20T11:00:00.000Z',
@@ -305,22 +320,28 @@ describe('buildGitHubLifecycleSnapshot', () => {
       headRefName: 'autopilot/2084',
       closingIssueNumbers: [],
       isDraft: draft,
-      labels: humanOverlay
-        ? ['engine:review', 'review:needs-human']
-        : ['engine:review'],
-      humanIssueNumber: humanOverlay ? 2084 : null,
-      humanAuthor: humanOverlay ? 'maintenance-bot' : null,
-      humanHead: humanOverlay ? HEAD : null,
-      humanGeneration: humanOverlay ? generation : null,
-      humanLabelActor: humanOverlay ? 'maintenance-bot' : null,
-      draftActor: humanOverlay && draft ? 'maintenance-bot' : null,
-      humanReason: humanOverlay ? mappingReason : null,
+      labels: ['engine:review'],
+      humanIssueNumber: humanComments.length === 0
+        ? null
+        : parseHumanCommentEvidence(humanComments.at(-1).body)?.issueNumber ?? null,
+      humanAuthor: humanComments.at(-1)?.user.login ?? null,
+      humanHead: humanComments.length === 0
+        ? null
+        : parseHumanCommentEvidence(humanComments.at(-1).body)?.head ?? null,
+      humanGeneration: humanComments.length === 0
+        ? null
+        : parseHumanCommentEvidence(humanComments.at(-1).body)?.generation ?? null,
+      humanLabelActor: null,
+      draftActor: null,
+      humanReason: humanComments.length === 0
+        ? null
+        : parseHumanCommentEvidence(humanComments.at(-1).body)?.reason ?? null,
       reviews: nativeReviews,
       checks,
       mergeability,
       mergeStateStatus,
       reviewClaim: {
-        oid: reviewState === 'terminal-approved' ? newReviewOid : REVIEW_REF,
+        oid: reviewOid,
         payload: reviewPayload(),
       },
       branchClaimTrailers: [
@@ -400,11 +421,127 @@ describe('buildGitHubLifecycleSnapshot', () => {
       defaultBranch: 'next',
       machineAuthorLogins: new Set(['maintenance-bot', 'review-bot']),
     });
+    const credentials = new CredentialPool([{
+      login: 'maintenance-bot',
+      normalizedLogin: 'maintenance-bot',
+      implementationToken: 'maintenance-secret',
+    }, {
+      login: 'review-bot',
+      normalizedLogin: 'review-bot',
+      reviewToken: 'review-secret',
+    }]);
+    const selected = selectCredential(credentials, { phase: 'implement' });
+    if (selected.status !== 'selected') throw new Error('maintenance credential missing');
+    const staleReviewOid = 'dddddddddddddddddddddddddddddddddddddddd';
+    let reviewRefPushes = 0;
+    let sharedMutations = 0;
+    const rawTarget = () => {
+      const pr = targetPr();
+      return {
+        state: pr.state,
+        headRefName: pr.headRefName,
+        headOid: pr.headOid,
+        baseRefName: pr.baseRefName,
+        isDraft: pr.isDraft,
+        labels: pr.labels,
+        body: pr.body,
+        closingIssueNumbers: pr.closingIssueNumbers,
+        humanIssueNumber: pr.humanIssueNumber,
+        humanAuthor: pr.humanAuthor,
+        humanHead: pr.humanHead,
+        humanGeneration: pr.humanGeneration,
+        humanLabelActor: pr.humanLabelActor,
+        draftActor: pr.draftActor,
+        humanReason: pr.humanReason,
+        reviewClaim: pr.reviewClaim,
+      };
+    };
+    const writerFor = (cycleSnapshot) => makeProductionReconciliationWriter({
+      repositoryPath: '/repo',
+      cycleSnapshot,
+      readCanonicalSnapshot: async () => build(),
+      readPullRequestByNumber: async (prNumber) => (
+        prNumber === 84 ? rawTarget() : null
+      ),
+      readProjectItemForReconciliation: async (issueNumber) => (
+        issueNumber === 2084
+          ? { id: 'PVTI_2084', status: projectStatus, blockedOn: 'Another issue' }
+          : null
+      ),
+      readBranchHeadByName: async (headRefName) => (
+        headRefName === 'autopilot/2084' ? HEAD : null
+      ),
+      readIssueByNumber: async (issueNumber) => (
+        issueNumber === 2084
+          ? {
+              number: 2084,
+              title: 'stacked lifecycle work',
+              open: true,
+              author: 'trusted',
+              labels: [],
+            }
+          : null
+      ),
+      readBlockedByIssueNumbers: async (issueNumber) => (
+        issueNumber === 2084 ? [2083] : []
+      ),
+      readOpenPullRequestsByIssue: async (issueNumber) => (
+        issueNumber !== 2084 || !duplicatePresent
+          ? []
+          : [{
+              number: 85,
+              headRefName: 'feature/duplicate-2084',
+              headOid: HEAD,
+              baseRefName: 'next',
+              draft: false,
+              labels: [],
+              body: 'Closes #2084',
+            }]
+      ),
+      credential: selected.credential,
+      credentials,
+      now: () => new Date('2026-07-20T12:00:00.000Z'),
+      runner: async (_command, args) => {
+        if (args.includes('hash-object')) return `${'1'.repeat(40)}\n`;
+        if (args.includes('write-tree')) return `${'2'.repeat(40)}\n`;
+        if (args.includes('commit-tree')) return `${staleReviewOid}\n`;
+        if (args.includes('rev-list')) return `${staleReviewOid} ${REVIEW_REF}`;
+        if (args.includes('ls-remote')) {
+          return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (args.includes('push')) {
+          reviewRefPushes += 1;
+          reviewState = 'stale';
+          reviewOid = staleReviewOid;
+          return '';
+        }
+        if (args.includes('read-tree') || args.includes('update-index')) return '';
+        if (
+          (args[0] === 'pr' && (args[1] === 'edit' || args[1] === 'ready'))
+          || (args[0] === 'api' && args.includes('DELETE'))
+        ) {
+          sharedMutations += 1;
+          return '';
+        }
+        if (args[0] === 'api' && args[1]?.includes('/issues/84/comments')) {
+          return JSON.stringify(humanComments);
+        }
+        if (args[0] === 'pr' && args[1] === 'comment') {
+          humanComments.push({
+            id: humanComments.length + 1,
+            body: args[args.indexOf('--body') + 1],
+            user: { login: 'maintenance-bot' },
+          });
+          return '';
+        }
+        throw new Error(`unexpected production writer command: ${args.join(' ')}`);
+      },
+    });
 
     const ambiguous = await build();
     expect(ambiguous.pullRequestMappings?.find((mapping) => mapping.prNumber === 84))
       .toMatchObject({ status: 'ambiguous' });
-    expect(planProjection({
+    const diagnosticPlan = planProjection({
       view: deriveLifecycle(
         ambiguous.lifecycle,
         new Date('2026-07-20T12:00:00.000Z'),
@@ -413,10 +550,36 @@ describe('buildGitHubLifecycleSnapshot', () => {
       pullRequests: ambiguous.pullRequests.map((pr) => ({
         number: pr.number,
         reviewRefOid: pr.reviewClaim?.oid,
+        ...(pr.reviewClaim === undefined ? {} : {
+          reviewClaim: {
+            head: pr.reviewClaim.record.head,
+            generation: pr.reviewClaim.record.generation,
+            state: pr.reviewClaim.record.state,
+          },
+        }),
       })),
       orphanBranchClaims: [],
       mappingDiagnostics: ambiguous.diagnostics,
-    }).actions.some((action) => action.kind === 'ensure-human-comment')).toBe(true);
+    });
+    expect(diagnosticPlan.actions).toEqual([expect.objectContaining({
+      kind: 'ensure-human-comment',
+      issueNumber: 2084,
+      prNumber: 84,
+      expectedHead: HEAD,
+    })]);
+    const diagnosticResult = await executeProjectionPlan(
+      diagnosticPlan,
+      writerFor(ambiguous),
+    );
+    expect(diagnosticResult.results).toEqual([{
+      action: diagnosticPlan.actions[0],
+      outcome: 'applied',
+    }]);
+    expect(humanComments).toHaveLength(1);
+    expect(humanComments[0].body).toContain('issue=2084');
+    expect(humanComments[0].body).toContain(`head=${HEAD}`);
+    expect(humanComments[0].body).toContain(`generation=${generation}`);
+    expect(sharedMutations).toBe(0);
 
     duplicatePresent = false;
     const repairable = await build();
@@ -442,39 +605,30 @@ describe('buildGitHubLifecycleSnapshot', () => {
       expectedAuthor: 'maintenance-bot',
     })]);
 
-    let repairs = 0;
-    const reconciliation = await executeProjectionPlan(repairPlan, {
-      readPullRequest: async () => ({
-        head: HEAD,
-        draft,
-        labels: humanOverlay
-          ? ['engine:review', 'review:needs-human']
-          : ['engine:review'],
-      }),
-      readReviewRef: async () => ({
-        oid: REVIEW_REF,
-        head: HEAD,
-        generation,
-        state: reviewState,
-      }),
-      repairObsoleteMappingHuman: async () => {
-        repairs += 1;
-        reviewState = 'stale';
-        humanOverlay = false;
-        draft = false;
-      },
-      readObsoleteMappingHumanRepairState: async () => ({
-        complete: !humanOverlay && !draft && reviewState === 'stale',
-      }),
-    });
+    const reconciliation = await executeProjectionPlan(
+      repairPlan,
+      writerFor(repairable),
+    );
     expect(reconciliation.results).toEqual([{
       action: repairPlan.actions[0],
       outcome: 'applied',
     }]);
-    expect(repairs).toBe(1);
+    expect(reviewRefPushes).toBe(1);
+    expect(reviewState).toBe('stale');
+    expect(reviewOid).toBe(staleReviewOid);
+    expect(humanComments).toHaveLength(1);
+    expect(sharedMutations).toBe(0);
 
-    // The normal painter observes the removed durable Human sources.
-    projectStatus = 'In Review';
+    // The normal painter sees a non-draft open PR and no shared Human surface.
+    expect(derivePaintedStatus({
+      issueOpen: true,
+      merged: false,
+      labels: ['engine:review'],
+      hasClaimBranch: true,
+      hasOpenDraftPr: false,
+      hasOpenNonDraftPr: true,
+      hasOpenChildren: false,
+    })).toBe('In Review');
     const repainted = await build();
     const reviewView = deriveLifecycle(
       repainted.lifecycle,
@@ -494,52 +648,46 @@ describe('buildGitHubLifecycleSnapshot', () => {
     }]);
 
     let spawned = 0;
-    let activeRecord;
-    const candidate = {
-      issueNumber: 2084,
-      number: 84,
-      open: true,
-      head: HEAD,
-      headChangedAt: '2026-07-20T09:00:00.000Z',
-      headRefName: 'autopilot/2084',
-      baseRefName: 'autopilot/2083',
-      draft: false,
-      author: 'trusted',
-      labels: ['engine:review'],
-      body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
-      humanHold: false,
-      approvalPolicy: 'approve-eligible',
-      nativeReviews: [],
-      reviewRef: {
-        oid: REVIEW_REF,
-        record: JSON.parse(reviewPayload()),
+    const projectGraphQl = () => JSON.stringify({
+      data: {
+        rateLimit: {
+          remaining: 4999,
+          used: 1,
+          resetAt: '2026-07-20T13:00:00.000Z',
+        },
+        organization: {
+          projectV2: {
+            sprintField: null,
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [{
+                id: 'PVTI_2084',
+                content: {
+                  __typename: 'Issue',
+                  number: 2084,
+                  repository: { nameWithOwner: 'Jinn-Network/mono' },
+                  issueType: { name: 'feat' },
+                  blockedBy: { nodes: [{ number: 2083 }] },
+                },
+                status: { name: projectStatus },
+                priority: { name: 'P1' },
+                effort: { name: 'Medium' },
+                blockedOn: { name: 'Another issue' },
+                sprint: null,
+              }],
+            },
+          },
+        },
       },
-    };
-    const reviewResult = await executeReviewAction({
-      prNumber: 84,
-      expectedHead: HEAD,
-    }, {
-      readCandidate: async () => candidate,
-      confirmAcquisition: async ({ expectedReviewRefOid }) => ({
-        ...candidate,
-        reviewRef: { oid: expectedReviewRefOid, record: activeRecord },
-      }),
-      credentials: new CredentialPool([{
-        login: 'review-bot',
-        normalizedLogin: 'review-bot',
-        reviewToken: 'review-secret',
-      }]),
-      createReviewRecord: async ({ record }) => {
-        activeRecord = record;
-        return newReviewOid;
-      },
-      publishReviewClaim: async ({ recordOid, expectedRemoteRecordOid }) => ({
-        status: 'won',
-        expected: expectedRemoteRecordOid,
-        published: recordOid,
-        observed: recordOid,
-      }),
-      createAttempt: async (input) => ({
+    });
+    const reviewPort = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => build(),
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      createWorkspace: async (input) => ({
         attemptId: input.attemptId,
         paths: {
           worktree: '/tmp/review/worktree',
@@ -549,7 +697,44 @@ describe('buildGitHubLifecycleSnapshot', () => {
           askpass: '/tmp/review/askpass',
         },
       }),
-      repairProjection: async () => {},
+      runner: async (_command, args) => {
+        if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+          return JSON.stringify({
+            changed_files: 0,
+            head: { sha: HEAD },
+            base: { ref: 'autopilot/2083', sha: 'e'.repeat(40) },
+          });
+        }
+        if (args.includes('hash-object')) return `${'3'.repeat(40)}\n`;
+        if (args.includes('write-tree')) return `${'4'.repeat(40)}\n`;
+        if (args.includes('commit-tree')) return `${newReviewOid}\n`;
+        if (args.includes('rev-list')) return `${newReviewOid} ${staleReviewOid}`;
+        if (args.includes('ls-remote')) {
+          return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (args.includes('push')) {
+          reviewState = 'active';
+          reviewOid = newReviewOid;
+          return '';
+        }
+        if (args.includes('read-tree') || args.includes('update-index')) return '';
+        if (args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({
+            headRefOid: HEAD,
+            labels: [{ name: 'engine:review' }],
+            isDraft: false,
+          });
+        }
+        if (args[0] === 'api' && args[1] === 'graphql') return projectGraphQl();
+        throw new Error(`unexpected production review command: ${args.join(' ')}`);
+      },
+    });
+    const reviewResult = await executeReviewAction({
+      prNumber: 84,
+      expectedHead: HEAD,
+    }, {
+      ...reviewPort,
+      credentials,
       startSession: async () => {
         spawned += 1;
         return { status: 'started', backend: 'local', pid: 42 };
@@ -608,6 +793,78 @@ describe('buildGitHubLifecycleSnapshot', () => {
       head: HEAD,
       expectedBaseRefName: 'autopilot/2083',
     }]);
+    let merged = false;
+    let exactMergeCalls = 0;
+    const mergeCommitOid = 'f'.repeat(40);
+    const mergePort = makeProductionMergeActionPort({
+      readSnapshot: async () => build(),
+      authorAllowlist: new Set(['trusted']),
+      expectedBaseRefName: 'autopilot/2083',
+      runner: async (_command, args) => {
+        const endpoint = args.find((arg) => arg.startsWith('repos/'));
+        if (endpoint === 'repos/Jinn-Network/mono/pulls/84') {
+          return JSON.stringify({
+            changed_files: 1,
+            head: { sha: HEAD },
+            base: { ref: 'autopilot/2083', sha: 'e'.repeat(40) },
+          });
+        }
+        if (endpoint?.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
+          return JSON.stringify([[{ filename: 'README.md' }]]);
+        }
+        if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
+          return JSON.stringify({ content: Buffer.from('').toString('base64') });
+        }
+        if (endpoint?.startsWith('repos/Jinn-Network/mono/compare/')) {
+          expect(endpoint).toBe(
+            `repos/Jinn-Network/mono/compare/${'e'.repeat(40)}...${HEAD}`,
+          );
+          return JSON.stringify({ status: 'ahead' });
+        }
+        if (args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify(merged
+            ? {
+                state: 'MERGED',
+                headRefOid: HEAD,
+                baseRefName: 'autopilot/2083',
+                mergeCommit: { oid: mergeCommitOid },
+              }
+            : {
+                state: 'OPEN',
+                headRefOid: HEAD,
+                baseRefName: 'autopilot/2083',
+              });
+        }
+        if (
+          args[0] === 'api'
+          && args.includes('PUT')
+          && args.includes('repos/Jinn-Network/mono/pulls/84/merge')
+        ) {
+          exactMergeCalls += 1;
+          expect(args).toContain(`sha=${HEAD}`);
+          merged = true;
+          projectStatus = 'Done';
+          return JSON.stringify({ merged: true, sha: mergeCommitOid });
+        }
+        if (args[0] === 'api' && args[1] === 'graphql') return projectGraphQl();
+        throw new Error(`unexpected production merge command: ${args.join(' ')}`);
+      },
+    });
+    const mergeResult = await executeMergeAction({
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'autopilot/2083',
+    }, {
+      ...mergePort,
+      credentials,
+    });
+    expect(mergeResult).toEqual({
+      status: 'merged',
+      prNumber: 84,
+      head: HEAD,
+      mergeCommitOid,
+    });
+    expect(exactMergeCalls).toBe(1);
   });
 
   it('turns missing #2084 dependency evidence into a structured diagnostic', async () => {
@@ -1305,12 +1562,12 @@ describe('buildGitHubLifecycleSnapshot', () => {
       readPullRequests: async () => ({
         nodes: [{
           ...original,
-          labels: ['engine:review', 'review:needs-human'],
+          labels: ['engine:review'],
           humanIssueNumber: 42,
           humanAuthor: 'maintenance-bot',
           humanHead: HEAD,
           humanGeneration: '22222222-2222-4222-8222-222222222222',
-          humanLabelActor: 'maintenance-bot',
+          humanLabelActor: null,
           draftActor: null,
           humanReason: mappingReason,
           reviewClaim: {
@@ -1344,6 +1601,131 @@ describe('buildGitHubLifecycleSnapshot', () => {
         reason: mappingReason,
       },
     });
+  });
+
+  it('retires an exact comment-only machine mapping diagnostic after its review generation is stale', async () => {
+    const original = page('page-2').nodes[0]!;
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...original,
+          labels: ['engine:review'],
+          isDraft: false,
+          humanIssueNumber: 42,
+          humanAuthor: 'maintenance-bot',
+          humanHead: HEAD,
+          humanGeneration: generation,
+          humanLabelActor: null,
+          draftActor: null,
+          humanReason: {
+            phase: 'implementing',
+            code: 'branch-mapping-ambiguous',
+            detail: 'Old evidence could not uniquely map this PR.',
+          },
+          reviewClaim: {
+            ...original.reviewClaim!,
+            payload: JSON.stringify({
+              protocolVersion: 2,
+              prNumber: 101,
+              generation,
+              attempt: '33333333-3333-4333-8333-333333333333',
+              reviewer: 'reviewer',
+              head: HEAD,
+              state: 'stale',
+              recordedAt: '2026-07-20T09:00:00.000Z',
+            }),
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const current = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      machineAuthorLogins: new Set(['maintenance-bot']),
+    });
+
+    expect(current.lifecycle.items[0]).not.toHaveProperty('humanHold');
+    expect(current.lifecycle.items[0]).not.toHaveProperty('humanReason');
+    expect(current.lifecycle.items[0]).not.toHaveProperty('obsoleteMachineMappingHuman');
+    expect(deriveLifecycle(
+      current.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60_000,
+    ).items[0]).toMatchObject({ phase: 'awaiting-review' });
+  });
+
+  it('keeps the live legacy #2084 label and draft fail-closed until its authorized migration', async () => {
+    const original = page('page-2').nodes[0]!;
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...original,
+          labels: ['engine:review', 'review:needs-human'],
+          isDraft: true,
+          humanIssueNumber: 42,
+          humanAuthor: 'maintenance-bot',
+          humanHead: null,
+          humanGeneration: null,
+          humanLabelActor: 'maintenance-bot',
+          draftActor: 'maintenance-bot',
+          humanReason: {
+            phase: 'implementing',
+            code: 'branch-mapping-ambiguous',
+            detail: 'Legacy mapping diagnostic without an exact tuple.',
+          },
+          reviewClaim: {
+            ...original.reviewClaim!,
+            payload: JSON.stringify({
+              protocolVersion: 2,
+              prNumber: 101,
+              generation,
+              attempt: '33333333-3333-4333-8333-333333333333',
+              reviewer: 'reviewer',
+              head: HEAD,
+              state: 'human',
+              recordedAt: '2026-07-20T09:00:00.000Z',
+            }),
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const current = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+      machineAuthorLogins: new Set(['maintenance-bot']),
+    });
+
+    expect(current.lifecycle.items[0]).toMatchObject({
+      humanHold: true,
+      isDraft: true,
+      labels: ['engine:review', 'review:needs-human'],
+    });
+    expect(current.lifecycle.items[0]).not.toHaveProperty('obsoleteMachineMappingHuman');
+    const view = deriveLifecycle(
+      current.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60_000,
+    );
+    expect(planProjection({
+      view,
+      pullRequests: current.pullRequests.map((pr) => ({
+        number: pr.number,
+        reviewRefOid: pr.reviewClaim?.oid,
+      })),
+      orphanBranchClaims: [],
+      mappingDiagnostics: current.diagnostics,
+    }).actions).not.toContainEqual(expect.objectContaining({
+      kind: 'repair-obsolete-mapping-human',
+    }));
+    expect(planCycle(view, {
+      implementationSlots: 1,
+      reviewSlots: 1,
+      usableCredentialLanes: 1,
+    }, 'active')).toEqual([]);
   });
 
   it.each([

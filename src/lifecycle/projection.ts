@@ -14,6 +14,11 @@ import type {
 export interface ProjectionPullRequest {
   readonly number: number;
   readonly reviewRefOid?: GitOid;
+  readonly reviewClaim?: {
+    readonly head: GitOid;
+    readonly generation: string;
+    readonly state: 'active' | 'verdict-intent' | 'terminal-approved' | 'human' | 'stale';
+  };
 }
 
 export interface OrphanBranchClaim {
@@ -355,35 +360,27 @@ export function planProjection(
       detail: diagnostic.detail,
     };
     for (const pr of diagnostic.pullRequests) {
-      if (!pr.labels.includes(labels.review)) {
-        actions.push({
-          kind: 'set-pr-label',
-          prNumber: pr.number,
-          expectedHead: pr.head,
-          label: labels.review,
-          present: true,
-        });
-      }
-      if (!pr.draft) {
-        actions.push({
-          kind: 'set-pr-draft',
-          prNumber: pr.number,
-          expectedHead: pr.head,
-          draft: true,
-        });
-      }
-      if (!pr.labels.includes(labels.human)) {
-        actions.push({
-          kind: 'set-pr-label',
-          prNumber: pr.number,
-          expectedHead: pr.head,
-          label: labels.human,
-          present: true,
-        });
-      }
-      const marker = formatHumanCommentMarker({ prNumber: pr.number, reason });
+      const claim = context.pullRequests.find(
+        (candidate) => candidate.number === pr.number,
+      )?.reviewClaim;
+      const issueNumber = diagnostic.issueNumbers.length === 1
+        ? diagnostic.issueNumbers[0]
+        : undefined;
+      if (
+        issueNumber === undefined
+        || claim?.state !== 'human'
+        || claim.head !== pr.head
+      ) continue;
+      const marker = formatHumanCommentMarker({
+        issueNumber,
+        prNumber: pr.number,
+        head: pr.head,
+        generation: claim.generation,
+        reason,
+      });
       actions.push({
         kind: 'ensure-human-comment',
+        issueNumber,
         prNumber: pr.number,
         expectedHead: pr.head,
         marker,

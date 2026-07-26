@@ -71,23 +71,24 @@ function lifecycleMarkers(body: string): readonly LifecycleMarker[] {
   }));
 }
 
+function evidencedIssueNumbers(
+  pr: StructuredMappingPullRequest,
+): Set<number> {
+  const numbers = new Set(pr.closingIssueNumbers);
+  const branchIssue = stableBranchIssue(pr.headRefName);
+  if (branchIssue !== undefined) numbers.add(branchIssue);
+  for (const marker of lifecycleMarkers(pr.body)) numbers.add(marker.issueNumber);
+  if (pr.humanIssueNumber !== undefined) numbers.add(pr.humanIssueNumber);
+  return numbers;
+}
+
 function inferredIssueNumbers(
   pr: StructuredMappingPullRequest,
   knownIssues: ReadonlySet<number>,
 ): Set<number> {
-  const numbers = new Set<number>();
-  for (const issueNumber of pr.closingIssueNumbers) {
-    if (knownIssues.has(issueNumber)) numbers.add(issueNumber);
-  }
-  const branchIssue = stableBranchIssue(pr.headRefName);
-  if (branchIssue !== undefined && knownIssues.has(branchIssue)) numbers.add(branchIssue);
-  for (const marker of lifecycleMarkers(pr.body)) {
-    if (knownIssues.has(marker.issueNumber)) numbers.add(marker.issueNumber);
-  }
-  if (pr.humanIssueNumber !== undefined && knownIssues.has(pr.humanIssueNumber)) {
-    numbers.add(pr.humanIssueNumber);
-  }
-  return numbers;
+  return new Set(
+    [...evidencedIssueNumbers(pr)].filter((issueNumber) => knownIssues.has(issueNumber)),
+  );
 }
 
 export function resolveStructuredPullRequestMappings(
@@ -132,16 +133,16 @@ export function resolveStructuredPullRequestMappings(
     });
     if (candidates.length !== 1) return undefined;
     const dependency = candidates[0]!.closingIssueNumbers[0]!;
-    const contenders = input.pullRequests.filter((candidate) => (
+    const parentEvidence = evidencedIssueNumbers(candidates[0]!);
+    const parentContenders = input.pullRequests.filter((candidate) => (
       candidate.state === 'OPEN'
-      && (
-        candidate.closingIssueNumbers.includes(dependency)
-        || lifecycleMarkers(candidate.body).some((marker) => (
-          marker.issueNumber === dependency
-        ))
-      )
+      && evidencedIssueNumbers(candidate).has(dependency)
     ));
-    return contenders.length === 1 ? dependency : undefined;
+    return parentEvidence.size === 1
+      && parentEvidence.has(dependency)
+      && parentContenders.length === 1
+      ? dependency
+      : undefined;
   };
 
   return input.pullRequests.map((pr): StructuredPullRequestMapping => {
