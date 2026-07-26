@@ -284,6 +284,13 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
 
   async changed(pr: PullRequestSnapshot): Promise<boolean> {
     if (pr.state !== 'OPEN') return false;
+    if (
+      pr.mergeability === 'MERGEABLE'
+      && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus)
+      && pr.compareStatus === undefined
+    ) {
+      return true;
+    }
     const detailResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/pulls/${pr.number}`,
     );

@@ -374,6 +374,44 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await expect(store.load()).resolves.toEqual(withCiRerunRecorded);
   });
 
+  it('round-trips exact compare evidence in snapshot and open-PR cache state', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const withCompareStatus: LifecycleDiscoveryState = {
+      ...base,
+      evidence: {
+        ...base.evidence,
+        pullRequests: [{
+          ...base.evidence.pullRequests[0]!,
+          compareStatus: 'behind',
+        }],
+      },
+      openPullRequestEvidence: [{
+        ...base.openPullRequestEvidence[0]!,
+        compareStatus: 'behind',
+      }],
+    };
+
+    await expect(store.save(withCompareStatus)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(withCompareStatus);
+  });
+
+  it('rejects malformed exact compare evidence from the cache', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    await writeFile(join(directory, 'lifecycle-cache.json'), JSON.stringify({
+      ...base,
+      evidence: {
+        ...base.evidence,
+        pullRequests: [{ ...base.evidence.pullRequests[0]!, compareStatus: 'clean' }],
+      },
+    }), { mode: 0o600 });
+
+    await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
+  });
+
   it('persists complete incremental quota evidence supplied by zero-point REST authority', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });

@@ -26,6 +26,7 @@ import type {
 } from './snapshot.js';
 import type { GitHubUsage } from './github-usage.js';
 import { implementationClaimFingerprint } from './terminal-claim.js';
+import { COMPARE_STATUSES } from './types.js';
 
 export const DEFAULT_AUTOPILOT_STATE_DIRECTORY = join(
   homedir(),
@@ -270,6 +271,7 @@ const pullRequestSchema = z.object({
   closingIssueNumbers: z.array(positiveInteger),
   mergeability: z.enum(['MERGEABLE', 'CONFLICTING', 'UNKNOWN']),
   mergeStateStatus: z.string(),
+  compareStatus: z.enum(COMPARE_STATUSES).optional(),
   checks: z.array(z.object({
     name: z.string(),
     status: z.string(),

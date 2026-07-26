@@ -7,6 +7,7 @@ import {
   type GitHubLifecycleReader,
   type PullRequestPage,
 } from '../../src/lifecycle/snapshot.js';
+import { deriveLifecycle } from '../../src/lifecycle/lifecycle.js';
 import { FULL_SCAN_RESERVE } from '../../src/lifecycle/github-usage.js';
 
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -157,6 +158,62 @@ describe('buildGitHubLifecycleSnapshot', () => {
     });
     expect(Object.isFrozen(snapshot)).toBe(true);
     expect(Object.isFrozen(snapshot.pullRequests)).toBe(true);
+  });
+
+  it('maps MERGEABLE/CLEAN with exact compare behind to lifecycle behind', async () => {
+    const raw = page('page-2').nodes[0]!;
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...raw,
+          mergeability: 'MERGEABLE',
+          mergeStateStatus: 'CLEAN',
+          compareStatus: 'behind',
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({
+      kind: 'pull-request',
+      mergeState: 'behind',
+      approved: true,
+    });
+  });
+
+  it('fails closed when MERGEABLE/CLEAN has exact unknown compare evidence', async () => {
+    const raw = page('page-2').nodes[0]!;
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...raw,
+          mergeability: 'MERGEABLE',
+          mergeStateStatus: 'CLEAN',
+          compareStatus: 'unknown',
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({
+      kind: 'pull-request',
+      mergeState: 'blocked',
+      approved: true,
+    });
+    const [view] = deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60 * 1000,
+    ).items;
+    expect(view?.phase).not.toBe('merge-ready');
   });
 
   it('fails closed when a review claim payload is malformed', async () => {

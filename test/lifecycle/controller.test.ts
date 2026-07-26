@@ -1284,6 +1284,206 @@ describe('lifecycle controller', () => {
     }]);
   });
 
+  it('schedules update-branch instead of merge when CLEAN has exact behind evidence', async () => {
+    const clean = implementation({
+      projectStatus: 'In Review',
+      approved: true,
+      needsReview: false,
+      mergeState: 'behind',
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{
+        source: 'check-run',
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+      }],
+    });
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+    const active = {
+      preflight: async () => ({ ok: true }),
+      readLocalState: () => ({
+        remaining: { implementation: 1, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      }),
+      implementationBackpressureThreshold: 10,
+      executeAction: async (action: unknown) => {
+        actions.push(action);
+        return { outcome: 'spawned' };
+      },
+    };
+    const behindSnapshot = snapshot(clean);
+    behindSnapshot.pullRequests[0] = {
+      ...behindSnapshot.pullRequests[0]!,
+      mergeability: 'MERGEABLE',
+      mergeStateStatus: 'CLEAN',
+      compareStatus: 'behind',
+      checks: clean.checks!,
+    };
+
+    await runLifecycleCycle('active', {
+      ...deps(clean, [], noOpWriter),
+      readSnapshot: async () => behindSnapshot,
+      mergePolicy: 'safe-auto',
+      active,
+    });
+
+    expect(actions).toEqual([{
+      kind: 'update-branch',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+    }]);
+  });
+
+  it('does not schedule a merge or update when CLEAN has exact unknown evidence', async () => {
+    const clean = implementation({
+      projectStatus: 'In Review',
+      approved: true,
+      needsReview: false,
+      mergeState: 'clean',
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{ source: 'check-run', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    });
+    const actions: unknown[] = [];
+    const writerCalls: string[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get(_target, property) {
+        return async () => {
+          writerCalls.push(String(property));
+          return null;
+        };
+      },
+    });
+    const active = {
+      preflight: async () => ({ ok: true }),
+      readLocalState: () => ({
+        remaining: { implementation: 1, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      }),
+      implementationBackpressureThreshold: 10,
+      executeAction: async (action: unknown) => {
+        actions.push(action);
+        return { outcome: 'spawned' };
+      },
+    };
+    const falseClean = snapshot(clean);
+    falseClean.pullRequests[0] = {
+      ...falseClean.pullRequests[0]!,
+      mergeability: 'MERGEABLE',
+      mergeStateStatus: 'CLEAN',
+      compareStatus: 'unknown',
+      checks: clean.checks!,
+    };
+
+    await runLifecycleCycle('active', {
+      ...deps(clean, [], noOpWriter),
+      readSnapshot: async () => falseClean,
+      mergePolicy: 'safe-auto',
+      active,
+    });
+
+    expect(actions).toEqual([]);
+    expect(writerCalls).toEqual([]);
+  });
+
+  it('routes exact diverged evidence through update-branch instead of merge', async () => {
+    const clean = implementation({
+      projectStatus: 'In Review',
+      approved: true,
+      needsReview: false,
+      mergeState: 'clean',
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{ source: 'check-run', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    });
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+    const active = {
+      preflight: async () => ({ ok: true }),
+      readLocalState: () => ({
+        remaining: { implementation: 1, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      }),
+      implementationBackpressureThreshold: 10,
+      executeAction: async (action: unknown) => {
+        actions.push(action);
+        return { outcome: 'spawned' };
+      },
+    };
+    const falseClean = snapshot(clean);
+    falseClean.pullRequests[0] = {
+      ...falseClean.pullRequests[0]!,
+      mergeability: 'MERGEABLE',
+      mergeStateStatus: 'CLEAN',
+      compareStatus: 'diverged',
+      checks: clean.checks!,
+    };
+
+    await runLifecycleCycle('active', {
+      ...deps(clean, [], noOpWriter),
+      readSnapshot: async () => falseClean,
+      mergePolicy: 'safe-auto',
+      active,
+    });
+
+    expect(actions).toEqual([{
+      kind: 'update-branch',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+    }]);
+  });
+
   it.skip('reports legacy stale-looking items without reaping them', async () => {
     const calls: string[] = [];
     const legacy = implementation({

@@ -32,6 +32,29 @@ describe('chooseIntegrationLadderAction', () => {
     })).toEqual({ kind: 'update-branch' });
   });
 
+  it('updates the branch when exact compare evidence is behind despite GraphQL CLEAN', () => {
+    expect(chooseIntegrationLadderAction({
+      ...base,
+      compareStatus: 'behind',
+      mergeStateStatus: 'CLEAN',
+    })).toEqual({ kind: 'update-branch' });
+  });
+
+  it('updates the branch when exact compare evidence is diverged despite GraphQL CLEAN', () => {
+    expect(chooseIntegrationLadderAction({
+      ...base,
+      compareStatus: 'diverged',
+      mergeStateStatus: 'CLEAN',
+    })).toEqual({ kind: 'update-branch' });
+  });
+
+  it('blocks exact unknown compare evidence', () => {
+    expect(chooseIntegrationLadderAction({
+      ...base,
+      compareStatus: 'unknown',
+    })).toEqual({ kind: 'blocked', reasons: ['mergeability'] });
+  });
+
   it('blocks when behind and children disarmed', () => {
     expect(chooseIntegrationLadderAction({
       ...base,

@@ -27,6 +27,7 @@ function pr(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnapshot {
     closingIssueNumbers: [42],
     mergeability: 'MERGEABLE',
     mergeStateStatus: 'CLEAN',
+    compareStatus: 'ahead',
     checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     reviews: [],
     ...overrides,
@@ -149,6 +150,15 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
       restNotModified: 5,
       cacheHits: 5,
     });
+  });
+
+  it('re-hydrates false-clean PRs missing exact compare evidence', async () => {
+    const probe = new ConditionalPullRequestEvidenceProbe(new ConditionalRestClient(
+      async () => included({ status: 200, body: equalBodies().detail }),
+      { usageMeter: new GitHubUsageMeter() },
+    ));
+
+    await expect(probe.changed(pr({ compareStatus: undefined }))).resolves.toBe(true);
   });
 
   it('uses the workflow run id from a check-run details URL', async () => {

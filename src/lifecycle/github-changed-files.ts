@@ -1,8 +1,10 @@
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
-import { gitOid, type GitOid } from './types.js';
+import { decodeCompareStatus, gitOid, type CompareStatus, type GitOid } from './types.js';
 
 export const GITHUB_CHANGED_FILES_MAX = 3_000;
+
+export type { CompareStatus } from './types.js';
 
 export interface ExactChangedFiles {
   readonly baseOid: GitOid;
@@ -81,4 +83,30 @@ export async function readExactChangedFiles(
       && files.length === metadata.changed_files
       && new Set(files).size === files.length,
   };
+}
+
+/**
+ * Bind REST compare status to the exact REST head/base snapshot used by merge.
+ */
+export async function readExactCompareStatus(
+  options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
+): Promise<CompareStatus> {
+  const repositorySlug = options.repositorySlug ?? REPO;
+  const metadata = JSON.parse(await options.run('gh', [
+    'api', `repos/${repositorySlug}/pulls/${options.prNumber}`,
+  ])) as {
+    head?: { sha?: unknown };
+    base?: { ref?: unknown; sha?: unknown };
+  };
+  if (
+    metadata.head?.sha !== options.expectedHead
+    || metadata.base?.ref !== options.expectedBaseRefName
+    || typeof metadata.base.sha !== 'string'
+  ) {
+    throw new Error('Compare metadata lost exact PR authority');
+  }
+  const compare = JSON.parse(await options.run('gh', [
+    'api', `repos/${repositorySlug}/compare/${metadata.base.sha}...${options.expectedHead}`,
+  ])) as { status?: unknown };
+  return decodeCompareStatus(compare.status);
 }
