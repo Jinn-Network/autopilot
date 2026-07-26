@@ -204,6 +204,11 @@ export interface CreateAttemptWorkspaceRuntime {
   readonly verifyMarketplaceTaskRequest?: typeof verifyMarketplaceTaskRequest;
   readonly writeManifest?: (path: string, manifest: AttemptManifest) => void;
   readonly afterMarketplaceJournalInstalled?: (journalPath: string) => void;
+  readonly beforeMarketplaceManifestInstall?: () => void | Promise<void>;
+  readonly afterMarketplaceManifestInstalled?: (
+    manifestPath: string,
+    manifest: AttemptManifest,
+  ) => void | Promise<void>;
 }
 
 export type MarketplaceCredentialResolver = (
@@ -2010,8 +2015,14 @@ function retireMarketplaceInitializationJournal(
       'Marketplace initialization journal cannot retire without a manifest',
     );
   }
-  rmSync(journalPath);
-  fsyncDirectory(dirname(journalPath));
+  let removed = false;
+  try {
+    rmSync(journalPath);
+    removed = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (removed) fsyncDirectory(dirname(journalPath));
   // A matching terminal transition may win after prepared readback but before
   // the journal unlink. Re-read so the caller observes that durable winner.
   const after = classifyMarketplaceJournalManifest(journal);
@@ -2021,6 +2032,45 @@ function retireMarketplaceInitializationJournal(
     );
   }
   return after.manifest;
+}
+
+async function installPreparedMarketplaceManifest(
+  manifest: AttemptManifest,
+  runtime: CreateAttemptWorkspaceRuntime,
+): Promise<void> {
+  const path = manifest.paths.manifest;
+  const valid = decodeAttemptManifest(manifest);
+  const bytes = Buffer.from(`${JSON.stringify(valid, null, 2)}\n`);
+  const temporary = join(
+    dirname(path),
+    `.${basename(path)}.marketplace-init-${process.pid}-${randomUUID()}`,
+  );
+  let descriptor: number | undefined;
+  let installed = false;
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600);
+    writeFileSync(descriptor, bytes);
+    chmodSync(temporary, 0o600);
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    try {
+      linkSync(temporary, path);
+      installed = true;
+      fsyncDirectory(dirname(path));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (existsSync(temporary)) {
+      rmSync(temporary);
+      fsyncDirectory(dirname(path));
+    }
+  }
+  if (installed) {
+    await runtime.afterMarketplaceManifestInstalled?.(path, manifest);
+  }
 }
 
 async function resolveMarketplaceInitialization(
@@ -2071,7 +2121,8 @@ async function resolveMarketplaceInitialization(
     return retireMarketplaceInitializationJournal(journalPath, journal);
   }
   if (beforeInstall.status === 'absent') {
-    (runtime.writeManifest ?? writeManifestAtomic)(manifest.paths.manifest, manifest);
+    await runtime.beforeMarketplaceManifestInstall?.();
+    await installPreparedMarketplaceManifest(manifest, runtime);
   }
   return retireMarketplaceInitializationJournal(journalPath, journal);
 }
@@ -2080,6 +2131,7 @@ export async function recoverMarketplaceAttemptInitializations(
   v2Base: string,
   runner: CommandRunner,
   resolveCredential: MarketplaceCredentialResolver,
+  runtime: CreateAttemptWorkspaceRuntime = {},
 ): Promise<readonly AttemptManifest[]> {
   if (!isAbsolute(v2Base)) {
     throw new Error('Marketplace initialization recovery base must be absolute');
@@ -2112,6 +2164,7 @@ export async function recoverMarketplaceAttemptInitializations(
           journalPath,
           runner,
           resolveCredential,
+          runtime,
         ));
       }
     }

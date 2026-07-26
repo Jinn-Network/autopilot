@@ -225,6 +225,38 @@ function terminalAttempt(manifest: AttemptManifest): AttemptManifest {
   );
 }
 
+function deferred(): {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+} {
+  let resolvePromise!: () => void;
+  return {
+    promise: new Promise<void>((resolve) => {
+      resolvePromise = resolve;
+    }),
+    resolve: () => resolvePromise(),
+  };
+}
+
+async function withTimeout<T>(promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('timed out waiting for initialization barrier'));
+    }, 1_000);
+    timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 function transitionInWorker(input: Record<string, unknown>): Promise<{
   readonly code: number | null;
   readonly result: { readonly ok: boolean; readonly error?: string };
@@ -558,17 +590,12 @@ describe('attempt workspace and manifest', () => {
         expect(existsSync(join(dirname(requestPath), 'manifest.json'))).toBe(false);
         return verifyMarketplaceTaskRequest(requestPath, requestDigest);
       },
-      writeManifest(path, prepared) {
+      afterMarketplaceManifestInstalled(_path, prepared) {
         events.push('write-manifest');
         expect(verifyMarketplaceTaskRequest(
           prepared.execution.state.requestPath,
           prepared.execution.state.requestDigest,
         ).id).toBe(`autopilot:${UUID_A}`);
-        writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
-          encoding: 'utf8',
-          mode: 0o600,
-          flag: 'wx',
-        });
       },
     });
 
@@ -773,12 +800,7 @@ describe('attempt workspace and manifest', () => {
       credential,
       marketplacePreparation: marketplacePreparation(fixture),
     }), defaultRunner, {
-      writeManifest(path, prepared) {
-        writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
-          encoding: 'utf8',
-          mode: 0o600,
-          flag: 'wx',
-        });
+      afterMarketplaceManifestInstalled() {
         throw new Error('injected crash after prepared manifest installation');
       },
     })).rejects.toThrow('injected crash after prepared manifest installation');
@@ -818,12 +840,7 @@ describe('attempt workspace and manifest', () => {
         credential,
         marketplacePreparation: marketplacePreparation(fixture),
       }), defaultRunner, {
-        writeManifest(path, prepared) {
-          writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
-            encoding: 'utf8',
-            mode: 0o600,
-            flag: 'wx',
-          });
+        afterMarketplaceManifestInstalled() {
           throw new Error('injected crash after prepared manifest installation');
         },
       })).rejects.toThrow('injected crash after prepared manifest installation');
@@ -892,12 +909,7 @@ describe('attempt workspace and manifest', () => {
         credential,
         marketplacePreparation: marketplacePreparation(fixture),
       }), defaultRunner, {
-        writeManifest(path, prepared) {
-          writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
-            encoding: 'utf8',
-            mode: 0o600,
-            flag: 'wx',
-          });
+        afterMarketplaceManifestInstalled() {
           throw new Error('injected crash after prepared manifest installation');
         },
       })).rejects.toThrow('injected crash after prepared manifest installation');
@@ -967,12 +979,7 @@ describe('attempt workspace and manifest', () => {
       targetBaseOid: fixture.oid,
       marketplacePreparation: preparation,
     }), defaultRunner, {
-      writeManifest(path, prepared) {
-        writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
-          encoding: 'utf8',
-          mode: 0o600,
-          flag: 'wx',
-        });
+      afterMarketplaceManifestInstalled(path, prepared) {
         transitionMarketplaceExecution(
           path,
           prepared.execution.state.requestDigest,
@@ -989,6 +996,183 @@ describe('attempt workspace and manifest', () => {
     expect(existsSync(marketplaceInitializationJournalPathForTest(
       fixture,
     ))).toBe(false);
+  });
+
+  it.each(['submitted', 'cancelled'] as const)(
+    'preserves a %s winner when two stale initializers both observed no prepared manifest',
+    async (terminal) => {
+      const fixture = repositoryFixture();
+      const credential =
+        new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+      await expect(createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        credential,
+        marketplacePreparation: marketplacePreparation(fixture),
+      }), defaultRunner, {
+        beforeMarketplaceManifestInstall() {
+          throw new Error('injected crash immediately before manifest install');
+        },
+      })).rejects.toThrow('injected crash immediately before manifest install');
+
+      const journalPath = marketplaceInitializationJournal(fixture);
+      const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as {
+        manifest: AttemptManifest;
+      };
+      const manifestPath = journal.manifest.paths.manifest;
+      expect(existsSync(manifestPath)).toBe(false);
+      const firstRelease = deferred();
+      const secondRelease = deferred();
+      const bothAtBarrier = deferred();
+      const terminalInstalled = deferred();
+      let barrierCalls = 0;
+      let installCalls = 0;
+      const runtime = {
+        beforeMarketplaceManifestInstall() {
+          barrierCalls += 1;
+          if (barrierCalls === 2) bothAtBarrier.resolve();
+          return barrierCalls === 1
+            ? firstRelease.promise
+            : secondRelease.promise;
+        },
+        afterMarketplaceManifestInstalled(path: string, prepared: AttemptManifest) {
+          installCalls += 1;
+          if (
+            prepared.execution.backend !== 'marketplace'
+            || prepared.execution.state.schemaVersion
+              !== 'marketplace-execution-v2'
+          ) {
+            throw new Error('expected prepared marketplace manifest');
+          }
+          transitionMarketplaceExecution(
+            path,
+            prepared.execution.state.requestDigest,
+            terminal === 'submitted'
+              ? { status: 'submitted', submission: SUBMISSION_RESULT }
+              : { status: 'cancelled', reason: 'operator-cancelled' },
+            () => new Date('2026-07-20T00:02:00.000Z'),
+          );
+          terminalInstalled.resolve();
+        },
+      };
+      const resolveCredential = vi.fn(() => credential);
+      const first = recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        defaultRunner,
+        resolveCredential,
+        runtime,
+      );
+      const second = recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        defaultRunner,
+        resolveCredential,
+        runtime,
+      );
+
+      await withTimeout(bothAtBarrier.promise);
+      firstRelease.resolve();
+      await withTimeout(terminalInstalled.promise);
+      const terminalBytes = readFileSync(manifestPath);
+      secondRelease.resolve();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+
+      expect(firstResult[0]!.execution).toMatchObject({
+        backend: 'marketplace',
+        state: { status: terminal },
+      });
+      expect(secondResult[0]!.execution).toMatchObject({
+        backend: 'marketplace',
+        state: { status: terminal },
+      });
+      expect(installCalls).toBe(1);
+      expect(readFileSync(manifestPath)).toEqual(terminalBytes);
+      expect(existsSync(journalPath)).toBe(false);
+    },
+  );
+
+  it('retains the journal when a concurrent manifest-install winner contradicts its request identity', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      beforeMarketplaceManifestInstall() {
+        throw new Error('injected crash immediately before manifest install');
+      },
+    })).rejects.toThrow('injected crash immediately before manifest install');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as {
+      manifest: AttemptManifest;
+    };
+    const manifestPath = journal.manifest.paths.manifest;
+    const firstRelease = deferred();
+    const secondRelease = deferred();
+    const bothAtBarrier = deferred();
+    const contradictoryInstalled = deferred();
+    let barrierCalls = 0;
+    const runtime = {
+      beforeMarketplaceManifestInstall() {
+        barrierCalls += 1;
+        if (barrierCalls === 2) bothAtBarrier.resolve();
+        return barrierCalls === 1
+          ? firstRelease.promise
+          : secondRelease.promise;
+      },
+      afterMarketplaceManifestInstalled(path: string, prepared: AttemptManifest) {
+        if (
+          prepared.execution.backend !== 'marketplace'
+          || prepared.execution.state.schemaVersion
+            !== 'marketplace-execution-v2'
+        ) {
+          throw new Error('expected prepared marketplace manifest');
+        }
+        transitionMarketplaceExecution(
+          path,
+          prepared.execution.state.requestDigest,
+          { status: 'submitted', submission: SUBMISSION_RESULT },
+          () => new Date('2026-07-20T00:02:00.000Z'),
+        );
+        const raw = JSON.parse(readFileSync(path, 'utf8')) as {
+          execution: { state: { submission: { id: string } } };
+        };
+        raw.execution.state.submission.id =
+          'autopilot:22222222-2222-4222-8222-222222222222';
+        writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
+        contradictoryInstalled.resolve();
+      },
+    };
+    const first = recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+      runtime,
+    );
+    const second = recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+      runtime,
+    );
+
+    await withTimeout(bothAtBarrier.promise);
+    firstRelease.resolve();
+    await withTimeout(contradictoryInstalled.promise);
+    const contradictoryBytes = readFileSync(manifestPath);
+    secondRelease.resolve();
+    const outcomes = await Promise.allSettled([first, second]);
+
+    expect(outcomes.every((outcome) =>
+      outcome.status === 'rejected'
+      && /identity.*journal/i.test(String(outcome.reason)))).toBe(true);
+    expect(readFileSync(manifestPath)).toEqual(contradictoryBytes);
+    expect(existsSync(journalPath)).toBe(true);
   });
 
   it('fails closed when initialization cannot resolve the exact recorded login', async () => {
