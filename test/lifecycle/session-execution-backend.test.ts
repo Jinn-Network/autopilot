@@ -1,12 +1,15 @@
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   afterEach,
   describe,
@@ -16,6 +19,7 @@ import {
   vi,
 } from 'vitest';
 import { TaskSubmitRequestV1Schema } from '@jinn-network/sdk/autopilot';
+import type { CommandRunner } from '../../src/dispatcher/issue-source.js';
 import {
   LocalSessionExecutionBackend,
   MarketplaceSessionExecutionBackend,
@@ -66,6 +70,7 @@ function marketplaceFixture(
 ) {
   const root = mkdtempSync(join(tmpdir(), 'autopilot-marketplace-backend-'));
   roots.push(root);
+  mkdirSync(join(root, '.git'), { recursive: true });
   const attemptDir = join(root, 'attempt');
   mkdirSync(join(attemptDir, 'worktree'), { recursive: true });
   writeFileSync(
@@ -140,7 +145,7 @@ function marketplaceFixture(
     selectedLogin: 'implementation-bot',
     repository: {
       root,
-      gitCommonDir: join(root, '.git'),
+      gitCommonDir: realpathSync(join(root, '.git')),
       remoteName: 'jinn-autopilot-v2',
       remoteUrlHash: 'a'.repeat(64),
     },
@@ -186,6 +191,47 @@ function marketplaceFixture(
   };
 }
 
+function marketplaceProofRunner(
+  manifest: ReturnType<typeof marketplaceFixture>['manifest'],
+  failure?: 'unregistered' | 'wrong-common-dir' | 'wrong-head' | 'dirty',
+): CommandRunner {
+  const wrongCommonDir = join(dirname(manifest.repository.gitCommonDir), 'other.git');
+  if (failure === 'wrong-common-dir') {
+    mkdirSync(wrongCommonDir, { recursive: true });
+  }
+  return async (command, args) => {
+    if (
+      command === 'git'
+      && args.includes('worktree')
+      && args.includes('list')
+    ) {
+      return failure === 'unregistered'
+        ? ''
+        : `worktree ${manifest.paths.worktree}\0HEAD ${manifest.expectedHead}\0\0`;
+    }
+    if (
+      command === 'git'
+      && args.includes('rev-parse')
+      && args.includes('--git-common-dir')
+    ) {
+      return failure === 'wrong-common-dir'
+        ? wrongCommonDir
+        : manifest.repository.gitCommonDir;
+    }
+    if (
+      command === 'git'
+      && args.includes('rev-parse')
+      && args.includes('HEAD^{commit}')
+    ) {
+      return failure === 'wrong-head' ? BASE : manifest.expectedHead;
+    }
+    if (command === 'git' && args.includes('status')) {
+      return failure === 'dirty' ? '?? partial-checkout\n' : '';
+    }
+    throw new Error(`Unexpected proof command: ${command} ${args.join(' ')}`);
+  };
+}
+
 function marketplaceRecoveryFixture(
   v2Base: string,
   input: {
@@ -199,6 +245,7 @@ function marketplaceRecoveryFixture(
     };
   },
 ) {
+  mkdirSync(join(v2Base, '.git'), { recursive: true });
   const attemptDir = join(
     v2Base,
     input.runnerId,
@@ -299,7 +346,7 @@ function marketplaceRecoveryFixture(
     selectedLogin: 'implementation-bot',
     repository: {
       root: v2Base,
-      gitCommonDir: join(v2Base, '.git'),
+      gitCommonDir: realpathSync(join(v2Base, '.git')),
       remoteName: 'jinn-autopilot-v2',
       remoteUrlHash: 'a'.repeat(64),
     },
@@ -327,6 +374,51 @@ function marketplaceRecoveryFixture(
     { mode: 0o600 },
   );
   return { manifest, requestPath, submission };
+}
+
+function marketplaceRecoveryProofRunner(v2Base: string): CommandRunner {
+  return async (command, args) => {
+    if (
+      command === 'git'
+      && args.includes('worktree')
+      && args.includes('list')
+    ) {
+      const worktrees: string[] = [];
+      for (const runner of readdirSync(v2Base, { withFileTypes: true })) {
+        if (!runner.isDirectory() || runner.name === '.git') continue;
+        const runnerPath = join(v2Base, runner.name);
+        for (const phase of readdirSync(runnerPath, { withFileTypes: true })) {
+          if (!phase.isDirectory()) continue;
+          const phasePath = join(runnerPath, phase.name);
+          for (const attempt of readdirSync(phasePath, { withFileTypes: true })) {
+            if (!attempt.isDirectory()) continue;
+            const manifestPath = join(phasePath, attempt.name, 'manifest.json');
+            const manifest = readAttemptManifest(manifestPath);
+            worktrees.push(
+              `worktree ${manifest.paths.worktree}\0HEAD ${manifest.expectedHead}\0\0`,
+            );
+          }
+        }
+      }
+      return worktrees.join('');
+    }
+    const worktreeIndex = args.indexOf('-C');
+    const worktree = worktreeIndex === -1 ? undefined : args[worktreeIndex + 1];
+    if (worktree === undefined || !existsSync(join(worktree, '.git'))) {
+      throw new Error('Marketplace proof worktree is not initialized');
+    }
+    const manifest = readAttemptManifest(join(dirname(worktree), 'manifest.json'));
+    if (args.includes('--git-common-dir')) {
+      return manifest.repository.gitCommonDir;
+    }
+    if (args.includes('HEAD^{commit}')) {
+      return manifest.expectedHead;
+    }
+    if (args.includes('status')) {
+      return '';
+    }
+    throw new Error(`Unexpected recovery proof command: ${command} ${args.join(' ')}`);
+  };
 }
 
 const implementationRequest = (): LocalImplementationSessionExecutionRequest => ({
@@ -529,6 +621,7 @@ describe('session execution backends', () => {
     });
     const backend = new MarketplaceSessionExecutionBackend({
       adapter: { submit, recover },
+      runner: marketplaceProofRunner(fixture.manifest),
       now: () => new Date('2026-07-26T12:02:00.000Z'),
     });
 
@@ -551,6 +644,28 @@ describe('session execution backends', () => {
         },
       });
   });
+
+  it.each([
+    ['unregistered', /exactly registered/i],
+    ['wrong-common-dir', /common directory changed/i],
+    ['wrong-head', /HEAD changed/i],
+    ['dirty', /not clean/i],
+  ] as const)(
+    'rejects a %s prepared checkout using runner-backed proof before invoking the marketplace CLI',
+    async (failure, expected) => {
+      const fixture = marketplaceFixture();
+      const submit = vi.fn(async () => SUBMISSION);
+      const recover = vi.fn(async () => SUBMISSION);
+      const backend = new MarketplaceSessionExecutionBackend({
+        adapter: { submit, recover },
+        runner: marketplaceProofRunner(fixture.manifest, failure),
+      });
+
+      await expect(backend.start(fixture.request)).rejects.toThrow(expected);
+      expect(submit).not.toHaveBeenCalled();
+      expect(recover).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(['missing', 'modified'] as const)(
     'rejects a %s immutable request artifact before invoking the marketplace CLI',
@@ -581,6 +696,7 @@ describe('session execution backends', () => {
     const submit = vi.fn(async () => SUBMISSION);
     const crashed = new MarketplaceSessionExecutionBackend({
       adapter: { submit, recover: vi.fn(async () => SUBMISSION) },
+      runner: marketplaceProofRunner(fixture.manifest),
       transitionMarketplaceExecution: () => {
         throw new Error('injected crash before manifest bookkeeping');
       },
@@ -600,6 +716,7 @@ describe('session execution backends', () => {
     const recover = vi.fn(async () => duplicate);
     const restarted = new MarketplaceSessionExecutionBackend({
       adapter: { submit: vi.fn(async () => SUBMISSION), recover },
+      runner: marketplaceProofRunner(fixture.manifest),
       now: () => new Date('2026-07-26T12:03:00.000Z'),
     });
     await expect(restarted.recover(fixture.request)).resolves.toEqual({
@@ -681,6 +798,7 @@ describe('session execution backends', () => {
         })),
         recover: vi.fn(async () => SUBMISSION),
       },
+      runner: marketplaceProofRunner(fixture.manifest),
     });
 
     await expect(backend.start(fixture.request)).rejects.toThrow(
@@ -710,6 +828,7 @@ describe('session execution backends', () => {
           idempotent: true as const,
         })),
       },
+      runner: marketplaceProofRunner(fixture.manifest),
       now: () => new Date('2026-07-26T12:03:00.000Z'),
     });
 
@@ -802,6 +921,7 @@ describe('session execution backends', () => {
     });
     const backend = new MarketplaceSessionExecutionBackend({
       adapter: { submit: vi.fn(async () => SUBMISSION), recover },
+      runner: marketplaceRecoveryProofRunner(v2Base),
       now: () => new Date('2026-07-26T12:03:00.000Z'),
     });
 
@@ -863,11 +983,16 @@ describe('session execution backends', () => {
       const recover = vi.fn(async () => fixture.submission);
       const backend = new MarketplaceSessionExecutionBackend({
         adapter: { submit: vi.fn(async () => fixture.submission), recover },
+        runner: marketplaceRecoveryProofRunner(v2Base),
       });
 
       await expect(
         recoverPreparedMarketplaceAttempts(v2Base, backend),
-      ).rejects.toThrow(/marketplace.*worktree.*initialized/i);
+      ).rejects.toThrow(
+        missing === 'worktree'
+          ? /marketplace.*worktree.*initialized/i
+          : /marketplace.*worktree.*identity could not be proven/i,
+      );
       expect(recover).not.toHaveBeenCalled();
     },
   );

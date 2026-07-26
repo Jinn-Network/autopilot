@@ -2,8 +2,6 @@ import type { SpawnResult } from '../dispatcher/coordinator-session.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
 import {
   existsSync,
-  lstatSync,
-  readFileSync,
   readdirSync,
 } from 'node:fs';
 import {
@@ -17,7 +15,12 @@ import type {
   TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
 import {
+  defaultRunner,
+  type CommandRunner,
+} from '../dispatcher/issue-source.js';
+import {
   MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+  proveMarketplaceAttemptWorktree,
   readAttemptManifest,
   transitionMarketplaceExecution,
   type AttemptManifest,
@@ -239,6 +242,7 @@ export interface MarketplaceSessionExecutionBackendOptions {
   readonly readAttemptManifest?: typeof readAttemptManifest;
   readonly verifyMarketplaceTaskRequest?: typeof verifyMarketplaceTaskRequest;
   readonly transitionMarketplaceExecution?: typeof transitionMarketplaceExecution;
+  readonly runner?: CommandRunner;
   readonly now?: () => Date;
 }
 
@@ -253,30 +257,6 @@ interface VerifiedMarketplaceExecution {
   };
 }
 
-function assertInitializedMarketplaceWorktree(path: string): void {
-  try {
-    const worktree = lstatSync(path);
-    const markerPath = join(path, '.git');
-    const marker = lstatSync(markerPath);
-    const markerContents = readFileSync(markerPath, 'utf8');
-    if (
-      worktree.isSymbolicLink()
-      || !worktree.isDirectory()
-      || marker.isSymbolicLink()
-      || !marker.isFile()
-      || marker.size === 0
-      || !/^gitdir:\s+\S/m.test(markerContents)
-    ) {
-      throw new Error('invalid worktree marker');
-    }
-  } catch (error) {
-    throw new Error(
-      'Marketplace attempt worktree is not initialized',
-      { cause: error },
-    );
-  }
-}
-
 export class MarketplaceSessionExecutionBackend
   implements SessionExecutionBackend<'marketplace', MarketplaceSessionExecutionRequest> {
   readonly backend = 'marketplace' as const;
@@ -284,6 +264,7 @@ export class MarketplaceSessionExecutionBackend
   private readonly readManifest: typeof readAttemptManifest;
   private readonly verifyRequest: typeof verifyMarketplaceTaskRequest;
   private readonly transition: typeof transitionMarketplaceExecution;
+  private readonly runner: CommandRunner;
   private readonly now: () => Date;
 
   constructor(options: MarketplaceSessionExecutionBackendOptions = {}) {
@@ -293,6 +274,7 @@ export class MarketplaceSessionExecutionBackend
       options.verifyMarketplaceTaskRequest ?? verifyMarketplaceTaskRequest;
     this.transition =
       options.transitionMarketplaceExecution ?? transitionMarketplaceExecution;
+    this.runner = options.runner ?? defaultRunner;
     this.now = options.now ?? (() => new Date());
   }
 
@@ -301,7 +283,7 @@ export class MarketplaceSessionExecutionBackend
     if (verified.state.status !== 'prepared') {
       throw new Error('Marketplace start requires a prepared marketplace execution');
     }
-    assertInitializedMarketplaceWorktree(verified.manifest.paths.worktree);
+    await proveMarketplaceAttemptWorktree(verified.manifest, this.runner);
     return this.submitAndPersist(request, verified, 'submit');
   }
 
@@ -316,7 +298,7 @@ export class MarketplaceSessionExecutionBackend
     if (verified.state.status !== 'prepared') {
       throw new Error('Marketplace recovery requires a prepared marketplace execution');
     }
-    assertInitializedMarketplaceWorktree(verified.manifest.paths.worktree);
+    await proveMarketplaceAttemptWorktree(verified.manifest, this.runner);
     return this.submitAndPersist(request, verified, 'recover');
   }
 

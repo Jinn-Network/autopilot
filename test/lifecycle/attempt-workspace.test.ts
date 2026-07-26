@@ -33,6 +33,7 @@ import {
   markAttemptExited,
   markAttemptRunning,
   readAttemptManifest,
+  recoverMarketplaceAttemptInitializations,
   sweepDeadAttempts,
   trackAttemptChild,
   transitionMarketplaceExecution,
@@ -182,6 +183,23 @@ function marketplacePreparation(
     agentSoftDeadline: built.agentSoftDeadline,
     adoptionDeadline: built.adoptionDeadline,
   };
+}
+
+function marketplaceInitializationJournal(
+  fixture: ReturnType<typeof repositoryFixture>,
+): string {
+  const phaseDir = join(
+    fixture.base,
+    'v2',
+    'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    'implement',
+  );
+  const journals = existsSync(phaseDir)
+    ? readdirSync(phaseDir)
+      .filter((name) => name.endsWith('.marketplace-initialization.json'))
+    : [];
+  expect(journals).toHaveLength(1);
+  return join(phaseDir, journals[0]!);
 }
 
 function terminalAttempt(manifest: AttemptManifest): AttemptManifest {
@@ -562,6 +580,242 @@ describe('attempt workspace and manifest', () => {
     expect(readAttemptManifest(manifest.paths.manifest)).toEqual(manifest);
   });
 
+  it('installs a non-secret sibling journal before creating the marketplace attempt directory and recovers it', async () => {
+    const fixture = repositoryFixture();
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const credential =
+      new SelectedCredential('Impl-Bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      selectedLogin: 'Impl-Bot',
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      afterMarketplaceJournalInstalled(journalPath) {
+        expect(existsSync(attemptDir)).toBe(false);
+        expect(statSync(journalPath).mode & 0o777).toBe(0o600);
+        const journal = readFileSync(journalPath, 'utf8');
+        expect(journal).not.toContain('selected-secret');
+        expect(journal).toContain('"selectedLogin": "Impl-Bot"');
+        throw new Error('injected crash after journal installation');
+      },
+    })).rejects.toThrow('injected crash after journal installation');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    expect(existsSync(attemptDir)).toBe(false);
+    const resolveCredential = vi.fn((normalizedLogin: string) => {
+      expect(normalizedLogin).toBe('impl-bot');
+      return credential;
+    });
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      resolveCredential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(resolveCredential).toHaveBeenCalledOnce();
+    expect(existsSync(journalPath)).toBe(false);
+    expect(readAttemptManifest(join(attemptDir, 'manifest.json')))
+      .toEqual(recovered[0]);
+    expect(git(join(attemptDir, 'worktree'), ['rev-parse', 'HEAD']))
+      .toBe(fixture.oid);
+  });
+
+  it('does not install a new initialization journal over an unrelated preexisting attempt directory', async () => {
+    const fixture = repositoryFixture();
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    mkdirSync(attemptDir, { recursive: true });
+    writeFileSync(join(attemptDir, 'sentinel'), 'unrelated\n');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner)).rejects.toThrow(/attempt directory.*already exists/i);
+
+    expect(readFileSync(join(attemptDir, 'sentinel'), 'utf8'))
+      .toBe('unrelated\n');
+    expect(readdirSync(dirname(attemptDir))
+      .some((name) => name.endsWith('.marketplace-initialization.json')))
+      .toBe(false);
+  });
+
+  it('recovers the exact journal-owned request after a crash before worktree creation', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      persistMarketplaceTaskRequest(requestPath, request) {
+        const persisted = persistMarketplaceTaskRequest(requestPath, request);
+        throw new Error(`injected request-only crash:${persisted.requestDigest}`);
+      },
+    })).rejects.toThrow('injected request-only crash');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const journalBefore = readFileSync(journalPath);
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const requestPath = join(attemptDir, 'marketplace-request.json');
+    const requestBefore = readFileSync(requestPath);
+
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(existsSync(journalPath)).toBe(false);
+    expect(readFileSync(requestPath)).toEqual(requestBefore);
+    expect(journalBefore.toString('utf8')).not.toContain('selected-secret');
+    expect(git(join(attemptDir, 'worktree'), ['rev-parse', 'HEAD']))
+      .toBe(fixture.oid);
+  });
+
+  it('repairs only an interrupted journal-owned worktree and converges to the recorded head', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+    let interrupted = false;
+    const runner: CommandRunner = async (command, args, runnerOptions) => {
+      const result = await defaultRunner(command, args, runnerOptions);
+      if (
+        !interrupted
+        && command === 'git'
+        && args.includes('worktree')
+        && args.includes('add')
+      ) {
+        interrupted = true;
+        throw new Error('injected crash after worktree registration');
+      }
+      return result;
+    };
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), runner)).rejects.toThrow('injected crash after worktree registration');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const sibling = join(dirname(journalPath), 'keep-me');
+    mkdirSync(sibling);
+    writeFileSync(join(sibling, 'sentinel'), 'preserve\n');
+
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(existsSync(journalPath)).toBe(false);
+    expect(readFileSync(join(sibling, 'sentinel'), 'utf8')).toBe('preserve\n');
+    expect(git(recovered[0]!.paths.worktree, ['rev-parse', 'HEAD']))
+      .toBe(fixture.oid);
+    expect(git(fixture.repo, ['worktree', 'list', '--porcelain']))
+      .toContain(recovered[0]!.paths.worktree);
+  });
+
+  it('retires a surviving initialization journal when its exact prepared manifest and worktree are already durable', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      writeManifest(path, prepared) {
+        writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
+          encoding: 'utf8',
+          mode: 0o600,
+          flag: 'wx',
+        });
+        throw new Error('injected crash after prepared manifest installation');
+      },
+    })).rejects.toThrow('injected crash after prepared manifest installation');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const manifestPath = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+      'manifest.json',
+    );
+    const preparedBefore = readFileSync(manifestPath);
+    const recovered = await recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => credential,
+    );
+
+    expect(recovered).toHaveLength(1);
+    expect(readFileSync(manifestPath)).toEqual(preparedBefore);
+    expect(existsSync(journalPath)).toBe(false);
+  });
+
+  it('fails closed when initialization cannot resolve the exact recorded login', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      afterMarketplaceJournalInstalled() {
+        throw new Error('injected crash after journal installation');
+      },
+    })).rejects.toThrow('injected crash after journal installation');
+
+    await expect(recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      defaultRunner,
+      () => new SelectedCredential('other-bot', 'implementation', 'other-secret'),
+    )).rejects.toThrow(/credential.*recorded login/i);
+    expect(existsSync(marketplaceInitializationJournal(fixture))).toBe(true);
+  });
+
   it('accepts a bodyless task snapshot whose required problem statement falls back to its title', async () => {
     const fixture = repositoryFixture();
     const manifest = await createAttemptWorkspace(options(fixture, {
@@ -590,7 +844,7 @@ describe('attempt workspace and manifest', () => {
       .toBe('Publish one durable marketplace task');
   });
 
-  it('removes only the new attempt directory when marketplace initialization fails before worktree creation', async () => {
+  it('retains only the exact journal-owned attempt when marketplace initialization is interrupted before worktree creation', async () => {
     const fixture = repositoryFixture();
     const attemptDir = join(
       fixture.base,
@@ -615,7 +869,8 @@ describe('attempt workspace and manifest', () => {
       },
     })).rejects.toThrow('injected post-request initialization failure');
 
-    expect(existsSync(attemptDir)).toBe(false);
+    expect(existsSync(attemptDir)).toBe(true);
+    expect(existsSync(marketplaceInitializationJournal(fixture))).toBe(true);
     expect(readFileSync(join(sibling, 'sentinel'), 'utf8')).toBe('preserve\n');
     expect(git(fixture.repo, ['worktree', 'list', '--porcelain']))
       .not.toContain(join(attemptDir, 'worktree'));
