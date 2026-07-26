@@ -116,16 +116,15 @@ function harness(overrides: Partial<ReviewExecutorDeps> = {}) {
     repairProjection: async () => {
       events.push('projection');
     },
-    spawnCoordinator: (input) => {
+    startSession: async (request) => {
       events.push('spawn');
+      const input = request.local.spawnInput;
       expect(input.environment.GH_TOKEN).toBe('review-secret');
       expect(input.environment.GITHUB_TOKEN).toBeUndefined();
       expect(input.environment.JINN_AUTOPILOT_SESSION_MANIFEST)
         .toBe(`/tmp/${input.attemptId}/manifest.json`);
-      return { pid: 4242 };
-    },
-    trackChild: () => {
       events.push('track');
+      return { status: 'started', backend: 'local', pid: 4242 };
     },
     escalateHuman: async (input) => {
       human.push(input);
@@ -356,9 +355,10 @@ describe('review action executor', () => {
           record: claim({ reviewer: 'one-bot' }),
         },
       }),
-      spawnCoordinator: (input) => {
+      startSession: async (request) => {
+        const input = request.local.spawnInput;
         expect(input.environment.GH_TOKEN).toBe('one-secret');
-        return { pid: 42 };
+        return { status: 'started', backend: 'local', pid: 42 };
       },
     });
 
@@ -409,12 +409,13 @@ describe('review action executor', () => {
           },
         };
       },
-      spawnCoordinator: (input) => {
+      startSession: async (request) => {
         h.events.push('spawn');
+        const input = request.local.spawnInput;
         expect(input.environment.GH_TOKEN).toBe('review-secret');
         expect(input.environment.JINN_AUTOPILOT_SESSION_MANIFEST)
           .toBe('/tmp/review/manifest.json');
-        return { pid: 42 };
+        return { status: 'started', backend: 'local', pid: 42 };
       },
     });
 
@@ -434,6 +435,51 @@ describe('review action executor', () => {
     });
     expect(h.events.indexOf('projection')).toBeGreaterThan(h.events.indexOf('claim'));
     expect(h.events.indexOf('spawn')).toBeGreaterThan(h.events.indexOf('projection'));
+  });
+
+  it('starts an exact-head local review session with fenced identity and sanitized launch input', async () => {
+    const requests: unknown[] = [];
+    const h = harness({
+      startSession: async (request) => {
+        h.events.push('start');
+        requests.push(request);
+        return { status: 'started', backend: 'local', pid: 4242 };
+      },
+    });
+
+    await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned', reviewer: 'review-bot' });
+    expect(h.events).toEqual(['record', 'claim', 'attempt', 'projection', 'start']);
+    expect(requests).toEqual([{
+      kind: 'exact-head-review',
+      backend: 'local',
+      manifestPath: `/tmp/${ATTEMPT_A}/manifest.json`,
+      attemptId: ATTEMPT_A,
+      issueNumber: 42,
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBase: 'next',
+      worktreePath: `/tmp/${ATTEMPT_A}/worktree`,
+      logPath: `/tmp/${ATTEMPT_A}/session.log`,
+      reviewedHead: HEAD,
+      reviewerLogin: 'review-bot',
+      local: {
+        spawnInput: expect.objectContaining({
+          attemptId: ATTEMPT_A,
+          candidate: expect.objectContaining({
+            issueNumber: 42,
+            number: 84,
+            head: HEAD,
+          }),
+          environment: expect.objectContaining({
+            GH_TOKEN: 'review-secret',
+            JINN_AUTOPILOT_SESSION_MANIFEST: `/tmp/${ATTEMPT_A}/manifest.json`,
+          }),
+          worktreePath: `/tmp/${ATTEMPT_A}/worktree`,
+          logPath: `/tmp/${ATTEMPT_A}/session.log`,
+        }),
+      },
+    }]);
   });
 
   it('re-reads exact ref, head, and Human authority after projection before spawn', async () => {

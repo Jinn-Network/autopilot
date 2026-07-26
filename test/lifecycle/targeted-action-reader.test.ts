@@ -299,12 +299,10 @@ function executeTargetedRecovery(
         },
       };
     },
-    spawnCoordinator: () => {
+    startSession: async () => {
       events.push('worker');
-      return { pid: 42 };
-    },
-    trackChild: () => {
       events.push('track');
+      return { status: 'started', backend: 'local', pid: 42 };
     },
     ambientEnvironment: {},
     nextAttemptId: () => '22222222-2222-4222-8222-222222222222',

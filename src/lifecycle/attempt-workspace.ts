@@ -28,6 +28,26 @@ import {
 export type AttemptPhase = 'implement' | 'review';
 export type AttemptProcessState = 'preparing' | 'running' | 'exited';
 export type ReviewApprovalPolicy = 'approve-eligible' | 'human-codeowner';
+export const MARKETPLACE_EXECUTION_SCHEMA_VERSION = 'marketplace-execution-v1';
+
+export type MarketplaceExecutionState =
+  | {
+      readonly schemaVersion: typeof MARKETPLACE_EXECUTION_SCHEMA_VERSION;
+      readonly status: 'unsubmitted';
+      readonly requestPath: string;
+    }
+  | {
+      readonly schemaVersion: typeof MARKETPLACE_EXECUTION_SCHEMA_VERSION;
+      readonly status: 'submitted';
+      readonly requestPath: string;
+      readonly taskId: string;
+      readonly taskCid: string;
+      readonly submittedAt: string;
+    };
+
+export type AttemptExecution =
+  | { readonly backend: 'local' }
+  | { readonly backend: 'marketplace'; readonly state: MarketplaceExecutionState };
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SAFE_COMPONENT_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
@@ -71,6 +91,7 @@ export interface AttemptManifest {
   readonly runnerId: string;
   readonly host: string;
   readonly phase: AttemptPhase;
+  readonly execution: AttemptExecution;
   readonly subject: string;
   readonly issueNumber: number;
   readonly prNumber?: number;
@@ -96,6 +117,7 @@ export interface CreateAttemptOptions {
   readonly worktreeBase: string;
   readonly runnerId?: string;
   readonly phase: AttemptPhase;
+  readonly execution?: AttemptExecution;
   readonly subject: string;
   readonly issueNumber: number;
   readonly prNumber?: number;
@@ -182,11 +204,13 @@ function exactKeys(
   record: Record<string, unknown>,
   allowed: readonly string[],
   name: string,
+  optional: readonly string[] = [],
 ): void {
   const allowedSet = new Set(allowed);
   const unknown = Object.keys(record).find((key) => !allowedSet.has(key));
   if (unknown !== undefined) throw new Error(`Unknown field: ${unknown}`);
   const missing = allowed.find((key) => !Object.hasOwn(record, key)
+    && !optional.includes(key)
     && ![
       'prNumber',
       'reviewGeneration',
@@ -198,6 +222,60 @@ function exactKeys(
       'childExitedAt',
     ].includes(key));
   if (missing !== undefined) throw new Error(`Missing ${name} field: ${missing}`);
+}
+
+function decodeMarketplaceExecutionState(value: unknown): MarketplaceExecutionState {
+  const state = record(value, 'marketplace execution state');
+  if (state.schemaVersion !== MARKETPLACE_EXECUTION_SCHEMA_VERSION) {
+    throw new Error('Unsupported marketplace execution schema version');
+  }
+  if (state.status === 'unsubmitted') {
+    exactKeys(state, [
+      'schemaVersion',
+      'status',
+      'requestPath',
+    ], 'unsubmitted marketplace execution state');
+    return {
+      schemaVersion: MARKETPLACE_EXECUTION_SCHEMA_VERSION,
+      status: 'unsubmitted',
+      requestPath: absolutePath(state.requestPath, 'marketplace request path'),
+    };
+  }
+  if (state.status === 'submitted') {
+    exactKeys(state, [
+      'schemaVersion',
+      'status',
+      'requestPath',
+      'taskId',
+      'taskCid',
+      'submittedAt',
+    ], 'submitted marketplace execution state');
+    return {
+      schemaVersion: MARKETPLACE_EXECUTION_SCHEMA_VERSION,
+      status: 'submitted',
+      requestPath: absolutePath(state.requestPath, 'marketplace request path'),
+      taskId: stringField(state.taskId, 'marketplace task ID'),
+      taskCid: stringField(state.taskCid, 'marketplace task CID'),
+      submittedAt: isoTimestamp(stringField(state.submittedAt, 'marketplace submitted timestamp')),
+    };
+  }
+  throw new Error('Invalid marketplace execution status');
+}
+
+function decodeAttemptExecution(value: unknown): AttemptExecution {
+  const execution = record(value, 'attempt execution');
+  if (execution.backend === 'local') {
+    exactKeys(execution, ['backend'], 'local attempt execution');
+    return { backend: 'local' };
+  }
+  if (execution.backend === 'marketplace') {
+    exactKeys(execution, ['backend', 'state'], 'marketplace attempt execution');
+    return {
+      backend: 'marketplace',
+      state: decodeMarketplaceExecutionState(execution.state),
+    };
+  }
+  throw new Error('Invalid attempt execution backend');
 }
 
 function record(value: unknown, name: string): Record<string, unknown> {
@@ -301,6 +379,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'runnerId',
     'host',
     'phase',
+    'execution',
     'subject',
     'issueNumber',
     'prNumber',
@@ -319,12 +398,15 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'terminalHead',
     'paths',
     'timestamps',
-  ], 'attempt manifest');
+  ], 'attempt manifest', ['execution']);
   if (manifest.version !== 2) throw new Error('Unsupported attempt manifest version');
   const phase = manifest.phase;
   if (phase !== 'implement' && phase !== 'review') {
     throw new Error('Invalid attempt phase');
   }
+  const execution = Object.hasOwn(manifest, 'execution')
+    ? decodeAttemptExecution(manifest.execution)
+    : { backend: 'local' } as const;
   const attemptId = uuid(stringField(manifest.attemptId, 'attempt ID'), 'attempt ID');
   const runnerId = safeComponent(stringField(manifest.runnerId, 'runner ID'), 'runner ID');
   const host = filesystemSafeHostname(stringField(manifest.host, 'attempt host'));
@@ -410,6 +492,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     runnerId,
     host,
     phase,
+    execution,
     subject,
     issueNumber,
     ...(prNumber === undefined ? {} : { prNumber }),
@@ -892,6 +975,7 @@ export async function createAttemptWorkspace(
     runnerId,
     host,
     phase: options.phase,
+    execution: options.execution ?? { backend: 'local' },
     subject,
     issueNumber: options.issueNumber,
     ...(options.prNumber === undefined ? {} : { prNumber: options.prNumber }),

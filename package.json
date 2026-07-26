@@ -36,6 +36,8 @@
     "paint-board": "tsx scripts/paint-board.ts"
   },
   "dependencies": {
+    "@jinn-network/client": "0.2.2",
+    "@jinn-network/sdk": "0.1.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

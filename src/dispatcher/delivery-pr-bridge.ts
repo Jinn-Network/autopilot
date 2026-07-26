@@ -52,15 +52,12 @@ import { REPO } from './constants.js';
 // ── Narrow wire-format schemas ──────────────────────────────────────────────
 //
 // Deliberately NOT importing `client/src/types/envelope.ts` or
-// `@jinn-network/client` (autopilot must not depend on the client package —
-// coordinator override of the original plan) and NOT depending on
-// `@jinn-network/sdk` either: the envelope wire shape isn't exported by the
-// SDK at all (only the task/payload schemas are), so a local schema is
-// required regardless; duplicating the ~15-line task-shape alongside it to
-// avoid a portal dependency (which would require building the SDK before
-// every autopilot install/typecheck/test, with no existing CI wiring to
-// automate that) is the simpler trade. These schemas cover ONLY what the
-// bridge consumes — not the full `jinn.execution.v1` / `jinn-repo.v1` shapes.
+// `@jinn-network/client`: Autopilot invokes the installed client binary but
+// does not use its internal modules as a programmatic API. The legacy bridge
+// envelope wire shape is not part of the SDK's public Autopilot contracts, so
+// this narrow local schema remains necessary. These schemas cover ONLY what
+// the bridge consumes — not the full `jinn.execution.v1` / `jinn-repo.v1`
+// shapes.
 
 /** The solverType this bridge acts on — the live variant of `jinn-repo`. */
 export const MARKETPLACE_SOLVER_TYPE = 'jinn-repo.v1';
