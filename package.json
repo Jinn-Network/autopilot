@@ -22,9 +22,6 @@
     "access": "public",
     "provenance": true
   },
-  "resolutions": {
-    "openredaction": "1.1.2"
-  },
   "scripts": {
     "build": "node scripts/build-distribution.mjs",
     "verify:dist": "node scripts/verify-distribution.mjs",
@@ -39,7 +36,7 @@
     "paint-board": "tsx scripts/paint-board.ts"
   },
   "dependencies": {
-    "@jinn-network/client": "0.2.1",
+    "@jinn-network/client": "0.2.2",
     "@jinn-network/sdk": "0.1.1",
     "zod": "^4.4.3"
   },

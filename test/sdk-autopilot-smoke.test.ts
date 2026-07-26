@@ -1,4 +1,5 @@
 import { access, realpath } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
@@ -105,5 +106,19 @@ describe('published Autopilot marketplace boundary', () => {
     await expect(realpath(localJinnBinary)).resolves.toContain(
       '/node_modules/@jinn-network/client/dist/bin/jinn.js',
     );
+  });
+
+  it('executes the installed client CLI under the supported Node runtime', () => {
+    const result = spawnSync(process.execPath, [localJinnBinary, '--help'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        NO_COLOR: '1',
+      },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('jinn tasks');
   });
 });

@@ -8,8 +8,8 @@ import type { BridgeEnvelope, DeliveredRecord, DeliveryReader } from './delivery
  * NARROW by design (coordinator override, issue #1892): replicates the
  * minimal GraphQL query shape from `client/src/discovery/http.ts`'s
  * `QUERY_ENVELOPES_QUERY` and the plain-fetch pattern from
- * `client/src/corpus/fetch.ts` — does not import either (autopilot must not
- * depend on `@jinn-network/client`). Also does not replicate
+ * `client/src/corpus/fetch.ts` — does not import either because the installed
+ * client is a CLI boundary, not an internal module API. Also does not replicate
  * `client/src/adapters/mech/ipfs.ts`'s multi-codec/multi-gateway fallback
  * machinery; a single gateway GET is enough for this reader's job.
  *

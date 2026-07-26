@@ -950,7 +950,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@jinn-network/autopilot@workspace:."
   dependencies:
-    "@jinn-network/client": "npm:0.2.1"
+    "@jinn-network/client": "npm:0.2.2"
     "@jinn-network/sdk": "npm:0.1.1"
     "@types/node": "npm:^22"
     esbuild: "npm:^0.28.0"
@@ -963,17 +963,17 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@jinn-network/client@npm:0.2.1":
-  version: 0.2.1
-  resolution: "@jinn-network/client@npm:0.2.1"
+"@jinn-network/client@npm:0.2.2":
+  version: 0.2.2
+  resolution: "@jinn-network/client@npm:0.2.2"
   dependencies:
     "@coinbase/cdp-sdk": "npm:^1.48.2"
     "@ethereumjs/wallet": "npm:^10.0.0"
     "@grpc/grpc-js": "npm:^1.14.3"
     "@hono/node-server": "npm:^2.0.5"
     "@huggingface/transformers": "npm:^4.2.0"
-    "@jinn-network/core": "npm:0.1.0"
-    "@jinn-network/plugin": "npm:0.1.0"
+    "@jinn-network/core": "npm:0.1.1"
+    "@jinn-network/plugin": "npm:0.1.1"
     "@lmoe/gliner-onnx": "npm:0.1.0"
     "@modelcontextprotocol/sdk": "npm:^1.27.1"
     "@msgpack/msgpack": "npm:^3.0.0"
@@ -1021,35 +1021,35 @@ __metadata:
     client: dist/bin/jinn.js
     jinn: dist/bin/jinn.js
     jinn-stop-hook: dist/bin/jinn-stop-hook.js
-  checksum: 10c0/3d9df9a90cd7d3f76aeb979fc5996268b9a5f22bd5588a73c7a97af44f0e0f1ceb3dd21f50a4332bc1c66ac9113e3c69b62cf4444c083b72168df0ab48a05296
+  checksum: 10c0/e88ffe4f01990af5c4f82cbaeffb6fb3ecd54562db562244692e045219a4616bc38b763701766d90ed717703ab8203e9d1c033d0e98b52a97ab051429e0176ef
   languageName: node
   linkType: hard
 
-"@jinn-network/core@npm:0.1.0":
-  version: 0.1.0
-  resolution: "@jinn-network/core@npm:0.1.0"
+"@jinn-network/core@npm:0.1.1":
+  version: 0.1.1
+  resolution: "@jinn-network/core@npm:0.1.1"
   dependencies:
     "@huggingface/transformers": "npm:^4.2.0"
-    "@jinn-network/plugin": "npm:0.1.0"
+    "@jinn-network/plugin": "npm:0.1.1"
+    "@lmoe/gliner-onnx": "npm:0.1.0"
     "@noble/hashes": "npm:^2.2.0"
     "@secretlint/core": "npm:^13.0.2"
     "@secretlint/secretlint-rule-preset-recommend": "npm:^13.0.2"
     better-sqlite3: "npm:^12.10.0"
     canonicalize: "npm:^3.0.0"
-    openredaction: "npm:^1.1.2"
     zod: "npm:^4.4.3"
   peerDependencies:
     vitest: ^4.1.8
   peerDependenciesMeta:
     vitest:
       optional: true
-  checksum: 10c0/80c6d1f4ca6966d8f9f44b10cdfbe4fdb9011835ec6433871e76e660b1f4882a202ce3c8d7b83e02383a3130e78b5a4241c85a5e48a966cc7193e520f70216a2
+  checksum: 10c0/019f1543b63061bb28ee98e4cae270d4b789fe9e21752ab602a476eb63cd117349a4e89d66bf45b2c7600e1ffc4c6071dc197fe423eae0c11a064ab7ac8c89fe
   languageName: node
   linkType: hard
 
-"@jinn-network/plugin@npm:0.1.0":
-  version: 0.1.0
-  resolution: "@jinn-network/plugin@npm:0.1.0"
+"@jinn-network/plugin@npm:0.1.1":
+  version: 0.1.1
+  resolution: "@jinn-network/plugin@npm:0.1.1"
   dependencies:
     zod: "npm:^4.4.3"
   peerDependencies:
@@ -1057,7 +1057,7 @@ __metadata:
   peerDependenciesMeta:
     vitest:
       optional: true
-  checksum: 10c0/53a66ab3c636660662588df013e40c7ac2aabc659121f4ffe45d1723d9046dd53ae8818bfe9cc4cd3275f6c1f7ac0a730d09d0392916ba6c3a6a9956dab4e304
+  checksum: 10c0/299d9d3e4589d6f422c24871c24612cadb981d0614c3291c3c5d16068bb92eb9bac222c1a4ee0f8c66a5bcbf989bf815e2bc4d1337dca3e27617c1b09804411c
   languageName: node
   linkType: hard
 
@@ -4804,27 +4804,6 @@ __metadata:
     platform: "npm:^1.3.6"
     protobufjs: "npm:^7.2.4"
   checksum: 10c0/81c6ccdd81844f9590b0c1fccd220d31d201341969ca7ad659a36542ba7741cb0e090020ca85f61d3656a9ccc96ce0889106986a6bab8afc29c3cb1895ddb38e
-  languageName: node
-  linkType: hard
-
-"openredaction@npm:1.1.2":
-  version: 1.1.2
-  resolution: "openredaction@npm:1.1.2"
-  peerDependencies:
-    mammoth: ^1.6.0
-    pdf-parse: ^1.1.1
-    react: ^18.0.0 || ^19.0.0
-    tesseract.js: ^5.0.0
-  peerDependenciesMeta:
-    mammoth:
-      optional: true
-    pdf-parse:
-      optional: true
-    react:
-      optional: true
-    tesseract.js:
-      optional: true
-  checksum: 10c0/3b0348f9068622dc67d93b03da07b1740e52acf3b4efe4b4db182c2825418284fbba2c025c50ababe13e275bf1261857e1806ae2c627f753dbb1178873ea394e
   languageName: node
   linkType: hard
 
