@@ -9,6 +9,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -200,6 +201,18 @@ function marketplaceInitializationJournal(
     : [];
   expect(journals).toHaveLength(1);
   return join(phaseDir, journals[0]!);
+}
+
+function marketplaceInitializationJournalPathForTest(
+  fixture: ReturnType<typeof repositoryFixture>,
+): string {
+  return join(
+    fixture.base,
+    'v2',
+    'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    'implement',
+    `.issue-42-${UUID_A}.marketplace-initialization.json`,
+  );
 }
 
 function terminalAttempt(manifest: AttemptManifest): AttemptManifest {
@@ -791,6 +804,193 @@ describe('attempt workspace and manifest', () => {
     expect(existsSync(journalPath)).toBe(false);
   });
 
+  it.each(['submitted', 'cancelled'] as const)(
+    'retires a stale initialization journal around an agreeing %s terminal manifest without touching credentials or Git',
+    async (terminal) => {
+      const fixture = repositoryFixture();
+      const credential =
+        new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+      await expect(createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        credential,
+        marketplacePreparation: marketplacePreparation(fixture),
+      }), defaultRunner, {
+        writeManifest(path, prepared) {
+          writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
+            encoding: 'utf8',
+            mode: 0o600,
+            flag: 'wx',
+          });
+          throw new Error('injected crash after prepared manifest installation');
+        },
+      })).rejects.toThrow('injected crash after prepared manifest installation');
+
+      const journalPath = marketplaceInitializationJournal(fixture);
+      const manifestPath = join(
+        fixture.base,
+        'v2',
+        'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'implement',
+        `issue-42-${UUID_A}`,
+        'manifest.json',
+      );
+      const prepared = readAttemptManifest(manifestPath);
+      if (
+        prepared.execution.backend !== 'marketplace'
+        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v2'
+      ) {
+        throw new Error('expected prepared marketplace execution');
+      }
+      transitionMarketplaceExecution(
+        manifestPath,
+        prepared.execution.state.requestDigest,
+        terminal === 'submitted'
+          ? { status: 'submitted', submission: SUBMISSION_RESULT }
+          : { status: 'cancelled', reason: 'operator-cancelled' },
+        () => new Date('2026-07-20T00:02:00.000Z'),
+      );
+      const terminalBytes = readFileSync(manifestPath);
+      const resolveCredential = vi.fn(() => {
+        throw new Error('terminal recovery must not resolve credentials');
+      });
+      const runner = vi.fn(async () => {
+        throw new Error('terminal recovery must not inspect or repair Git');
+      });
+
+      const recovered = await recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        runner,
+        resolveCredential,
+      );
+
+      expect(recovered).toHaveLength(1);
+      expect(recovered[0]!.execution).toMatchObject({
+        backend: 'marketplace',
+        state: { status: terminal },
+      });
+      expect(resolveCredential).not.toHaveBeenCalled();
+      expect(runner).not.toHaveBeenCalled();
+      expect(readFileSync(manifestPath)).toEqual(terminalBytes);
+      expect(existsSync(journalPath)).toBe(false);
+    },
+  );
+
+  it.each(['digest', 'submission-identity'] as const)(
+    'retains the initialization journal and terminal bytes when the %s contradicts it',
+    async (contradiction) => {
+      const fixture = repositoryFixture();
+      const credential =
+        new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+      await expect(createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        credential,
+        marketplacePreparation: marketplacePreparation(fixture),
+      }), defaultRunner, {
+        writeManifest(path, prepared) {
+          writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
+            encoding: 'utf8',
+            mode: 0o600,
+            flag: 'wx',
+          });
+          throw new Error('injected crash after prepared manifest installation');
+        },
+      })).rejects.toThrow('injected crash after prepared manifest installation');
+
+      const journalPath = marketplaceInitializationJournal(fixture);
+      const manifestPath = join(
+        fixture.base,
+        'v2',
+        'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'implement',
+        `issue-42-${UUID_A}`,
+        'manifest.json',
+      );
+      const prepared = readAttemptManifest(manifestPath);
+      if (
+        prepared.execution.backend !== 'marketplace'
+        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v2'
+      ) {
+        throw new Error('expected prepared marketplace execution');
+      }
+      transitionMarketplaceExecution(
+        manifestPath,
+        prepared.execution.state.requestDigest,
+        { status: 'submitted', submission: SUBMISSION_RESULT },
+        () => new Date('2026-07-20T00:02:00.000Z'),
+      );
+      const raw = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+        execution: {
+          state: {
+            requestDigest: string;
+            submission: { id: string };
+          };
+        };
+      };
+      if (contradiction === 'digest') {
+        raw.execution.state.requestDigest = `sha256:${'f'.repeat(64)}`;
+      } else {
+        raw.execution.state.submission.id =
+          'autopilot:22222222-2222-4222-8222-222222222222';
+      }
+      writeFileSync(manifestPath, `${JSON.stringify(raw, null, 2)}\n`, {
+        mode: 0o600,
+      });
+      const terminalBytes = readFileSync(manifestPath);
+      const resolveCredential = vi.fn(() => credential);
+      const runner = vi.fn(async () => '');
+
+      await expect(recoverMarketplaceAttemptInitializations(
+        join(fixture.base, 'v2'),
+        runner,
+        resolveCredential,
+      )).rejects.toThrow(/terminal.*journal|conflicts.*journal/i);
+
+      expect(resolveCredential).not.toHaveBeenCalled();
+      expect(runner).not.toHaveBeenCalled();
+      expect(readFileSync(manifestPath)).toEqual(terminalBytes);
+      expect(existsSync(journalPath)).toBe(true);
+    },
+  );
+
+  it('accepts an agreeing terminal transition between prepared-manifest installation and readback', async () => {
+    const fixture = repositoryFixture();
+    const preparation = marketplacePreparation(fixture);
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: preparation,
+    }), defaultRunner, {
+      writeManifest(path, prepared) {
+        writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
+          encoding: 'utf8',
+          mode: 0o600,
+          flag: 'wx',
+        });
+        transitionMarketplaceExecution(
+          path,
+          prepared.execution.state.requestDigest,
+          { status: 'submitted', submission: SUBMISSION_RESULT },
+          () => new Date('2026-07-20T00:02:00.000Z'),
+        );
+      },
+    });
+
+    expect(manifest.execution).toMatchObject({
+      backend: 'marketplace',
+      state: { status: 'submitted' },
+    });
+    expect(existsSync(marketplaceInitializationJournalPathForTest(
+      fixture,
+    ))).toBe(false);
+  });
+
   it('fails closed when initialization cannot resolve the exact recorded login', async () => {
     const fixture = repositoryFixture();
     const credential =
@@ -814,6 +1014,133 @@ describe('attempt workspace and manifest', () => {
       () => new SelectedCredential('other-bot', 'implementation', 'other-secret'),
     )).rejects.toThrow(/credential.*recorded login/i);
     expect(existsSync(marketplaceInitializationJournal(fixture))).toBe(true);
+  });
+
+  it('rejects a journal whose arbitrary direct-child path is not its subject and attempt identity before any side effect', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      afterMarketplaceJournalInstalled() {
+        throw new Error('injected journal-only crash');
+      },
+    })).rejects.toThrow('injected journal-only crash');
+
+    const originalJournal = marketplaceInitializationJournal(fixture);
+    const raw = JSON.parse(readFileSync(originalJournal, 'utf8')) as {
+      manifest: AttemptManifest;
+    };
+    const arbitraryAttemptDir = join(dirname(originalJournal), 'arbitrary-child');
+    raw.manifest.paths = {
+      attemptDir: arbitraryAttemptDir,
+      worktree: join(arbitraryAttemptDir, 'worktree'),
+      manifest: join(arbitraryAttemptDir, 'manifest.json'),
+      log: join(arbitraryAttemptDir, 'session.log'),
+      ghConfigDir: join(arbitraryAttemptDir, 'gh-config'),
+      askpass: join(arbitraryAttemptDir, 'askpass'),
+      tokenFile: join(arbitraryAttemptDir, 'gh-token'),
+    };
+    if (
+      raw.manifest.execution.backend !== 'marketplace'
+      || raw.manifest.execution.state.schemaVersion
+        !== 'marketplace-execution-v2'
+    ) {
+      throw new Error('expected marketplace journal');
+    }
+    raw.manifest.execution.state.requestPath =
+      join(arbitraryAttemptDir, 'marketplace-request.json');
+    raw.manifest.execution.state.solverNetSelectionPath =
+      `${raw.manifest.execution.state.requestPath}.solvernet-selection.json`;
+    const tamperedJournal = join(
+      dirname(originalJournal),
+      '.arbitrary-child.marketplace-initialization.json',
+    );
+    renameSync(originalJournal, tamperedJournal);
+    writeFileSync(tamperedJournal, `${JSON.stringify(raw, null, 2)}\n`, {
+      mode: 0o600,
+    });
+    const resolveCredential = vi.fn(() => credential);
+    const runner = vi.fn(async () => '');
+
+    await expect(recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      runner,
+      resolveCredential,
+    )).rejects.toThrow(/subject.*attempt|attempt.*identity/i);
+
+    expect(resolveCredential).not.toHaveBeenCalled();
+    expect(runner).not.toHaveBeenCalled();
+    expect(existsSync(arbitraryAttemptDir)).toBe(false);
+    expect(existsSync(tamperedJournal)).toBe(true);
+  });
+
+  it('re-establishes repository identity before repairing an interrupted worktree', async () => {
+    const fixture = repositoryFixture();
+    const credential =
+      new SelectedCredential('impl-bot', 'implementation', 'selected-secret');
+    let interrupted = false;
+    const crashRunner: CommandRunner = async (command, args, runnerOptions) => {
+      const result = await defaultRunner(command, args, runnerOptions);
+      if (
+        !interrupted
+        && command === 'git'
+        && args.includes('worktree')
+        && args.includes('add')
+      ) {
+        interrupted = true;
+        throw new Error('injected crash after worktree registration');
+      }
+      return result;
+    };
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      credential,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), crashRunner)).rejects.toThrow('injected crash after worktree registration');
+
+    const journalPath = marketplaceInitializationJournal(fixture);
+    const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as {
+      manifest: AttemptManifest;
+    };
+    writeFileSync(
+      join(journal.manifest.paths.worktree, 'partial-checkout'),
+      'dirty\n',
+    );
+    git(fixture.repo, ['remote', 'set-url', 'origin', join(fixture.root, 'other.git')]);
+    let removeCalls = 0;
+    const recoveryRunner: CommandRunner = async (command, args, runnerOptions) => {
+      if (
+        command === 'git'
+        && args.includes('worktree')
+        && args.includes('remove')
+      ) {
+        removeCalls += 1;
+      }
+      return defaultRunner(command, args, runnerOptions);
+    };
+
+    await expect(recoverMarketplaceAttemptInitializations(
+      join(fixture.base, 'v2'),
+      recoveryRunner,
+      () => credential,
+    )).rejects.toThrow(/repository identity.*match/i);
+
+    expect(removeCalls).toBe(0);
+    expect(readFileSync(
+      join(journal.manifest.paths.worktree, 'partial-checkout'),
+      'utf8',
+    )).toBe('dirty\n');
+    expect(existsSync(journalPath)).toBe(true);
   });
 
   it('accepts a bodyless task snapshot whose required problem statement falls back to its title', async () => {

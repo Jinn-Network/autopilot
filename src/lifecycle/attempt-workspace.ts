@@ -1620,6 +1620,8 @@ function assertMarketplaceJournalCorrelation(
   }
   const state = manifest.execution.state;
   const expectedPaths = expectedAttemptPaths(manifest.paths.attemptDir);
+  const phaseDir = dirname(manifest.paths.attemptDir);
+  const runnerDir = dirname(phaseDir);
   const session = request.spec.session;
   const expectedWorkflow = session.workflow === 'implement'
     ? 'implementation'
@@ -1627,7 +1629,17 @@ function assertMarketplaceJournalCorrelation(
       ? 'review-finding'
       : session.workflow;
   if (
+    basename(manifest.paths.attemptDir)
+      !== `${manifest.subject}-${manifest.attemptId}`
+  ) {
+    throw new Error(
+      'Marketplace initialization journal subject and attempt identity disagree',
+    );
+  }
+  if (
     !samePaths(manifest.paths, expectedPaths)
+    || basename(phaseDir) !== manifest.phase
+    || basename(runnerDir) !== manifest.runnerId
     || state.requestPath !== join(manifest.paths.attemptDir, 'marketplace-request.json')
     || state.solverNetSelectionPath !== `${state.requestPath}.solvernet-selection.json`
     || canonicalMarketplaceRequest(request).digest !== state.requestDigest
@@ -1871,6 +1883,16 @@ async function repairMarketplaceAttemptWorktree(
     // The durable journal exclusively owns this exact not-yet-prepared path.
     // Repair is intentionally limited to this registration and checkout.
   }
+  const repository = await readRepositoryIdentity(
+    manifest.repository.root,
+    manifest.repository.remoteName,
+    runner,
+  );
+  if (!sameRepositoryIdentity(repository, manifest.repository)) {
+    throw new Error(
+      'Marketplace initialization repository identity does not match its journal',
+    );
+  }
   const registered = await registeredWorktreePaths(
     manifest.repository.gitCommonDir,
     runner,
@@ -1905,6 +1927,102 @@ async function repairMarketplaceAttemptWorktree(
   await proveMarketplaceAttemptWorktree(manifest, runner);
 }
 
+type MarketplaceJournalManifestClassification =
+  | { readonly status: 'absent' }
+  | { readonly status: 'prepared'; readonly manifest: AttemptManifest }
+  | { readonly status: 'terminal'; readonly manifest: AttemptManifest };
+
+function sameMarketplacePreparedFields(
+  expected: MarketplacePreparedExecutionFields,
+  actual: MarketplacePreparedExecutionFields,
+): boolean {
+  return expected.requestPath === actual.requestPath
+    && expected.requestDigest === actual.requestDigest
+    && expected.solverNetSelectionPath === actual.solverNetSelectionPath
+    && expected.preparedAt === actual.preparedAt
+    && expected.agentSoftDeadline === actual.agentSoftDeadline
+    && expected.adoptionDeadline === actual.adoptionDeadline;
+}
+
+function classifyMarketplaceJournalManifest(
+  journal: MarketplaceAttemptInitializationJournal,
+): MarketplaceJournalManifestClassification {
+  const path = journal.manifest.paths.manifest;
+  if (!existsSync(path)) return { status: 'absent' };
+  const current = readAttemptManifest(path);
+  if (isDeepStrictEqual(current, journal.manifest)) {
+    return { status: 'prepared', manifest: current };
+  }
+  const expectedExecution = journal.manifest.execution;
+  const actualExecution = current.execution;
+  if (
+    expectedExecution.backend !== 'marketplace'
+    || expectedExecution.state.schemaVersion
+      !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || expectedExecution.state.status !== 'prepared'
+    || actualExecution.backend !== 'marketplace'
+    || actualExecution.state.schemaVersion
+      !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || (
+      actualExecution.state.status !== 'submitted'
+      && actualExecution.state.status !== 'cancelled'
+    )
+    || !sameMarketplacePreparedFields(
+      expectedExecution.state,
+      actualExecution.state,
+    )
+  ) {
+    throw new Error(
+      'Marketplace terminal manifest conflicts with its initialization journal',
+    );
+  }
+  if (
+    actualExecution.state.status === 'submitted'
+    && actualExecution.state.submission.id !== journal.request.id
+  ) {
+    throw new Error(
+      'Marketplace terminal request identity conflicts with its initialization journal',
+    );
+  }
+  const normalized = decodeAttemptManifest({
+    ...current,
+    execution: journal.manifest.execution,
+    timestamps: {
+      ...current.timestamps,
+      updatedAt: journal.manifest.timestamps.updatedAt,
+    },
+  });
+  if (!isDeepStrictEqual(normalized, journal.manifest)) {
+    throw new Error(
+      'Marketplace terminal manifest conflicts with its initialization journal',
+    );
+  }
+  return { status: 'terminal', manifest: current };
+}
+
+function retireMarketplaceInitializationJournal(
+  journalPath: string,
+  journal: MarketplaceAttemptInitializationJournal,
+): AttemptManifest {
+  const before = classifyMarketplaceJournalManifest(journal);
+  if (before.status === 'absent') {
+    throw new Error(
+      'Marketplace initialization journal cannot retire without a manifest',
+    );
+  }
+  rmSync(journalPath);
+  fsyncDirectory(dirname(journalPath));
+  // A matching terminal transition may win after prepared readback but before
+  // the journal unlink. Re-read so the caller observes that durable winner.
+  const after = classifyMarketplaceJournalManifest(journal);
+  if (after.status === 'absent') {
+    throw new Error(
+      'Marketplace initialization manifest disappeared during journal retirement',
+    );
+  }
+  return after.manifest;
+}
+
 async function resolveMarketplaceInitialization(
   journalPath: string,
   runner: CommandRunner,
@@ -1913,6 +2031,10 @@ async function resolveMarketplaceInitialization(
 ): Promise<AttemptManifest> {
   const journal = readMarketplaceInitializationJournal(journalPath);
   const { manifest, request } = journal;
+  const installed = classifyMarketplaceJournalManifest(journal);
+  if (installed.status === 'terminal') {
+    return retireMarketplaceInitializationJournal(journalPath, journal);
+  }
   const credential = await resolveCredential(manifest.selectedLogin.toLowerCase());
   if (credential.normalizedLogin !== manifest.selectedLogin.toLowerCase()) {
     throw new Error('Marketplace credential does not match the recorded login');
@@ -1944,20 +2066,14 @@ async function resolveMarketplaceInitialization(
     throw new Error('Marketplace request verification changed canonical request bytes');
   }
   await repairMarketplaceAttemptWorktree(manifest, runner);
-  if (existsSync(manifest.paths.manifest)) {
-    const existing = readAttemptManifest(manifest.paths.manifest);
-    if (!isDeepStrictEqual(existing, manifest)) {
-      throw new Error('Prepared marketplace manifest conflicts with its journal');
-    }
-  } else {
+  const beforeInstall = classifyMarketplaceJournalManifest(journal);
+  if (beforeInstall.status === 'terminal') {
+    return retireMarketplaceInitializationJournal(journalPath, journal);
+  }
+  if (beforeInstall.status === 'absent') {
     (runtime.writeManifest ?? writeManifestAtomic)(manifest.paths.manifest, manifest);
   }
-  if (!isDeepStrictEqual(readAttemptManifest(manifest.paths.manifest), manifest)) {
-    throw new Error('Attempt manifest verification failed after persistence');
-  }
-  rmSync(journalPath);
-  fsyncDirectory(dirname(journalPath));
-  return manifest;
+  return retireMarketplaceInitializationJournal(journalPath, journal);
 }
 
 export async function recoverMarketplaceAttemptInitializations(
