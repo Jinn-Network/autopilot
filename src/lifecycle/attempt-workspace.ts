@@ -845,6 +845,8 @@ export type MarketplaceExecutionTransition =
 
 const MARKETPLACE_TERMINAL_EVIDENCE_SCHEMA_VERSION = 'marketplace-terminal-v1';
 const MARKETPLACE_TERMINAL_EVIDENCE_SUFFIX = '.marketplace-terminal.json';
+const MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION = 'marketplace-dispatch-v1';
+const MARKETPLACE_DISPATCH_DECISION_SUFFIX = '.marketplace-dispatch.json';
 
 type MarketplaceTerminalEvidence =
   | {
@@ -862,8 +864,27 @@ type MarketplaceTerminalEvidence =
       readonly cancelledAt: string;
     };
 
+export type MarketplaceDispatchDecision =
+  | {
+      readonly schemaVersion: typeof MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION;
+      readonly requestDigest: string;
+      readonly decision: 'broadcast';
+      readonly decidedAt: string;
+    }
+  | {
+      readonly schemaVersion: typeof MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION;
+      readonly requestDigest: string;
+      readonly decision: 'cancelled';
+      readonly reason: string;
+      readonly decidedAt: string;
+    };
+
 function marketplaceTerminalEvidencePath(manifestPath: string): string {
   return `${manifestPath}${MARKETPLACE_TERMINAL_EVIDENCE_SUFFIX}`;
+}
+
+function marketplaceDispatchDecisionPath(manifestPath: string): string {
+  return `${manifestPath}${MARKETPLACE_DISPATCH_DECISION_SUFFIX}`;
 }
 
 function decodeMarketplaceTerminalEvidence(value: unknown): MarketplaceTerminalEvidence {
@@ -911,11 +932,90 @@ function decodeMarketplaceTerminalEvidence(value: unknown): MarketplaceTerminalE
 }
 
 function readMarketplaceTerminalEvidence(path: string): MarketplaceTerminalEvidence | undefined {
-  if (!existsSync(path)) return undefined;
+  let metadata;
+  try {
+    metadata = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new Error('Invalid marketplace terminal evidence', { cause: error });
+  }
+  if (
+    metadata.isSymbolicLink()
+    || !metadata.isFile()
+    || (metadata.mode & 0o777) !== 0o600
+  ) {
+    throw new Error('Invalid marketplace terminal evidence');
+  }
   try {
     return decodeMarketplaceTerminalEvidence(JSON.parse(readFileSync(path, 'utf8')) as unknown);
-  } catch {
-    throw new Error('Invalid marketplace terminal evidence');
+  } catch (error) {
+    throw new Error('Invalid marketplace terminal evidence', { cause: error });
+  }
+}
+
+function decodeMarketplaceDispatchDecision(value: unknown): MarketplaceDispatchDecision {
+  const decision = record(value, 'marketplace dispatch decision');
+  if (decision.schemaVersion !== MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION) {
+    throw new Error('Invalid marketplace dispatch decision schema version');
+  }
+  if (decision.decision === 'broadcast') {
+    exactKeys(decision, [
+      'schemaVersion',
+      'requestDigest',
+      'decision',
+      'decidedAt',
+    ], 'broadcast marketplace dispatch decision');
+    return {
+      schemaVersion: MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION,
+      requestDigest: marketplaceRequestDigest(decision.requestDigest),
+      decision: 'broadcast',
+      decidedAt: isoTimestamp(
+        stringField(decision.decidedAt, 'marketplace dispatch decision timestamp'),
+      ),
+    };
+  }
+  if (decision.decision === 'cancelled') {
+    exactKeys(decision, [
+      'schemaVersion',
+      'requestDigest',
+      'decision',
+      'reason',
+      'decidedAt',
+    ], 'cancelled marketplace dispatch decision');
+    return {
+      schemaVersion: MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION,
+      requestDigest: marketplaceRequestDigest(decision.requestDigest),
+      decision: 'cancelled',
+      reason: stringField(decision.reason, 'marketplace dispatch cancellation reason'),
+      decidedAt: isoTimestamp(
+        stringField(decision.decidedAt, 'marketplace dispatch decision timestamp'),
+      ),
+    };
+  }
+  throw new Error('Invalid marketplace dispatch decision');
+}
+
+function readMarketplaceDispatchDecision(path: string): MarketplaceDispatchDecision | undefined {
+  let metadata;
+  try {
+    metadata = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new Error('Invalid marketplace dispatch decision', { cause: error });
+  }
+  if (
+    metadata.isSymbolicLink()
+    || !metadata.isFile()
+    || (metadata.mode & 0o777) !== 0o600
+  ) {
+    throw new Error('Invalid marketplace dispatch decision');
+  }
+  try {
+    return decodeMarketplaceDispatchDecision(
+      JSON.parse(readFileSync(path, 'utf8')) as unknown,
+    );
+  } catch (error) {
+    throw new Error('Invalid marketplace dispatch decision', { cause: error });
   }
 }
 
@@ -989,7 +1089,30 @@ function writeMarketplaceTerminalCandidate(
   let descriptor: number | undefined;
   try {
     descriptor = openSync(candidate, 'wx', 0o600);
+    chmodSync(candidate, 0o600);
     writeFileSync(descriptor, `${JSON.stringify(evidence, null, 2)}\n`, 'utf8');
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    return candidate;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function writeMarketplaceDispatchCandidate(
+  decisionPath: string,
+  decision: MarketplaceDispatchDecision,
+): string {
+  const candidate = join(
+    dirname(decisionPath),
+    `.${basename(decisionPath)}.candidate-${process.pid}-${randomUUID()}`,
+  );
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(candidate, 'wx', 0o600);
+    chmodSync(candidate, 0o600);
+    writeFileSync(descriptor, `${JSON.stringify(decision, null, 2)}\n`, 'utf8');
     fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = undefined;
@@ -1014,6 +1137,84 @@ function installMarketplaceTerminalEvidence(
   } finally {
     if (existsSync(candidate)) rmSync(candidate);
   }
+}
+
+function installMarketplaceDispatchDecision(
+  manifestPath: string,
+  candidate: string,
+): MarketplaceDispatchDecision {
+  const decisionPath = marketplaceDispatchDecisionPath(manifestPath);
+  try {
+    linkSync(candidate, decisionPath);
+    fsyncDirectory(dirname(decisionPath));
+    return readMarketplaceDispatchDecision(decisionPath)!;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    return readMarketplaceDispatchDecision(decisionPath)!;
+  } finally {
+    if (existsSync(candidate)) rmSync(candidate);
+  }
+}
+
+/**
+ * Atomically chooses whether a prepared marketplace request may be broadcast
+ * or must remain cancelled. The immutable hard-link winner closes the window
+ * where cancellation could otherwise commit while submission was starting.
+ */
+export function claimMarketplaceDispatchDecision(
+  path: string,
+  expectedRequestDigest: string,
+  desired:
+    | { readonly decision: 'broadcast' }
+    | { readonly decision: 'cancelled'; readonly reason: string },
+  now: () => Date = () => new Date(),
+): MarketplaceDispatchDecision {
+  const expectedDigest = marketplaceRequestDigest(expectedRequestDigest);
+  const decisionPath = marketplaceDispatchDecisionPath(path);
+  let decision = readMarketplaceDispatchDecision(decisionPath);
+  if (decision === undefined) {
+    const manifest = readAttemptManifest(path);
+    if (
+      manifest.execution.backend !== 'marketplace'
+      || manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      || manifest.execution.state.requestDigest !== expectedDigest
+    ) {
+      throw new Error('Marketplace dispatch decision does not match the attempt manifest');
+    }
+    const state = manifest.execution.state;
+    if (state.status !== 'prepared') {
+      throw new Error('Only a prepared marketplace execution may choose dispatch');
+    }
+    const decidedAt = transitionTimestamp(now);
+    if (Date.parse(decidedAt) < Date.parse(state.preparedAt)) {
+      throw new Error('Marketplace dispatch decision predates preparation timestamp');
+    }
+    if (Date.parse(decidedAt) < Date.parse(manifest.timestamps.updatedAt)) {
+      throw new Error('Marketplace dispatch decision predates manifest updated timestamp');
+    }
+    const candidate = writeMarketplaceDispatchCandidate(
+      decisionPath,
+      desired.decision === 'broadcast'
+        ? {
+            schemaVersion: MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION,
+            requestDigest: expectedDigest,
+            decision: 'broadcast',
+            decidedAt,
+          }
+        : {
+            schemaVersion: MARKETPLACE_DISPATCH_DECISION_SCHEMA_VERSION,
+            requestDigest: expectedDigest,
+            decision: 'cancelled',
+            reason: stringField(desired.reason, 'marketplace cancellation reason'),
+            decidedAt,
+          },
+    );
+    decision = installMarketplaceDispatchDecision(path, candidate);
+  }
+  if (decision.requestDigest !== expectedDigest) {
+    throw new Error('Marketplace dispatch decision request digest changed');
+  }
+  return decision;
 }
 
 function marketplaceStateForTerminalEvidence(
@@ -1046,6 +1247,87 @@ function marketplaceStateForTerminalEvidence(
         reason: evidence.reason,
         cancelledAt: evidence.cancelledAt,
       };
+}
+
+function applyMarketplaceTerminalEvidence(
+  path: string,
+  expectedDigest: string,
+  evidence: MarketplaceTerminalEvidence,
+): AttemptManifest {
+  if (evidence.requestDigest !== expectedDigest) {
+    throw new Error('Marketplace terminal evidence request digest changed before transition');
+  }
+  const current = readAttemptManifest(path);
+  if (
+    current.execution.backend !== 'marketplace'
+    || current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || current.execution.state.requestDigest !== expectedDigest
+  ) {
+    throw new Error('Marketplace terminal evidence does not match the attempt manifest');
+  }
+  const state = current.execution.state;
+  if (Date.parse(terminalEvidenceTimestamp(evidence)) < Date.parse(state.preparedAt)) {
+    throw new Error('Marketplace terminal evidence predates preparation timestamp');
+  }
+  const persistedMatchesEvidence = state.status === 'submitted'
+    ? evidence.status === 'submitted'
+      && marketplaceSubmissionIdentityMatches(state.submission, evidence.submission)
+    : state.status === 'cancelled'
+      ? evidence.status === 'cancelled' && state.reason === evidence.reason
+      : true;
+  if (!persistedMatchesEvidence) {
+    throw new Error('Marketplace terminal evidence contradicts persisted execution');
+  }
+  const terminalState = marketplaceStateForTerminalEvidence(state, evidence);
+  const next = decodeAttemptManifest({
+    ...current,
+    execution: { backend: 'marketplace', state: terminalState },
+    timestamps: {
+      ...current.timestamps,
+      updatedAt: Date.parse(current.timestamps.updatedAt) >= Date.parse(terminalEvidenceTimestamp(evidence))
+        ? current.timestamps.updatedAt
+        : terminalEvidenceTimestamp(evidence),
+    },
+  });
+  if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
+  return next;
+}
+
+/**
+ * Repairs the manifest from immutable terminal evidence before any caller
+ * inspects execution state or starts an external process.
+ */
+export function reconcileMarketplaceTerminalEvidence(path: string): AttemptManifest {
+  const current = readAttemptManifest(path);
+  if (
+    current.execution.backend !== 'marketplace'
+    || current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+  ) {
+    return current;
+  }
+  const evidence = readMarketplaceTerminalEvidence(
+    marketplaceTerminalEvidencePath(path),
+  );
+  if (evidence !== undefined) {
+    return applyMarketplaceTerminalEvidence(
+      path,
+      current.execution.state.requestDigest,
+      evidence,
+    );
+  }
+  const decision = readMarketplaceDispatchDecision(
+    marketplaceDispatchDecisionPath(path),
+  );
+  if (decision === undefined || decision.decision === 'broadcast') return current;
+  if (decision.requestDigest !== current.execution.state.requestDigest) {
+    throw new Error('Marketplace dispatch decision request digest changed');
+  }
+  return transitionMarketplaceExecution(
+    path,
+    decision.requestDigest,
+    { status: 'cancelled', reason: decision.reason },
+    () => new Date(decision.decidedAt),
+  );
 }
 
 /**
@@ -1085,11 +1367,40 @@ export function transitionMarketplaceExecution(
     if (Date.parse(timestamp) < Date.parse(previous.timestamps.updatedAt)) {
       throw new Error('Marketplace transition timestamp predates manifest updated timestamp');
     }
-    const candidate = writeMarketplaceTerminalCandidate(
-      terminalPath,
-      terminalEvidenceForTransition(expectedDigest, transition, timestamp),
+    const decision = claimMarketplaceDispatchDecision(
+      path,
+      expectedDigest,
+      transition.status === 'submitted'
+        ? { decision: 'broadcast' }
+        : {
+            decision: 'cancelled',
+            reason: stringField(transition.reason, 'marketplace cancellation reason'),
+          },
+      () => new Date(timestamp),
     );
-    evidence = installMarketplaceTerminalEvidence(path, candidate);
+    if (transition.status === 'submitted' && decision.decision !== 'broadcast') {
+      throw new Error('Cannot submit a cancelled marketplace execution');
+    }
+    if (transition.status === 'cancelled' && decision.decision !== 'cancelled') {
+      throw new Error(
+        'Marketplace cancellation cannot proceed after broadcast authorization started',
+      );
+    }
+    if (
+      transition.status === 'cancelled'
+      && decision.decision === 'cancelled'
+      && decision.reason !== transition.reason
+    ) {
+      throw new Error('Marketplace execution already has a contradictory cancellation');
+    }
+    evidence = readMarketplaceTerminalEvidence(terminalPath);
+    if (evidence === undefined) {
+      const candidate = writeMarketplaceTerminalCandidate(
+        terminalPath,
+        terminalEvidenceForTransition(expectedDigest, transition, timestamp),
+      );
+      evidence = installMarketplaceTerminalEvidence(path, candidate);
+    }
   }
   if (evidence.requestDigest !== expectedDigest) {
     throw new Error('Marketplace terminal evidence request digest changed before transition');
@@ -1103,40 +1414,7 @@ export function transitionMarketplaceExecution(
     }
     throw new Error('Only a prepared marketplace execution may transition');
   }
-  const current = readAttemptManifest(path);
-  if (
-    current.execution.backend !== 'marketplace'
-    || current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
-    || current.execution.state.requestDigest !== expectedDigest
-  ) {
-    throw new Error('Marketplace terminal evidence does not match the attempt manifest');
-  }
-  const state = current.execution.state;
-  if (Date.parse(terminalEvidenceTimestamp(evidence)) < Date.parse(state.preparedAt)) {
-    throw new Error('Marketplace terminal evidence predates preparation timestamp');
-  }
-  const persistedMatchesEvidence = state.status === 'submitted'
-    ? evidence.status === 'submitted'
-      && marketplaceSubmissionIdentityMatches(state.submission, evidence.submission)
-    : state.status === 'cancelled'
-      ? evidence.status === 'cancelled' && state.reason === evidence.reason
-      : true;
-  if (!persistedMatchesEvidence) {
-    throw new Error('Marketplace terminal evidence contradicts persisted execution');
-  }
-  const terminalState = marketplaceStateForTerminalEvidence(state, evidence);
-  const next = decodeAttemptManifest({
-    ...current,
-    execution: { backend: 'marketplace', state: terminalState },
-    timestamps: {
-      ...current.timestamps,
-      updatedAt: Date.parse(current.timestamps.updatedAt) >= Date.parse(terminalEvidenceTimestamp(evidence))
-        ? current.timestamps.updatedAt
-        : terminalEvidenceTimestamp(evidence),
-    },
-  });
-  if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
-  return next;
+  return applyMarketplaceTerminalEvidence(path, expectedDigest, evidence);
 }
 
 /**

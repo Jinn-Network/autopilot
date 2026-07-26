@@ -19,9 +19,11 @@ import {
   type CommandRunner,
 } from '../dispatcher/issue-source.js';
 import {
+  claimMarketplaceDispatchDecision,
   MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
   proveMarketplaceAttemptWorktree,
   readAttemptManifest,
+  reconcileMarketplaceTerminalEvidence,
   transitionMarketplaceExecution,
   type AttemptManifest,
 } from './attempt-workspace.js';
@@ -241,6 +243,8 @@ export interface MarketplaceSessionExecutionBackendOptions {
   readonly adapter?: MarketplaceTaskSubmissionAdapter;
   readonly readAttemptManifest?: typeof readAttemptManifest;
   readonly verifyMarketplaceTaskRequest?: typeof verifyMarketplaceTaskRequest;
+  readonly claimMarketplaceDispatchDecision?: typeof claimMarketplaceDispatchDecision;
+  readonly reconcileMarketplaceTerminalEvidence?: typeof reconcileMarketplaceTerminalEvidence;
   readonly transitionMarketplaceExecution?: typeof transitionMarketplaceExecution;
   readonly runner?: CommandRunner;
   readonly now?: () => Date;
@@ -263,6 +267,8 @@ export class MarketplaceSessionExecutionBackend
   private readonly adapter: MarketplaceTaskSubmissionAdapter;
   private readonly readManifest: typeof readAttemptManifest;
   private readonly verifyRequest: typeof verifyMarketplaceTaskRequest;
+  private readonly claimDispatch: typeof claimMarketplaceDispatchDecision;
+  private readonly reconcileTerminal: typeof reconcileMarketplaceTerminalEvidence;
   private readonly transition: typeof transitionMarketplaceExecution;
   private readonly runner: CommandRunner;
   private readonly now: () => Date;
@@ -272,6 +278,11 @@ export class MarketplaceSessionExecutionBackend
     this.readManifest = options.readAttemptManifest ?? readAttemptManifest;
     this.verifyRequest =
       options.verifyMarketplaceTaskRequest ?? verifyMarketplaceTaskRequest;
+    this.claimDispatch =
+      options.claimMarketplaceDispatchDecision ?? claimMarketplaceDispatchDecision;
+    this.reconcileTerminal =
+      options.reconcileMarketplaceTerminalEvidence
+      ?? reconcileMarketplaceTerminalEvidence;
     this.transition =
       options.transitionMarketplaceExecution ?? transitionMarketplaceExecution;
     this.runner = options.runner ?? defaultRunner;
@@ -279,16 +290,23 @@ export class MarketplaceSessionExecutionBackend
   }
 
   async start(request: MarketplaceSessionExecutionRequest): Promise<SessionExecutionResult> {
-    const verified = this.verifiedExecution(request);
+    let verified = this.reconciledExecution(request);
     if (verified.state.status !== 'prepared') {
       throw new Error('Marketplace start requires a prepared marketplace execution');
     }
     await proveMarketplaceAttemptWorktree(verified.manifest, this.runner);
+    verified = this.reconciledExecution(request);
+    if (verified.state.status === 'cancelled') {
+      throw new Error('Cannot start a cancelled marketplace execution');
+    }
+    if (verified.state.status !== 'prepared') {
+      throw new Error('Marketplace start requires a prepared marketplace execution');
+    }
     return this.submitAndPersist(request, verified, 'submit');
   }
 
   async recover(request: MarketplaceSessionExecutionRequest): Promise<SessionExecutionResult> {
-    const verified = this.verifiedExecution(request);
+    let verified = this.reconciledExecution(request);
     if (verified.state.status === 'submitted') {
       return this.startedIdentity(verified.manifest);
     }
@@ -299,11 +317,21 @@ export class MarketplaceSessionExecutionBackend
       throw new Error('Marketplace recovery requires a prepared marketplace execution');
     }
     await proveMarketplaceAttemptWorktree(verified.manifest, this.runner);
+    verified = this.reconciledExecution(request);
+    if (verified.state.status === 'submitted') {
+      return this.startedIdentity(verified.manifest);
+    }
+    if (verified.state.status === 'cancelled') {
+      throw new Error('Cannot recover a cancelled marketplace execution');
+    }
+    if (verified.state.status !== 'prepared') {
+      throw new Error('Marketplace recovery requires a prepared marketplace execution');
+    }
     return this.submitAndPersist(request, verified, 'recover');
   }
 
   async cancel(request: MarketplaceSessionExecutionRequest): Promise<SessionExecutionResult> {
-    const verified = this.verifiedExecution(request);
+    const verified = this.reconciledExecution(request);
     if (verified.state.status !== 'prepared') {
       throw new Error('Marketplace cancellation requires a prepared marketplace execution');
     }
@@ -318,6 +346,13 @@ export class MarketplaceSessionExecutionBackend
       backend: 'marketplace',
       reason: MARKETPLACE_CANCEL_INTENT_REASON,
     };
+  }
+
+  private reconciledExecution(
+    request: MarketplaceSessionExecutionRequest,
+  ): VerifiedMarketplaceExecution {
+    this.reconcileTerminal(request.manifestPath);
+    return this.verifiedExecution(request);
   }
 
   private verifiedExecution(
@@ -421,6 +456,21 @@ export class MarketplaceSessionExecutionBackend
     verified: VerifiedMarketplaceExecution,
     operation: 'submit' | 'recover',
   ): Promise<SessionExecutionResult> {
+    const decision = this.claimDispatch(
+      executionRequest.manifestPath,
+      verified.state.requestDigest,
+      { decision: 'broadcast' },
+      this.now,
+    );
+    if (decision.decision === 'cancelled') {
+      this.transition(
+        executionRequest.manifestPath,
+        verified.state.requestDigest,
+        { status: 'cancelled', reason: decision.reason },
+        this.now,
+      );
+      throw new Error(`Cannot ${operation} a cancelled marketplace execution`);
+    }
     const submission = operation === 'submit'
       ? await this.adapter.submit(verified.state.requestPath)
       : await this.adapter.recover(verified.state.requestPath);

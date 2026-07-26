@@ -29,6 +29,7 @@ import {
   type MarketplaceSessionExecutionRequest,
 } from '../../src/lifecycle/session-execution-backend.js';
 import {
+  claimMarketplaceDispatchDecision,
   decodeAttemptManifest,
   readAttemptManifest,
   transitionMarketplaceExecution,
@@ -64,6 +65,19 @@ afterEach(() => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+function deferred(): {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+} {
+  let resolvePromise!: () => void;
+  return {
+    promise: new Promise<void>((resolve) => {
+      resolvePromise = resolve;
+    }),
+    resolve: () => resolvePromise(),
+  };
+}
 
 function marketplaceFixture(
   state: 'prepared' | 'submitted' | 'cancelled' = 'prepared',
@@ -808,7 +822,7 @@ describe('session execution backends', () => {
       .toMatchObject({ backend: 'marketplace', state: { status: 'prepared' } });
   });
 
-  it('fails closed when replay returns a result that contradicts committed terminal evidence', async () => {
+  it('reconciles committed submission evidence without replaying the adapter', async () => {
     const fixture = marketplaceFixture();
     const preparedBytes = readFileSync(fixture.manifest.paths.manifest);
     transitionMarketplaceExecution(
@@ -818,25 +832,29 @@ describe('session execution backends', () => {
       () => new Date('2026-07-26T12:02:00.000Z'),
     );
     writeFileSync(fixture.manifest.paths.manifest, preparedBytes);
+    const recover = vi.fn(async () => ({
+      ...SUBMISSION,
+      taskId: 'contradictory-task',
+      status: 'already_submitted' as const,
+      idempotent: true as const,
+    }));
     const backend = new MarketplaceSessionExecutionBackend({
       adapter: {
         submit: vi.fn(async () => SUBMISSION),
-        recover: vi.fn(async () => ({
-          ...SUBMISSION,
-          taskId: 'contradictory-task',
-          status: 'already_submitted' as const,
-          idempotent: true as const,
-        })),
+        recover,
       },
       runner: marketplaceProofRunner(fixture.manifest),
       now: () => new Date('2026-07-26T12:03:00.000Z'),
     });
 
-    await expect(backend.recover(fixture.request)).rejects.toThrow(
-      /contradictory submission/i,
-    );
+    await expect(backend.recover(fixture.request)).resolves.toMatchObject({
+      status: 'started',
+      backend: 'marketplace',
+      taskId: SUBMISSION.taskId,
+    });
+    expect(recover).not.toHaveBeenCalled();
     expect(readAttemptManifest(fixture.manifest.paths.manifest).execution)
-      .toMatchObject({ backend: 'marketplace', state: { status: 'prepared' } });
+      .toMatchObject({ backend: 'marketplace', state: { status: 'submitted' } });
   });
 
   it('records cancellation as durable local intent without invoking the CLI', async () => {
@@ -862,6 +880,146 @@ describe('session execution backends', () => {
           status: 'cancelled',
           reason: MARKETPLACE_CANCEL_INTENT_REASON,
         },
+      });
+  });
+
+  it.each(['start', 'recover'] as const)(
+    'reconciles committed cancellation evidence before %s can inspect Git or invoke the marketplace adapter',
+    async (operation) => {
+      const fixture = marketplaceFixture();
+      const preparedBytes = readFileSync(fixture.manifest.paths.manifest);
+      transitionMarketplaceExecution(
+        fixture.manifest.paths.manifest,
+        fixture.requestDigest,
+        { status: 'cancelled', reason: MARKETPLACE_CANCEL_INTENT_REASON },
+        () => new Date('2026-07-26T12:02:00.000Z'),
+      );
+      writeFileSync(fixture.manifest.paths.manifest, preparedBytes);
+      const submit = vi.fn(async () => SUBMISSION);
+      const recover = vi.fn(async () => SUBMISSION);
+      const runner = vi.fn(async () => {
+        throw new Error('cancelled evidence must be reconciled before Git proof');
+      });
+      const backend = new MarketplaceSessionExecutionBackend({
+        adapter: { submit, recover },
+        runner,
+      });
+
+      await expect(backend[operation](fixture.request)).rejects.toThrow(
+        /cancelled marketplace execution|prepared marketplace execution/i,
+      );
+
+      expect(runner).not.toHaveBeenCalled();
+      expect(submit).not.toHaveBeenCalled();
+      expect(recover).not.toHaveBeenCalled();
+      expect(readAttemptManifest(fixture.manifest.paths.manifest).execution)
+        .toMatchObject({
+          backend: 'marketplace',
+          state: { status: 'cancelled' },
+        });
+    },
+  );
+
+  it.each(['start', 'recover'] as const)(
+    'converges a cancellation decision crash before %s can inspect Git or invoke the marketplace adapter',
+    async (operation) => {
+      const fixture = marketplaceFixture();
+      claimMarketplaceDispatchDecision(
+        fixture.manifest.paths.manifest,
+        fixture.requestDigest,
+        {
+          decision: 'cancelled',
+          reason: MARKETPLACE_CANCEL_INTENT_REASON,
+        },
+        () => new Date('2026-07-26T12:02:00.000Z'),
+      );
+      const submit = vi.fn(async () => SUBMISSION);
+      const recover = vi.fn(async () => SUBMISSION);
+      const runner = vi.fn(async () => {
+        throw new Error('cancelled decision must be reconciled before Git proof');
+      });
+      const backend = new MarketplaceSessionExecutionBackend({
+        adapter: { submit, recover },
+        runner,
+      });
+
+      await expect(backend[operation](fixture.request)).rejects.toThrow(
+        /cancelled marketplace execution|prepared marketplace execution/i,
+      );
+
+      expect(runner).not.toHaveBeenCalled();
+      expect(submit).not.toHaveBeenCalled();
+      expect(recover).not.toHaveBeenCalled();
+      expect(readAttemptManifest(fixture.manifest.paths.manifest).execution)
+        .toMatchObject({
+          backend: 'marketplace',
+          state: { status: 'cancelled' },
+        });
+    },
+  );
+
+  it('lets cancellation committed during worktree proof stop start before adapter invocation', async () => {
+    const fixture = marketplaceFixture();
+    const proofReached = deferred();
+    const releaseProof = deferred();
+    const proof = marketplaceProofRunner(fixture.manifest);
+    const runner: CommandRunner = async (command, args, options) => {
+      if (command === 'git' && args.includes('status')) {
+        proofReached.resolve();
+        await releaseProof.promise;
+      }
+      return proof(command, args, options);
+    };
+    const submit = vi.fn(async () => SUBMISSION);
+    const backend = new MarketplaceSessionExecutionBackend({
+      adapter: { submit, recover: vi.fn(async () => SUBMISSION) },
+      runner,
+      now: () => new Date('2026-07-26T12:02:00.000Z'),
+    });
+
+    const starting = backend.start(fixture.request);
+    await proofReached.promise;
+    await expect(backend.cancel(fixture.request)).resolves.toMatchObject({
+      status: 'cancelled',
+      backend: 'marketplace',
+    });
+    releaseProof.resolve();
+
+    await expect(starting).rejects.toThrow(/cancelled marketplace execution/i);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it('prevents cancellation from committing after start has crossed the durable broadcast boundary', async () => {
+    const fixture = marketplaceFixture();
+    const adapterCalled = deferred();
+    const releaseAdapter = deferred();
+    const submit = vi.fn(async () => {
+      adapterCalled.resolve();
+      await releaseAdapter.promise;
+      return SUBMISSION;
+    });
+    const backend = new MarketplaceSessionExecutionBackend({
+      adapter: { submit, recover: vi.fn(async () => SUBMISSION) },
+      runner: marketplaceProofRunner(fixture.manifest),
+      now: () => new Date('2026-07-26T12:02:00.000Z'),
+    });
+
+    const starting = backend.start(fixture.request);
+    await adapterCalled.promise;
+    await expect(backend.cancel(fixture.request)).rejects.toThrow(
+      /broadcast.*started|cancellation.*broadcast/i,
+    );
+    releaseAdapter.resolve();
+
+    await expect(starting).resolves.toMatchObject({
+      status: 'started',
+      backend: 'marketplace',
+      taskId: SUBMISSION.taskId,
+    });
+    expect(readAttemptManifest(fixture.manifest.paths.manifest).execution)
+      .toMatchObject({
+        backend: 'marketplace',
+        state: { status: 'submitted' },
       });
   });
 

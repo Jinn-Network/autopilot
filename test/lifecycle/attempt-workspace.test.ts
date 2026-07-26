@@ -3,7 +3,9 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -1843,7 +1845,13 @@ describe('attempt workspace and manifest', () => {
       `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
       'utf8',
     )) as Record<string, unknown>;
+    const terminalMetadata = lstatSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+    );
     const current = readAttemptManifest(manifest.paths.manifest);
+    expect(terminalMetadata.isFile()).toBe(true);
+    expect(terminalMetadata.isSymbolicLink()).toBe(false);
+    expect(terminalMetadata.mode & 0o777).toBe(0o600);
     expect(current.execution).toMatchObject({
       backend: 'marketplace',
       state: { status: terminal.status },
@@ -1870,13 +1878,17 @@ describe('attempt workspace and manifest', () => {
         },
       },
     }), defaultRunner);
-    writeFileSync(`${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, JSON.stringify({
-      schemaVersion: 'marketplace-terminal-v1',
-      requestDigest,
-      status: 'submitted',
-      submission: SUBMISSION_RESULT,
-      submittedAt: '2026-07-20T00:02:00.000Z',
-    }));
+    writeFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      JSON.stringify({
+        schemaVersion: 'marketplace-terminal-v1',
+        requestDigest,
+        status: 'submitted',
+        submission: SUBMISSION_RESULT,
+        submittedAt: '2026-07-20T00:02:00.000Z',
+      }),
+      { mode: 0o600 },
+    );
 
     const repaired = transitionMarketplaceExecution(
       manifest.paths.manifest,
@@ -1913,13 +1925,17 @@ describe('attempt workspace and manifest', () => {
         },
       },
     }), defaultRunner);
-    writeFileSync(`${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, JSON.stringify({
-      schemaVersion: 'marketplace-terminal-v1',
-      requestDigest,
-      status: 'submitted',
-      submission: SUBMISSION_RESULT,
-      submittedAt: '2026-07-20T00:02:00.000Z',
-    }));
+    writeFileSync(
+      `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      JSON.stringify({
+        schemaVersion: 'marketplace-terminal-v1',
+        requestDigest,
+        status: 'submitted',
+        submission: SUBMISSION_RESULT,
+        submittedAt: '2026-07-20T00:02:00.000Z',
+      }),
+      { mode: 0o600 },
+    );
     const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
     writeFileSync(manifest.paths.manifest, JSON.stringify({
       ...raw,
@@ -2019,7 +2035,11 @@ describe('attempt workspace and manifest', () => {
       },
     }), defaultRunner);
     const malformedOriginal = readFileSync(malformed.paths.manifest, 'utf8');
-    writeFileSync(`${malformed.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, '{bad json');
+    writeFileSync(
+      `${malformed.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      '{bad json',
+      { mode: 0o600 },
+    );
     expect(() => transitionMarketplaceExecution(
       malformed.paths.manifest,
       requestDigest,
@@ -2044,13 +2064,17 @@ describe('attempt workspace and manifest', () => {
       },
     }), defaultRunner);
     const mismatchedOriginal = readFileSync(mismatched.paths.manifest, 'utf8');
-    writeFileSync(`${mismatched.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`, JSON.stringify({
-      schemaVersion: 'marketplace-terminal-v1',
-      requestDigest: `sha256:${'b'.repeat(64)}`,
-      status: 'cancelled',
-      reason: 'operator-cancelled',
-      cancelledAt: '2026-07-20T00:02:00.000Z',
-    }));
+    writeFileSync(
+      `${mismatched.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`,
+      JSON.stringify({
+        schemaVersion: 'marketplace-terminal-v1',
+        requestDigest: `sha256:${'b'.repeat(64)}`,
+        status: 'cancelled',
+        reason: 'operator-cancelled',
+        cancelledAt: '2026-07-20T00:02:00.000Z',
+      }),
+      { mode: 0o600 },
+    );
     expect(() => transitionMarketplaceExecution(
       mismatched.paths.manifest,
       requestDigest,
@@ -2058,6 +2082,53 @@ describe('attempt workspace and manifest', () => {
     )).toThrow(/terminal evidence.*digest/i);
     expect(readFileSync(mismatched.paths.manifest, 'utf8')).toBe(mismatchedOriginal);
   });
+
+  it.each(['permissive-mode', 'symlink'] as const)(
+    'rejects %s terminal evidence without rewriting the prepared manifest',
+    async (kind) => {
+      const fixture = repositoryFixture();
+      const requestDigest = `sha256:${'a'.repeat(64)}`;
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        execution: {
+          backend: 'marketplace',
+          state: {
+            schemaVersion: 'marketplace-execution-v2',
+            status: 'prepared',
+            requestPath: join(fixture.root, 'marketplace-request.json'),
+            requestDigest,
+            solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
+            preparedAt: '2026-07-20T00:01:00.000Z',
+            agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+            adoptionDeadline: '2026-07-20T01:30:00.000Z',
+          },
+        },
+      }), defaultRunner);
+      const preparedBytes = readFileSync(manifest.paths.manifest);
+      transitionMarketplaceExecution(
+        manifest.paths.manifest,
+        requestDigest,
+        { status: 'cancelled', reason: 'operator-cancelled' },
+        () => new Date('2026-07-20T00:02:00.000Z'),
+      );
+      writeFileSync(manifest.paths.manifest, preparedBytes);
+      const terminalPath =
+        `${manifest.paths.manifest}${MARKETPLACE_TERMINAL_RECORD_SUFFIX}`;
+      if (kind === 'permissive-mode') {
+        chmodSync(terminalPath, 0o644);
+      } else {
+        const targetPath = `${terminalPath}.target`;
+        renameSync(terminalPath, targetPath);
+        symlinkSync(targetPath, terminalPath);
+      }
+
+      expect(() => transitionMarketplaceExecution(
+        manifest.paths.manifest,
+        requestDigest,
+        { status: 'cancelled', reason: 'operator-cancelled' },
+      )).toThrow(/terminal evidence/i);
+      expect(readFileSync(manifest.paths.manifest)).toEqual(preparedBytes);
+    },
+  );
 
   it('reserves every generic manifest writer for local and legacy marketplace attempts', async () => {
     const requestDigest = `sha256:${'a'.repeat(64)}`;
