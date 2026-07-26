@@ -23,8 +23,12 @@ import {
   parseAutopilotExecutionBackend,
 } from '../src/config/execution-backend.js';
 import {
-  MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+  MarketplaceSessionExecutionBackend,
+  recoverPreparedMarketplaceAttempts,
 } from '../src/lifecycle/session-execution-backend.js';
+import {
+  MarketplaceTaskCliAdapter,
+} from '../src/lifecycle/marketplace-task.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
 import {
   paintBoardOptionsFromConfig,
@@ -215,16 +219,10 @@ export function executionBackendForEnvironment(
 }
 
 export async function preflightProductionEntrypoint<Value>(
-  mode: 'observe' | 'recover' | 'active',
-  environment: NodeJS.ProcessEnv,
+  _mode: 'observe' | 'recover' | 'active',
+  _environment: NodeJS.ProcessEnv,
   setup: () => Promise<Value>,
 ): Promise<Value> {
-  if (
-    mode === 'active'
-    && executionBackendForEnvironment(environment) === 'marketplace'
-  ) {
-    throw new Error(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
-  }
   return setup();
 }
 
@@ -367,9 +365,9 @@ export async function runAutopilotV2(
   }
 
   const options = parseLifecycleCli(arguments_);
-  // `configuredEnvironment` preserves this process-local selector unchanged.
-  // Check it before repository/config/credential setup so the foundation
-  // marketplace lane always fails with its stable outcome.
+  // Repository/config setup is shared by both execution backends. Marketplace
+  // capability validation runs later through the active controller's
+  // mutation-free preflight boundary.
   const repositoryPath = (await preflightProductionEntrypoint(
     options.mode,
     env,
@@ -565,6 +563,25 @@ export async function runAutopilotV2(
   const worktreeBase =
     env.JINN_AUTOPILOT_WORKTREE_BASE ?? loaded.paths.attempts;
   const v2AttemptsBase = join(worktreeBase, 'v2');
+  const marketplaceTaskAdapter =
+    executionBackend === 'marketplace' && options.mode !== 'observe'
+      ? new MarketplaceTaskCliAdapter({ environment: runtimeEnvironment })
+      : undefined;
+  const marketplaceExecutionBackend = marketplaceTaskAdapter === undefined
+    ? undefined
+    : new MarketplaceSessionExecutionBackend({
+        adapter: marketplaceTaskAdapter,
+        now: () => new Date(),
+      });
+  const recoverMarketplaceAttempts =
+    marketplaceExecutionBackend === undefined
+      ? undefined
+      : async (): Promise<void> => {
+          await recoverPreparedMarketplaceAttempts(
+            v2AttemptsBase,
+            marketplaceExecutionBackend,
+          );
+        };
   const cleanupEnabled = options.mode === 'active'
     && activeCleanupEnabled(
       env.JINN_AUTOPILOT_CLEANUP_ENABLED,
@@ -656,6 +673,12 @@ export async function runAutopilotV2(
         defaultBranch: loaded.config.repository.defaultBranch,
         projectMapping: loaded.config.project,
         newWorkPaused: diskBelowFloor,
+        ...(marketplaceTaskAdapter === undefined
+          ? {}
+          : { marketplaceTaskAdapter }),
+        ...(marketplaceExecutionBackend === undefined
+          ? {}
+          : { marketplaceExecutionBackend }),
       });
 
   const runOnce = async (): Promise<void> => {
@@ -673,6 +696,9 @@ export async function runAutopilotV2(
         readGitHubUsage: () => reader.githubUsage(),
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
         ...(active === undefined ? {} : { active }),
+        ...(recoverMarketplaceAttempts === undefined
+          ? {}
+          : { recoverMarketplaceAttempts }),
         now: () => new Date(),
         staleAfterMs,
         runnerId,

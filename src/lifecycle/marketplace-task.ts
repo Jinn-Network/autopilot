@@ -30,7 +30,21 @@ import {
   type TaskSubmitRequestV1,
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
+import {
+  JinnRepoMergedPrTaskSchema,
+} from '@jinn-network/sdk/solvernets/jinn-repo';
 import { isGitHubSecretEnvironmentKey } from './credentials.js';
+
+/**
+ * The fixed marketplace profile is owned by the published SDK contract. Read
+ * its legacy literal fields instead of embedding a standalone repository
+ * fallback in the distributable Autopilot binary.
+ */
+export const MARKETPLACE_REPOSITORY =
+  JinnRepoMergedPrTaskSchema.shape.repo.value;
+export const MARKETPLACE_LANGUAGE =
+  JinnRepoMergedPrTaskSchema.shape.language.value;
+export const MARKETPLACE_VERIFICATION_PROFILE = 'jinn-mono.v1';
 
 export type MarketplaceMutationWorkflow =
   | 'implementation'
@@ -84,13 +98,14 @@ export function buildMarketplaceTaskRequest(
   input: MarketplaceTaskBuildInput,
 ): BuiltMarketplaceTaskRequest {
   if (
-    input.repository !== 'Jinn-Network/mono'
-    || input.language !== 'typescript'
-    || input.verificationProfile !== 'jinn-mono.v1'
+    input.repository !== MARKETPLACE_REPOSITORY
+    || input.language !== MARKETPLACE_LANGUAGE
+    || input.verificationProfile !== MARKETPLACE_VERIFICATION_PROFILE
   ) {
     throw new Error(
-      'Marketplace Task submission supports only Jinn-Network/mono, '
-      + 'typescript, and verification profile jinn-mono.v1',
+      `Marketplace Task submission supports only ${MARKETPLACE_REPOSITORY}, `
+      + `${MARKETPLACE_LANGUAGE}, and verification profile `
+      + MARKETPLACE_VERIFICATION_PROFILE,
     );
   }
   if (
@@ -179,7 +194,9 @@ export function buildMarketplaceTaskRequest(
       schemaVersion: 'jinn-repo.v1',
       instance_id: id,
       base_commit: input.expectedHead,
-      problem_statement: input.taskSnapshot.body,
+      problem_statement: input.taskSnapshot.body.length === 0
+        ? input.taskSnapshot.title
+        : input.taskSnapshot.body,
       repo: input.repository,
       language: input.language,
       verificationProfile: input.verificationProfile,

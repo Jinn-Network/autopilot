@@ -249,6 +249,22 @@ describe('marketplace Task request builder', () => {
     });
   });
 
+  it('preserves an empty task body while using the issue title as the required problem statement', () => {
+    const input = buildInput({
+      taskSnapshot: {
+        ...buildInput().taskSnapshot,
+        body: '',
+      },
+    });
+
+    const built = buildMarketplaceTaskRequest(input);
+
+    expect(built.session.taskSnapshot.body).toBe('');
+    expect(built.request.spec.problem_statement)
+      .toBe('Implement exact marketplace contracts');
+    expect(TaskSubmitRequestV1Schema.parse(built.request)).toEqual(built.request);
+  });
+
   it.each([
     ['review-finding', 'fix-child', 'fix-child'],
     ['reconcile', 'reconcile', 'reconcile'],

@@ -21,11 +21,19 @@ import { hostname as systemHostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  TaskSubmitRequestV1Schema,
   TaskSubmitResultV1Schema,
+  type TaskSubmitRequestV1,
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { gitOid, gitRefName, isoTimestamp } from './types.js';
+import {
+  persistMarketplaceTaskRequest,
+  verifyMarketplaceTaskRequest,
+  type MarketplaceMutationWorkflow,
+  type PersistedMarketplaceTaskRequest,
+} from './marketplace-task.js';
 import {
   gitPublicationArgs,
   isolatedGitCommandOverlay,
@@ -158,6 +166,7 @@ export interface CreateAttemptOptions {
   readonly branch: string;
   readonly targetBase: string;
   readonly targetBaseOid?: string;
+  readonly marketplacePreparation?: MarketplaceAttemptPreparation;
   readonly expectedHead: string;
   readonly claimOid: string;
   readonly reviewGeneration?: string;
@@ -177,6 +186,23 @@ export interface CreateAttemptOptions {
   readonly attemptId?: string;
   readonly host?: string;
   readonly now?: () => Date;
+}
+
+export interface MarketplaceAttemptPreparation {
+  readonly workflow: MarketplaceMutationWorkflow;
+  readonly baseSha: string;
+  readonly request: TaskSubmitRequestV1;
+  readonly agentSoftDeadline: string;
+  readonly adoptionDeadline: string;
+}
+
+export interface CreateAttemptWorkspaceRuntime {
+  readonly persistMarketplaceTaskRequest?: (
+    requestPath: string,
+    request: TaskSubmitRequestV1,
+  ) => PersistedMarketplaceTaskRequest;
+  readonly verifyMarketplaceTaskRequest?: typeof verifyMarketplaceTaskRequest;
+  readonly writeManifest?: (path: string, manifest: AttemptManifest) => void;
 }
 
 export interface RunnerIdOptions {
@@ -585,7 +611,13 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const targetBaseOid = manifest.targetBaseOid === undefined
     ? undefined
     : gitOid(stringField(manifest.targetBaseOid, 'target base OID'));
-  if (targetBaseOid !== undefined) {
+  if (
+    targetBaseOid !== undefined
+    && !(
+      execution.backend === 'marketplace'
+      && execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    )
+  ) {
     throw new Error('Target base OID is not valid for attempt manifests');
   }
   const claimOid = gitOid(stringField(manifest.claimOid, 'claim OID'));
@@ -1424,9 +1456,110 @@ async function ensureExpectedHeadAvailable(
   );
 }
 
+function marketplaceWorkflow(
+  workflow: MarketplaceMutationWorkflow,
+): 'implement' | 'fix-child' | 'reconcile' | 'ci-failure' {
+  if (workflow === 'implementation') return 'implement';
+  if (workflow === 'ci-failure') return 'ci-failure';
+  if (workflow === 'reconcile') return 'reconcile';
+  return 'fix-child';
+}
+
+function validateMarketplacePreparation(
+  options: CreateAttemptOptions,
+  attemptId: string,
+  runnerId: string,
+): MarketplaceAttemptPreparation | undefined {
+  const preparation = options.marketplacePreparation;
+  if (preparation === undefined) return undefined;
+  if (options.execution !== undefined) {
+    throw new Error(
+      'Marketplace preparation cannot be combined with explicit execution state',
+    );
+  }
+  if (options.phase !== 'implement') {
+    throw new Error('Marketplace preparation is valid only for implementation attempts');
+  }
+  if (options.prNumber === undefined) {
+    throw new Error('Marketplace preparation requires a PR number');
+  }
+  if (options.targetBaseOid === undefined) {
+    throw new Error('Marketplace preparation requires an exact target-base OID');
+  }
+  const request = TaskSubmitRequestV1Schema.parse(preparation.request);
+  const session = request.spec.session;
+  const agentSoftDeadline = isoTimestamp(preparation.agentSoftDeadline);
+  const adoptionDeadline = isoTimestamp(preparation.adoptionDeadline);
+  const baseSha = gitOid(preparation.baseSha);
+  const targetBaseOid = gitOid(options.targetBaseOid);
+  const mismatch = (field: string): never => {
+    throw new Error(`Marketplace preparation ${field} does not match attempt binding`);
+  };
+  if (
+    request.id !== `autopilot:${attemptId}`
+    || request.spec.instance_id !== request.id
+    || session.v2AttemptId !== attemptId
+  ) {
+    mismatch('v2 attempt ID');
+  }
+  if (session.runnerId !== runnerId) mismatch('runner ID');
+  if (session.issueNumber !== options.issueNumber) mismatch('issue number');
+  if (session.prNumber !== options.prNumber) mismatch('PR number');
+  if (session.branch !== options.branch) mismatch('branch');
+  if (session.targetBase !== options.targetBase) mismatch('target base');
+  if (session.claimOid !== options.claimOid) mismatch('claim OID');
+  if (
+    session.expectedHead !== options.expectedHead
+    || request.spec.base_commit !== options.expectedHead
+  ) {
+    mismatch('expected head');
+  }
+  if (session.workflow !== marketplaceWorkflow(preparation.workflow)) {
+    mismatch('workflow');
+  }
+  if (session.taskSnapshot.baseSha !== baseSha) mismatch('base SHA');
+  if (session.taskSnapshot.targetBaseOid !== targetBaseOid) {
+    mismatch('target-base OID');
+  }
+  if (
+    session.deadline !== agentSoftDeadline
+    || request.window.endTs !== Date.parse(adoptionDeadline)
+    || request.claimPolicy.submissionDeadlineTs !== Date.parse(adoptionDeadline)
+  ) {
+    mismatch('deadlines');
+  }
+  const expectedProblemStatement = session.taskSnapshot.body.length === 0
+    ? session.taskSnapshot.title
+    : session.taskSnapshot.body;
+  if (
+    request.description !== session.taskSnapshot.title
+    || request.spec.problem_statement !== expectedProblemStatement
+  ) {
+    mismatch('task snapshot');
+  }
+  if (preparation.workflow === 'implementation') {
+    if (session.childIssueNumber !== undefined || session.parentPrNumber !== undefined) {
+      mismatch('implementation child metadata');
+    }
+  } else if (
+    session.childIssueNumber !== options.issueNumber
+    || session.parentPrNumber !== options.prNumber
+  ) {
+    mismatch('child binding');
+  }
+  return {
+    ...preparation,
+    baseSha,
+    request,
+    agentSoftDeadline,
+    adoptionDeadline,
+  };
+}
+
 export async function createAttemptWorkspace(
   options: CreateAttemptOptions,
   runner: CommandRunner,
+  runtime: CreateAttemptWorkspaceRuntime = {},
 ): Promise<AttemptManifest> {
   if ((options.reviewGeneration === undefined) !== (options.reviewRefOid === undefined)) {
     throw new Error('Review generation and ref OID must appear together');
@@ -1449,6 +1582,11 @@ export async function createAttemptWorkspace(
   }
   const attemptId = uuid(options.attemptId ?? randomUUID(), 'attempt ID');
   const runnerId = defaultRunnerId({ configured: options.runnerId });
+  const marketplacePreparation = validateMarketplacePreparation(
+    options,
+    attemptId,
+    runnerId,
+  );
   const host = filesystemSafeHostname(options.host ?? systemHostname());
   const timestamp = (options.now ?? (() => new Date()))().toISOString();
   isoTimestamp(timestamp);
@@ -1470,43 +1608,47 @@ export async function createAttemptWorkspace(
     askpass: join(attemptDir, 'askpass'),
     tokenFile: join(attemptDir, 'gh-token'),
   };
-  const manifest = decodeAttemptManifest({
-    version: 2,
-    attemptId,
-    runnerId,
-    host,
-    phase: options.phase,
-    execution: options.execution ?? { backend: 'local' },
-    subject,
-    issueNumber: options.issueNumber,
-    ...(options.prNumber === undefined ? {} : { prNumber: options.prNumber }),
-    branch: options.branch,
-    targetBase: options.targetBase,
-    ...(options.targetBaseOid === undefined ? {} : { targetBaseOid: options.targetBaseOid }),
-    expectedHead: options.expectedHead,
-    claimOid: options.claimOid,
-    ...(options.reviewGeneration === undefined
-      ? {}
-      : {
-          reviewGeneration: options.reviewGeneration,
-          reviewRefOid: options.reviewRefOid,
-          reviewApprovalPolicy: options.reviewApprovalPolicy,
-        }),
-    selectedLogin: options.selectedLogin,
-    repository,
-    processState: options.pid === undefined || options.pid === null
-      ? 'preparing'
-      : 'running',
-    pid: options.pid ?? null,
-    paths,
-    timestamps: {
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      ...(options.pid === undefined || options.pid === null
+  const buildManifest = (execution: AttemptExecution): AttemptManifest =>
+    decodeAttemptManifest({
+      version: 2,
+      attemptId,
+      runnerId,
+      host,
+      phase: options.phase,
+      execution,
+      subject,
+      issueNumber: options.issueNumber,
+      ...(options.prNumber === undefined ? {} : { prNumber: options.prNumber }),
+      branch: options.branch,
+      targetBase: options.targetBase,
+      ...(options.targetBaseOid === undefined ? {} : { targetBaseOid: options.targetBaseOid }),
+      expectedHead: options.expectedHead,
+      claimOid: options.claimOid,
+      ...(options.reviewGeneration === undefined
         ? {}
-        : { childStartedAt: timestamp }),
-    },
-  });
+        : {
+            reviewGeneration: options.reviewGeneration,
+            reviewRefOid: options.reviewRefOid,
+            reviewApprovalPolicy: options.reviewApprovalPolicy,
+          }),
+      selectedLogin: options.selectedLogin,
+      repository,
+      processState: options.pid === undefined || options.pid === null
+        ? 'preparing'
+        : 'running',
+      pid: options.pid ?? null,
+      paths,
+      timestamps: {
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        ...(options.pid === undefined || options.pid === null
+          ? {}
+          : { childStartedAt: timestamp }),
+      },
+    });
+  let manifest = marketplacePreparation === undefined
+    ? buildManifest(options.execution ?? { backend: 'local' })
+    : undefined;
   const registeredBefore = (await registeredWorktreePaths(
     repository.gitCommonDir,
     runner,
@@ -1522,37 +1664,86 @@ export async function createAttemptWorkspace(
   });
   mkdirSync(phaseDir, { recursive: true, mode: 0o700 });
   mkdirSync(attemptDir, { mode: 0o700 });
-  mkdirSync(paths.ghConfigDir, { mode: 0o700 });
-  writeFileSync(paths.log, '', { mode: 0o600, flag: 'wx' });
-  writeFileSync(paths.askpass, buildAskpassScript(paths.tokenFile), {
-    mode: 0o700,
-    flag: 'wx',
-  });
-  // Security note: this file (and gh-config/hosts.yml below) hold the raw
-  // GH token in plaintext at rest. Any process running as this same OS user
-  // could read it — an equivalent exposure to passing the token via
-  // environment variables on this platform, not a regression. The
-  // delegated-stage environment (run-stage.ts's
-  // `buildUnprivilegedStageEnvironment`) deliberately keeps stage roots
-  // pointed at a bogus `GH_CONFIG_DIR` and never forwards
-  // `JINN_AUTOPILOT_SESSION_MANIFEST`, so stage children spawned by the
-  // coordinator are not handed this file's location.
-  writeFileSync(paths.tokenFile, `${options.credential.secret()}\n`, {
-    mode: 0o600,
-    flag: 'wx',
-  });
-  writeFileSync(
-    join(paths.ghConfigDir, 'hosts.yml'),
-    buildGhHostsYaml(manifest.selectedLogin, options.credential.secret()),
-    { mode: 0o600, flag: 'wx' },
-  );
-  writeManifestAtomic(paths.manifest, manifest);
+  try {
+    mkdirSync(paths.ghConfigDir, { mode: 0o700 });
+    writeFileSync(paths.log, '', { mode: 0o600, flag: 'wx' });
+    writeFileSync(paths.askpass, buildAskpassScript(paths.tokenFile), {
+      mode: 0o700,
+      flag: 'wx',
+    });
+    // Security note: this file (and gh-config/hosts.yml below) hold the raw
+    // GH token in plaintext at rest. Any process running as this same OS user
+    // could read it — an equivalent exposure to passing the token via
+    // environment variables on this platform, not a regression. The
+    // delegated-stage environment (run-stage.ts's
+    // `buildUnprivilegedStageEnvironment`) deliberately keeps stage roots
+    // pointed at a bogus `GH_CONFIG_DIR` and never forwards
+    // `JINN_AUTOPILOT_SESSION_MANIFEST`, so stage children spawned by the
+    // coordinator are not handed this file's location.
+    writeFileSync(paths.tokenFile, `${options.credential.secret()}\n`, {
+      mode: 0o600,
+      flag: 'wx',
+    });
+    writeFileSync(
+      join(paths.ghConfigDir, 'hosts.yml'),
+      buildGhHostsYaml(options.selectedLogin, options.credential.secret()),
+      { mode: 0o600, flag: 'wx' },
+    );
+    if (marketplacePreparation !== undefined) {
+      const requestPath = join(paths.attemptDir, 'marketplace-request.json');
+      const persistRequest = runtime.persistMarketplaceTaskRequest
+        ?? persistMarketplaceTaskRequest;
+      const verifyRequest = runtime.verifyMarketplaceTaskRequest
+        ?? verifyMarketplaceTaskRequest;
+      const persisted = persistRequest(
+        requestPath,
+        marketplacePreparation.request,
+      );
+      if (
+        persisted.requestPath !== requestPath
+        || persisted.solverNetSelectionPath !== `${requestPath}.solvernet-selection.json`
+        || persisted.reused
+      ) {
+        throw new Error('Marketplace request persistence did not bind the attempt path');
+      }
+      const verified = verifyRequest(
+        persisted.requestPath,
+        persisted.requestDigest,
+      );
+      if (!isDeepStrictEqual(verified, marketplacePreparation.request)) {
+        throw new Error('Marketplace request verification changed canonical request bytes');
+      }
+      manifest = buildManifest({
+        backend: 'marketplace',
+        state: {
+          schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+          status: 'prepared',
+          requestPath: persisted.requestPath,
+          requestDigest: persisted.requestDigest,
+          solverNetSelectionPath: persisted.solverNetSelectionPath,
+          preparedAt: timestamp,
+          agentSoftDeadline: marketplacePreparation.agentSoftDeadline,
+          adoptionDeadline: marketplacePreparation.adoptionDeadline,
+        },
+      });
+    }
+    const preparedManifest = manifest!;
+    const writeManifest = runtime.writeManifest ?? writeManifestAtomic;
+    writeManifest(paths.manifest, preparedManifest);
+    if (!isDeepStrictEqual(readAttemptManifest(paths.manifest), preparedManifest)) {
+      throw new Error('Attempt manifest verification failed after persistence');
+    }
+  } catch (error) {
+    rmSync(paths.attemptDir, { recursive: true });
+    fsyncDirectory(phaseDir);
+    throw error;
+  }
   try {
     await runner('git', [
       '-C', repository.root,
       'worktree', 'add', '--detach',
       paths.worktree,
-      manifest.expectedHead,
+      manifest!.expectedHead,
     ]);
   } catch (error) {
     try {
@@ -1576,7 +1767,7 @@ export async function createAttemptWorkspace(
     if (!registered) rmSync(paths.attemptDir, { recursive: true });
     throw error;
   }
-  return manifest;
+  return manifest!;
 }
 
 function directories(path: string): string[] {

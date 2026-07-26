@@ -47,7 +47,9 @@ describe('lifecycle script entrypoint', () => {
     })).toBe('local');
   });
 
-  it('short-circuits active marketplace mode before repository and credential setup', async () => {
+  it.each(['observe', 'recover', 'active'] as const)(
+    'allows %s marketplace mode to continue into repository setup',
+    async (mode) => {
     const preflightProductionEntrypoint = Reflect.get(
       lifecycleEntrypoint,
       'preflightProductionEntrypoint',
@@ -60,13 +62,11 @@ describe('lifecycle script entrypoint', () => {
 
     expect(preflightProductionEntrypoint).toBeTypeOf('function');
     await expect(preflightProductionEntrypoint!(
-      'active',
+      mode,
       { JINN_AUTOPILOT_EXECUTION_BACKEND: 'marketplace' },
       setup,
-    )).rejects.toThrow(
-      'Marketplace session submission and adoption are not enabled yet.',
-    );
-    expect(setup).not.toHaveBeenCalled();
+    )).resolves.toBe('/repo');
+    expect(setup).toHaveBeenCalledTimes(1);
   });
 
   it('allows attempt cleanup only for successful complete local active cycles', () => {

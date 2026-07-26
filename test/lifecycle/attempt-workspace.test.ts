@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultRunner, type CommandRunner } from '../../src/dispatcher/issue-source.js';
 import { SelectedCredential } from '../../src/lifecycle/credentials.js';
@@ -40,6 +40,11 @@ import {
   type AttemptManifest,
   type CreateAttemptOptions,
 } from '../../src/lifecycle/attempt-workspace.js';
+import {
+  buildMarketplaceTaskRequest,
+  persistMarketplaceTaskRequest,
+  verifyMarketplaceTaskRequest,
+} from '../../src/lifecycle/marketplace-task.js';
 
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
@@ -135,6 +140,47 @@ function options(
     attemptId: UUID_A,
     now: () => new Date(NOW),
     ...overrides,
+  };
+}
+
+function marketplacePreparation(
+  fixture: ReturnType<typeof repositoryFixture>,
+  workflow: 'implementation' | 'review-finding' | 'reconcile' | 'ci-failure' =
+    'implementation',
+  body = 'The authoritative issue body.',
+) {
+  const built = buildMarketplaceTaskRequest({
+    workflow,
+    repository: 'Jinn-Network/mono',
+    language: 'typescript',
+    verificationProfile: 'jinn-mono.v1',
+    issueNumber: 42,
+    ...(workflow === 'implementation'
+      ? {}
+      : { childIssueNumber: 42, parentPrNumber: 84 }),
+    prNumber: 84,
+    targetBase: 'main',
+    branch: 'autopilot/42',
+    claimOid: fixture.oid,
+    expectedHead: fixture.oid,
+    v2AttemptId: UUID_A,
+    runnerId: 'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    taskSnapshot: {
+      title: 'Publish one durable marketplace task',
+      body,
+      prBody: 'Closes #42',
+      baseSha: fixture.oid,
+      targetBaseOid: fixture.oid,
+    },
+    receiptAuthors: ['impl-bot'],
+    createdAt: Date.parse(NOW),
+  });
+  return {
+    workflow,
+    baseSha: fixture.oid,
+    request: built.request,
+    agentSoftDeadline: built.agentSoftDeadline,
+    adoptionDeadline: built.adoptionDeadline,
   };
 }
 
@@ -461,6 +507,182 @@ describe('attempt workspace and manifest', () => {
     expect(manifest.execution).toEqual(execution);
     expect(readAttemptManifest(manifest.paths.manifest).execution).toEqual(execution);
   });
+
+  it('durably writes and verifies the immutable request before installing its prepared manifest', async () => {
+    const fixture = repositoryFixture();
+    const events: string[] = [];
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      persistMarketplaceTaskRequest(requestPath, request) {
+        events.push('persist-request');
+        expect(existsSync(join(dirname(requestPath), 'manifest.json'))).toBe(false);
+        return persistMarketplaceTaskRequest(requestPath, request);
+      },
+      verifyMarketplaceTaskRequest(requestPath, requestDigest) {
+        events.push('verify-request');
+        expect(existsSync(join(dirname(requestPath), 'manifest.json'))).toBe(false);
+        return verifyMarketplaceTaskRequest(requestPath, requestDigest);
+      },
+      writeManifest(path, prepared) {
+        events.push('write-manifest');
+        expect(verifyMarketplaceTaskRequest(
+          prepared.execution.state.requestPath,
+          prepared.execution.state.requestDigest,
+        ).id).toBe(`autopilot:${UUID_A}`);
+        writeFileSync(path, `${JSON.stringify(prepared, null, 2)}\n`, {
+          encoding: 'utf8',
+          mode: 0o600,
+          flag: 'wx',
+        });
+      },
+    });
+
+    expect(events).toEqual([
+      'persist-request',
+      'verify-request',
+      'write-manifest',
+    ]);
+    expect(manifest).toMatchObject({
+      targetBaseOid: fixture.oid,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(manifest.paths.attemptDir, 'marketplace-request.json'),
+          preparedAt: NOW,
+        },
+      },
+    });
+    expect(statSync(manifest.execution.state.requestPath).mode & 0o777).toBe(0o600);
+    expect(readAttemptManifest(manifest.paths.manifest)).toEqual(manifest);
+  });
+
+  it('accepts a bodyless task snapshot whose required problem statement falls back to its title', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(
+        fixture,
+        'implementation',
+        '',
+      ),
+    }), defaultRunner);
+    if (
+      manifest.execution.backend !== 'marketplace'
+      || manifest.execution.state.schemaVersion !== 'marketplace-execution-v2'
+    ) {
+      throw new Error('expected a version-2 marketplace execution');
+    }
+
+    const request = verifyMarketplaceTaskRequest(
+      manifest.execution.state.requestPath,
+      manifest.execution.state.requestDigest,
+    );
+    expect(request.spec.session.taskSnapshot.body).toBe('');
+    expect(request.spec.problem_statement)
+      .toBe('Publish one durable marketplace task');
+  });
+
+  it('removes only the new attempt directory when marketplace initialization fails before worktree creation', async () => {
+    const fixture = repositoryFixture();
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const sibling = join(dirname(attemptDir), 'keep-me');
+    mkdirSync(sibling, { recursive: true });
+    writeFileSync(join(sibling, 'sentinel'), 'preserve\n');
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: marketplacePreparation(fixture),
+    }), defaultRunner, {
+      persistMarketplaceTaskRequest(requestPath, request) {
+        persistMarketplaceTaskRequest(requestPath, request);
+        throw new Error('injected post-request initialization failure');
+      },
+    })).rejects.toThrow('injected post-request initialization failure');
+
+    expect(existsSync(attemptDir)).toBe(false);
+    expect(readFileSync(join(sibling, 'sentinel'), 'utf8')).toBe('preserve\n');
+    expect(git(fixture.repo, ['worktree', 'list', '--porcelain']))
+      .not.toContain(join(attemptDir, 'worktree'));
+  });
+
+  it('rejects a schema-valid marketplace capsule that contradicts its attempt binding before side effects', async () => {
+    const fixture = repositoryFixture();
+    const preparation = marketplacePreparation(fixture);
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const request = structuredClone(preparation.request);
+    request.spec.session.branch = 'autopilot/wrong-issue';
+    let worktreeAdds = 0;
+    const runner: CommandRunner = async (command, args, runnerOptions) => {
+      if (command === 'git' && args.includes('worktree') && args.includes('add')) {
+        worktreeAdds += 1;
+      }
+      return defaultRunner(command, args, runnerOptions);
+    };
+
+    await expect(createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      marketplacePreparation: {
+        ...preparation,
+        request,
+      },
+    }), runner)).rejects.toThrow(/marketplace preparation.*branch/i);
+
+    expect(existsSync(attemptDir)).toBe(false);
+    expect(worktreeAdds).toBe(0);
+  });
+
+  it.each([
+    ['implementation', 'implement'],
+    ['review-finding', 'fix-child'],
+    ['reconcile', 'reconcile'],
+    ['ci-failure', 'ci-failure'],
+  ] as const)(
+    'accepts the canonical %s workflow discriminator as %s',
+    async (workflow, expectedSessionWorkflow) => {
+      const fixture = repositoryFixture();
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        prNumber: 84,
+        branch: 'autopilot/42',
+        targetBaseOid: fixture.oid,
+        marketplacePreparation: marketplacePreparation(fixture, workflow),
+      }), defaultRunner);
+      if (
+        manifest.execution.backend !== 'marketplace'
+        || manifest.execution.state.schemaVersion !== 'marketplace-execution-v2'
+      ) {
+        throw new Error('expected a version-2 marketplace execution');
+      }
+
+      expect(verifyMarketplaceTaskRequest(
+        manifest.execution.state.requestPath,
+        manifest.execution.state.requestDigest,
+      ).spec.session.workflow).toBe(expectedSessionWorkflow);
+    },
+  );
 
   it('atomically transitions a prepared marketplace execution to submitted for its expected digest', async () => {
     const fixture = repositoryFixture();

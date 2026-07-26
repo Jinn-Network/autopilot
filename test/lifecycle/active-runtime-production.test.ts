@@ -1,5 +1,12 @@
 // @ts-nocheck — Stage 5: deleted merge-prep/review-fix/project-status fixtures.
+import {
+  existsSync,
+  readFileSync,
+  statSync,
+} from 'node:fs';
+import { dirname } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { TaskSubmitRequestV1Schema } from '@jinn-network/sdk/autopilot';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
 import {
   makeProductionActiveRuntime,
@@ -9,7 +16,7 @@ import {
   runLifecycleCycle,
 } from '../../src/lifecycle/controller.js';
 import {
-  MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
+  MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
 } from '../../src/lifecycle/session-execution-backend.js';
 import {
   decodeCapabilityAttestation,
@@ -60,6 +67,17 @@ function marketplaceRuntime(overrides: Record<string, unknown> = {}) {
     caps: { implementation: 1, review: 1 },
     implementationBackpressureThreshold: 30,
     staleAfterMs: 60_000,
+    repositorySlug: 'Jinn-Network/mono',
+    defaultBranch: 'next',
+    marketplaceTaskAdapter: {
+      dryRun: vi.fn(async () => ({})),
+      submit: vi.fn(async () => {
+        throw new Error('marketplace submit must be explicitly configured');
+      }),
+      recover: vi.fn(async () => {
+        throw new Error('marketplace recovery must be explicitly configured');
+      }),
+    },
     runner: vi.fn(async () => {
       throw new Error('runner must remain untouched');
     }),
@@ -127,22 +145,37 @@ describe('decodeCapabilityAttestation timestamps', () => {
 });
 
 describe('production active runtime preflight', () => {
-  it('rejects marketplace execution before Git, credentials, attestation, or local runtime probes', async () => {
+  it('dry-runs a fresh SDK-valid temporary request on every marketplace preflight without local probes', async () => {
     const runner = vi.fn(async () => {
       throw new Error('Git probe must remain untouched');
     });
     const readCapabilityAttestation = vi.fn(() => {
       throw new Error('attestation probe must remain untouched');
     });
-    const credentials = {
-      logins: vi.fn(() => {
-        throw new Error('credential probe must remain untouched');
-      }),
-    };
+    const seen: Array<{ path: string; request: unknown; mode: number }> = [];
+    const dryRun = vi.fn(async (path: string) => {
+      expect(existsSync(path)).toBe(true);
+      const request = TaskSubmitRequestV1Schema.parse(
+        JSON.parse(readFileSync(path, 'utf8')),
+      );
+      seen.push({
+        path,
+        request,
+        mode: statSync(path).mode & 0o777,
+      });
+      return {};
+    });
+    const ids = [
+      '11111111-1111-4111-8111-111111111121',
+      '11111111-1111-4111-8111-111111111122',
+    ];
     const preflight = makeProductionCapabilityPreflight({
       executionBackend: 'marketplace',
       repositoryPath: '/repo',
-      credentials,
+      runnerId: 'runner-a',
+      credentials: pool(),
+      repositorySlug: 'Jinn-Network/mono',
+      defaultBranch: 'next',
       config: {
         ...DEFAULT_CONFIG,
         runtime: 'cursor',
@@ -150,18 +183,65 @@ describe('production active runtime preflight', () => {
       },
       runner,
       readCapabilityAttestation,
+      marketplaceTaskAdapter: {
+        dryRun,
+        submit: vi.fn(),
+        recover: vi.fn(),
+      },
+      now: () => NOW,
+      nextId: () => ids.shift()!,
     });
 
-    await expect(preflight()).resolves.toEqual({
-      ok: false,
-      detail: MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
-    });
+    await expect(preflight()).resolves.toEqual({ ok: true });
+    await expect(preflight()).resolves.toEqual({ ok: true });
+    expect(dryRun).toHaveBeenCalledTimes(2);
+    expect(seen[0]!.path).not.toBe(seen[1]!.path);
+    expect(seen.map(({ request }) => request.id)).toEqual([
+      'autopilot:11111111-1111-4111-8111-111111111121',
+      'autopilot:11111111-1111-4111-8111-111111111122',
+    ]);
+    expect(seen.map(({ mode }) => mode)).toEqual([0o600, 0o600]);
+    expect(seen.every(({ path }) =>
+      !existsSync(path) && !existsSync(dirname(path)))).toBe(true);
     expect(runner).not.toHaveBeenCalled();
     expect(readCapabilityAttestation).not.toHaveBeenCalled();
-    expect(credentials.logins).not.toHaveBeenCalled();
   });
 
-  it('rejects a marketplace production cycle before snapshot discovery or any claim path', async () => {
+  it.each([
+    ['repository', { repositorySlug: 'Other/repository' }],
+    ['language', { marketplaceLanguage: 'rust' }],
+    ['verification profile', { marketplaceVerificationProfile: 'other.v1' }],
+  ])(
+    'rejects an unsupported marketplace %s before invoking the dry-run adapter',
+    async (_label, overrides) => {
+      const dryRun = vi.fn();
+      const preflight = makeProductionCapabilityPreflight({
+        executionBackend: 'marketplace',
+        repositoryPath: '/repo',
+        runnerId: 'runner-a',
+        credentials: pool(),
+        repositorySlug: 'Jinn-Network/mono',
+        defaultBranch: 'next',
+        config: DEFAULT_CONFIG,
+        marketplaceTaskAdapter: {
+          dryRun,
+          submit: vi.fn(),
+          recover: vi.fn(),
+        },
+        ...overrides,
+      });
+
+      await expect(preflight()).resolves.toMatchObject({
+        ok: false,
+        detail: expect.stringMatching(
+          /supports only Jinn-Network\/mono.*typescript.*jinn-mono\.v1/i,
+        ),
+      });
+      expect(dryRun).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects a failed marketplace dry-run before snapshot discovery or any claim path', async () => {
     const spawn = vi.fn(() => {
       throw new Error('local spawn must remain untouched');
     });
@@ -174,10 +254,18 @@ describe('production active runtime preflight', () => {
     const trackAttemptChild = vi.fn(() => {
       throw new Error('local tracking must remain untouched');
     });
+    const dryRun = vi.fn(async () => {
+      throw new Error('marketplace funding is unavailable');
+    });
     const active = marketplaceRuntime({
       spawn,
       isPidAlive,
       trackAttemptChild,
+      marketplaceTaskAdapter: {
+        dryRun,
+        submit: vi.fn(),
+        recover: vi.fn(),
+      },
     });
 
     await expect(runLifecycleCycle('active', {
@@ -191,42 +279,123 @@ describe('production active runtime preflight', () => {
     })).resolves.toMatchObject({
       status: 'rejected',
       message:
-        `active capability preflight failed: ${MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL}`,
+        'active capability preflight failed: marketplace funding is unavailable',
       events: [],
     });
+    expect(dryRun).toHaveBeenCalledTimes(1);
     expect(readSnapshot).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
     expect(isPidAlive).not.toHaveBeenCalled();
     expect(trackAttemptChild).not.toHaveBeenCalled();
   });
 
-  it('fails a direct marketplace implementation dispatch before authority reads or local spawn', async () => {
+  it('routes marketplace implementation dispatch through its backend without local spawn or tracking', async () => {
+    const base = gitOid('1'.repeat(40));
+    const claim = gitOid('2'.repeat(40));
+    const attemptId = '11111111-1111-4111-8111-111111111123';
     const spawn = vi.fn(() => {
       throw new Error('local spawn must remain untouched');
-    });
-    const readImplementationSnapshot = vi.fn(async () => {
-      throw new Error('implementation authority must remain untouched');
     });
     const trackAttemptChild = vi.fn(() => {
       throw new Error('local tracking must remain untouched');
     });
+    let preparation: unknown;
+    const makeImplementationActionPort = vi.fn(() => ({
+      readIssue: async () => ({
+        number: 42,
+        title: 'Wire marketplace production dispatch',
+        body: '',
+        open: true,
+        eligible: true,
+        targetBase: gitRefName('next'),
+        effort: 'High',
+      }),
+      readStaleRecovery: async () => {
+        throw new Error('not used');
+      },
+      runRealityCheck: async () => ({
+        classification: 'clear',
+        evidence: {},
+        suggestedBlockedOn: null,
+        suggestedComment: null,
+      }),
+      listOpenPullRequests: async () => [],
+      readTargetBaseHead: async () => base,
+      createClaimCommit: async () => claim,
+      claimBranch: async (input) => ({
+        status: 'won',
+        expected: input.expectedRemoteHead,
+        published: input.claimOid,
+        observed: input.claimOid,
+      }),
+      ensureDraftPullRequest: async (input) => ({
+        number: 84,
+        headRefName: input.branch,
+        head: input.claimOid,
+        baseRefName: input.targetBase,
+        draft: true,
+        labels: [input.label],
+        body: input.body,
+      }),
+      setProjectInProgress: async () => {},
+      createAttempt: async (input) => {
+        preparation = input.marketplacePreparation;
+        return {
+          attemptId: input.attemptId,
+          paths: {
+            worktree: '/attempt/marketplace-worktree',
+            manifest: '/attempt/marketplace-manifest.json',
+            log: '/attempt/marketplace.log',
+            ghConfigDir: '/attempt/marketplace-gh',
+            askpass: '/attempt/marketplace-askpass',
+          },
+        };
+      },
+      escalateHuman: async () => {},
+    }));
+    const start = vi.fn(async (request) => {
+      expect(request).toMatchObject({
+        kind: 'implementation',
+        workflow: 'implementation',
+        backend: 'marketplace',
+        manifestPath: '/attempt/marketplace-manifest.json',
+      });
+      expect(request).not.toHaveProperty('local');
+      return {
+        status: 'started',
+        backend: 'marketplace',
+        id: `autopilot:${attemptId}`,
+        taskId: 'task-42',
+        taskCid: 'bafy-task-42',
+      };
+    });
     const active = marketplaceRuntime({
       spawn,
-      readImplementationSnapshot,
       trackAttemptChild,
+      makeImplementationActionPort,
+      marketplaceExecutionBackend: { start },
+      nextId: () => attemptId,
+      now: () => NOW,
+      environment: {},
+      repositoryUrl: 'https://github.com/Jinn-Network/mono.git',
     });
 
     await expect(active.executeAction({
       kind: 'claim-implementation',
       intent: 'fresh',
       issueNumber: 42,
-    }, {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
-    expect(readImplementationSnapshot).not.toHaveBeenCalled();
+    }, {} as never)).resolves.toEqual({ outcome: 'spawned' });
+    expect(TaskSubmitRequestV1Schema.parse(preparation.request))
+      .toEqual(preparation.request);
+    expect(preparation.request.spec.session.taskSnapshot.body).toBe('');
+    expect(preparation.request.spec.problem_statement)
+      .toBe('Wire marketplace production dispatch');
+    expect(start).toHaveBeenCalledTimes(1);
     expect(spawn).not.toHaveBeenCalled();
     expect(trackAttemptChild).not.toHaveBeenCalled();
   });
 
-  it('fails a direct marketplace exact-head review before acquisition reads or local spawn', async () => {
+  it('returns a stable unavailable marketplace exact-head review without acquisition reads or local spawn', async () => {
     const spawn = vi.fn(() => {
       throw new Error('local spawn must remain untouched');
     });
@@ -247,35 +416,38 @@ describe('production active runtime preflight', () => {
       issueNumber: 42,
       prNumber: 84,
       head: '1'.repeat(40),
-    }, {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
+    }, {} as never)).resolves.toEqual({
+      outcome: 'unavailable',
+      reason: MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
+    });
     expect(readReviewSnapshot).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
     expect(trackAttemptChild).not.toHaveBeenCalled();
   });
 
-  it('guards direct marketplace dispatch before credential and full-capacity local-state reads', async () => {
-    const credentials = {
-      logins: vi.fn(() => {
-        throw new Error('credential/local-state probe must remain untouched');
-      }),
-    };
+  it('rejects an unsupported marketplace repository before implementation authority reads or claims', async () => {
+    const readIssue = vi.fn(async () => {
+      throw new Error('implementation authority must remain untouched');
+    });
+    const makeImplementationActionPort = vi.fn(() => ({
+      readIssue,
+    }));
+    const start = vi.fn();
     const active = marketplaceRuntime({
-      credentials,
-      caps: { implementation: 0, review: 0 },
+      repositorySlug: 'Other/repository',
+      makeImplementationActionPort,
+      marketplaceExecutionBackend: { start },
     });
 
     await expect(active.executeAction({
       kind: 'claim-implementation',
       intent: 'fresh',
       issueNumber: 42,
-    }, {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
-    await expect(active.executeReviewActions!([{
-      kind: 'claim-review',
-      issueNumber: 42,
-      prNumber: 84,
-      head: '1'.repeat(40),
-    }], {} as never)).rejects.toThrow(MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL);
-    expect(credentials.logins).not.toHaveBeenCalled();
+    }, {} as never)).rejects.toThrow(
+      /supports only Jinn-Network\/mono.*typescript.*jinn-mono\.v1/i,
+    );
+    expect(readIssue).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
   });
 
   it('binds local implementation dispatch through the production backend composition', async () => {
