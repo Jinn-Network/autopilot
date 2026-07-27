@@ -20,6 +20,7 @@ import {
   CANONICAL_GITHUB_HTTPS_REMOTE,
   runCanonicalImplementationRealityCheck,
   type ImplementationExecutorDeps,
+  type ImplementationIssue,
   type ImplementationPullRequest,
 } from './implementation-executor.js';
 import { withSelectedCredential } from './production-auth.js';
@@ -161,6 +162,69 @@ function prLinks(snapshot: GitHubLifecycleSnapshot): Map<number, PrLink[]> {
   return links;
 }
 
+/**
+ * An issue projection, or a withheld projection carrying the reason it was
+ * withheld. Mirrors `TargetedAuthorityRefusal` in `targeted-action-reader.ts`:
+ * a bare `null` is unattributable, so every refusal names its own cause.
+ */
+interface IssueProjection {
+  readonly issue: ImplementationIssue | null;
+  readonly refusal?: string;
+}
+
+function issueRefusal(detail: string): IssueProjection {
+  return { issue: null, refusal: detail };
+}
+
+/**
+ * Describes why {@link resolveStackReady} admitted no authorized stacking base
+ * for a blocked issue, naming the blocker, the PR that failed the boundary and
+ * which boundary it failed. Pure reporting over the same inputs the resolver
+ * sees — it classifies nothing the resolver does not already classify and
+ * decides nothing. Never returns the empty string: the caller only reaches it
+ * once the resolver has already withheld a base.
+ */
+function describeStackRefusal(
+  blockedByIssues: readonly number[],
+  links: ReadonlyMap<number, PrLink[]>,
+  authorAllowlist: ReadonlySet<string>,
+): string {
+  const stackable: string[] = [];
+  for (const blocker of blockedByIssues) {
+    const candidates = links.get(blocker) ?? [];
+    if (candidates.some((link) => link.state === 'MERGED')) continue;
+    const trusted = candidates.find((link) =>
+      link.state === 'OPEN' && authorAllowlist.has(link.author.toLowerCase()));
+    if (trusted !== undefined) {
+      stackable.push(`#${blocker} (PR #${trusted.prNumber})`);
+      continue;
+    }
+    const untrustedOpen = candidates.filter((link) => link.state === 'OPEN');
+    if (untrustedOpen.length > 0) {
+      return `blocker issue #${blocker} has ${
+        untrustedOpen.length === 1 ? 'an open PR' : 'open PRs'
+      } ${
+        untrustedOpen.map((link) => `#${link.prNumber} by ${link.author || '(no author)'}`).join(', ')
+      }, and no author is on the dispatch author allowlist`;
+    }
+    const closed = candidates.filter((link) => link.state === 'CLOSED');
+    if (closed.length > 0) {
+      return `blocker issue #${blocker} has only closed-unmerged ${
+        closed.map((link) => `PR #${link.prNumber}`).join(', ')
+      }`;
+    }
+    return `blocker issue #${blocker} has no closing pull request`;
+  }
+  if (stackable.length > 1) {
+    return `blockers ${
+      stackable.join(' and ')
+    } are both unmerged with an open PR, and multi-parent stacking is not supported`;
+  }
+  // Unreachable while the resolver's admission rule and the classification
+  // above agree; kept so a future divergence still reports something factual.
+  return 'the stack resolver admitted no authorized base';
+}
+
 export function makeProductionImplementationActionPort(
   options: ProductionImplementationActionPortOptions,
 ): ProductionImplementationActionPort {
@@ -211,14 +275,20 @@ export function makeProductionImplementationActionPort(
     snapshot: GitHubLifecycleSnapshot,
     issueNumber: number,
     requireAuthorizedTarget = false,
-  ) => {
+  ): IssueProjection => {
     const source = snapshot.issues.find((issue) => issue.number === issueNumber);
     const lifecycle = snapshot.lifecycle.items.find((item) =>
       item.issueNumber === issueNumber);
-    if (source === undefined || lifecycle === undefined) return null;
+    if (source === undefined) {
+      return issueRefusal(`issue #${issueNumber} is absent from the snapshot issue index`);
+    }
+    if (lifecycle === undefined) {
+      return issueRefusal(`issue #${issueNumber} has no lifecycle item in the snapshot`);
+    }
+    const links = prLinks(snapshot);
     const stackReady = resolveStackReady(
       [...snapshot.issues],
-      prLinks(snapshot),
+      links,
       options.authorAllowlist,
       defaultBranch,
     );
@@ -228,7 +298,11 @@ export function makeProductionImplementationActionPort(
       && source.blockedByIssues.length > 0
       && authorizedStack === undefined
     ) {
-      return null;
+      return issueRefusal(
+        `issue #${issueNumber} is open but has no authorized stacking base — ${
+          describeStackRefusal(source.blockedByIssues, links, options.authorAllowlist)
+        }`,
+      );
     }
     const marker = parseChildMarker(source.body ?? '');
     const childKindLabel = hasChildKindLabel(source.labels);
@@ -244,7 +318,7 @@ export function makeProductionImplementationActionPort(
     const eligibilityDetail = lifecycle.kind === 'issue'
       ? lifecycle.eligibilityDetail
       : `Project status is ${lifecycle.projectStatus ?? 'missing'}`;
-    return {
+    return { issue: {
       number: source.number,
       title: source.title,
       body: source.body ?? '',
@@ -261,7 +335,7 @@ export function makeProductionImplementationActionPort(
       ...(marker === null
         ? {}
         : { child: { parentPr: marker.parentPr, kind: marker.kind } }),
-    };
+    } };
   };
   const openImplementationPullRequests = (
     snapshot: GitHubLifecycleSnapshot,
@@ -284,7 +358,7 @@ export function makeProductionImplementationActionPort(
   return {
     async readIssue(issueNumber) {
       const snapshot = await options.readSnapshot();
-      return issueFromSnapshot(snapshot, issueNumber);
+      return issueFromSnapshot(snapshot, issueNumber).issue;
     },
 
     async readStaleRecovery(issueNumber, prNumber) {
@@ -298,8 +372,12 @@ export function makeProductionImplementationActionPort(
       const pullRequest = snapshot.pullRequests.find((pr) =>
         pr.number === prNumber);
       const nativeIssue = snapshot.issues.find((issue) => issue.number === issueNumber);
+      const projection = issueFromSnapshot(snapshot, issueNumber, true);
       return {
-        issue: issueFromSnapshot(snapshot, issueNumber, true),
+        issue: projection.issue,
+        ...(projection.refusal === undefined
+          ? {}
+          : { issueRefusal: projection.refusal }),
         projectStatus: project?.status ?? null,
         humanHold: hasExternalHumanAuthority({
           pullRequestLabels: pullRequest?.labels,
