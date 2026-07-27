@@ -27,6 +27,7 @@ import {
   type GitHubUsage,
 } from '../../src/lifecycle/github-usage.js';
 import type { CommandRunner } from '../../src/dispatcher/issue-source.js';
+import type { PolledIssue } from '../../src/dispatcher/types.js';
 import { LifecycleSnapshotCoordinator } from '../../src/lifecycle/runner-snapshot.js';
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
@@ -64,6 +65,41 @@ function implementation(
       claimedAt: '2026-07-20T11:00:00.000Z',
     },
     ...overrides,
+  };
+}
+
+/**
+ * A live open issue, exactly as `snapshot.issues` carries it — every field a
+ * value the readers can actually produce (`shape` from `ISSUE_SHAPES`,
+ * `effort` from `EFFORTS`).
+ *
+ * The base `snapshot()` helper yields `issues: []`, which is only sound for
+ * fixtures whose issue is genuinely closed: eligibility is computed by
+ * `selectReady` over `snapshot.issues` alone, so an eligible Todo issue is by
+ * construction present there. Fixtures asserting recovery for a live claim
+ * must say so.
+ *
+ * NOTE: the `PolledIssue` annotation documents the contract but does not
+ * enforce it — the `@ts-nocheck` on line 1 suppresses checking for this whole
+ * file. Treat the field values as hand-verified against
+ * `src/dispatcher/types.ts`, not as compiler-guaranteed.
+ */
+function openIssue(number: number): PolledIssue {
+  return {
+    number,
+    title: 'feat: lifecycle',
+    labels: [],
+    body: '',
+    shape: 'feat',
+    blockedOn: 'Nothing',
+    blockedByIssues: [],
+    effort: 'Low',
+    priority: 'P1',
+    status: 'Todo',
+    onBoard: true,
+    author: 'trusted',
+    projectItemId: `PVTI_${number}`,
+    inCurrentSprint: true,
   };
 }
 
@@ -2077,6 +2113,7 @@ describe('lifecycle controller', () => {
     };
     const mismatchedSnapshot: GitHubLifecycleSnapshot = {
       ...snapshot(eligibleIssue),
+      issues: [openIssue(42)],
       branches: [{
         issueNumber: 42,
         headRefName: 'autopilot/42',
@@ -2131,6 +2168,7 @@ describe('lifecycle controller', () => {
     };
     const mismatchedSnapshot: GitHubLifecycleSnapshot = {
       ...snapshot(eligibleIssue),
+      issues: [openIssue(42)],
       branches: [{
         issueNumber: 42,
         headRefName: 'autopilot/42',
@@ -2209,6 +2247,11 @@ describe('lifecycle controller', () => {
   function orphanReconciliationSnapshot(): GitHubLifecycleSnapshot {
     return {
       ...snapshot(ELIGIBLE_ISSUE),
+      // Same correction as the two fixtures above: `ELIGIBLE_ISSUE` is an
+      // eligible, Todo, open issue, so it is by construction present in the
+      // open-issue set the cycle reads. The base `snapshot()` helper yields
+      // `issues: []`, which would describe a closed issue.
+      issues: [openIssue(42)],
       branches: [{
         issueNumber: 42,
         headRefName: 'autopilot/42',
@@ -2424,6 +2467,85 @@ describe('lifecycle controller', () => {
       renderLifecycleHuman(report).split('\n')
         .some((line) => line.startsWith('claim-review issue:1/')),
     ).toBe(false);
+  });
+
+  it('plans no orphan recovery for a claim whose issue is absent from the live snapshot', async () => {
+    const calls: string[] = [];
+    // Issue #42 is closed, so it is absent from the open-issue set the cycle
+    // re-reads every pass. Only the retained implement claim survives; there is
+    // no live evidence about the subject at all. The writer's own precondition
+    // rejects this ("Issue is absent from the lifecycle snapshot"), so planning
+    // a mutation here can only fail, forever.
+    const closedIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'In Progress',
+      labels: [],
+      eligible: false,
+      eligibilityReason: 'not-selected',
+      eligibilityDetail: 'Issue is not on the Project',
+    };
+    const absentIssueSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(closedIssue),
+      issues: [],
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+      terminalClaims: [],
+    };
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(closedIssue, calls),
+      readSnapshot: async () => absentIssueSnapshot,
+    });
+
+    expect(report.orphanBranchClaims).toEqual([]);
+    expect(JSON.stringify(report)).not.toContain('ensure-draft-pr');
+    expect(calls).toEqual([]);
+  });
+
+  it('plans no orphan recovery when a populated live issue set omits the claim issue', async () => {
+    const calls: string[] = [];
+    // The gate must be evidence about *this* issue, not merely that the cycle
+    // read some issues. A busy repository always has a non-empty open-issue
+    // set; issue #42 is still closed and absent from it, so the claim on
+    // `autopilot/42` is still unsupported.
+    const closedIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'In Progress',
+      labels: [],
+      eligible: false,
+      eligibilityReason: 'not-selected',
+      eligibilityDetail: 'Issue is not on the Project',
+    };
+    const otherIssuesSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(closedIssue),
+      issues: [openIssue(99)],
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+      terminalClaims: [],
+    };
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(closedIssue, calls),
+      readSnapshot: async () => otherIssuesSnapshot,
+    });
+
+    expect(report.orphanBranchClaims).toEqual([]);
+    expect(JSON.stringify(report)).not.toContain('ensure-draft-pr');
+    expect(calls).toEqual([]);
   });
 
   it.skip('never reopens Done or otherwise merged work because its stable ref was retained', async () => {
