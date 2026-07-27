@@ -410,6 +410,7 @@ function projectionContext(
   now: Date,
   staleAfterMs: number,
 ): ProjectionContext {
+  const liveIssues = new Set(snapshot.issues.map((issue) => issue.number));
   const prBranches = new Set(snapshot.pullRequests.map((pr) => pr.headRefName));
   const ambiguousIssues = new Set(snapshot.diagnostics.flatMap((diagnostic) => (
     diagnostic.issueNumbers
@@ -430,6 +431,7 @@ function projectionContext(
     .filter((branch) => {
       const claim = branch.claim;
       return claim.phase === 'implement'
+        && liveIssues.has(branch.issueNumber)
         && !prBranches.has(branch.headRefName)
         && !ambiguousIssues.has(branch.issueNumber)
         && !terminalIssues.has(branch.issueNumber)
@@ -677,6 +679,7 @@ function eventFor(
     ...('expectedHead' in action ? { head: action.expectedHead } : {}),
     action: action.kind,
     outcome: result.outcome,
+    ...(result.detail === undefined ? {} : { reason: logSafeReason(result.detail) }),
   };
 }
 
@@ -1162,7 +1165,7 @@ async function executeActivePass(
     ...('head' in action ? { head: action.head } : {}),
     action: action.kind,
     outcome: result.outcome,
-    ...(result.reason === undefined ? {} : { reason: result.reason }),
+    ...(result.reason === undefined ? {} : { reason: logSafeReason(result.reason) }),
   });
   for (let index = 0; index < scheduling.actions.length;) {
     const action = scheduling.actions[index]!;
@@ -1687,6 +1690,56 @@ function paritySummary(
         + `full=${difference.full ?? 'absent'}.`
     )),
   ];
+}
+
+/**
+ * Elision budget for `LifecycleLogEvent.reason`.
+ *
+ * Failure detail originates as `message(error)`, and the production writer
+ * shells out via execFile, whose rejection message is
+ * `Command failed: <argv>\n<stderr>`. The argv comes FIRST and carries whole PR
+ * bodies and raw issue titles from the target repository, while the actual
+ * diagnosis — stderr — sits at the END. So the budget is biased hard toward the
+ * tail: truncating from the front would keep the noise and drop the cause.
+ */
+const LOG_REASON_HEAD_LENGTH = 120;
+const LOG_REASON_TAIL_LENGTH = 600;
+
+/**
+ * Minimum number of elided characters worth spending the marker on. Comfortably
+ * exceeds the marker's own length, so eliding always shortens the string.
+ */
+const LOG_REASON_ELISION_THRESHOLD = 64;
+
+/**
+ * Renders untrusted failure detail as a single bounded log field.
+ *
+ * Event reasons are interpolated into one-line, operator-facing log records,
+ * but their content is attacker-influenceable: a target-repo issue title or PR
+ * body reaches the detail verbatim through a failed `gh` invocation. Collapsing
+ * whitespace keeps a title that begins with a newline from forging an extra
+ * event line for a human reading the log, and the middle elision stops one
+ * failure from emitting a multi-KB record — while preserving the trailing
+ * stderr that makes the reason worth logging at all.
+ *
+ * The collapsed class deliberately exceeds `\s`, which matches no C0 control
+ * beyond the five ASCII spaces and no C1 control at all. ESC (0x1B) in a PR
+ * body would otherwise survive into an operator's terminal as a live escape
+ * sequence — the same misleading-a-human channel the newline collapse closes,
+ * reached by a different byte.
+ *
+ * Pure and total: never throws, and never returns a string containing a line
+ * break or any other control character. Sanitizing here, at event construction,
+ * means every consumer of `LifecycleLogEvent` inherits the guarantee instead of
+ * re-deriving it.
+ */
+function logSafeReason(detail: string): string {
+  const flattened = detail.replace(/[\s\u0000-\u001F\u007F-\u009F]+/gu, ' ').trim();
+  const elided = flattened.length - LOG_REASON_HEAD_LENGTH - LOG_REASON_TAIL_LENGTH;
+  if (elided <= LOG_REASON_ELISION_THRESHOLD) return flattened;
+  return `${flattened.slice(0, LOG_REASON_HEAD_LENGTH)} […${elided} chars elided…] ${
+    flattened.slice(flattened.length - LOG_REASON_TAIL_LENGTH)
+  }`;
 }
 
 function lifecycleEventSummary(event: LifecycleLogEvent): string {

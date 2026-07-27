@@ -27,6 +27,7 @@ import {
   type GitHubUsage,
 } from '../../src/lifecycle/github-usage.js';
 import type { CommandRunner } from '../../src/dispatcher/issue-source.js';
+import type { PolledIssue } from '../../src/dispatcher/types.js';
 import { LifecycleSnapshotCoordinator } from '../../src/lifecycle/runner-snapshot.js';
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
@@ -64,6 +65,41 @@ function implementation(
       claimedAt: '2026-07-20T11:00:00.000Z',
     },
     ...overrides,
+  };
+}
+
+/**
+ * A live open issue, exactly as `snapshot.issues` carries it — every field a
+ * value the readers can actually produce (`shape` from `ISSUE_SHAPES`,
+ * `effort` from `EFFORTS`).
+ *
+ * The base `snapshot()` helper yields `issues: []`, which is only sound for
+ * fixtures whose issue is genuinely closed: eligibility is computed by
+ * `selectReady` over `snapshot.issues` alone, so an eligible Todo issue is by
+ * construction present there. Fixtures asserting recovery for a live claim
+ * must say so.
+ *
+ * NOTE: the `PolledIssue` annotation documents the contract but does not
+ * enforce it — the `@ts-nocheck` on line 1 suppresses checking for this whole
+ * file. Treat the field values as hand-verified against
+ * `src/dispatcher/types.ts`, not as compiler-guaranteed.
+ */
+function openIssue(number: number): PolledIssue {
+  return {
+    number,
+    title: 'feat: lifecycle',
+    labels: [],
+    body: '',
+    shape: 'feat',
+    blockedOn: 'Nothing',
+    blockedByIssues: [],
+    effort: 'Low',
+    priority: 'P1',
+    status: 'Todo',
+    onBoard: true,
+    author: 'trusted',
+    projectItemId: `PVTI_${number}`,
+    inCurrentSprint: true,
   };
 }
 
@@ -2077,6 +2113,7 @@ describe('lifecycle controller', () => {
     };
     const mismatchedSnapshot: GitHubLifecycleSnapshot = {
       ...snapshot(eligibleIssue),
+      issues: [openIssue(42)],
       branches: [{
         issueNumber: 42,
         headRefName: 'autopilot/42',
@@ -2131,6 +2168,7 @@ describe('lifecycle controller', () => {
     };
     const mismatchedSnapshot: GitHubLifecycleSnapshot = {
       ...snapshot(eligibleIssue),
+      issues: [openIssue(42)],
       branches: [{
         issueNumber: 42,
         headRefName: 'autopilot/42',
@@ -2164,6 +2202,349 @@ describe('lifecycle controller', () => {
         ]),
       }),
     ]);
+    expect(calls).toEqual([]);
+  });
+
+  it('reports the cause of a reconciliation failure instead of a bare failed outcome', async () => {
+    // Regression: eventFor built reconciliation log events without copying
+    // ReconciliationResult.detail onto LifecycleLogEvent.reason, so every
+    // reconciliation failure rendered as a bare `failed.` while sibling action
+    // events (actionEvent) printed their reason. A live canary lost the cause
+    // of a systematic 7/7 ensure-draft-pr failure loop to this hole.
+    const failure = 'Issue is absent from the lifecycle snapshot';
+    const { report, calls } = await ensureDraftPrCycle(async () => {
+      throw new Error(failure);
+    });
+
+    expect(calls).toContain('ensureDraftPullRequest');
+    expect(report.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        action: 'ensure-draft-pr',
+        subject: 'issue:42',
+        outcome: 'failed',
+        reason: failure,
+      }),
+    ]));
+    expect(renderLifecycleHuman(report)).toContain(
+      `ensure-draft-pr issue:42: failed (${failure}).`,
+    );
+  });
+
+  // Shared fixture for the log-safety cases: an orphan branch claim whose
+  // reconciliation plans ensure-draft-pr, so a writer rejection produces a
+  // `failed` reconciliation result carrying the raw error text as `detail`.
+  const ELIGIBLE_ISSUE: LifecycleItem = {
+    kind: 'issue',
+    issueNumber: 42,
+    v2Marked: false,
+    projectStatus: 'Todo',
+    labels: [],
+    eligible: true,
+    eligibilityReason: 'eligible',
+    eligibilityDetail: 'All implementation admission gates pass',
+  };
+
+  function orphanReconciliationSnapshot(): GitHubLifecycleSnapshot {
+    return {
+      ...snapshot(ELIGIBLE_ISSUE),
+      // Same correction as the two fixtures above: `ELIGIBLE_ISSUE` is an
+      // eligible, Todo, open issue, so it is by construction present in the
+      // open-issue set the cycle reads. The base `snapshot()` helper yields
+      // `issues: []`, which would describe a closed issue.
+      issues: [openIssue(42)],
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+    };
+  }
+
+  async function ensureDraftPrCycle(ensureDraftPullRequest: () => Promise<void>) {
+    const calls: string[] = [];
+    const writer: ReconciliationWriter = {
+      ...throwingWriter(calls),
+      readIssueHead: async () => HEAD,
+      readBranchHead: async () => HEAD,
+      readPullRequest: async () => null,
+      readDraftPullRequestAuthority: async () => ({ kind: 'missing' }),
+      ensureDraftPullRequest: async () => {
+        calls.push('ensureDraftPullRequest');
+        await ensureDraftPullRequest();
+      },
+    };
+    const report = await runLifecycleCycle('active', {
+      ...deps(ELIGIBLE_ISSUE, calls, writer),
+      readSnapshot: async () => orphanReconciliationSnapshot(),
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 1, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async () => ({ outcome: 'spawned' }),
+      },
+    });
+    return { report, calls };
+  }
+
+  it('cannot let attacker-controlled error text forge a log line in a reconciliation event', async () => {
+    // Security: ReconciliationResult.detail is message(error), and the
+    // production writer shells out via execFile, whose rejection message reads
+    // `Command failed: <argv>\n<stderr>`. `gh pr create` puts the target repo's
+    // raw issue title and PR body into that argv, so `detail` carries
+    // attacker-influenceable content with literal newlines straight into a
+    // single-line operator log. Unflattened, an issue title beginning with a
+    // newline forges an entire fake event line in a persisted log.
+    const forged = 'ensure-draft-pr issue:1: applied.';
+    const { report } = await ensureDraftPrCycle(async () => {
+      throw new Error(
+        `Command failed: gh pr create --title\n\n${forged}\n  trailing detail`,
+      );
+    });
+
+    const event = report.events.find((candidate) => candidate.action === 'ensure-draft-pr');
+    expect(event).toMatchObject({ outcome: 'failed' });
+    expect(event!.reason).not.toMatch(/[\r\n]/);
+    expect(event!.reason).toBe(
+      `Command failed: gh pr create --title ${forged} trailing detail`,
+    );
+
+    const lines = renderLifecycleHuman(report).split('\n');
+    // The forged text must never begin a line: starting a line is exactly what
+    // makes it read as a genuine event to an operator or a log parser.
+    expect(lines.some((line) => line.startsWith('ensure-draft-pr issue:1:'))).toBe(false);
+    expect(lines.filter((line) => line.includes(forged))).toHaveLength(1);
+    expect(lines).toContain(
+      `ensure-draft-pr issue:42: failed (Command failed: gh pr create --title ${
+        forged
+      } trailing detail).`,
+    );
+  });
+
+  it('keeps the trailing stderr of a long execFile failure message', async () => {
+    // This is the point of the whole PR. Node's execFile rejection reads
+    // `Command failed: <argv>\n<stderr>`: the argv comes FIRST and `gh pr
+    // create`/`gh pr edit` push an entire PR body through it, while the actual
+    // diagnosis — stderr — sits at the END. Any front-truncating bound would
+    // keep the useless argv and discard the cause, re-hiding exactly what this
+    // change exists to surface. The bound must preserve the tail.
+    const stderr = 'pull request already exists for branch autopilot/42';
+    const { report } = await ensureDraftPrCycle(async () => {
+      throw new Error(
+        `Command failed: gh pr create --body ${'x'.repeat(4_000)}\n${stderr}`,
+      );
+    });
+
+    const event = report.events.find((candidate) => candidate.action === 'ensure-draft-pr');
+    expect(event!.outcome).toBe('failed');
+    expect(event!.reason).toContain(stderr);
+    expect(event!.reason!.endsWith(stderr)).toBe(true);
+    expect(renderLifecycleHuman(report)).toContain(stderr);
+  });
+
+  it('elides the middle of an oversized failure reason and marks the elision', async () => {
+    // An unbounded reason turns a single failure into a multi-KB log entry, so
+    // the middle goes — never the ends.
+    const stderr = 'pull request already exists';
+    const detail = `Command failed: gh pr edit --body ${'x'.repeat(4_000)}\n${stderr}`;
+    const { report } = await ensureDraftPrCycle(async () => {
+      throw new Error(detail);
+    });
+
+    const event = report.events.find((candidate) => candidate.action === 'ensure-draft-pr');
+    const reason = event!.reason!;
+    expect(reason.length).toBeLessThan(detail.length);
+    expect(reason.startsWith('Command failed: gh pr edit --body xxx')).toBe(true);
+    expect(reason.endsWith(stderr)).toBe(true);
+    expect(reason).toMatch(/ \[…\d+ chars elided…\] /u);
+    expect(reason).not.toMatch(/[\r\n]/);
+  });
+
+  it('leaves a failure reason under the elision threshold byte-identical', async () => {
+    // No gratuitous mangling: the common case must survive untouched.
+    const detail = 'Command failed: gh pr create --title x: HTTP 422 validation failed';
+    const { report } = await ensureDraftPrCycle(async () => {
+      throw new Error(detail);
+    });
+
+    const event = report.events.find((candidate) => candidate.action === 'ensure-draft-pr');
+    expect(event!.reason).toBe(detail);
+    expect(renderLifecycleHuman(report)).toContain(
+      `ensure-draft-pr issue:42: failed (${detail}).`,
+    );
+  });
+
+  it('strips control characters that the whitespace class does not cover', async () => {
+    // The regex whitespace class matches no C1 control and only five of the C0
+    // controls, so ESC (0x1B) in a target-repo PR body would otherwise reach
+    // the reason intact and be acted on by the operator's terminal -- the same
+    // forge-a-line channel the newline collapse closes, arriving as a different
+    // byte. Built from char codes so the fixture cannot be mistaken for prose.
+    const esc = String.fromCharCode(0x1b);
+    const csi = String.fromCharCode(0x9b);
+    const hasControl = (text: string): boolean =>
+      [...text].some((char) => {
+        const code = char.codePointAt(0)!;
+        return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+      });
+
+    const stderr = 'pull request already exists';
+    const detail =
+      `Command failed: gh pr edit --body ${esc}[2K${esc}[31mDONE${csi}1m\n${stderr}`;
+    expect(hasControl(detail)).toBe(true);
+
+    const { report } = await ensureDraftPrCycle(async () => {
+      throw new Error(detail);
+    });
+
+    const event = report.events.find((candidate) => candidate.action === 'ensure-draft-pr');
+    const reason = event!.reason!;
+    expect(hasControl(reason)).toBe(false);
+    expect(reason.endsWith(stderr)).toBe(true);
+    // The printable payload survives: this bounds the escape, not the message.
+    expect(reason).toContain('DONE');
+    // The render is legitimately multi-line, so check inside the lines: the
+    // guarantee is that no *field* smuggles a control character into one.
+    const lines = renderLifecycleHuman(report).split('\n');
+    expect(lines.some((line) => hasControl(line))).toBe(false);
+  });
+
+  it('omits reason entirely from a successful reconciliation event', async () => {
+    // Pins the negative case so a later refactor cannot start emitting
+    // `reason: undefined` (or an empty reason) on success unnoticed.
+    const { report } = await ensureDraftPrCycle(async () => {});
+
+    const event = report.events.find((candidate) => candidate.action === 'ensure-draft-pr');
+    expect(event!.outcome).toBe('applied');
+    expect(event).not.toHaveProperty('reason');
+    expect(Object.keys(event!)).not.toContain('reason');
+    expect(renderLifecycleHuman(report).split('\n')).toContain(
+      'ensure-draft-pr issue:42: applied.',
+    );
+  });
+
+  it('applies the same log-injection protection to scheduled action events', async () => {
+    // actionEvent (the sibling builder) takes the same unsanitized route from a
+    // thrown Error to a single-line log, so the protection must sit at both
+    // construction sites, not only at eventFor.
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      isDraft: false,
+      needsReview: true,
+      approved: false,
+    });
+    const forged = 'claim-review issue:1/pr:1: spawned.';
+
+    const report = await runLifecycleCycle('active', {
+      ...deps(delivered, []),
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 1, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async () => {
+          throw new Error(`Command failed: gh pr comment --body\n\n${forged}`);
+        },
+      },
+    });
+
+    const event = report.events.find((candidate) => candidate.action === 'claim-review');
+    expect(event).toMatchObject({ outcome: 'failed' });
+    expect(event!.reason).not.toMatch(/[\r\n]/);
+    expect(event!.reason).toBe(`Command failed: gh pr comment --body ${forged}`);
+    expect(
+      renderLifecycleHuman(report).split('\n')
+        .some((line) => line.startsWith('claim-review issue:1/')),
+    ).toBe(false);
+  });
+
+  it('plans no orphan recovery for a claim whose issue is absent from the live snapshot', async () => {
+    const calls: string[] = [];
+    // Issue #42 is closed, so it is absent from the open-issue set the cycle
+    // re-reads every pass. Only the retained implement claim survives; there is
+    // no live evidence about the subject at all. The writer's own precondition
+    // rejects this ("Issue is absent from the lifecycle snapshot"), so planning
+    // a mutation here can only fail, forever.
+    const closedIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'In Progress',
+      labels: [],
+      eligible: false,
+      eligibilityReason: 'not-selected',
+      eligibilityDetail: 'Issue is not on the Project',
+    };
+    const absentIssueSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(closedIssue),
+      issues: [],
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+      terminalClaims: [],
+    };
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(closedIssue, calls),
+      readSnapshot: async () => absentIssueSnapshot,
+    });
+
+    expect(report.orphanBranchClaims).toEqual([]);
+    expect(JSON.stringify(report)).not.toContain('ensure-draft-pr');
+    expect(calls).toEqual([]);
+  });
+
+  it('plans no orphan recovery when a populated live issue set omits the claim issue', async () => {
+    const calls: string[] = [];
+    // The gate must be evidence about *this* issue, not merely that the cycle
+    // read some issues. A busy repository always has a non-empty open-issue
+    // set; issue #42 is still closed and absent from it, so the claim on
+    // `autopilot/42` is still unsupported.
+    const closedIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'In Progress',
+      labels: [],
+      eligible: false,
+      eligibilityReason: 'not-selected',
+      eligibilityDetail: 'Issue is not on the Project',
+    };
+    const otherIssuesSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(closedIssue),
+      issues: [openIssue(99)],
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+      terminalClaims: [],
+    };
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(closedIssue, calls),
+      readSnapshot: async () => otherIssuesSnapshot,
+    });
+
+    expect(report.orphanBranchClaims).toEqual([]);
+    expect(JSON.stringify(report)).not.toContain('ensure-draft-pr');
     expect(calls).toEqual([]);
   });
 
