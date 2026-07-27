@@ -1259,6 +1259,29 @@ describe('lifecycle controller', () => {
       approved: true,
       needsReview: false,
       mergeState: 'clean',
+      // Merge-ready needs the engine's own signed approval bound to this exact
+      // head, not just GitHub's native APPROVED state.
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'review-bot',
+        head: HEAD,
+        state: 'terminal-approved',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+        verdict: {
+          marker: '44444444-4444-4444-8444-444444444444',
+          state: 'APPROVE',
+        },
+      },
+      terminalVerdict: {
+        head: HEAD,
+        state: 'APPROVE',
+        marker: '44444444-4444-4444-8444-444444444444',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
       branchClaim: {
         kind: 'branch-claim',
         protocolVersion: 2,
@@ -1318,6 +1341,158 @@ describe('lifecycle controller', () => {
       issueNumber: 42,
       prNumber: 101,
       head: HEAD,
+      expectedBaseRefName: 'next',
+    }]);
+  });
+
+  it('re-enrolls review when GitHub carried an approval onto an unsigned head', async () => {
+    // PR #2130 / #2081: the update-branch merge commit becomes the head and
+    // GitHub re-points the prior APPROVED review onto it, so `approved` reads
+    // true while the engine's signed claim is still bound to the old sha.
+    const NEW_HEAD = gitOid('cccccccccccccccccccccccccccccccccccccccc');
+    const carried = implementation({
+      projectStatus: 'In Review',
+      head: NEW_HEAD,
+      approved: true,
+      needsReview: false,
+      mergeState: 'clean',
+      branchClaim: undefined,
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'review-bot',
+        head: HEAD,
+        state: 'terminal-approved',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+        verdict: {
+          marker: '44444444-4444-4444-8444-444444444444',
+          state: 'APPROVE',
+        },
+      },
+      terminalVerdict: {
+        head: HEAD,
+        state: 'APPROVE',
+        marker: '44444444-4444-4444-8444-444444444444',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{
+        source: 'check-run',
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+      }],
+    });
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+
+    const report = await runLifecycleCycle('active', {
+      ...deps(carried, [], noOpWriter),
+      mergePolicy: 'safe-auto',
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 0, review: 1 },
+          availableLogins: ['review-bot'],
+          implementationPreferredLogin: 'review-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async (action: unknown) => {
+          actions.push(action);
+          return { outcome: 'spawned' };
+        },
+      },
+    });
+
+    expect(report.items[0]).toMatchObject({ phase: 'awaiting-review' });
+    expect(actions).toEqual([{
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 101,
+      head: NEW_HEAD,
+    }]);
+    expect(actions.some((action) => (action as { kind: string }).kind === 'merge')).toBe(false);
+  });
+
+  it('lets the integration ladder outrank re-review while a lapsed PR is still behind', async () => {
+    // Ordering guard: re-reviewing a behind PR would only be invalidated again
+    // by the update-branch that has to follow it, so the ladder goes first.
+    const NEW_HEAD = gitOid('cccccccccccccccccccccccccccccccccccccccc');
+    const behind = implementation({
+      projectStatus: 'In Review',
+      head: NEW_HEAD,
+      approved: true,
+      needsReview: false,
+      mergeState: 'behind',
+      branchClaim: undefined,
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'review-bot',
+        head: HEAD,
+        state: 'terminal-approved',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+        verdict: {
+          marker: '44444444-4444-4444-8444-444444444444',
+          state: 'APPROVE',
+        },
+      },
+      checks: [{
+        source: 'check-run',
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+      }],
+    });
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+
+    const behindSnapshot = snapshot(behind);
+    behindSnapshot.pullRequests[0] = {
+      ...behindSnapshot.pullRequests[0]!,
+      mergeability: 'MERGEABLE',
+      mergeStateStatus: 'CLEAN',
+      compareStatus: 'behind',
+      checks: behind.checks!,
+    };
+
+    await runLifecycleCycle('active', {
+      ...deps(behind, [], noOpWriter),
+      readSnapshot: async () => behindSnapshot,
+      mergePolicy: 'safe-auto',
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 0, review: 1 },
+          availableLogins: ['review-bot'],
+          implementationPreferredLogin: 'review-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async (action: unknown) => {
+          actions.push(action);
+          return { outcome: 'spawned' };
+        },
+      },
+    });
+
+    expect(actions).toEqual([{
+      kind: 'update-branch',
+      issueNumber: 42,
+      prNumber: 101,
+      head: NEW_HEAD,
       expectedBaseRefName: 'next',
     }]);
   });

@@ -189,3 +189,27 @@ describe('head-pinned merge executor', () => {
     ).resolves.toMatchObject({ status: 'merged-projection-pending' });
   });
 });
+
+// Guard for the update-branch re-approval fix: tightening the lifecycle view is
+// only safe because the merge gate itself is untouched and still fails closed on
+// a missing head-bound engine approval.
+describe('merge gate approval authority is not loosened', () => {
+  it('still refuses to merge when the engine approval is not bound to the head', () => {
+    expect(evaluateMergeGate(candidate({ terminalApprovalMatches: false }))).toEqual({
+      pass: false,
+      reasons: ['terminal-approval'],
+    });
+  });
+
+  it('still refuses when a carried-forward native APPROVED is the only approval', () => {
+    // Exactly the #2130 / #2081 shape: GitHub re-pointed the old review onto the
+    // update-branch merge commit, so the native review reads APPROVED at the
+    // current head while the engine's signed marker is bound to the old sha.
+    const result = evaluateMergeGate(candidate({
+      terminalApprovalMatches: false,
+      effectiveReviews: [{ reviewer: 'review-bot', state: 'APPROVED', commitId: HEAD }],
+    }));
+    expect(result.pass).toBe(false);
+    expect(result.reasons).toContain('terminal-approval');
+  });
+});
