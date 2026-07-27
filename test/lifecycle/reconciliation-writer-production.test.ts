@@ -1586,6 +1586,68 @@ describe('production reconciliation writer', () => {
     expect(mutations).toBe(0);
   });
 
+  it.each([
+    'pull-request label',
+    'pull-request draft',
+    'implementation summary',
+    'review ref',
+  ] as const)(
+    'fences a %s mutation when a native issue Human label arrives after the cycle snapshot',
+    async (mutation) => {
+      const cycle = snapshot(true);
+      const live: GitHubLifecycleSnapshot = {
+        ...cycle,
+        issues: cycle.issues.map((issue) => ({
+          ...issue,
+          labels: [...(issue.labels ?? []), 'autopilot:human'],
+        })),
+      };
+      const targeted = targetedWriterOptions(() => live, cycle);
+      const activeRecord: ReviewClaimRecord = {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 84,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'jinn-reviewer',
+        head: HEAD,
+        recordedAt: '2026-07-20T11:00:00.000Z',
+        state: 'active',
+      };
+      let mutations = 0;
+      const writer = makeProductionReconciliationWriter({
+        repositoryPath: '/repo',
+        ...targeted,
+        readPullRequestByNumber: async (prNumber) => {
+          const raw = await targeted.readPullRequestByNumber(prNumber);
+          return raw === null ? null : {
+            ...raw,
+            reviewClaim: {
+              oid: CLAIM_OID,
+              payload: encodeReviewClaimPayload(activeRecord),
+            },
+          };
+        },
+        credential: selectedCredential(),
+        runner: async () => {
+          mutations += 1;
+          throw new Error('native issue Human fence was bypassed');
+        },
+      });
+
+      const operation = mutation === 'pull-request label'
+        ? writer.setPullRequestLabel(84, 'ready-for-review', true, HEAD)
+        : mutation === 'pull-request draft'
+          ? writer.setPullRequestDraft(84, false, HEAD)
+          : mutation === 'implementation summary'
+            ? writer.ensureImplementationSummary(84, HEAD, 'Implementation completed.')
+            : writer.markReviewStale(84, CLAIM_OID);
+
+      await expect(operation).rejects.toThrow(/Human is dominant/i);
+      expect(mutations).toBe(0);
+    },
+  );
+
   it('behavioral ledger: uses one exact PR hydration before a reconciliation mutation', async () => {
     const current = snapshot(true);
     const targeted = targetedWriterOptions(() => current, current);
@@ -2520,7 +2582,7 @@ describe('production reconciliation writer', () => {
     });
 
     await expect(writer.repairObsoleteMappingHuman?.(harness.action))
-      .rejects.toThrow(/provenance/i);
+      .rejects.toThrow(/provenance|authority/i);
     expect(pushes).toBe(0);
     expect(mutations).toBe(0);
   });

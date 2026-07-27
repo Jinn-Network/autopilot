@@ -357,12 +357,14 @@ export type NewWorkAction =
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
     }
   | {
       readonly kind: 'file-reconcile-child';
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
       readonly effort: 'low' | 'medium' | 'high';
     }
   | {

@@ -45,6 +45,44 @@ describe('active local scheduler', () => {
     ]);
   });
 
+  it.each([
+    {
+      phase: 'update-branch' as const,
+      expected: {
+        kind: 'update-branch',
+        issueNumber: 42,
+        prNumber: 84,
+        head: HEAD,
+        expectedBaseRefName: gitRefName('stack/custom-parent'),
+      },
+    },
+    {
+      phase: 'file-reconcile-child' as const,
+      expected: {
+        kind: 'file-reconcile-child',
+        issueNumber: 42,
+        prNumber: 84,
+        head: HEAD,
+        expectedBaseRefName: gitRefName('stack/custom-parent'),
+        effort: 'medium' as const,
+      },
+    },
+  ])('preserves the canonical stacked base for $phase actions', ({ phase, expected }) => {
+    const plan = scheduleActiveActions(input({
+      candidates: [{
+        phase,
+        issueNumber: 42,
+        prNumber: 84,
+        head: HEAD,
+        expectedBaseRefName: gitRefName('stack/custom-parent'),
+        ...(phase === 'file-reconcile-child' ? { effort: 'medium' as const } : {}),
+      }],
+      remaining: { implementation: 0, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([expected]);
+  });
+
   it('schedules machine-child repair first without consuming an implementation slot', () => {
     const plan = scheduleActiveActions(input({
       candidates: [

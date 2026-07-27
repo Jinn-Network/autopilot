@@ -584,7 +584,6 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     const prIssueNumbers = (pr: PullRequestSnapshot): ReadonlySet<number> => {
       const numbers = new Set(associatedIssueNumbers(pr));
       if (pr.branchClaim !== undefined) numbers.add(pr.branchClaim.issueNumber);
-      if (pr.humanIssueNumber !== undefined) numbers.add(pr.humanIssueNumber);
       const marker =
         /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/.exec(pr.body);
       if (marker?.[1] !== undefined) numbers.add(Number(marker[1]));

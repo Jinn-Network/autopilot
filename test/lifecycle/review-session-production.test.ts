@@ -169,6 +169,7 @@ function makeProductionReviewSessionPort(
       };
   return makeRawProductionReviewSessionPort({
     readProjectHumanAuthority: async () => false,
+    readNativeIssueHumanAuthority: async () => false,
     readMappingAuthority: async ({ manifest: bound }) =>
       completeMappingAuthority(bound),
     ...options,
@@ -468,6 +469,7 @@ describe('production review session port', () => {
       },
       readManifest: () => stackedManifest,
       readProjectHumanAuthority: async () => false,
+      readNativeIssueHumanAuthority: async () => false,
       readMappingAuthority: async () => authority,
       runner: async (cmd, args) => {
         if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
@@ -511,6 +513,7 @@ describe('production review session port', () => {
       name: 'Project Blocked on Human remains active',
       labels: ['engine:review'],
       projectHumanAuthority: true,
+      nativeIssueHumanAuthority: false,
       mappingAuthority: null,
       expectedStatus: 'human' as const,
     },
@@ -518,6 +521,15 @@ describe('production review session port', () => {
       name: 'fresh Project Human overrides non-Human mapping evidence',
       labels: ['engine:review'],
       projectHumanAuthority: true,
+      nativeIssueHumanAuthority: false,
+      mappingAuthority: completeMappingAuthority(manifest()),
+      expectedStatus: 'human' as const,
+    },
+    {
+      name: 'a post-snapshot native issue Human label remains active',
+      labels: ['engine:review'],
+      projectHumanAuthority: false,
+      nativeIssueHumanAuthority: true,
       mappingAuthority: completeMappingAuthority(manifest()),
       expectedStatus: 'human' as const,
     },
@@ -525,6 +537,7 @@ describe('production review session port', () => {
       name: 'the external Human label remains active',
       labels: ['engine:review', 'review:needs-human'],
       projectHumanAuthority: null,
+      nativeIssueHumanAuthority: null,
       mappingAuthority: null,
       expectedStatus: 'human' as const,
     },
@@ -532,6 +545,15 @@ describe('production review session port', () => {
       name: 'external Human evidence is unavailable',
       labels: ['engine:review'],
       projectHumanAuthority: null,
+      nativeIssueHumanAuthority: false,
+      mappingAuthority: null,
+      expectedError: /Human authority is unavailable or inconsistent/i,
+    },
+    {
+      name: 'native issue Human evidence is unavailable',
+      labels: ['engine:review'],
+      projectHumanAuthority: false,
+      nativeIssueHumanAuthority: null,
       mappingAuthority: null,
       expectedError: /Human authority is unavailable or inconsistent/i,
     },
@@ -540,6 +562,7 @@ describe('production review session port', () => {
     async ({
       labels,
       projectHumanAuthority,
+      nativeIssueHumanAuthority,
       mappingAuthority,
       expectedStatus,
       expectedError,
@@ -554,6 +577,7 @@ describe('production review session port', () => {
         readManifest: () => bound,
         readMappingAuthority: async () => mappingAuthority,
         readProjectHumanAuthority: async () => projectHumanAuthority,
+        readNativeIssueHumanAuthority: async () => nativeIssueHumanAuthority,
         runner: async (cmd: string, args: readonly string[]) => {
           if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
             return JSON.stringify({
@@ -593,6 +617,7 @@ describe('production review session port', () => {
         },
       } as ProductionReviewSessionPortOptions & {
         readonly readProjectHumanAuthority: () => Promise<boolean | null>;
+        readonly readNativeIssueHumanAuthority: () => Promise<boolean | null>;
       };
       const production = makeRawProductionReviewSessionPort(options);
       const protocol = makeReviewSessionProtocol({

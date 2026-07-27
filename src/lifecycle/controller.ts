@@ -827,18 +827,22 @@ function activeCandidates(
         childrenEnabled: childrenOn,
       });
       if (ladder.kind === 'update-branch') {
+        if (item.expectedBaseRefName === undefined) continue;
         other.push({
           phase: 'update-branch',
           issueNumber: item.issueNumber,
           prNumber: item.prNumber,
           head: item.head,
+          expectedBaseRefName: gitRefName(item.expectedBaseRefName),
         });
       } else if (ladder.kind === 'file-reconcile-child') {
+        if (item.expectedBaseRefName === undefined) continue;
         other.push({
           phase: 'file-reconcile-child',
           issueNumber: item.issueNumber,
           prNumber: item.prNumber,
           head: item.head,
+          expectedBaseRefName: gitRefName(item.expectedBaseRefName),
           effort: ladder.effort,
         });
       }

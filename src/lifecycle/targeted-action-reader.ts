@@ -138,9 +138,6 @@ function issueNumbers(raw: RawPullRequest): readonly number[] {
   const marker = /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/
     .exec(raw.body);
   if (marker?.[1] !== undefined) numbers.add(Number(marker[1]));
-  if (raw.humanIssueNumber !== undefined && raw.humanIssueNumber !== null) {
-    numbers.add(raw.humanIssueNumber);
-  }
   return [...numbers];
 }
 

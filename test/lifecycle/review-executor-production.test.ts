@@ -260,6 +260,44 @@ describe('production review acquisition port', () => {
     });
   });
 
+  it('does not treat stale painter-owned Project Status Human as authority', async () => {
+    const current = snapshot();
+    const staleStatus: GitHubLifecycleSnapshot = {
+      ...current,
+      lifecycle: {
+        items: current.lifecycle.items.map((item) => (
+          item.kind === 'pull-request'
+            ? { ...item, projectStatus: 'Human' as const }
+            : item
+        )),
+      },
+    };
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => staleStatus,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async (command, args) => {
+        expect(command).toBe('gh');
+        if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+          return JSON.stringify({
+            changed_files: 0,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: '4'.repeat(40) },
+          });
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      humanHold: false,
+      issueNumber: 42,
+    });
+  });
+
   it('fails closed on the canonical structured mapping result during acquisition and confirmation', async () => {
     const ambiguous: GitHubLifecycleSnapshot = {
       ...snapshot(),

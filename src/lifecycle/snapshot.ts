@@ -36,6 +36,10 @@ import {
   resolveStructuredPullRequestMappings,
   type StructuredPullRequestMapping,
 } from './pr-mapping.js';
+import {
+  hasExternalHumanAuthority,
+  hasExternalHumanLabel,
+} from './human-authority.js';
 
 export type SnapshotReadMode = 'incremental' | 'full';
 
@@ -565,15 +569,22 @@ function lifecyclePr(
   const decisive = latestDecisiveReview(pr);
   const reviewClaim = pr.reviewClaim?.record;
   const issueLabels = [...(issue.labels ?? [])];
+  const humanHold = hasExternalHumanAuthority({
+    pullRequestLabels: pr.labels,
+    nativeIssueLabels: issueLabels,
+    projectBlockedOn: issue.blockedOn,
+  });
   const humanSource = issue.blockedOn === 'Human'
     ? 'Project Blocked on: Human'
     : pr.labels.includes('review:needs-human')
       ? 'PR label: review:needs-human'
-      : issueLabels.includes('review:needs-human')
-        ? 'Issue label: review:needs-human'
-        : issueLabels.includes('autopilot:human')
-          ? 'Issue label: autopilot:human'
-          : undefined;
+      : pr.labels.includes('autopilot:human')
+        ? 'PR label: autopilot:human'
+        : issueLabels.includes('review:needs-human')
+          ? 'Issue label: review:needs-human'
+          : issueLabels.includes('autopilot:human')
+            ? 'Issue label: autopilot:human'
+            : undefined;
   const implementationActive = pr.branchClaim?.phase === 'implement'
     && pr.branchClaim.phaseComplete !== true;
   const reviewPhase = reviewClaim !== undefined && reviewClaim.head === pr.headOid
@@ -617,18 +628,16 @@ function lifecyclePr(
   // never lifecycle Human authority. Only maintainer-visible GitHub surfaces
   // above may synthesize a Human hold.
   const humanReason = synthesizedHumanReason;
-  const humanHold = humanReason !== undefined;
   const obsoleteMachineMappingHuman = (
     signedMachineMappingComment
     && pr.humanGeneration === reviewClaim?.generation
-    && !pr.labels.includes('review:needs-human')
+    && !hasExternalHumanLabel(pr.labels)
     && !pr.isDraft
     && reviewClaim !== undefined
     && reviewClaim.head === pr.headOid
     && reviewClaim.state === 'human'
     && issue.blockedOn !== 'Human'
-    && !issueLabels.includes('review:needs-human')
-    && !issueLabels.includes('autopilot:human')
+    && !hasExternalHumanLabel(issueLabels)
   )
     ? {
         generation: reviewClaim.generation,
@@ -715,9 +724,6 @@ function resolveMappings(
         baseRefName: pr.baseRefName,
         closingIssueNumbers: [...pr.closingIssueNumbers],
         body: pr.body,
-        ...(pr.humanIssueNumber === undefined
-          ? {}
-          : { humanIssueNumber: pr.humanIssueNumber }),
       })),
     stableBranches: branches.map((branch) => ({
       issueNumber: branch.issueNumber,
@@ -955,9 +961,10 @@ function lifecycleItems(
   for (const issue of issues) {
     if (issuesWithPr.has(issue.number)) continue;
     const issueLabels = [...(issue.labels ?? [])];
-    const sourceHumanHold = issue.blockedOn === 'Human'
-      || issueLabels.includes('review:needs-human')
-      || issueLabels.includes('autopilot:human');
+    const sourceHumanHold = hasExternalHumanAuthority({
+      nativeIssueLabels: issueLabels,
+      projectBlockedOn: issue.blockedOn,
+    });
     const selectedReady = ready.has(issue.number);
     const eligible = selectedReady && !sourceHumanHold;
     const holdDetail = issue.blockedOn === 'Human'
@@ -1002,6 +1009,7 @@ function lifecycleItems(
     });
   }
   for (const pr of prs) {
+    if (!mappingEvidenceComplete) continue;
     const issueNumber = mappings.issueByPr.get(pr.number);
     if (issueNumber === undefined) continue;
     const issue = byIssue.get(issueNumber);
@@ -1066,6 +1074,11 @@ export function composeGitHubLifecycleSnapshot(
   ) {
     throw new Error('Global open-pipeline backlog must be a non-negative integer');
   }
+  const mappingEvidenceComplete = options.closingIssueEvidenceIncomplete !== true
+    && evidence.pullRequests.every((pr) => (
+      pr.closingIssueNumbersIncomplete !== true
+      && pr.evidenceIncompleteReason === undefined
+    ));
   const lifecycle = lifecycleItems(
     evidence.issues,
     evidence.pullRequests,
@@ -1076,7 +1089,7 @@ export function composeGitHubLifecycleSnapshot(
     ),
     evidence.project,
     options.defaultBranch ?? 'next',
-    options.closingIssueEvidenceIncomplete !== true,
+    mappingEvidenceComplete,
   );
   return deepFreeze({
     project: evidence.project,
@@ -1089,10 +1102,7 @@ export function composeGitHubLifecycleSnapshot(
     lifecycle: { items: lifecycle.items },
     capturedAt: options.capturedAt,
     snapshotMode: options.snapshotMode,
-    snapshotComplete: options.closingIssueEvidenceIncomplete !== true
-      && evidence.pullRequests.every(
-        (pr) => pr.closingIssueNumbersIncomplete !== true,
-      ),
+    snapshotComplete: mappingEvidenceComplete,
     lastFullReconciliationAt: options.lastFullReconciliationAt,
     githubUsage: options.githubUsage,
     ...(options.parityDifferences === undefined

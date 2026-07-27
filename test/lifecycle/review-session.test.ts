@@ -661,6 +661,20 @@ describe('review session protocol', () => {
     expect(h.events.some((event) => event.startsWith('label:'))).toBe(false);
   });
 
+  it('accepts a canonical closing-reference mapping without a lifecycle marker', async () => {
+    const h = harness({ state: 'active', draft: false });
+    const read = h.port.readPullRequest;
+    h.port.readPullRequest = async (...args) => ({
+      ...await read(...args),
+      body: 'Closes #42',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+    expect(h.events).not.toContain('record:mapping-reread');
+    expect(h.events).not.toContain('claim:mapping-reread');
+  });
+
   it.each([
     {
       name: 'verdict',

@@ -86,6 +86,7 @@ import { gitOid } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
 import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 import {
   LocalSessionExecutionBackend,
   MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
@@ -573,21 +574,20 @@ export function makeProductionActiveRuntime(
       }
       const diagnosticIssues = new Set(diagnostic.issueNumbers);
       const externalHumanActive = (
-        [...live.labels, ...canonicalPr.labels].some((label) => (
-          label === NEEDS_HUMAN_LABEL || label === 'autopilot:human'
-        ))
+        hasExternalHumanAuthority({
+          pullRequestLabels: [...live.labels, ...canonicalPr.labels],
+        })
         || authoritySnapshot.issues.some((issue) => (
           diagnosticIssues.has(issue.number)
-          && (
-            issue.blockedOn === 'Human'
-            || issue.labels?.includes(NEEDS_HUMAN_LABEL) === true
-            || issue.labels?.includes('autopilot:human') === true
-          )
+          && hasExternalHumanAuthority({
+            nativeIssueLabels: issue.labels,
+            projectBlockedOn: issue.blockedOn,
+          })
         ))
         || authoritySnapshot.project.items.some((item) => (
           item.contentType === 'Issue'
           && diagnosticIssues.has(item.number)
-          && item.blockedOn === 'Human'
+          && hasExternalHumanAuthority({ projectBlockedOn: item.blockedOn })
         ))
       );
       if (externalHumanActive) return;
@@ -975,7 +975,7 @@ export function makeProductionActiveRuntime(
           ...makeProductionMergeActionPort({
             readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
-            expectedBaseRefName: options.defaultBranch,
+            expectedBaseRefName: action.expectedBaseRefName,
             repositorySlug: options.repositorySlug,
             projectOwner: options.projectMapping?.owner,
             projectNumber: options.projectMapping?.number,
@@ -1002,7 +1002,7 @@ export function makeProductionActiveRuntime(
           ...makeProductionMergeActionPort({
             readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
-            expectedBaseRefName: options.defaultBranch,
+            expectedBaseRefName: action.expectedBaseRefName,
             repositorySlug: options.repositorySlug,
             projectOwner: options.projectMapping?.owner,
             projectNumber: options.projectMapping?.number,

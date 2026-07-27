@@ -401,14 +401,13 @@ describe('review action executor', () => {
     expect(h.records[0]?.reviewer).toBe('one-bot');
   });
 
-  it('fails contradictory mapping, Human evidence, self-review, and wrong draft policy closed', async () => {
+  it('fails canonical ambiguity, Human evidence, self-review, and wrong draft policy closed', async () => {
     const cases: ReviewActionCandidate[] = [
-      candidate({ issueNumber: 43 }),
+      candidate({ mappingProblem: 'Canonical mapping changed to issue #43.' }),
       candidate({ humanHold: true }),
       candidate({ author: 'review-bot' }),
       candidate({ draft: true }),
       candidate({ open: false }),
-      candidate({ body: '<!-- malformed -->' }),
     ];
     for (const current of cases) {
       const h = harness({ readCandidate: async () => current });
@@ -416,6 +415,29 @@ describe('review action executor', () => {
       expect(result.status).not.toBe('spawned');
       expect(h.events).not.toContain('spawn');
     }
+  });
+
+  it('executes an unambiguous canonical closing-reference mapping without a lifecycle marker', async () => {
+    const noMarker = candidate({
+      headRefName: gitRefName('feature/42'),
+      body: 'Closes #42',
+    });
+    const h = harness({
+      readCandidate: async () => noMarker,
+      confirmAcquisition: async ({ expectedHead, expectedReviewRefOid }) => ({
+        ...noMarker,
+        head: expectedHead,
+        reviewRef: {
+          oid: expectedReviewRefOid,
+          record: claim(),
+        },
+      }),
+    });
+
+    await expect(executeReviewAction({ prNumber: 84, expectedHead: HEAD }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned', prNumber: 84 });
+    expect(h.human).toEqual([]);
+    expect(h.events).toContain('spawn');
   });
 
   it('binds attempt authority and approval policy before projection and runtime spawn', async () => {

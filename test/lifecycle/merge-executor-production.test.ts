@@ -167,6 +167,32 @@ function candidateRunner(changedFiles: number, filenames: readonly string[]) {
 }
 
 describe('production head-pinned merge port', () => {
+  it('does not treat stale painter-owned Project Status Human as authority', async () => {
+    const current = snapshot();
+    const staleStatus: GitHubLifecycleSnapshot = {
+      ...current,
+      lifecycle: {
+        ...current.lifecycle,
+        items: current.lifecycle.items.map((item) => (
+          item.kind === 'pull-request'
+            ? { ...item, projectStatus: 'Human' as const }
+            : item
+        )),
+      },
+    };
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => staleStatus,
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: candidateRunner(1, ['GREETING.md']),
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      humanHold: false,
+      issueNumber: 84,
+    });
+  });
+
   it.each([
     {
       name: 'the terminal approval is dismissed',

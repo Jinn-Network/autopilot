@@ -9,6 +9,7 @@ import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
 import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 import type { BlockedOn, ProjectStatus } from '../dispatcher/types.js';
 import {
   IMPLEMENTATION_SUMMARY_END,
@@ -268,23 +269,6 @@ function exactDraftIdentity(
     && pullRequest.body === expected.body;
 }
 
-function humanDominatesPullRequest(
-  snapshot: GitHubLifecycleSnapshot,
-  prNumber: number,
-): boolean {
-  const pr = snapshot.pullRequests.find((candidate) => candidate.number === prNumber);
-  const lifecycle = snapshot.lifecycle.items.find((item) =>
-    item.kind === 'pull-request' && item.prNumber === prNumber);
-  return pr?.labels.includes(NEEDS_HUMAN_LABEL) === true
-    || (
-      lifecycle?.kind === 'pull-request'
-      && (
-        lifecycle.humanHold === true
-        || lifecycle.projectStatus === 'Human'
-      )
-    );
-}
-
 function nextReviewRecord(
   current: ReviewClaimRecord,
   state: 'terminal-approved' | 'stale',
@@ -516,9 +500,6 @@ function makeProductionReconciliationWriterWithScope(
               baseRefName: raw.baseRefName,
               closingIssueNumbers: [...raw.closingIssueNumbers],
               body: raw.body,
-              ...(raw.humanIssueNumber === undefined || raw.humanIssueNumber === null
-                ? {}
-                : { humanIssueNumber: raw.humanIssueNumber }),
             }
           : {
               number: pr.number,
@@ -528,9 +509,6 @@ function makeProductionReconciliationWriterWithScope(
               baseRefName: pr.baseRefName,
               closingIssueNumbers: [...pr.closingIssueNumbers],
               body: pr.body,
-              ...(pr.humanIssueNumber === undefined
-                ? {}
-                : { humanIssueNumber: pr.humanIssueNumber }),
             }
       )),
       stableBranches: options.cycleSnapshot.branches.map((branch) => ({
@@ -664,16 +642,24 @@ function makeProductionReconciliationWriterWithScope(
     supplied?: ReconciliationPullRequestNode | null,
   ): Promise<boolean> => {
     const raw = supplied === undefined ? await readMappedRawPr(prNumber) : supplied;
-    const mapping = raw === null ? null : validateLiveMapping(prNumber, raw);
-    if (mapping?.kind === 'diagnostic') return true;
-    if (humanDominatesPullRequest(options.cycleSnapshot, prNumber)) return true;
-    if (raw?.labels.includes(NEEDS_HUMAN_LABEL) === true) return true;
-    const lifecycle = options.cycleSnapshot.lifecycle.items.find((item) => (
-      item.kind === 'pull-request' && item.prNumber === prNumber
-    ));
-    if (lifecycle?.kind !== 'pull-request') return true;
-    const project = await readProjectItem(lifecycle.issueNumber);
-    return project === null || project.status === 'Human' || project.blockedOn === 'Human';
+    if (raw === null) return true;
+    const mapping = validateLiveMapping(prNumber, raw);
+    if (mapping.kind === 'diagnostic') return true;
+    const [project, nativeIssue] = await Promise.all([
+      readProjectItem(mapping.issueNumber),
+      options.readIssueByNumber(mapping.issueNumber),
+    ]);
+    if (
+      project === null
+      || nativeIssue === null
+      || nativeIssue.number !== mapping.issueNumber
+      || !nativeIssue.open
+    ) return true;
+    return hasExternalHumanAuthority({
+      pullRequestLabels: raw.labels,
+      nativeIssueLabels: nativeIssue.labels,
+      projectBlockedOn: project.blockedOn,
+    });
   };
   const sameMappingDiagnostic = (
     left: import('./types.js').MappingDiagnosticAuthority,
@@ -836,7 +822,7 @@ function makeProductionReconciliationWriterWithScope(
       if (expectedHead !== undefined && beforePr?.head !== expectedHead) {
         throw new Error('Pull-request draft reconciliation lost exact-head authority');
       }
-      if (!draft && await liveHumanDominatesPullRequest(prNumber, beforeRaw)) {
+      if (await liveHumanDominatesPullRequest(prNumber, beforeRaw)) {
         throw new Error('Human is dominant over pull-request draft reconciliation');
       }
       if (mapping?.kind === 'diagnostic' && !draft) {
@@ -964,6 +950,9 @@ function makeProductionReconciliationWriterWithScope(
       if (pr === null || pr.state !== 'OPEN' || gitOid(pr.headOid) !== expectedHead) {
         throw new Error('Implementation summary head changed');
       }
+      if (await liveHumanDominatesPullRequest(prNumber, pr)) {
+        throw new Error('Human is dominant over implementation summary reconciliation');
+      }
       const desired = completionBody(pr.body, summary);
       if (desired === pr.body) return;
       await selected(({ run }) => mutateWithExactReadback(
@@ -1031,7 +1020,10 @@ function makeProductionReconciliationWriterWithScope(
       if (projectItem === null) {
         throw new Error('Draft PR reconciliation issue is missing from Project');
       }
-      if (projectItem.status === 'Human' || projectItem.blockedOn === 'Human') {
+      if (hasExternalHumanAuthority({
+        nativeIssueLabels: nativeIssue.labels,
+        projectBlockedOn: projectItem.blockedOn,
+      })) {
         throw new Error('Human is dominant over draft PR reconciliation');
       }
       if (
@@ -1264,11 +1256,13 @@ function makeProductionReconciliationWriterWithScope(
           || raw.baseRefName !== liveMapping.expectedBaseRefName
           || liveIssue === undefined
           || project === null
-          || project.blockedOn === 'Human'
           || nativeIssue === null
           || !nativeIssue.open
-          || nativeIssue.labels.includes('review:needs-human')
-          || nativeIssue.labels.includes('autopilot:human')
+          || hasExternalHumanAuthority({
+            pullRequestLabels: raw.labels,
+            nativeIssueLabels: nativeIssue.labels,
+            projectBlockedOn: project.blockedOn,
+          })
         ) {
           throw new Error('Obsolete mapping Human canonical or Human authority changed');
         }

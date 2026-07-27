@@ -15,6 +15,7 @@ import {
 } from './credentials.js';
 import { makeGitProtocolPort } from './git-protocol.js';
 import { hasChildKindLabel, parseChildMarker } from './child-issues.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 import {
   CANONICAL_GITHUB_HTTPS_REMOTE,
   runCanonicalImplementationRealityCheck,
@@ -296,15 +297,15 @@ export function makeProductionImplementationActionPort(
         && item.prNumber === prNumber);
       const pullRequest = snapshot.pullRequests.find((pr) =>
         pr.number === prNumber);
+      const nativeIssue = snapshot.issues.find((issue) => issue.number === issueNumber);
       return {
         issue: issueFromSnapshot(snapshot, issueNumber, true),
         projectStatus: project?.status ?? null,
-        humanHold: project?.status === 'Human'
-          || project?.blockedOn === 'Human'
-          || lifecycle?.humanHold === true
-          || lifecycle?.humanReason !== undefined
-          || lifecycle?.labels.includes('review:needs-human') === true
-          || lifecycle?.labels.includes('autopilot:human') === true,
+        humanHold: hasExternalHumanAuthority({
+          pullRequestLabels: pullRequest?.labels,
+          nativeIssueLabels: nativeIssue?.labels,
+          projectBlockedOn: project?.blockedOn,
+        }),
         pullRequest: pullRequest === undefined
           ? null
           : {
@@ -479,7 +480,15 @@ export function makeProductionImplementationActionPort(
         const item = current.project.items.find((candidate) =>
           candidate.contentType === 'Issue' && candidate.number === issueNumber);
         if (item === undefined) throw new Error('Implementation issue is missing from Project');
-        if (item.status === 'Human' || item.blockedOn === 'Human') {
+        const nativeIssue = current.issues.find((issue) => issue.number === issueNumber);
+        const pullRequest = current.pullRequests.find((pr) => (
+          pr.closingIssueNumbers.includes(issueNumber)
+        ));
+        if (hasExternalHumanAuthority({
+          pullRequestLabels: pullRequest?.labels,
+          nativeIssueLabels: nativeIssue?.labels,
+          projectBlockedOn: item.blockedOn,
+        })) {
           throw new Error('Human is dominant over implementation Project acquisition');
         }
         if (item.status === 'In Progress') return;

@@ -312,23 +312,11 @@ export async function executeReviewAction(
       detail: 'Pull request head changed after scheduling.',
     };
   }
-  const lifecycleMarker =
-    `<!-- jinn-autopilot:v2 issue=${candidate.issueNumber} branch=${candidate.headRefName} -->`;
-  const closingMarker = new RegExp(
-    String.raw`<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->`,
-  ).exec(candidate.body);
-  if (
-    candidate.mappingProblem !== undefined
-    ||
-    closingMarker === null
-    || Number(closingMarker[1]) !== candidate.issueNumber
-    || closingMarker[2] !== candidate.headRefName
-    || !candidate.body.includes(lifecycleMarker)
-  ) {
+  if (candidate.mappingProblem !== undefined) {
     const reason: HumanReason = {
       phase: 'awaiting-review',
       code: 'branch-mapping-ambiguous',
-      detail: candidate.mappingProblem ?? 'PR lifecycle mapping or marker is contradictory.',
+      detail: candidate.mappingProblem,
     };
     await deps.escalateHuman({ candidate, reason });
     return {

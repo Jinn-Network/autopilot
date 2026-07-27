@@ -40,6 +40,10 @@ import {
   type GitOid,
 } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
+import {
+  hasExternalHumanAuthority,
+  hasExternalHumanLabel,
+} from './human-authority.js';
 
 export interface ProductionReviewActionPortOptions {
   readonly repositoryPath: string;
@@ -188,6 +192,10 @@ export function makeProductionReviewActionPort(
         ? structuredMapping.issueNumbers[0]
         : undefined;
     if (issueNumber === undefined) return null;
+    const nativeIssue = snapshot.issues.find((issue) => issue.number === issueNumber);
+    const projectItem = snapshot.project.items.find((item) => (
+      item.contentType === 'Issue' && item.number === issueNumber
+    ));
     const changedFiles = await readExactChangedFiles({
       run: runner,
       prNumber,
@@ -226,9 +234,11 @@ export function makeProductionReviewActionPort(
       author: pr.author,
       labels: [...pr.labels],
       body: pr.body,
-      humanHold: lifecycle?.humanHold === true
-        || lifecycle?.projectStatus === 'Human'
-        || pr.labels.includes('review:needs-human'),
+      humanHold: hasExternalHumanAuthority({
+        pullRequestLabels: pr.labels,
+        nativeIssueLabels: nativeIssue?.labels,
+        projectBlockedOn: projectItem?.blockedOn,
+      }),
       approvalPolicy: humanSurface ? 'human-codeowner' : 'approve-eligible',
       nativeReviews: pr.reviews.map((review) => ({
         reviewer: review.reviewer,
@@ -373,7 +383,9 @@ export function makeProductionReviewActionPort(
           throw new Error('Review projection PR authority changed');
         }
         const labels = pr.labels!.map((label) => label.name);
-        if (labels.includes('review:needs-human')) {
+        if (hasExternalHumanLabel(labels.filter(
+          (label): label is string => typeof label === 'string',
+        ))) {
           throw new Error('Review projection stopped because Human is dominant');
         }
         if (!labels.includes('engine:review')) {
@@ -398,7 +410,7 @@ export function makeProductionReviewActionPort(
         const item = project.items.find((entry) =>
           entry.contentType === 'Issue' && entry.number === candidate.issueNumber);
         if (item === undefined) throw new Error('Review issue is missing from Project');
-        if (item.status === 'Human' || item.blockedOn === 'Human') {
+        if (item.blockedOn === 'Human') {
           throw new Error('Review projection stopped because Human is dominant');
         }
         if (item.status !== 'In Review') {

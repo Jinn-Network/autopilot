@@ -22,6 +22,7 @@ import type {
 } from './snapshot.js';
 import { decodeCompareStatus, gitOid, gitRefName } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 
 export interface ProductionMergeActionPortOptions {
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
@@ -107,6 +108,12 @@ export function makeProductionMergeActionPort(
         expectedBase,
       )
     ) return null;
+    const nativeIssue = (snapshot.issues ?? []).find((issue) => (
+      issue.number === lifecycle.issueNumber
+    ));
+    const projectItem = (snapshot.project?.items ?? []).find((item) => (
+      item.contentType === 'Issue' && item.number === lifecycle.issueNumber
+    ));
     const changedFiles = await readExactChangedFiles({
       run: runner,
       prNumber: pr.number,
@@ -173,9 +180,11 @@ export function makeProductionMergeActionPort(
       expectedBaseRefName: expectedBase,
       draft: pr.isDraft,
       labels: [...pr.labels],
-      humanHold: lifecycle.humanHold === true
-        || lifecycle.projectStatus === 'Human'
-        || pr.labels.includes('review:needs-human'),
+      humanHold: hasExternalHumanAuthority({
+        pullRequestLabels: pr.labels,
+        nativeIssueLabels: nativeIssue?.labels,
+        projectBlockedOn: projectItem?.blockedOn,
+      }),
       author: pr.author,
       authorAllowed: options.authorAllowlist.has(pr.author.toLowerCase()),
       uniqueIssueMapping: true,

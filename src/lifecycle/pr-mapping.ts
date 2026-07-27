@@ -15,7 +15,6 @@ export interface StructuredMappingPullRequest {
   readonly baseRefName: string;
   readonly closingIssueNumbers: readonly number[];
   readonly body: string;
-  readonly humanIssueNumber?: number;
 }
 
 export interface StructuredMappingStableBranch {
@@ -78,7 +77,6 @@ function evidencedIssueNumbers(
   const branchIssue = stableBranchIssue(pr.headRefName);
   if (branchIssue !== undefined) numbers.add(branchIssue);
   for (const marker of lifecycleMarkers(pr.body)) numbers.add(marker.issueNumber);
-  if (pr.humanIssueNumber !== undefined) numbers.add(pr.humanIssueNumber);
   return numbers;
 }
 
@@ -197,16 +195,6 @@ export function resolveStructuredPullRequestMappings(
     ) {
       details.push('Lifecycle marker contradicts the resolved issue or exact PR branch.');
     }
-    if (
-      pr.humanIssueNumber !== undefined
-      && primaryIssue !== undefined
-      && pr.humanIssueNumber !== primaryIssue
-    ) {
-      details.push(
-        `Structured Human marker issue #${pr.humanIssueNumber} contradicts issue #${primaryIssue}.`,
-      );
-    }
-
     const stableClaim = primaryIssue === undefined
       ? undefined
       : input.stableBranches.find((branch) => (

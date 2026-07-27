@@ -1486,6 +1486,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
         }],
       }),
       readProjectHumanAuthority: async () => false,
+      readNativeIssueHumanAuthority: async () => false,
       now: () => new Date('2026-07-20T12:10:00.000Z'),
       writeMetadataFile: (payload) => {
         pendingSessionRecord = decodeReviewClaimPayload(payload);
@@ -2093,6 +2094,40 @@ describe('buildGitHubLifecycleSnapshot', () => {
         eligible: false,
       }),
     ]));
+    expect(planCycle(deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60_000,
+    ), {
+      implementationSlots: 2,
+      reviewSlots: 2,
+      usableCredentialLanes: 2,
+    }, 'active')).toEqual([]);
+  });
+
+  it('invalidates sibling action authority when any non-comment PR evidence is incomplete', async () => {
+    const incompleteReviews = {
+      ...page('page-2').nodes[0]!,
+      evidenceIncompleteReason: 'PR #101 reviews were truncated',
+      reviews: [],
+      reviewClaim: null,
+    };
+    const source = reader({
+      readIssues: async () => [
+        { ...issue(), status: 'In Review' },
+        { ...issue(), number: 43, status: 'Todo' },
+      ],
+      readPullRequests: async () => ({
+        nodes: [incompleteReviews],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.snapshotComplete).toBe(false);
     expect(planCycle(deriveLifecycle(
       snapshot.lifecycle,
       new Date('2026-07-20T12:00:00.000Z'),
@@ -2814,7 +2849,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
     ]);
   });
 
-  it('diagnoses a Human marker whose issue contradicts the resolved PR mapping', async () => {
+  it('treats a contradictory structured Human comment as inert audit evidence', async () => {
     const contradictory = {
       ...page('page-2').nodes[0]!,
       humanIssueNumber: 43,
@@ -2846,17 +2881,10 @@ describe('buildGitHubLifecycleSnapshot', () => {
       authorAllowlist: new Set(['trusted']),
     });
 
-    expect(snapshot.lifecycle.items).toEqual([]);
-    expect(snapshot.diagnostics).toEqual([
-      expect.objectContaining({
-        code: 'branch-mapping-ambiguous',
-        issueNumbers: [42, 43],
-        detail: expect.stringContaining('Human marker issue #43'),
-        pullRequests: [
-          expect.objectContaining({ number: 101 }),
-          expect.objectContaining({ number: 102 }),
-        ],
-      }),
-    ]);
+    expect(snapshot.lifecycle.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'pull-request', prNumber: 101, issueNumber: 42 }),
+      expect.objectContaining({ kind: 'pull-request', prNumber: 102, issueNumber: 43 }),
+    ]));
+    expect(snapshot.diagnostics).toEqual([]);
   });
 });

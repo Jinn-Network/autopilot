@@ -53,6 +53,10 @@ import {
   gitOid,
   type GitOid,
 } from './types.js';
+import {
+  hasExternalHumanAuthority,
+  hasExternalHumanLabel,
+} from './human-authority.js';
 
 export interface ProductionReviewSessionPortOptions {
   readonly runner?: CommandRunner;
@@ -79,6 +83,10 @@ export interface ProductionReviewSessionPortOptions {
    * `null` means the external Human boundary could not be read completely.
    */
   readonly readProjectHumanAuthority?: (input: {
+    readonly manifest: AttemptManifest;
+  }) => Promise<boolean | null>;
+  /** Fresh native issue Human-label authority for the manifest issue. */
+  readonly readNativeIssueHumanAuthority?: (input: {
     readonly manifest: AttemptManifest;
   }) => Promise<boolean | null>;
 }
@@ -165,6 +173,35 @@ export function makeProductionReviewSessionPort(
         manifest.issueNumber,
       );
       return project === null ? null : project.blockedOn === 'Human';
+    } catch {
+      return null;
+    }
+  };
+  const defaultNativeIssueHumanAuthority = async (
+    manifest: AttemptManifest,
+  ): Promise<boolean | null> => {
+    try {
+      const value = JSON.parse(await run(manifest, 'gh', [
+        'issue', 'view', String(manifest.issueNumber),
+        '--repo', REPO,
+        '--json', 'number,state,labels',
+      ])) as {
+        readonly number?: unknown;
+        readonly state?: unknown;
+        readonly labels?: unknown;
+      };
+      if (
+        value.number !== manifest.issueNumber
+        || !['OPEN', 'CLOSED'].includes(String(value.state))
+        || !Array.isArray(value.labels)
+      ) return null;
+      const labels = value.labels.map((label) => (
+        typeof label === 'object' && label !== null
+          ? (label as { readonly name?: unknown }).name
+          : undefined
+      ));
+      if (labels.some((label) => typeof label !== 'string')) return null;
+      return hasExternalHumanLabel(labels as string[]);
     } catch {
       return null;
     }
@@ -519,19 +556,27 @@ export function makeProductionReviewSessionPort(
         }
       }
     }
-    const externalHumanLabel =
-      pullRequest.labels.includes('review:needs-human')
-      || pullRequest.labels.includes('autopilot:human');
+    const externalHumanLabel = hasExternalHumanLabel(pullRequest.labels);
     let projectHumanAuthority: boolean | null | undefined;
+    let nativeIssueHumanAuthority: boolean | null | undefined;
     if (!externalHumanLabel) {
       try {
-        projectHumanAuthority = options.readProjectHumanAuthority === undefined
-          ? await defaultProjectHumanAuthority(manifest)
-          : await options.readProjectHumanAuthority({ manifest });
+        [projectHumanAuthority, nativeIssueHumanAuthority] = await Promise.all([
+          options.readProjectHumanAuthority === undefined
+            ? defaultProjectHumanAuthority(manifest)
+            : options.readProjectHumanAuthority({ manifest }),
+          options.readNativeIssueHumanAuthority === undefined
+            ? defaultNativeIssueHumanAuthority(manifest)
+            : options.readNativeIssueHumanAuthority({ manifest }),
+        ]);
       } catch {
         projectHumanAuthority = null;
+        nativeIssueHumanAuthority = null;
       }
-      if (projectHumanAuthority === null) {
+      if (
+        projectHumanAuthority === null
+        || nativeIssueHumanAuthority === null
+      ) {
         throw new Error(
           'Complete external Human authority is unavailable or inconsistent.',
         );
@@ -566,8 +611,12 @@ export function makeProductionReviewSessionPort(
       labels: pullRequest.labels,
       body: pullRequest.body,
       approvalPolicy,
-      humanHold:
-        externalHumanLabel || projectHumanAuthority === true,
+      humanHold: externalHumanLabel || hasExternalHumanAuthority({
+        nativeIssueLabels: nativeIssueHumanAuthority === true
+          ? ['autopilot:human']
+          : [],
+        projectBlockedOn: projectHumanAuthority === true ? 'Human' : null,
+      }),
       ...(mappingProblem === undefined ? {} : { mappingProblem }),
     };
   };

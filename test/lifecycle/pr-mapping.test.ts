@@ -129,6 +129,38 @@ describe('canonical structured PR-to-issue mapping', () => {
     }]);
   });
 
+  it('treats a contradictory structured Human comment as inert audit evidence', () => {
+    const auditTaggedPullRequest = {
+      number: 84,
+      state: 'OPEN' as const,
+      head: HEAD,
+      headRefName: 'feature/42',
+      baseRefName: 'main',
+      closingIssueNumbers: [42],
+      body: 'Closes #42',
+      humanIssueNumber: 43,
+    };
+    const input = stackedInput({
+      issues: [
+        { number: 42, blockedOn: 'Nothing', blockedByIssues: [] },
+        { number: 43, blockedOn: 'Nothing', blockedByIssues: [] },
+      ],
+      // Runtime GraphQL objects may still carry legacy audit fields, but the
+      // resolver's typed authority surface deliberately excludes them.
+      pullRequests: [auditTaggedPullRequest],
+      stableBranches: [],
+      defaultBranch: 'main',
+    });
+
+    expect(resolveStructuredPullRequestMappings(input)).toEqual([{
+      status: 'resolved',
+      prNumber: 84,
+      issueNumber: 42,
+      expectedBaseRefName: 'main',
+      evidence: 'closing-reference',
+    }]);
+  });
+
   it('rejects empty closing references on the default branch without an issue dependency', () => {
     const input = stackedInput({
       issues: [{ number: 2084, blockedOn: 'Nothing', blockedByIssues: [] }],

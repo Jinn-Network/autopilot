@@ -215,8 +215,6 @@ function pullRequestAuthorityProblem(
   manifest: AttemptManifest,
   pullRequest: ReviewSessionPullRequest,
 ): PullRequestAuthorityProblem | undefined {
-  const marker =
-    `<!-- jinn-autopilot:v2 issue=${manifest.issueNumber} branch=${manifest.branch} -->`;
   if (!pullRequest.open) {
     return { kind: 'human', detail: 'The review pull request is no longer open.' };
   }
@@ -227,11 +225,10 @@ function pullRequestAuthorityProblem(
     pullRequest.issueNumber !== manifest.issueNumber
     || pullRequest.headRefName !== manifest.branch
     || pullRequest.baseRefName !== manifest.targetBase
-    || !pullRequest.body.includes(marker)
   ) {
     return {
       kind: 'mapping',
-      detail: 'The unique PR, issue, branch, base, or lifecycle-marker mapping changed.',
+      detail: 'The unique canonical PR, issue, branch, or base mapping changed.',
     };
   }
   if (pullRequest.approvalPolicy !== manifest.reviewApprovalPolicy) {
