@@ -40,10 +40,7 @@ import {
   type GitOid,
 } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
-import {
-  hasExternalHumanAuthority,
-  hasExternalHumanLabel,
-} from './human-authority.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 
 export interface ProductionReviewActionPortOptions {
   readonly repositoryPath: string;
@@ -173,6 +170,62 @@ export function makeProductionReviewActionPort(
     }
     return Buffer.from(contents.content.replaceAll('\n', ''), 'base64')
       .toString('utf8');
+  };
+  const readFreshExternalHumanAuthority = async (input: {
+    readonly prNumber: number;
+    readonly expectedIssueNumber?: number;
+    readonly pullRequestLabels?: readonly string[];
+  }): Promise<boolean> => {
+    const snapshot = await options.readSnapshot(input.prNumber);
+    if (snapshot === null) {
+      throw new Error('Fresh review Human authority is unavailable');
+    }
+    const mapping = snapshot.pullRequestMappings?.find(
+      (entry) => entry.prNumber === input.prNumber,
+    );
+    if (
+      mapping?.status !== 'resolved'
+      || (
+        input.expectedIssueNumber !== undefined
+        && mapping.issueNumber !== input.expectedIssueNumber
+      )
+    ) {
+      throw new Error('Fresh review Human authority lost canonical mapping');
+    }
+    const pullRequest = snapshot.pullRequests.find(
+      (candidate) => candidate.number === input.prNumber,
+    );
+    const nativeIssue = snapshot.issues.find(
+      (issue) => issue.number === mapping.issueNumber,
+    );
+    const projectItem = snapshot.project.items.find((item) => (
+      item.contentType === 'Issue' && item.number === mapping.issueNumber
+    ));
+    if (
+      pullRequest === undefined
+      || pullRequest.state !== 'OPEN'
+      || nativeIssue === undefined
+      || projectItem === undefined
+    ) {
+      throw new Error('Fresh review Human authority is incomplete');
+    }
+    return hasExternalHumanAuthority({
+      pullRequestLabels: [
+        ...pullRequest.labels,
+        ...(input.pullRequestLabels ?? []),
+      ],
+      nativeIssueLabels: nativeIssue.labels,
+      projectBlockedOn: projectItem.blockedOn,
+    });
+  };
+  const assertFreshExternalHumanAuthorityClear = async (input: {
+    readonly prNumber: number;
+    readonly expectedIssueNumber?: number;
+    readonly pullRequestLabels?: readonly string[];
+  }): Promise<void> => {
+    if (await readFreshExternalHumanAuthority(input)) {
+      throw new Error('Review stopped because Human is dominant');
+    }
   };
   const candidateFromSnapshot = async (
     snapshot: GitHubLifecycleSnapshot,
@@ -307,7 +360,7 @@ export function makeProductionReviewActionPort(
       expectedRemoteRecordOid,
       recordOid,
       credential,
-    }) => withCredential(credential, (askpass, environment) => {
+    }) => withCredential(credential, async (askpass, environment) => {
       const secureRunner = (
         _command: 'git',
         args: readonly string[],
@@ -316,6 +369,7 @@ export function makeProductionReviewActionPort(
         '-C', options.repositoryPath,
         ...args,
       ], { env: environment });
+      await assertFreshExternalHumanAuthorityClear({ prNumber });
       return makeGitProtocolPort(secureRunner, {
         remote: repositoryUrl,
       }).publishReviewClaim({
@@ -383,11 +437,13 @@ export function makeProductionReviewActionPort(
           throw new Error('Review projection PR authority changed');
         }
         const labels = pr.labels!.map((label) => label.name);
-        if (hasExternalHumanLabel(labels.filter(
-          (label): label is string => typeof label === 'string',
-        ))) {
-          throw new Error('Review projection stopped because Human is dominant');
-        }
+        await assertFreshExternalHumanAuthorityClear({
+          prNumber: candidate.number,
+          expectedIssueNumber: candidate.issueNumber,
+          pullRequestLabels: labels.filter(
+            (label): label is string => typeof label === 'string',
+          ),
+        });
         if (!labels.includes('engine:review')) {
           await mutateWithExactReadback(
             () => gh('gh', [
