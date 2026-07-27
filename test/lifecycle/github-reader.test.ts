@@ -652,6 +652,8 @@ describe('GhLifecycleReader', () => {
     });
     expect(query).toContain('projectItems(first: 10)');
     expect(query).toContain('closedByPullRequestsReferences(first: 100, includeClosedPrs: true)');
+    expect(query).toContain('issueType { name }');
+    expect(query).not.toContain('fieldValueByName(name: "Type")');
     expect(reader.githubUsage()).toMatchObject({ graphqlRequests: 1, graphqlCost: 2 });
   });
 

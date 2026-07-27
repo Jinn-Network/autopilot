@@ -232,8 +232,9 @@ function parseSingleReviewClaimRef(raw: string, ref: GitRefName): GitOid | null 
  * GraphQL exposes no `ProjectV2` field by that name, so
  * `fieldValueByName(name: "Type")` resolves to null for every item. Only REST
  * projects the native type as a board field (`data_type: 'issue_type'`), which
- * is why the incremental snapshot reads it there and the board snapshot reads
- * `content { ... on Issue { issueType } }` here.
+ * is why the incremental snapshot reads it from REST while every GraphQL path
+ * reads the native field: `content { ... on Issue { issueType } }` in the board
+ * snapshot, `issue { issueType }` here.
  */
 const PROJECT_ITEM_BY_ISSUE_QUERY =
 `query($owner: String!, $name: String!, $number: Int!) {
