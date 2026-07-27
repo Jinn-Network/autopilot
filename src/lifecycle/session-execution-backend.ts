@@ -763,10 +763,17 @@ export async function recoverSubmittedMarketplaceAttempts(
             case 'solution-verified':
             case 'host-committed':
             case 'lifecycle-completed':
-            case 'review-anchored':
-              await options.makeAdopter(manifest.paths.manifest)
+            case 'review-anchored': {
+              const adoptionResult = await options.makeAdopter(manifest.paths.manifest)
                 .adopt(manifest.paths.manifest);
+              if (adoptionResult.status === 'rejected') {
+                return {
+                  ok: false,
+                  detail: `Marketplace adoption recovery rejected ${manifest.paths.manifest}: ${adoptionResult.reason}`,
+                };
+              }
               break;
+            }
             case 'receipt-published':
               await reconcileReceiptTerminalState(manifest, options);
               break;

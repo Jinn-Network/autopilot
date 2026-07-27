@@ -1,16 +1,18 @@
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   makeProductionCapabilityPreflight,
+  buildMarketplaceRecoveryLifecycleSnapshot,
 } from '../../src/lifecycle/active-runtime-production.js';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
@@ -36,6 +38,7 @@ import { Harness } from './marketplace-mutation-adoption.test.js';
 
 const NOW = new Date('2026-07-27T12:00:00.000Z');
 const ATTEMPT_ID = '123e4567-e89b-42d3-a456-426614174001';
+const REVIEW_ATTEMPT = '22222222-2222-4222-8222-222222222222';
 const roots: string[] = [];
 
 function marketplaceExecutionState(manifest: AttemptManifest): MarketplaceExecutionState {
@@ -96,6 +99,57 @@ function pool(): CredentialPool {
   }]);
 }
 
+function relocateMarketplaceExecutionState(
+  state: MarketplaceExecutionState,
+  linkedDir: string,
+): MarketplaceExecutionState {
+  if (state.schemaVersion !== 'marketplace-execution-v3') {
+    return state;
+  }
+  const requestPath = join(linkedDir, 'marketplace-request.json');
+  const solverNetSelectionPath = join(linkedDir, 'solvernet-selection.json');
+  const relocatedBase = {
+    ...state,
+    requestPath,
+    solverNetSelectionPath,
+  };
+  if ('progress' in relocatedBase) {
+    const progress = relocatedBase.progress;
+    return {
+      ...relocatedBase,
+      progress: {
+        ...progress,
+        delivery: {
+          ...progress.delivery,
+          observationPath: join(linkedDir, 'marketplace-solution-observation.json'),
+        },
+        ...('reviewAnchor' in progress
+          ? {
+            reviewAnchor: {
+              ...progress.reviewAnchor,
+              manifestPath: join(
+                linkedDir,
+                basename(dirname(progress.reviewAnchor.manifestPath)),
+                basename(progress.reviewAnchor.manifestPath),
+              ),
+            },
+          }
+          : {}),
+      },
+    };
+  }
+  if ('delivery' in relocatedBase) {
+    return {
+      ...relocatedBase,
+      delivery: {
+        ...relocatedBase.delivery,
+        observationPath: join(linkedDir, 'marketplace-solution-observation.json'),
+      },
+    };
+  }
+  return relocatedBase;
+}
+
 function installHarnessAtV2(
   harness: Harness,
   v2Base: string,
@@ -108,42 +162,31 @@ function installHarnessAtV2(
   const manifestPath = join(linkedDir, 'manifest.json');
   const source = readAttemptManifest(harness.manifestPath);
   const state = marketplaceExecutionState(source);
+  const relocatedState = relocateMarketplaceExecutionState(state, linkedDir);
   const requestPath = join(linkedDir, 'marketplace-request.json');
   const solverNetSelectionPath = join(linkedDir, 'solvernet-selection.json');
-  const nextState = 'submission' in state
+  const nextState = 'submission' in relocatedState
     ? {
-        ...state,
+        ...relocatedState,
         requestPath,
         solverNetSelectionPath,
         submission: {
-          ...state.submission,
+          ...relocatedState.submission,
           id: `autopilot:${attemptId}`,
         },
       }
     : {
-        ...state,
+        ...relocatedState,
         requestPath,
         solverNetSelectionPath,
       };
-  const relocatedState = 'delivery' in nextState
-    ? {
-        ...nextState,
-        delivery: {
-          ...nextState.delivery,
-          observationPath: join(
-            linkedDir,
-            'marketplace-solution-observation.json',
-          ),
-        },
-      }
-    : nextState;
   writeFileSync(manifestPath, `${JSON.stringify({
     ...source,
     attemptId,
     runnerId,
     execution: {
       backend: 'marketplace',
-      state: relocatedState,
+      state: nextState,
     },
     paths: {
       ...source.paths,
@@ -263,39 +306,78 @@ describe('marketplace solution recovery', () => {
 
   it('reconciles rejected receipt-published attempts without re-adoption', async () => {
     const harness = new Harness();
+    await harness.coordinator().adopt(harness.manifestPath);
     const adopt = vi.fn();
-    const v2Base = join(dirname(dirname(harness.manifestPath)), 'v2');
-    mkdirSync(join(v2Base, 'runner-1', 'implement'), { recursive: true });
-    const manifestPath = join(v2Base, 'runner-1', 'implement', `issue-2001-${ATTEMPT_ID}`, 'manifest.json');
-    mkdirSync(dirname(manifestPath), { recursive: true });
-    const rejected = readAttemptManifest(harness.manifestPath);
-    const rejectedState = marketplaceExecutionState(rejected);
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const linkedDir = join(v2Base, 'runner-1', 'implement', `issue-2001-${ATTEMPT_ID}`);
+    const runnerDir = join(v2Base, 'runner-1');
+    const reviewDir = join(runnerDir, 'review', `pr-2101-${REVIEW_ATTEMPT}`);
+    mkdirSync(linkedDir, { recursive: true });
+    cpSync(harness.attemptDir, linkedDir, { recursive: true });
+    const sourceReviewDir = join(
+      dirname(dirname(harness.attemptDir)),
+      'review',
+      `pr-2101-${REVIEW_ATTEMPT}`,
+    );
+    if (existsSync(sourceReviewDir)) {
+      mkdirSync(dirname(reviewDir), { recursive: true });
+      cpSync(sourceReviewDir, reviewDir, { recursive: true });
+    }
+    const manifestPath = join(linkedDir, 'manifest.json');
+    const source = readAttemptManifest(harness.manifestPath);
+    const adoptedState = relocateMarketplaceExecutionState(
+      marketplaceExecutionState(source),
+      linkedDir,
+    );
+    expect(adoptedState.status).toBe('receipt-published');
+    if (!('progress' in adoptedState) || adoptedState.progress.status !== 'review-anchored') {
+      throw new Error('expected review-anchored progress');
+    }
+    const progress = {
+      ...adoptedState.progress,
+      reviewAnchor: {
+        ...adoptedState.progress.reviewAnchor,
+        manifestPath: join(reviewDir, 'manifest.json'),
+      },
+    };
+    const acceptedEvidence = 'receipt' in adoptedState ? adoptedState.receipt : undefined;
+    if (acceptedEvidence === undefined) {
+      throw new Error('expected receipt evidence');
+    }
     writeFileSync(manifestPath, `${JSON.stringify({
-      ...rejected,
+      ...source,
+      attemptId: ATTEMPT_ID,
+      runnerId: 'runner-1',
+      processState: 'running',
+      paths: {
+        ...source.paths,
+        attemptDir: linkedDir,
+        manifest: manifestPath,
+        worktree: join(linkedDir, 'worktree'),
+        log: join(linkedDir, 'session.log'),
+        ghConfigDir: join(linkedDir, 'gh-config'),
+        askpass: join(linkedDir, 'askpass'),
+        tokenFile: join(linkedDir, 'token'),
+      },
       execution: {
         backend: 'marketplace',
         state: {
-          ...rejectedState,
+          ...adoptedState,
           status: 'receipt-published',
+          progress,
           receipt: {
-            commentId: 9001,
-            author: 'jinn-autopilot',
-            recordedAt: NOW.toISOString(),
+            ...acceptedEvidence,
             receipt: {
-              schemaVersion: 'jinn-autopilot-marketplace-adoption.v1',
+              ...acceptedEvidence.receipt,
               disposition: 'rejected',
-              role: 'solution',
               reason: 'stale-head',
               detail: 'head moved',
-              taskId: '501',
-              requestId: `0x${'1'.repeat(64)}`,
-              deliveryEnvelopeCid: 'bafy-envelope',
-              v2AttemptId: ATTEMPT_ID,
-              artifactDigest: `sha256:${'a'.repeat(64)}`,
-              claimOid: gitOid('1'.repeat(40)),
-              prNumber: 2101,
-              expectedHead: gitOid('2'.repeat(40)),
-              recordedAt: NOW.toISOString(),
+              resultingHead: undefined,
+              reviewGeneration: undefined,
+              reviewRefOid: undefined,
+              operation: undefined,
             },
           },
         },
@@ -308,10 +390,126 @@ describe('marketplace solution recovery', () => {
       makeAdopter: () => ({ adopt }),
       releaseReviewAnchor: release,
       isPidAlive: () => true,
+      now: () => new Date('2026-07-28T12:00:00.000Z'),
+    });
+    expect(result).toEqual({ ok: true });
+    expect(adopt).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledWith(progress.reviewAnchor);
+    expect(readAttemptManifest(manifestPath).processState).toBe('exited');
+  });
+
+  it('fails closed when adoption recovery returns rejected', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const harness = new Harness('implement', 'submitted');
+    const manifestPath = installHarnessAtV2(harness, v2Base, 'runner-1', ATTEMPT_ID);
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base,
+      recoverPrepared: async () => [],
+      makeAdopter: () => ({
+        adopt: async () => ({
+          status: 'rejected',
+          reason: 'correlation-mismatch',
+          receipt: {
+            schemaVersion: 'jinn-autopilot-marketplace-adoption.v1',
+            disposition: 'rejected',
+            role: 'solution',
+            reason: 'correlation-mismatch',
+            detail: 'mismatch',
+            taskId: '501',
+            attemptIndex: 0,
+            requestId: `0x${'1'.repeat(64)}`,
+            deliveryEnvelopeCid: 'bafy-envelope',
+            v2AttemptId: ATTEMPT_ID,
+            prNumber: 2101,
+            claimOid: gitOid('1'.repeat(40)),
+            expectedHead: gitOid('2'.repeat(40)),
+            recordedAt: NOW.toISOString(),
+          },
+        }),
+      }),
+      isPidAlive: () => true,
       now: () => NOW,
     });
     expect(result.ok).toBe(false);
-    expect(adopt).not.toHaveBeenCalled();
+    expect(result.detail).toMatch(/rejected/);
+    expect(result.detail).toContain(manifestPath);
+  });
+
+  it('keeps pending delivery recoverable without failing recovery', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const harness = new Harness('implement', 'submitted');
+    installHarnessAtV2(harness, v2Base, 'runner-1', ATTEMPT_ID);
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base,
+      recoverPrepared: async () => [],
+      makeAdopter: () => ({
+        adopt: async () => ({
+          status: 'recoverable',
+          stage: 'observation',
+          detail: 'delivery pending',
+        }),
+      }),
+      isPidAlive: () => true,
+      now: () => NOW,
+    });
+    expect(result).toEqual({ ok: true });
+  });
+
+  it('builds recovery snapshots with resolved PR mappings from manifest facts', () => {
+    const harness = new Harness('implement', 'submitted');
+    const manifest = readAttemptManifest(harness.manifestPath);
+    const snapshot = buildMarketplaceRecoveryLifecycleSnapshot({
+      manifest,
+      capturedAt: NOW.toISOString(),
+      issue: {
+        number: 2001,
+        title: 'Implement contracts',
+        open: true,
+        author: 'jinn-autopilot',
+        labels: [],
+      },
+      projectItem: {
+        id: 'PVTI_issue',
+        status: 'Todo',
+        priority: 'P1',
+        effort: 'High',
+        blockedOn: 'Nothing',
+        issueType: 'feat',
+      },
+    });
+    expect(snapshot.pullRequestMappings).toEqual([{
+      status: 'resolved',
+      prNumber: 2101,
+      issueNumber: 2001,
+      expectedBaseRefName: 'next',
+      evidence: 'closing-reference',
+    }]);
+    expect(snapshot.pullRequests?.[0]?.headOid).toBe(gitOid(manifest.expectedHead));
+  });
+
+  it('fails closed on contradictory recovery manifest paths', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const harness = new Harness('implement', 'submitted');
+    const manifestPath = installHarnessAtV2(harness, v2Base, 'runner-1', ATTEMPT_ID);
+    writeFileSync(manifestPath, readFileSync(manifestPath, 'utf8').replace(
+      '"runner-1"',
+      '"runner-other"',
+    ));
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base,
+      recoverPrepared: async () => [],
+      makeAdopter: () => ({ adopt: vi.fn() }),
+      isPidAlive: () => true,
+      now: () => NOW,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/does not match its v2 attempt path/i);
   });
 
   it('fails closed when prepared attempts remain before adoption recovery', async () => {

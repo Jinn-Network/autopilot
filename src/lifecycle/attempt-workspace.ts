@@ -1755,23 +1755,59 @@ export function markAttemptExited(
   now: () => Date = () => new Date(),
   terminalHead?: string,
 ): AttemptManifest {
+  const current = readAttemptManifest(manifestPath);
+  if (
+    current.execution.backend === 'marketplace'
+    && (
+      current.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      || current.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+      || current.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1'
+    )
+  ) {
+    return markMarketplaceAttemptExited(manifestPath, now, terminalHead);
+  }
   const timestamp = transitionTimestamp(now);
   const validTerminalHead = terminalHead === undefined ? undefined : gitOid(terminalHead);
-  return updateAttemptManifest(manifestPath, (current) => {
-    if (current.processState !== 'running') {
+  return updateAttemptManifest(manifestPath, (manifest) => {
+    if (manifest.processState !== 'running') {
       throw new Error('Only a running attempt may transition to exited');
     }
     return {
-      ...current,
+      ...manifest,
       processState: 'exited',
       ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
       timestamps: {
-        ...current.timestamps,
+        ...manifest.timestamps,
         updatedAt: timestamp,
         childExitedAt: timestamp,
       },
     };
   });
+}
+
+export function markMarketplaceAttemptExited(
+  manifestPath: string,
+  now: () => Date = () => new Date(),
+  terminalHead?: string,
+): AttemptManifest {
+  const timestamp = transitionTimestamp(now);
+  const validTerminalHead = terminalHead === undefined ? undefined : gitOid(terminalHead);
+  const current = readAttemptManifest(manifestPath);
+  if (current.processState !== 'running') {
+    throw new Error('Only a running attempt may transition to exited');
+  }
+  const next = decodeAttemptManifest({
+    ...current,
+    processState: 'exited',
+    ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
+    timestamps: {
+      ...current.timestamps,
+      updatedAt: timestamp,
+      childExitedAt: timestamp,
+    },
+  });
+  writeManifestAtomic(manifestPath, next);
+  return next;
 }
 
 export interface TrackableAttemptChild {

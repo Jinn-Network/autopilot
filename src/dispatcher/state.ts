@@ -1,5 +1,6 @@
 import type { CommandRunner, ProjectSnapshot } from './project-snapshot.js';
 import type { InFlightSession } from './types.js';
+import { JINN_MONO_WORKTREES_DIR } from '../runtime-profile.js';
 import { sessionLogPath, sessionStartedAtPath } from './session-log.js';
 import {
   type ParsedWorktree,
@@ -145,7 +146,7 @@ export async function deriveInFlight(
       });
     } else {
       drift.push(
-        `drift: issue #${issueNumber} is In Progress on the board but has no jinn-mono_worktrees/${issueNumber} worktree`,
+        `drift: issue #${issueNumber} is In Progress on the board but has no ${JINN_MONO_WORKTREES_DIR}/${issueNumber} worktree`,
       );
     }
   }

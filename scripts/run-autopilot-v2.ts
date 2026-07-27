@@ -34,15 +34,13 @@ import {
 } from '../src/lifecycle/marketplace-task.js';
 import {
   assertMarketplaceRuntimeProfile,
+  buildMarketplaceRecoveryLifecycleSnapshot,
   makeProductionMarketplaceAdoptionRecoveryCoordinator,
 } from '../src/lifecycle/active-runtime-production.js';
 import { readAttemptManifest } from '../src/lifecycle/attempt-workspace.js';
 import { releaseMarketplaceReviewAnchor } from '../src/lifecycle/marketplace-review-anchor.js';
 import { makeProductionReviewSessionPort } from '../src/lifecycle/review-session-production.js';
 import type { GitHubLifecycleSnapshot } from '../src/lifecycle/snapshot.js';
-import type { PolledIssue } from '../src/dispatcher/types.js';
-import type { SnapshotItem } from '../src/dispatcher/project-snapshot.js';
-import { EMPTY_GITHUB_USAGE } from '../src/lifecycle/github-usage.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
 import {
   paintBoardOptionsFromConfig,
@@ -672,54 +670,12 @@ export async function runAutopilotV2(
         restDiscovery.readIssueForAction(manifest.issueNumber),
         reader.readProjectItemForReconciliation(manifest.issueNumber),
       ]);
-      const issues: PolledIssue[] = issueEntry === null ? [] : [{
-        number: issueEntry.number,
-        title: issueEntry.title,
-        labels: [...issueEntry.labels],
-        shape: projectItem?.issueType ?? null,
-        blockedOn: projectItem?.blockedOn ?? null,
-        blockedByIssues: [],
-        effort: projectItem?.effort ?? null,
-        priority: projectItem?.priority ?? null,
-        status: projectItem?.status ?? null,
-        onBoard: projectItem !== null,
-        author: issueEntry.author,
-        projectItemId: projectItem?.id ?? null,
-        inCurrentSprint: false,
-      }];
-      const items: SnapshotItem[] = projectItem === null || manifest.issueNumber === undefined
-        ? []
-        : [{
-          id: projectItem.id,
-          number: manifest.issueNumber,
-          contentType: 'Issue',
-          status: projectItem.status,
-          priority: projectItem.priority,
-          effort: projectItem.effort,
-          blockedOn: projectItem.blockedOn,
-          issueType: projectItem.issueType,
-          blockedByIssues: [],
-          sprintIterationId: null,
-        }];
-      return {
+      return buildMarketplaceRecoveryLifecycleSnapshot({
+        manifest,
         capturedAt,
-        snapshotComplete: true,
-        issues,
-        project: {
-          items,
-          rateLimit: {
-            remaining: 5_000,
-            used: 0,
-            resetAt: capturedAt,
-          },
-          currentSprintIterationId: null,
-        },
-        pullRequests: [],
-        branches: [],
-        diagnostics: [],
-        lifecycle: { items: [] },
-        githubUsage: EMPTY_GITHUB_USAGE,
-      };
+        issue: issueEntry,
+        projectItem,
+      });
     };
   };
   const recoverSubmittedMarketplaceAdoptions =

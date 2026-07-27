@@ -1,4 +1,5 @@
 import { statSync } from 'node:fs';
+import { JINN_MONO_WORKTREES_DIR } from '../runtime-profile.js';
 
 // ---------------------------------------------------------------------------
 // Shared `git worktree list --porcelain` parsing + worktree helpers,
@@ -13,7 +14,7 @@ import { statSync } from 'node:fs';
  * Task worktrees use the issue number as `<name>`, so the full shape is
  * `…/jinn-mono_worktrees/<N>`.
  */
-const WORKTREE_PARENT_COMPONENT = 'jinn-mono_worktrees';
+const WORKTREE_PARENT_COMPONENT = JINN_MONO_WORKTREES_DIR;
 
 /**
  * One parsed worktree block from `git worktree list --porcelain`.

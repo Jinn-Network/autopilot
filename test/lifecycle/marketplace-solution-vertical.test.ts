@@ -1,10 +1,21 @@
 import { rmSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { readAttemptManifest } from '../../src/lifecycle/attempt-workspace.js';
+import type { MarketplaceMutationAdoptionBoundary } from '../../src/lifecycle/marketplace-mutation-adoption.js';
 import { Harness } from './marketplace-mutation-adoption.test.js';
 
 const HOST_COMMIT = '3'.repeat(40);
 const roots: string[] = [];
+
+const BOUNDARIES: readonly MarketplaceMutationAdoptionBoundary[] = [
+  'observation-persisted',
+  'patch-applied',
+  'verification-persisted',
+  'host-commit-created',
+  'checkpoint-published',
+  'completion-confirmed',
+  'review-anchor-published',
+];
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -31,15 +42,7 @@ describe('marketplace solution vertical acceptance', () => {
     expect(harness.comments).toHaveLength(1);
   });
 
-  it.each([
-    'observation-persisted',
-    'patch-applied',
-    'verification-persisted',
-    'host-commit-created',
-    'checkpoint-published',
-    'completion-confirmed',
-    'review-anchor-published',
-  ] as const)('recovers idempotently after crash at %s', async (boundary) => {
+  it.each(BOUNDARIES)('recovers idempotently after crash at %s', async (boundary) => {
     const harness = new Harness(
       'implement',
       boundary === 'observation-persisted' ? 'submitted' : 'solution-observed',
@@ -63,6 +66,20 @@ describe('marketplace solution vertical acceptance', () => {
     const second = await adopt(harness);
     expect(second).toMatchObject({ status: 'accepted' });
     expect(harness.observeCalls).toBe(1);
+    expect(harness.comments).toHaveLength(1);
+  });
+
+  it('records receipt publication boundaries and stays idempotent', async () => {
+    const harness = new Harness();
+    const first = await adopt(harness);
+    expect(first).toMatchObject({ status: 'accepted' });
+    expect(harness.boundaries).toEqual(expect.arrayContaining([
+      'receipt-comment-created',
+      'receipt-persisted',
+    ]));
+    expect(harness.comments).toHaveLength(1);
+    const second = await adopt(harness);
+    expect(second).toMatchObject({ status: 'accepted' });
     expect(harness.comments).toHaveLength(1);
   });
 });

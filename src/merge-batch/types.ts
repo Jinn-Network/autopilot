@@ -1,4 +1,5 @@
 import type { BlockedOn } from '../dispatcher/types.js';
+import { JINN_MONO_REPOSITORY } from '../runtime-profile.js';
 
 export type MergeBatchCi =
   | { kind: 'green' }
@@ -70,7 +71,7 @@ export interface MergeBatchWave {
 
 export interface MergeBatchManifest {
   schemaVersion: 1;
-  repo: 'Jinn-Network/mono';
+  repo: typeof JINN_MONO_REPOSITORY;
   baseBranch: 'next';
   baseNextSha: string;
   createdAt: string;

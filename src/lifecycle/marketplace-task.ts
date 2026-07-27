@@ -67,12 +67,14 @@ export class MarketplaceTaskCliFailure extends MarketplaceMachineCliFailure {
   }
 }
 
+import { JINN_MONO_REPOSITORY } from '../runtime-profile.js';
+
 /**
  * The fixed marketplace profile is owned by the published SDK contract. Read
  * its legacy literal fields instead of embedding a standalone repository
  * fallback in the distributable Autopilot binary.
  */
-export const MARKETPLACE_REPOSITORY = 'Jinn-Network/mono';
+export const MARKETPLACE_REPOSITORY = JINN_MONO_REPOSITORY;
 export const MARKETPLACE_LANGUAGE = 'typescript';
 export const MARKETPLACE_VERIFICATION_PROFILE = 'jinn-mono.v1';
 

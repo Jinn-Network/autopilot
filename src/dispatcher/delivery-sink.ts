@@ -1,8 +1,9 @@
+import { JINN_MONO_REPOSITORY } from '../runtime-profile.js';
 import type { SessionResult } from './types.js';
 import { type CommandRunner, defaultRunner } from './issue-source.js';
 
 // Pin the repo so `gh` never infers it from cwd (mirrors pr-source.ts).
-const REPO = 'Jinn-Network/mono';
+const REPO = JINN_MONO_REPOSITORY;
 
 /**
  * SEAM: what happens to finished work.
