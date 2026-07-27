@@ -50,6 +50,28 @@ import {
   verifyMarketplaceTaskRequest,
 } from '../../src/lifecycle/marketplace-task.js';
 
+// This file is deliberately subprocess-heavy: almost every test builds one or more real
+// `git` repository fixtures and drives `createAttemptWorkspace` against them, so a single
+// test routinely spawns dozens of real `git` processes. Vitest's 5000 ms default leaves
+// too little headroom for that on a loaded runner — this file has already timed out twice
+// on `macos-latest`.
+//
+// The number below is derived from measurement, not picked:
+//   - Local worst case, unloaded dev Mac, 3 runs, slowest test in the file ('retains
+//     authentication failure, missing objects, malformed manifests, and escaped paths'):
+//     1474 / 1388 / 1466 ms.
+//   - Observed CI slowdown floor: a test measured here at 1893 / 1891 / 1812 ms still
+//     exceeded the 5000 ms default on `macos-latest`, so that runner is at least
+//     5000 / 1893 = 2.6x slower than this baseline.
+//   - Extrapolated CI worst case: 1474 ms x 2.6 = ~3.9 s, i.e. only ~1.3x under the
+//     default — the next timeout would be a matter of runner variance, not of any one
+//     test. 15000 ms restores a ~3.8x margin over that extrapolated CI worst case
+//     (~10x over local) while still failing fast on a genuine hang.
+//
+// Scoped to this file on purpose. Raising `testTimeout` in vitest.config.ts would hide
+// slowness across the entire suite; this file's cost is a known, intended property of it.
+vi.setConfig({ testTimeout: 15_000 });
+
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
 const UUID_C = '33333333-3333-4333-8333-333333333333';
