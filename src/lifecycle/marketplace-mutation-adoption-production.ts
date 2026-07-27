@@ -48,6 +48,8 @@ import {
 import { createMarketplaceMutationGitPort } from './marketplace-mutation-git.js';
 import {
   createProductionMarketplaceVerificationPort,
+  createMarketplaceVerificationDockerInspector,
+  createMarketplaceVerificationDockerSandbox,
   type MarketplaceVerificationDockerRunner,
 } from './marketplace-mutation-verification-production.js';
 import type { MarketplaceMutationVerificationPort } from './marketplace-mutation-verification.js';
@@ -552,16 +554,25 @@ function makeWorktreeProofPort(
   };
 }
 
-async function copyWorktreeForVerification(
+export async function copyWorktreeForVerification(
   sourcePath: string,
   workspacePath: string,
 ): Promise<void> {
   await cp(sourcePath, workspacePath, {
     recursive: true,
     force: true,
-    filter: (path) => !path.includes(`${join(sourcePath, '.git')}`)
-      && !path.includes('node_modules'),
+    filter: (path) => !shouldExcludeWorktreeVerificationCopyPath(sourcePath, path),
   });
+}
+
+export function shouldExcludeWorktreeVerificationCopyPath(
+  sourcePath: string,
+  path: string,
+): boolean {
+  const gitDir = join(sourcePath, '.git');
+  return path === gitDir
+    || path.startsWith(`${gitDir}/`)
+    || path.includes('node_modules');
 }
 
 export interface ProductionMarketplaceMutationAdoptionOptions {
@@ -600,13 +611,20 @@ export function makeProductionMarketplaceMutationAdoptionCoordinator(
       now: options.now,
     }),
   );
+  const dockerSandbox = options.verification === undefined
+    ? (options.dockerRunner === undefined
+      ? createMarketplaceVerificationDockerSandbox()
+      : {
+        dockerRunner: options.dockerRunner,
+        dockerInspector: createMarketplaceVerificationDockerInspector(),
+        cleanup: async () => 'confirmed' as const,
+      })
+    : undefined;
   const verification = options.verification
     ?? createProductionMarketplaceVerificationPort({
-      dockerRunner: options.dockerRunner ?? (async () => ({
-        exitCode: 0,
-        stdout: '',
-        stderr: '',
-      })),
+      dockerRunner: dockerSandbox!.dockerRunner,
+      dockerInspector: dockerSandbox!.dockerInspector,
+      cleanup: dockerSandbox!.cleanup,
       prepareWorkspace: async ({ sourcePath, workspacePath }) => {
         await copyWorktreeForVerification(sourcePath, workspacePath);
       },

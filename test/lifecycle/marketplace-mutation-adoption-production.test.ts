@@ -1,7 +1,9 @@
 import {
   mkdtempSync,
+  mkdirSync,
   rmSync,
   writeFileSync,
+  existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,11 +15,25 @@ import {
   encodeBranchClaimTrailers,
 } from '../../src/lifecycle/codecs.js';
 import {
+  CredentialPool,
+} from '../../src/lifecycle/credentials.js';
+import {
   makeProductionMarketplaceAdoptionReceiptPorts,
   makeProductionMarketplaceMutationAdoptionCoordinator,
   makeProductionMarketplaceMutationAuthorityPort,
   secureMarketplaceAdoptionGitHubRunner,
+  shouldExcludeWorktreeVerificationCopyPath,
+  copyWorktreeForVerification,
 } from '../../src/lifecycle/marketplace-mutation-adoption-production.js';
+import {
+  buildJinnMonoV1VerificationPlan,
+  marketplaceVerificationPlanDigest,
+} from '../../src/lifecycle/marketplace-mutation-verification.js';
+import {
+  buildMarketplaceVerificationDockerInvocation,
+  createProductionMarketplaceVerificationPort,
+  JINN_MONO_V1_VERIFICATION_NODE_IMAGE,
+} from '../../src/lifecycle/marketplace-mutation-verification-production.js';
 import {
   buildMarketplaceTaskRequest,
   persistMarketplaceTaskRequest,
@@ -26,6 +42,196 @@ import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
 const directories: string[] = [];
+
+function snapshotForMapping(
+  mapping: {
+    readonly status: 'resolved' | 'ambiguous' | 'missing';
+    readonly issueNumber?: number;
+    readonly issueNumbers?: number[];
+    readonly labels?: readonly string[];
+  },
+) {
+  const issueNumber = mapping.issueNumber ?? 2001;
+  const base = {
+    capturedAt: '2026-07-24T12:00:00.000Z',
+    snapshotComplete: true,
+    issues: [{
+      number: issueNumber,
+      title: 'Implement contracts',
+      labels: mapping.labels ?? [],
+      shape: 'feat' as const,
+      blockedOn: 'Nothing' as const,
+      blockedByIssues: [],
+      effort: 'High' as const,
+      priority: 'P1' as const,
+      status: 'Todo' as const,
+      onBoard: true,
+      author: 'jinn-autopilot',
+      projectItemId: 'PVTI_issue',
+      inCurrentSprint: false,
+    }],
+    project: {
+      rateLimit: { remaining: 5000, used: 1, resetAt: '2026-07-24T13:00:00.000Z' },
+      currentSprintIterationId: null,
+      items: [{
+        id: 'PVTI_issue',
+        number: issueNumber,
+        contentType: 'Issue' as const,
+        status: 'Todo' as const,
+        priority: 'P1' as const,
+        effort: 'High' as const,
+        blockedOn: 'Nothing' as const,
+        issueType: 'feat' as const,
+        blockedByIssues: [],
+        sprintIterationId: null,
+      }],
+    },
+    branches: [],
+    diagnostics: [],
+    pullRequests: [{
+      number: 2101,
+      title: 'Implement contracts',
+      body: '',
+      author: 'jinn-autopilot',
+      baseRefName: 'next',
+      headRefName: 'codex/issue-2001',
+      headOid: HEAD,
+      headCommittedAt: '2026-07-24T12:00:00.000Z',
+      isDraft: false,
+      state: 'OPEN' as const,
+      labels: mapping.labels ?? [],
+      closingIssueNumbers: [issueNumber],
+      mergeability: 'MERGEABLE' as const,
+      mergeStateStatus: 'CLEAN',
+      checks: [],
+      reviews: [],
+    }],
+    lifecycle: {
+      items: [{
+        kind: 'pull-request' as const,
+        issueNumber,
+        prNumber: 2101,
+        v2Marked: true,
+        projectStatus: 'Todo' as const,
+        labels: mapping.labels ?? [],
+        head: HEAD,
+        headChangedAt: '2026-07-24T12:00:00.000Z',
+        isDraft: false,
+        merged: false,
+        needsReview: true,
+        approved: false,
+        mergeState: 'clean' as const,
+      }],
+    },
+  };
+  if (mapping.status === 'missing') {
+    return { ...base, pullRequestMappings: [] };
+  }
+  if (mapping.status === 'ambiguous') {
+    return {
+      ...base,
+      pullRequestMappings: [{
+        status: 'ambiguous' as const,
+        prNumber: 2101,
+        issueNumbers: mapping.issueNumbers ?? [2001, 2002],
+        details: ['PR maps to multiple issues'],
+      }],
+    };
+  }
+  return {
+    ...base,
+    pullRequestMappings: [{
+      status: 'resolved' as const,
+      prNumber: 2101,
+      issueNumber,
+      expectedBaseRefName: 'next',
+      evidence: 'closing-reference' as const,
+    }],
+  };
+}
+
+function credentialPool(): CredentialPool {
+  return new CredentialPool([{
+    login: 'jinn-autopilot',
+    normalizedLogin: 'jinn-autopilot',
+    implementationToken: 'implementation-secret',
+    reviewToken: 'review-secret',
+  }]);
+}
+
+function authorityRunner(manifest: ReturnType<typeof fixture>['manifest']) {
+  return vi.fn(async (
+    command: string,
+    args: string[],
+    options?: { readonly env?: Record<string, string> },
+  ) => {
+    if (command === 'gh' && args[0] === 'pr') {
+      return JSON.stringify({
+        number: 2101,
+        headRefOid: HEAD,
+        headRefName: 'codex/issue-2001',
+        baseRefName: 'next',
+        isDraft: false,
+        labels: [],
+        body: '',
+        state: 'OPEN',
+      });
+    }
+    if (command === 'gh' && args[0] === 'api') {
+      const path = args[1] ?? '';
+      if (path.includes('/pulls/2101/files')) {
+        return JSON.stringify([[]]);
+      }
+      if (path.includes('/pulls/2101')) {
+        return JSON.stringify({
+          changed_files: 0,
+          head: { sha: HEAD },
+          base: { ref: 'next', sha: '4'.repeat(40) },
+        });
+      }
+      if (path.includes('/contents/.github/CODEOWNERS')) {
+        return JSON.stringify({
+          encoding: 'base64',
+          content: Buffer.from('/\n').toString('base64'),
+        });
+      }
+    }
+    if (command === 'git') {
+      if (args.includes('remote') && args.includes('get-url')) {
+        return 'https://github.com/Jinn-Network/mono.git\n';
+      }
+      if (args.includes('ls-remote')) {
+        return `${manifest.claimOid}\trefs/heads/codex/issue-2001\n`;
+      }
+      if (args.includes('fetch')) return '';
+      if (args.includes('rev-list')) return `${manifest.claimOid}\n`;
+      if (args.includes('rev-parse')) return `${HEAD}\n`;
+      if (args.includes('show')) {
+        return [
+          'Autopilot implementation claim',
+          '',
+          encodeBranchClaimTrailers({
+            kind: 'branch-claim',
+            protocolVersion: 2,
+            phase: 'implement',
+            issueNumber: 2001,
+            prNumber: 2101,
+            attempt: '123e4567-e89b-42d3-a456-426614174001',
+            runner: 'runner-1',
+            login: 'jinn-autopilot',
+            expectedHead: HEAD,
+            targetBase: gitRefName('next'),
+            claimedAt: '2026-07-24T12:00:00.000Z',
+          }),
+        ].join('\n');
+      }
+    }
+    if (command === 'gh' && args.includes('user')) return 'jinn-autopilot\n';
+    if (command === 'gh' && args.some((arg) => arg.includes('comments'))) return '[]';
+    void options;
+    throw new Error(`unexpected ${command} ${args.join(' ')}`);
+  });
+}
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'jinn-adoption-production-'));
@@ -405,5 +611,338 @@ describe('makeProductionMarketplaceMutationAdoptionCoordinator', () => {
       },
     });
     expect(coordinator.adopt).toBeTypeOf('function');
+  });
+
+  it('wires the default docker sandbox with inspector instead of a success stub', async () => {
+    const verificationModule = await import(
+      '../../src/lifecycle/marketplace-mutation-verification-production.js'
+    );
+    const spy = vi.spyOn(verificationModule, 'createProductionMarketplaceVerificationPort');
+    const { manifestPath } = fixture();
+    makeProductionMarketplaceMutationAdoptionCoordinator({
+      originManifestPath: manifestPath,
+      repositoryPath: '/repo',
+      worktreeBase: '/tmp/worktrees',
+      runnerId: 'runner-1',
+      credentials: credentialPool(),
+      readSnapshot: async () => ({ snapshotComplete: true } as never),
+      staleAfterMs: 60_000,
+      environment: {
+        PATH: '/usr/bin',
+        JINN_AUTOPILOT_SESSION_MANIFEST: manifestPath,
+      },
+    });
+    expect(spy).toHaveBeenCalledOnce();
+    const portOptions = spy.mock.calls[0]![0];
+    expect(portOptions.dockerInspector).toBeDefined();
+    expect(portOptions.dockerRunner).toBeDefined();
+    spy.mockRestore();
+  });
+});
+
+describe('production worktree verification copy filter', () => {
+  it('excludes only the .git directory, not .gitignore or .github paths', () => {
+    const root = mkdtempSync(join(tmpdir(), 'jinn-adoption-copy-filter-'));
+    directories.push(root);
+    const gitDir = join(root, '.git');
+    mkdirSync(gitDir, { recursive: true });
+    writeFileSync(join(root, '.gitignore'), 'node_modules\n');
+    mkdirSync(join(root, '.github'), { recursive: true });
+    writeFileSync(join(root, '.github', 'CODEOWNERS'), '/\n');
+    writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+
+    expect(shouldExcludeWorktreeVerificationCopyPath(root, join(root, '.gitignore')))
+      .toBe(false);
+    expect(shouldExcludeWorktreeVerificationCopyPath(root, join(root, '.github', 'CODEOWNERS')))
+      .toBe(false);
+    expect(shouldExcludeWorktreeVerificationCopyPath(root, gitDir)).toBe(true);
+    expect(shouldExcludeWorktreeVerificationCopyPath(root, join(gitDir, 'HEAD'))).toBe(true);
+  });
+
+  it('copies .gitignore and .github while omitting .git metadata', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'jinn-adoption-copy-'));
+    const workspace = join(root, 'workspace');
+    directories.push(root);
+    const gitDir = join(root, 'source', '.git');
+    mkdirSync(gitDir, { recursive: true });
+    writeFileSync(join(root, 'source', '.gitignore'), 'dist\n');
+    mkdirSync(join(root, 'source', '.github', 'workflows'), { recursive: true });
+    writeFileSync(join(root, 'source', '.github', 'workflows', 'ci.yml'), 'on: push\n');
+    writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+
+    await copyWorktreeForVerification(join(root, 'source'), workspace);
+    expect(existsSync(join(workspace, '.gitignore'))).toBe(true);
+    expect(existsSync(join(workspace, '.github', 'workflows', 'ci.yml'))).toBe(true);
+    expect(existsSync(join(workspace, '.git', 'HEAD'))).toBe(false);
+  });
+});
+
+describe('production default docker verification sandbox', () => {
+  it('builds network-disabled verification docker argv for verify-phase commands', () => {
+    const plan = buildJinnMonoV1VerificationPlan({
+      repositoryPath: '/repo',
+      touchedPaths: ['packages/autopilot/src/engine.ts'],
+    });
+    const typecheck = plan.commands.find((entry) => entry.label.startsWith('typecheck'));
+    if (typecheck === undefined) throw new Error('missing typecheck command');
+    const invocation = buildMarketplaceVerificationDockerInvocation({
+      repositoryPath: '/repo',
+      workspacePath: '/workspace',
+      command: typecheck,
+      network: 'none',
+      environment: { PATH: '/usr/bin', CI: 'true' },
+    });
+    expect(invocation.argv).toContain('--network');
+    expect(invocation.argv[invocation.argv.indexOf('--network') + 1]).toBe('none');
+    expect(invocation.argv).toContain(JINN_MONO_V1_VERIFICATION_NODE_IMAGE);
+  });
+
+  it('fails closed when the production docker runner returns a non-zero exit code', async () => {
+    const port = createProductionMarketplaceVerificationPort({
+      dockerRunner: async (invocation) => ({
+        exitCode: invocation.label === 'install' ? 0 : 1,
+        stdout: invocation.label,
+        stderr: invocation.label === 'install' ? '' : 'type error',
+      }),
+      dockerInspector: {
+        inspectDaemon: async () => true,
+        inspectImage: async () => true,
+      },
+      cleanup: async () => 'confirmed',
+      prepareWorkspace: async () => {},
+      now: () => new Date('2020-01-01T00:00:00.000Z'),
+    });
+
+    await expect(port.verify({
+      profile: 'jinn-mono.v1',
+      repositoryPath: '/repo',
+      touchedPaths: ['packages/autopilot/src/engine.ts'],
+      artifactDigest: `sha256:${'a'.repeat(64)}`,
+      expectedTree: gitOid('b'.repeat(40)),
+      deadline: '2020-01-01T02:00:00.000Z',
+    })).rejects.toMatchObject({
+      reason: 'command-failed',
+      disposition: 'stable-rejection',
+    });
+  });
+
+  it('honours bounded verification command labels from the jinn-mono.v1 plan', () => {
+    const plan = buildJinnMonoV1VerificationPlan({
+      repositoryPath: '/repo',
+      touchedPaths: ['packages/autopilot/src/engine.ts'],
+    });
+    expect(plan.commands.map((entry) => entry.label)).toEqual([
+      'install',
+      'typecheck:packages/autopilot',
+      'test:packages/autopilot',
+    ]);
+    expect(marketplaceVerificationPlanDigest(plan)).toMatch(/^sha256:[a-f0-9]{64}$/);
+  });
+});
+
+describe('production marketplace authority surfaces', () => {
+  it('returns live open PR head, branch, base, and claim facts', async () => {
+    const { manifest, manifestPath } = fixture();
+    const runner = authorityRunner(manifest);
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot: async () => snapshotForMapping({ status: 'resolved' }) as never,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+
+    const authority = await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: [],
+    });
+    expect(authority.pullRequest).toMatchObject({
+      number: 2101,
+      head: HEAD,
+      headRefName: 'codex/issue-2001',
+      baseRefName: 'next',
+      open: true,
+      mappingStatus: 'resolved',
+      canonicalIssueNumber: 2001,
+    });
+    expect(authority.latestClaimOid).toBe(gitOid(manifest.claimOid));
+    expect(authority.remoteHead).toBe(gitOid(manifest.claimOid));
+  });
+
+  it('accepts a stacked base when the live PR base matches the session target', async () => {
+    const { manifest, manifestPath } = fixture();
+    const stackedBase = 'codex/issue-1999';
+    const runner = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'gh' && args[0] === 'pr') {
+        return JSON.stringify({
+          number: 2101,
+          headRefOid: HEAD,
+          headRefName: 'codex/issue-2001',
+          baseRefName: stackedBase,
+          isDraft: false,
+          labels: [],
+          body: '',
+          state: 'OPEN',
+        });
+      }
+      return authorityRunner(manifest)(command, args);
+    });
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot: async () => snapshotForMapping({ status: 'resolved' }) as never,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+
+    const authority = await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: [],
+    });
+    expect(authority.pullRequest.baseRefName).toBe(stackedBase);
+    expect(authority.latestClaim.targetBase).toBe(gitRefName('next'));
+  });
+
+  it('surfaces a retargeted PR base from live GitHub facts', async () => {
+    const { manifest, manifestPath } = fixture();
+    const runner = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'gh' && args[0] === 'pr') {
+        return JSON.stringify({
+          number: 2101,
+          headRefOid: HEAD,
+          headRefName: 'codex/issue-2001',
+          baseRefName: 'attacker/retarget',
+          isDraft: false,
+          labels: [],
+          body: '',
+          state: 'OPEN',
+        });
+      }
+      return authorityRunner(manifest)(command, args);
+    });
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot: async () => snapshotForMapping({ status: 'resolved' }) as never,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+
+    const authority = await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: [],
+    });
+    expect(authority.pullRequest.baseRefName).toBe('attacker/retarget');
+  });
+
+  it('marks Human dominance from live labels without mutating GitHub state', async () => {
+    const { manifest, manifestPath } = fixture();
+    const runner = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'gh' && args[0] === 'pr') {
+        return JSON.stringify({
+          number: 2101,
+          headRefOid: HEAD,
+          headRefName: 'codex/issue-2001',
+          baseRefName: 'next',
+          isDraft: false,
+          labels: [{ name: 'review:needs-human' }],
+          body: '',
+          state: 'OPEN',
+        });
+      }
+      return authorityRunner(manifest)(command, args);
+    });
+    const readSnapshot = vi.fn(async () => snapshotForMapping({
+      status: 'resolved',
+      labels: ['review:needs-human'],
+    }) as never);
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+
+    const authority = await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: [],
+    });
+    expect(authority.pullRequest.humanActive).toBe(true);
+    expect(readSnapshot).toHaveBeenCalled();
+    expect(runner.mock.calls.every((call) => call[0] !== 'POST')).toBe(true);
+  });
+
+  it('marks CODEOWNER review policy from the live review candidate', async () => {
+    const { manifest, manifestPath } = fixture();
+    const runner = vi.fn(async (command: string, args: string[]) => {
+      if (command === 'gh' && args.some((arg) => arg === `repos/Jinn-Network/mono/pulls/2101`)) {
+        return JSON.stringify({
+          changed_files: 1,
+          head: { sha: HEAD },
+          base: { ref: 'next', sha: '4'.repeat(40) },
+        });
+      }
+      if (command === 'gh' && args.some((arg) => arg.includes('/pulls/2101/files'))) {
+        return JSON.stringify([
+          [{ filename: 'packages/autopilot/src/engine.ts' }],
+        ]);
+      }
+      if (command === 'gh' && args.some((arg) => arg.endsWith('/contents/.github/CODEOWNERS'))) {
+        return JSON.stringify({
+          encoding: 'base64',
+          content: Buffer.from('/packages/autopilot/ @Jinn-Network/codeowners\n').toString('base64'),
+        });
+      }
+      return authorityRunner(manifest)(command, args);
+    });
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot: async () => snapshotForMapping({ status: 'resolved' }) as never,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+    const authority = await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: ['packages/autopilot/src/engine.ts'],
+    });
+    expect(authority.pullRequest.codeOwnerRequired).toBe(true);
+  });
+
+  it('reads authority through the implementation session manifest binding', async () => {
+    const { manifest, manifestPath } = fixture();
+    const runner = authorityRunner(manifest);
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot: async () => snapshotForMapping({ status: 'resolved' }) as never,
+      runner,
+      environment: {
+        PATH: '/usr/bin',
+        GH_TOKEN: 'ambient-secret',
+        GITHUB_TOKEN: 'also-ambient',
+        JINN_AUTOPILOT_SESSION_MANIFEST: '/wrong-manifest.json',
+      },
+    });
+
+    await port.readExactAuthority({ manifestPath, touchedPaths: [] });
+    const ghCalls = runner.mock.calls.filter((call) => call[0] === 'gh');
+    const prViewCall = ghCalls.find((call) => call[1][0] === 'pr');
+    expect(prViewCall).toBeDefined();
+    expect(prViewCall?.[2]?.env?.GH_TOKEN).toBe('attempt-secret');
+    expect(prViewCall?.[2]?.env?.GITHUB_TOKEN).toBe('');
   });
 });

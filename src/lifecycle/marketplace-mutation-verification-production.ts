@@ -6,8 +6,10 @@
  * GitHub, wallet, or RPC credentials from the host.
  */
 
-import { createHash } from 'node:crypto';
+import { spawn, execFile } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
+import { promisify } from 'node:util';
 import { isGitHubSecretEnvironmentKey } from './credentials.js';
 import { exactUtcTimestampMs } from './exact-utc-time.js';
 import type { MarketplaceVerificationEvidence } from './marketplace-execution-state.js';
@@ -20,6 +22,8 @@ import {
   type MarketplaceVerificationCommand,
   type MarketplaceVerificationRunResult,
 } from './marketplace-mutation-verification.js';
+
+const execFileAsync = promisify(execFile);
 
 export const JINN_MONO_V1_VERIFICATION_NODE_IMAGE =
   'node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3';
@@ -276,6 +280,131 @@ async function ensureSandboxCleanup(
       'Marketplace verification sandbox teardown could not be confirmed after SIGKILL',
     );
   }
+}
+
+async function dockerContainerRunning(name: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('docker', [
+      'inspect',
+      '-f',
+      '{{.State.Running}}',
+      name,
+    ]);
+    return stdout.trim() === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function createMarketplaceVerificationDockerInspector(): MarketplaceVerificationDockerInspector {
+  return {
+    inspectDaemon: async () => {
+      try {
+        await execFileAsync('docker', ['info']);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    inspectImage: async (image) => {
+      try {
+        await execFileAsync('docker', ['image', 'inspect', image]);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+export function createMarketplaceVerificationDockerSandbox(): {
+  readonly dockerRunner: MarketplaceVerificationDockerRunner;
+  readonly dockerInspector: MarketplaceVerificationDockerInspector;
+  readonly cleanup: MarketplaceVerificationSandboxCleanup;
+} {
+  const activeContainers = new Set<string>();
+  let activeChild: ReturnType<typeof spawn> | undefined;
+
+  const dockerRunner: MarketplaceVerificationDockerRunner = async (invocation) => {
+    const containerName = `jinn-verify-${randomUUID()}`;
+    const argv = [...invocation.argv];
+    const runIndex = argv.indexOf('run');
+    if (runIndex >= 0) {
+      argv.splice(runIndex + 1, 0, '--name', containerName);
+    }
+    activeContainers.add(containerName);
+
+    return new Promise((resolve, reject) => {
+      const child = spawn('docker', argv, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      activeChild = child;
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const maxBytes = MARKETPLACE_VERIFICATION_SANDBOX_LIMITS.maxRetainedOutputBytes;
+
+      const collectStdout = (chunk: Buffer): void => {
+        if (stdoutBytes + chunk.byteLength > maxBytes) return;
+        stdoutBytes += chunk.byteLength;
+        stdout.push(chunk);
+      };
+      const collectStderr = (chunk: Buffer): void => {
+        if (stderrBytes + chunk.byteLength > maxBytes) return;
+        stderrBytes += chunk.byteLength;
+        stderr.push(chunk);
+      };
+
+      child.stdout.on('data', collectStdout);
+      child.stderr.on('data', collectStderr);
+      child.on('error', (error) => {
+        activeChild = undefined;
+        activeContainers.delete(containerName);
+        reject(error);
+      });
+      child.on('close', (code, signal) => {
+        activeChild = undefined;
+        activeContainers.delete(containerName);
+        const exitCode = code ?? (signal === null ? 1 : 128);
+        resolve({
+          exitCode,
+          stdout: Buffer.concat(stdout).toString('utf8'),
+          stderr: Buffer.concat(stderr).toString('utf8'),
+        });
+      });
+    });
+  };
+
+  const cleanup: MarketplaceVerificationSandboxCleanup = async ({ signal }) => {
+    if (activeChild !== undefined) {
+      activeChild.kill(signal === 'SIGKILL' ? 'SIGKILL' : 'SIGTERM');
+    }
+    const targets = [...activeContainers];
+    for (const name of targets) {
+      try {
+        await execFileAsync('docker', [
+          'kill',
+          ...(signal === 'SIGKILL' ? ['-s', '9'] : ['-s', '15']),
+          name,
+        ]);
+      } catch {
+        // container may already have exited
+      }
+      if (await dockerContainerRunning(name)) {
+        if (signal === 'SIGKILL') return 'ambiguous';
+        continue;
+      }
+      activeContainers.delete(name);
+    }
+    return activeContainers.size === 0 ? 'confirmed' : 'ambiguous';
+  };
+
+  return {
+    dockerRunner,
+    dockerInspector: createMarketplaceVerificationDockerInspector(),
+    cleanup,
+  };
 }
 
 export function createProductionMarketplaceVerificationPort(
