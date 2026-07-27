@@ -637,6 +637,7 @@ export type MarketplacePatchGitRunner = (
     readonly stdin?: Uint8Array;
     readonly timeoutMs: number;
     readonly outputLimitBytes: number;
+    readonly env?: Readonly<Record<string, string>>;
   },
 ) => Promise<Uint8Array>;
 
@@ -678,6 +679,9 @@ export const runMarketplacePatchGit: MarketplacePatchGitRunner = (
   const child = spawn('git', [...args], {
     cwd: options.cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
+    ...(options.env === undefined
+      ? {}
+      : { env: { ...process.env, ...options.env } }),
   });
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
