@@ -318,15 +318,34 @@ export class GitHubUsageMeter {
         hiddenCost = usedDelta - end.cost;
       }
     } else if (endReset > startReset) {
-      if (end.used < end.cost) {
-        this.markIncomplete('opaque-command quota evidence straddled a reset inconsistently');
-      } else {
-        // The exact old-window spend is unknowable across a reset. Treat every
-        // point that remained at the first probe as potentially spent, then add
-        // evidenced new-window usage before the closing probe. This
-        // intentionally over-counts rather than understating a straddling cycle.
-        hiddenCost = start.remaining + end.used - end.cost;
-      }
+      // The span's cost is UNATTRIBUTABLE, not merely imprecise: the two probes
+      // were measured in different quota windows, so no subtraction between
+      // them means anything. `hiddenCost` stays 0 and the gap is declared.
+      //
+      // This previously computed `start.remaining + end.used - end.cost`, i.e.
+      // `limit - usedOld + usedNew - end.cost`, justified as "intentionally
+      // over-counts". That reasoning only holds when the old window was near
+      // exhausted at the opening probe. When BOTH windows are lightly used —
+      // the common case for a cycle that happens to cross the hour boundary —
+      // it approaches `limit`, so a single straddling span charged ~5000 points
+      // to a cycle that spent almost nothing. Observed live as
+      // "GraphQL 5091 points across 91 evidence requests, 4951 remaining",
+      // which is arithmetically impossible against a 5000-point limit.
+      //
+      // markIncomplete, not markApproximate: a straddled reset is a genuine
+      // evidence gap in THIS run's probe design, not an approximation forced by
+      // GitHub's API, so it must keep rendering as a WARNING rather than being
+      // demoted to the expected-approximation channel.
+      //
+      // The former `end.used < end.cost` sub-guard is folded away rather than
+      // kept: it is unreachable (GitHub's `used` includes the closing probe's
+      // own cost, so `end.used >= end.cost` always holds), and now that both
+      // arms would set `hiddenCost = 0` and mark incomplete, a dead branch
+      // distinguishing two messages would only be noise.
+      this.markIncomplete(
+        'an opaque command\'s quota evidence straddled a rate-limit reset, so its '
+          + 'cost cannot be attributed to either window; graphqlCost omits it',
+      );
     } else {
       this.markIncomplete('opaque-command closing probe belonged to an older reset window');
     }

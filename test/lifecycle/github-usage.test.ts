@@ -674,6 +674,145 @@ describe('GitHubUsageMeter', () => {
       cacheHits: 0,
     });
   });
+
+  it('attributes no cost to an opaque span that straddled a rate-limit reset', () => {
+    // The regression this pins. The opening probe was taken in the 13:00 window
+    // and the closing probe in the 14:00 window, both lightly used. The former
+    // `start.remaining + end.used - end.cost` arithmetic mixes an OLD-window
+    // remaining with a NEW-window used, yielding
+    // `limit - usedOld + usedNew - end.cost` = 5000 - 10 + 11 - 1 = 5000 hidden
+    // points for a span that plausibly cost 1. Reconstructed live as
+    // "GraphQL 5091 points across 91 evidence requests, 4951 remaining" —
+    // impossible against a 5000-point limit.
+    //
+    // Across a reset the two probes measure different windows, so no
+    // subtraction between them is meaningful. The only honest answer is to
+    // attribute nothing and say so.
+    const meter = new GitHubUsageMeter();
+
+    meter.recordOpaqueGraphQlSpan(
+      {
+        data: {
+          rateLimit: {
+            cost: 1,
+            remaining: 4_990,
+            used: 10,
+            limit: 5_000,
+            resetAt: '2026-07-22T13:00:00.000Z',
+          },
+        },
+      },
+      {
+        data: {
+          rateLimit: {
+            cost: 1,
+            remaining: 4_989,
+            used: 11,
+            limit: 5_000,
+            resetAt: '2026-07-22T14:00:00.000Z',
+          },
+        },
+      },
+    );
+
+    const usage = meter.read();
+    // The two probe responses and nothing else — no phantom hidden cost.
+    expect(usage.graphqlCost).toBe(2);
+    expect(usage.graphqlRequests).toBe(2);
+    expect(usage.accountingComplete).toBe(false);
+    expect(usage.incompleteReason).toContain('straddled a rate-limit reset');
+    // A straddled reset is a real evidence gap in this run's probe design, not
+    // an approximation forced by GitHub's API, so it must render as a WARNING
+    // rather than being demoted into the expected-approximation channel.
+    expect(usage.incompleteReason)
+      .not.toMatch(new RegExp(`^${EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX}`));
+    // Quota evidence still advances off the newer window's probe.
+    expect(usage.graphqlRemaining).toBe(4_989);
+    expect(usage.graphqlResetAt).toBe('2026-07-22T14:00:00.000Z');
+  });
+
+  it('still attributes hidden cost exactly for a consistent same-window span', () => {
+    // Guards against over-rotating: only the cross-reset branch changes. Within
+    // one window the probes are commensurable, so the unevidenced middle of the
+    // span is still charged exactly.
+    const meter = new GitHubUsageMeter();
+
+    meter.recordOpaqueGraphQlSpan(
+      {
+        data: {
+          rateLimit: {
+            cost: 1,
+            remaining: 998,
+            used: 2,
+            limit: 1_000,
+            resetAt: '2026-07-22T13:00:00.000Z',
+          },
+        },
+      },
+      {
+        data: {
+          rateLimit: {
+            cost: 1,
+            remaining: 990,
+            used: 10,
+            limit: 1_000,
+            resetAt: '2026-07-22T13:00:00.000Z',
+          },
+        },
+      },
+    );
+
+    // usedDelta 8, minus the closing probe's own cost 1, is 7 hidden points;
+    // plus the two probes' own cost of 1 each.
+    expect(meter.read()).toMatchObject({
+      graphqlCost: 9,
+      graphqlRequests: 2,
+      accountingComplete: true,
+    });
+  });
+
+  it('attributes no cost when the closing probe belonged to an older reset window', () => {
+    // The third reset branch, previously also untested. A closing probe from an
+    // EARLIER window than the opening one is out-of-order evidence; nothing can
+    // be attributed from it either.
+    const meter = new GitHubUsageMeter();
+
+    meter.recordOpaqueGraphQlSpan(
+      {
+        data: {
+          rateLimit: {
+            cost: 1,
+            remaining: 4_990,
+            used: 10,
+            limit: 5_000,
+            resetAt: '2026-07-22T14:00:00.000Z',
+          },
+        },
+      },
+      {
+        data: {
+          rateLimit: {
+            cost: 1,
+            remaining: 900,
+            used: 4_100,
+            limit: 5_000,
+            resetAt: '2026-07-22T13:00:00.000Z',
+          },
+        },
+      },
+    );
+
+    const usage = meter.read();
+    expect(usage.graphqlCost).toBe(2);
+    expect(usage.graphqlRequests).toBe(2);
+    expect(usage.accountingComplete).toBe(false);
+    expect(usage.incompleteReason).toContain('older reset window');
+    expect(usage.incompleteReason)
+      .not.toMatch(new RegExp(`^${EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX}`));
+    // The stale older-window probe must not drag the reported quota backwards.
+    expect(usage.graphqlRemaining).toBe(4_990);
+    expect(usage.graphqlResetAt).toBe('2026-07-22T14:00:00.000Z');
+  });
 });
 
 describe('GitHub quota reserves', () => {
