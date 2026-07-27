@@ -637,7 +637,7 @@ describe('attempt workspace and manifest', () => {
       execution: {
         backend: 'marketplace',
         state: {
-          schemaVersion: 'marketplace-execution-v2',
+          schemaVersion: 'marketplace-execution-v3',
           status: 'prepared',
           requestPath: join(manifest.paths.attemptDir, 'marketplace-request.json'),
           preparedAt: NOW,
@@ -885,7 +885,7 @@ describe('attempt workspace and manifest', () => {
       const prepared = readAttemptManifest(manifestPath);
       if (
         prepared.execution.backend !== 'marketplace'
-        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v2'
+        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v3'
       ) {
         throw new Error('expected prepared marketplace execution');
       }
@@ -954,7 +954,7 @@ describe('attempt workspace and manifest', () => {
       const prepared = readAttemptManifest(manifestPath);
       if (
         prepared.execution.backend !== 'marketplace'
-        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v2'
+        || prepared.execution.state.schemaVersion !== 'marketplace-execution-v3'
       ) {
         throw new Error('expected prepared marketplace execution');
       }
@@ -1069,7 +1069,7 @@ describe('attempt workspace and manifest', () => {
           if (
             prepared.execution.backend !== 'marketplace'
             || prepared.execution.state.schemaVersion
-              !== 'marketplace-execution-v2'
+              !== 'marketplace-execution-v3'
           ) {
             throw new Error('expected prepared marketplace manifest');
           }
@@ -1157,7 +1157,7 @@ describe('attempt workspace and manifest', () => {
         if (
           prepared.execution.backend !== 'marketplace'
           || prepared.execution.state.schemaVersion
-            !== 'marketplace-execution-v2'
+            !== 'marketplace-execution-v3'
         ) {
           throw new Error('expected prepared marketplace manifest');
         }
@@ -1262,7 +1262,7 @@ describe('attempt workspace and manifest', () => {
     if (
       raw.manifest.execution.backend !== 'marketplace'
       || raw.manifest.execution.state.schemaVersion
-        !== 'marketplace-execution-v2'
+        !== 'marketplace-execution-v3'
     ) {
       throw new Error('expected marketplace journal');
     }
@@ -1369,9 +1369,9 @@ describe('attempt workspace and manifest', () => {
     }), defaultRunner);
     if (
       manifest.execution.backend !== 'marketplace'
-      || manifest.execution.state.schemaVersion !== 'marketplace-execution-v2'
+      || manifest.execution.state.schemaVersion !== 'marketplace-execution-v3'
     ) {
-      throw new Error('expected a version-2 marketplace execution');
+      throw new Error('expected a version-3 marketplace execution');
     }
 
     const request = verifyMarketplaceTaskRequest(
@@ -1466,9 +1466,9 @@ describe('attempt workspace and manifest', () => {
       }), defaultRunner);
       if (
         manifest.execution.backend !== 'marketplace'
-        || manifest.execution.state.schemaVersion !== 'marketplace-execution-v2'
+        || manifest.execution.state.schemaVersion !== 'marketplace-execution-v3'
       ) {
-        throw new Error('expected a version-2 marketplace execution');
+        throw new Error('expected a version-3 marketplace execution');
       }
 
       expect(verifyMarketplaceTaskRequest(
@@ -1561,6 +1561,55 @@ describe('attempt workspace and manifest', () => {
     });
     expect(cancelled.timestamps.updatedAt).toBe('2026-07-20T00:02:00.000Z');
   });
+
+  // This catches a terminal journal that accepts only legacy v2 prepared manifests.
+  it.each(['submitted', 'cancelled'] as const)(
+    'atomically records a %s terminal outcome for a prepared v3 execution',
+    async (status) => {
+      const fixture = repositoryFixture();
+      const requestDigest = `sha256:${'a'.repeat(64)}`;
+      const attemptDir = join(
+        fixture.base,
+        'v2',
+        'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'implement',
+        `issue-42-${UUID_A}`,
+      );
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        execution: {
+          backend: 'marketplace',
+          state: {
+            schemaVersion: 'marketplace-execution-v3',
+            status: 'prepared',
+            requestPath: join(attemptDir, 'marketplace-request.json'),
+            requestDigest,
+            solverNetSelectionPath: join(attemptDir, 'solvernet-selection.json'),
+            preparedAt: NOW,
+            agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+            adoptionDeadline: '2026-07-20T01:30:00.000Z',
+          },
+        },
+      }), defaultRunner);
+
+      const transitioned = transitionMarketplaceExecution(
+        manifest.paths.manifest,
+        requestDigest,
+        status === 'submitted'
+          ? { status, submission: SUBMISSION_RESULT }
+          : { status, reason: 'operator-cancelled' },
+        () => new Date('2026-07-20T00:02:00.000Z'),
+      );
+
+      expect(transitioned.execution).toMatchObject({
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v3',
+          status,
+          requestDigest,
+        },
+      });
+    },
+  );
 
   it('rejects local and stale-digest transitions before an atomic manifest rewrite', async () => {
     const fixture = repositoryFixture();
@@ -1834,19 +1883,34 @@ describe('attempt workspace and manifest', () => {
     expect(readFileSync(manifest.paths.manifest, 'utf8')).toBe(persisted);
   });
 
-  it('uses one durable terminal winner when submitted and cancelled workers race', async () => {
+  it.each(['marketplace-execution-v2', 'marketplace-execution-v3'] as const)(
+    'uses one durable terminal winner when submitted and cancelled workers race for %s',
+    async (schemaVersion) => {
     const fixture = repositoryFixture();
     const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
     const manifest = await createAttemptWorkspace(options(fixture, {
       execution: {
         backend: 'marketplace',
         state: {
-          schemaVersion: 'marketplace-execution-v2',
+          schemaVersion,
           status: 'prepared',
-          requestPath: join(fixture.root, 'marketplace-request.json'),
+          requestPath: schemaVersion === 'marketplace-execution-v3'
+            ? join(attemptDir, 'marketplace-request.json')
+            : join(fixture.root, 'marketplace-request.json'),
           requestDigest,
-          solverNetSelectionPath: join(fixture.root, 'solvernet-selection.json'),
-          preparedAt: '2026-07-20T00:01:00.000Z',
+          solverNetSelectionPath: schemaVersion === 'marketplace-execution-v3'
+            ? join(attemptDir, 'solvernet-selection.json')
+            : join(fixture.root, 'solvernet-selection.json'),
+          preparedAt: schemaVersion === 'marketplace-execution-v3'
+            ? NOW
+            : '2026-07-20T00:01:00.000Z',
           agentSoftDeadline: '2026-07-20T01:00:00.000Z',
           adoptionDeadline: '2026-07-20T01:30:00.000Z',
         },
@@ -1884,7 +1948,8 @@ describe('attempt workspace and manifest', () => {
     });
     expect((current.execution as { state: Record<string, unknown> }).state.requestDigest)
       .toBe(terminal.requestDigest);
-  });
+    },
+  );
 
   it('repairs a prepared manifest from committed terminal evidence after a crash before rename', async () => {
     const fixture = repositoryFixture();

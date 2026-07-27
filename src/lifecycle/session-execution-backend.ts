@@ -27,6 +27,7 @@ import {
   transitionMarketplaceExecution,
   type AttemptManifest,
 } from './attempt-workspace.js';
+import { MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION } from './marketplace-execution-state.js';
 import {
   MARKETPLACE_LANGUAGE,
   MARKETPLACE_REPOSITORY,
@@ -257,7 +258,9 @@ interface VerifiedMarketplaceExecution {
     AttemptManifest['execution'],
     { readonly backend: 'marketplace' }
   >['state'] & {
-    readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+    readonly schemaVersion:
+      | typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      | typeof MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION;
   };
 }
 
@@ -364,10 +367,12 @@ export class MarketplaceSessionExecutionBackend
     const manifest = this.readManifest(request.manifestPath);
     if (
       manifest.execution.backend !== 'marketplace'
-      || manifest.execution.state.schemaVersion
+      || (manifest.execution.state.schemaVersion
         !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+        && manifest.execution.state.schemaVersion
+          !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION)
     ) {
-      throw new Error('Marketplace execution requires a version-2 marketplace attempt');
+      throw new Error('Marketplace execution requires a version-2 or version-3 marketplace attempt');
     }
     const state = manifest.execution.state;
     const expectedRequestPath = join(
@@ -491,8 +496,10 @@ export class MarketplaceSessionExecutionBackend
   private startedIdentity(manifest: AttemptManifest): SessionExecutionResult {
     if (
       manifest.execution.backend !== 'marketplace'
-      || manifest.execution.state.schemaVersion
+      || (manifest.execution.state.schemaVersion
         !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+        && manifest.execution.state.schemaVersion
+          !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION)
       || manifest.execution.state.status !== 'submitted'
     ) {
       throw new Error('Marketplace submission did not persist submitted state');
@@ -571,8 +578,10 @@ export async function recoverPreparedMarketplaceAttempts(
         }
         if (
           manifest.execution.backend !== 'marketplace'
-          || manifest.execution.state.schemaVersion
-            !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+          || (
+            manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+            && manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+          )
           || manifest.execution.state.status !== 'prepared'
         ) {
           continue;
