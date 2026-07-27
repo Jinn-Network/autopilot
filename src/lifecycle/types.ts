@@ -14,7 +14,25 @@ export function decodeCompareStatus(value: unknown): CompareStatus {
 }
 
 const OID_PATTERN = /^[0-9a-f]{40}$/;
-const INVALID_REF_PATTERN = /[\u0000-\u0020\u007f~^:?*[\]\\]/;
+/**
+ * Exactly the single characters `git check-ref-format` forbids: ASCII control
+ * characters and space (`\u0000`-`\u0020`), DEL (`\u007f`), and `~ ^ : ? * [ \`.
+ *
+ * `]` is deliberately absent. Git accepts it -- `git check-ref-format
+ * refs/heads/feat/x]y` exits 0 -- and it is inert in a URL path, so rejecting
+ * it only ever produced false negatives. That became load-bearing once
+ * `github-reader` started passing arbitrary PR base refs through `gitRefName`:
+ * one PR based on a branch containing `]` threw and aborted the *entire*
+ * snapshot read, not just that PR. Fail-closed with a repo-wide blast radius is
+ * still an outage.
+ *
+ * Everything that can change what a compare/contents URL means is still
+ * rejected, here or by the structural rules in `gitRefName`. `..` in particular
+ * must stay rejected: it is what stops a base branch named `x...y` from
+ * injecting a second `...` separator into `compare/heads/{base}...{head}` and
+ * silently changing which comparison is performed.
+ */
+const INVALID_REF_PATTERN = /[\u0000-\u0020\u007f~^:?*[\\]/;
 
 export function gitOid(value: string): GitOid {
   if (!OID_PATTERN.test(value)) {

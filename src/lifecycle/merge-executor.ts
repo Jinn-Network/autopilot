@@ -109,6 +109,40 @@ export type ExactMergeOutcome =
       readonly reason?: string;
     };
 
+/**
+ * Why an `update-branch` attempt did not move the head. The port classifies the
+ * failure once, at the only place that can still see the error text; every
+ * consumer downstream reasons about the class, never about a raw message.
+ *
+ * `conflict` and `forbidden` are *durable*: the head will not move without
+ * human intervention (a real merge conflict; a branch-protection, permission,
+ * or credential refusal). `queued`, `rate-limited`, `unavailable` and
+ * `unclassified` are *undetermined*: the request may have been accepted, may
+ * have been throttled, or may never have reached GitHub, and a later identical
+ * attempt can still succeed.
+ */
+export const UPDATE_BRANCH_FAILURE_CLASSES = [
+  'conflict',
+  'forbidden',
+  'queued',
+  'rate-limited',
+  'unavailable',
+  'unclassified',
+] as const;
+
+export type UpdateBranchFailureClass = typeof UPDATE_BRANCH_FAILURE_CLASSES[number];
+
+export const DURABLE_UPDATE_BRANCH_FAILURES: ReadonlySet<UpdateBranchFailureClass> =
+  new Set<UpdateBranchFailureClass>(['conflict', 'forbidden']);
+
+export type UpdateBranchOutcome =
+  | { readonly status: 'updated' | 'changed-head'; readonly head: GitOid }
+  | {
+      readonly status: 'rejected' | 'pending';
+      readonly head: GitOid;
+      readonly failure: UpdateBranchFailureClass;
+    };
+
 export interface MergeExecutorDeps {
   readCandidate(prNumber: number): Promise<MergeCandidate | null>;
   readonly credentials: CredentialPool;
@@ -128,7 +162,7 @@ export interface MergeExecutorDeps {
     readonly prNumber: number;
     readonly expectedHead: GitOid;
     readonly credential: SelectedCredential;
-  }): Promise<{ readonly status: 'updated' | 'changed-head' | 'rejected'; readonly head: GitOid }>;
+  }): Promise<UpdateBranchOutcome>;
   fileReconcileChild?(input: {
     readonly prNumber: number;
     readonly effort: 'low' | 'medium' | 'high';
@@ -292,10 +326,29 @@ export async function executeMergeAction(
   };
 }
 
+/**
+ * `pending` is a first-class outcome, not a flavour of `rejected`.
+ *
+ * `PUT /repos/{o}/{r}/pulls/{n}/update-branch` is documented to answer **202
+ * Accepted**: GitHub *queues* the update and the PR head has not moved by the
+ * time the call returns. The previous implementation read the head back once
+ * and called an unchanged head `rejected`, which reported a merge conflict for
+ * an update that was merely in flight, and equally for a 403 branch-protection
+ * refusal, a secondary rate limit, and a dropped connection. Live evidence:
+ * PR #2130's update-branch was reported `rejected`; the identical operation
+ * later succeeded with nothing changed but time.
+ *
+ * `rejected` now means only "GitHub durably refused" (`conflict` / `forbidden`).
+ * `pending` means "undetermined, retry is meaningful". Neither is `updated`.
+ */
 export type UpdateBranchResult =
   | { readonly status: 'updated'; readonly prNumber: number; readonly head: GitOid }
   | { readonly status: 'changed-head'; readonly prNumber: number; readonly head: GitOid }
-  | { readonly status: 'ineligible' | 'rejected'; readonly prNumber: number; readonly reason: string };
+  | {
+      readonly status: 'ineligible' | 'rejected' | 'pending';
+      readonly prNumber: number;
+      readonly reason: string;
+    };
 
 export async function executeUpdateBranchAction(
   action: { readonly prNumber: number; readonly expectedHead: GitOid },
@@ -320,13 +373,38 @@ export async function executeUpdateBranchAction(
     expectedHead: action.expectedHead,
     credential: selection.credential,
   });
-  if (outcome.status === 'changed-head') {
-    return { status: 'changed-head', prNumber: action.prNumber, head: outcome.head };
+  // Fail closed by construction: `updated` is reachable only from the single
+  // literal `updated` arm. Every other arm — including the `default`, which
+  // TypeScript proves unreachable today and which exists so that a variant
+  // added later cannot silently inherit success — lands on a non-success
+  // status. There is no fallthrough `return { status: 'updated' }`.
+  switch (outcome.status) {
+    case 'updated':
+      return { status: 'updated', prNumber: action.prNumber, head: outcome.head };
+    case 'changed-head':
+      return { status: 'changed-head', prNumber: action.prNumber, head: outcome.head };
+    case 'rejected':
+      return {
+        status: 'rejected',
+        prNumber: action.prNumber,
+        reason: `update-branch-${outcome.failure}`,
+      };
+    case 'pending':
+      return {
+        status: 'pending',
+        prNumber: action.prNumber,
+        reason: `update-branch-${outcome.failure}`,
+      };
+    default: {
+      const exhaustive: never = outcome;
+      void exhaustive;
+      return {
+        status: 'pending',
+        prNumber: action.prNumber,
+        reason: 'update-branch-unclassified',
+      };
+    }
   }
-  if (outcome.status === 'rejected') {
-    return { status: 'rejected', prNumber: action.prNumber, reason: 'update-branch-rejected' };
-  }
-  return { status: 'updated', prNumber: action.prNumber, head: outcome.head };
 }
 
 export type FileReconcileChildResult =

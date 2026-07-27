@@ -3,6 +3,7 @@ import { CredentialPool } from '../../src/lifecycle/credentials.js';
 import {
   evaluateMergeGate,
   executeMergeAction,
+  executeUpdateBranchAction,
   type MergeCandidate,
   type MergeExecutorDeps,
 } from '../../src/lifecycle/merge-executor.js';
@@ -211,5 +212,100 @@ describe('merge gate approval authority is not loosened', () => {
     }));
     expect(result.pass).toBe(false);
     expect(result.reasons).toContain('terminal-approval');
+  });
+});
+
+/**
+ * `update-branch` outcome mapping. The old executor ended with an unconditional
+ * `return { status: 'updated' }`, so every outcome that was neither
+ * `changed-head` nor `rejected` was reported to the operator as a successful
+ * branch update. That is the fail-open shape these tests pin shut.
+ */
+describe('update-branch outcome mapping fails closed', () => {
+  const updateHarness = (
+    outcome: Awaited<ReturnType<NonNullable<MergeExecutorDeps['updateBranch']>>>,
+  ) => ({
+    ...harness().deps,
+    updateBranch: async () => outcome,
+  });
+
+  it('reports an accepted-but-queued update as pending, never as updated', async () => {
+    const result = await executeUpdateBranchAction(
+      { prNumber: 84, expectedHead: HEAD },
+      updateHarness({ status: 'pending', head: HEAD, failure: 'queued' }),
+    );
+
+    expect(result).toEqual({
+      status: 'pending',
+      prNumber: 84,
+      reason: 'update-branch-queued',
+    });
+  });
+
+  it.each([
+    ['rate-limited', 'pending'],
+    ['unavailable', 'pending'],
+    ['unclassified', 'pending'],
+  ] as const)('reports a %s outcome as %s', async (failure, status) => {
+    const result = await executeUpdateBranchAction(
+      { prNumber: 84, expectedHead: HEAD },
+      updateHarness({ status: 'pending', head: HEAD, failure }),
+    );
+
+    expect(result).toMatchObject({ status, reason: `update-branch-${failure}` });
+  });
+
+  it.each(['conflict', 'forbidden'] as const)(
+    'keeps a durable %s refusal a rejection and names the class',
+    async (failure) => {
+      const result = await executeUpdateBranchAction(
+        { prNumber: 84, expectedHead: HEAD },
+        updateHarness({ status: 'rejected', head: HEAD, failure }),
+      );
+
+      expect(result).toEqual({
+        status: 'rejected',
+        prNumber: 84,
+        reason: `update-branch-${failure}`,
+      });
+    },
+  );
+
+  it('still reports a genuine head move as updated', async () => {
+    const moved = gitOid('7'.repeat(40));
+    const result = await executeUpdateBranchAction(
+      { prNumber: 84, expectedHead: HEAD },
+      updateHarness({ status: 'updated', head: moved }),
+    );
+
+    expect(result).toEqual({ status: 'updated', prNumber: 84, head: moved });
+  });
+
+  /**
+   * A variant nobody has taught the executor about. TypeScript proves this
+   * unreachable today; the runtime arm exists so that adding a case to
+   * `UpdateBranchOutcome` and forgetting this switch cannot make the new case
+   * inherit success.
+   */
+  it('never reports an unhandled outcome variant as updated', async () => {
+    const result = await executeUpdateBranchAction(
+      { prNumber: 84, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        updateBranch: async () => ({
+          status: 'queued-somewhere-new',
+          head: HEAD,
+        }) as unknown as Awaited<
+        ReturnType<NonNullable<MergeExecutorDeps['updateBranch']>>
+        >,
+      },
+    );
+
+    expect(result.status).not.toBe('updated');
+    expect(result).toEqual({
+      status: 'pending',
+      prNumber: 84,
+      reason: 'update-branch-unclassified',
+    });
   });
 });
