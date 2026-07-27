@@ -585,6 +585,15 @@ describe('GhLifecycleReader', () => {
     // Genuinely unset: refuse, do not invent a shape.
     await expect(readerFor(null).readProjectItemForReconciliation(42))
       .resolves.toMatchObject({ issueType: null });
+    // Field absent entirely — what `issue?.issueType` actually yields when the
+    // selection is missing. Must behave like `null`, not throw on `node.name`.
+    await expect(readerFor(undefined).readProjectItemForReconciliation(42))
+      .resolves.toMatchObject({ issueType: null });
+    // Malformed `name`: refuse rather than propagate a non-shape value. The
+    // vocabulary lookup already rejects it, so this pins the outcome, not the
+    // `typeof` guard — that guard exists to narrow `name` for the cast.
+    await expect(readerFor({ name: 123 }).readProjectItemForReconciliation(42))
+      .resolves.toMatchObject({ issueType: null });
     // Organisation-defined type outside the lifecycle vocabulary: refuse, and do
     // not throw — an unknown type is an ineligible issue, not a broken cycle.
     await expect(readerFor({ name: 'Bug' }).readProjectItemForReconciliation(42))

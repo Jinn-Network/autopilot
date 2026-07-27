@@ -16,6 +16,7 @@ import type {
   Priority,
   ProjectStatus,
 } from '../dispatcher/types.js';
+import { ISSUE_SHAPE_SET } from '../dispatcher/types.js';
 import type {
   GitHubLifecycleReader,
   PullRequestPage,
@@ -257,6 +258,11 @@ const PROJECT_ITEM_BY_ISSUE_QUERY =
   }
 }`;
 
+/**
+ * Same trap as `PROJECT_ITEM_BY_ISSUE_QUERY` above: the issue type must be read
+ * off the native `Issue.issueType`, never off a `fieldValueByName(name: "Type")`
+ * that GraphQL will silently resolve to null forever.
+ */
 const ISSUE_ACTION_CONTEXT_QUERY =
 `query($owner: String!, $name: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
@@ -292,7 +298,7 @@ interface ProjectItemByIssueNode {
 }
 
 /** Native `Issue.issueType`; absent or null when the issue has no type set. */
-type NativeIssueTypeNode = { readonly name?: unknown } | null | undefined;
+type NativeIssueTypeNode = { readonly name: string } | null | undefined;
 
 interface ProjectItemByIssueResponse {
   data: {
@@ -333,9 +339,6 @@ const VALID_PROJECT_STATUS = new Set<string>([
 const VALID_BLOCKED_ON = new Set<string>(['Nothing', 'Human', 'Another issue']);
 const VALID_PRIORITY = new Set<string>(['P0', 'P1', 'P2', 'P3', 'P4']);
 const VALID_EFFORT = new Set<string>(['Low', 'Medium', 'High', 'XHigh', 'Max']);
-const VALID_ISSUE_TYPE = new Set<string>([
-  'feat', 'fix', 'refactor', 'spike', 'chore', 'docs', 'test', 'incident', 'design',
-]);
 
 function parseProjectStatus(name: string | undefined): ProjectStatus | null {
   return name !== undefined && VALID_PROJECT_STATUS.has(name) ? (name as ProjectStatus) : null;
@@ -361,12 +364,15 @@ function parseSelected<Value extends string>(
  * Coerce an unrecognised native issue type to `null` rather than throwing, so
  * an organisation-defined type outside the lifecycle vocabulary makes the issue
  * ineligible instead of aborting the cycle. Mirrors `parseShape` in
- * `dispatcher/project-snapshot.ts`, which decodes the same native field.
+ * `dispatcher/project-snapshot.ts`, which decodes the same native field, and
+ * shares its `ISSUE_SHAPE_SET`: re-listing the shapes here would let a tenth
+ * shape be accepted by the observer and decoded as `null` by the claim path —
+ * the exact divergence this parser exists to close.
  */
 function parseNativeIssueType(node: NativeIssueTypeNode): IssueShape | null {
   const name = node?.name;
   if (typeof name !== 'string') return null;
-  return VALID_ISSUE_TYPE.has(name) ? (name as IssueShape) : null;
+  return ISSUE_SHAPE_SET.has(name as IssueShape) ? (name as IssueShape) : null;
 }
 
 function decodeTargetedProjectItem(
