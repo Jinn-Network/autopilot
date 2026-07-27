@@ -122,7 +122,7 @@ export function makeProductionMergeActionPort(
       context: 'Merge',
       repositorySlug,
     });
-    const { baseOid, files } = changedFiles;
+    const { baseOid, baseRefName: compareBaseRefName, files } = changedFiles;
     let codeownersResponse: string;
     try {
       codeownersResponse = await runner('gh', [
@@ -141,9 +141,15 @@ export function makeProductionMergeActionPort(
     if (typeof codeownersRaw.content !== 'string') {
       throw new Error('Merge CODEOWNERS read was incomplete');
     }
+    // `baseOid` is the PR's pinned fork point: correct for the CODEOWNERS blob
+    // read above, wrong for staleness. It never advances with the base branch,
+    // so comparing against it can only ever yield `ahead`/`identical` and made
+    // the `behind` merge-gate reason unreachable. Compare against the base
+    // branch name so GitHub resolves it to the current tip. See
+    // `readExactCompareStatus` for the race analysis.
     const compare = JSON.parse(await runner('gh', [
       'api',
-      `repos/${repositorySlug}/compare/${baseOid}...${pr.headOid}`,
+      `repos/${repositorySlug}/compare/${compareBaseRefName}...${pr.headOid}`,
     ])) as { status?: unknown };
     const compareStatus = decodeCompareStatus(compare.status);
     const effectiveReviews = effectiveCurrentHeadReviews(pr);

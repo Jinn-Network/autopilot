@@ -883,8 +883,10 @@ describe('buildGitHubLifecycleSnapshot', () => {
           derivedMergeAction !== undefined
           && endpoint?.startsWith('repos/Jinn-Network/mono/compare/')
         ) {
+          // Compare resolves the base branch tip, not the pinned `base.sha`
+          // fork point ('e' * 40) which is reserved for CODEOWNERS.
           expect(endpoint).toBe(
-            `repos/Jinn-Network/mono/compare/${'e'.repeat(40)}...`
+            'repos/Jinn-Network/mono/compare/autopilot/2083...'
             + derivedMergeAction.head,
           );
           return JSON.stringify({ status: 'ahead' });
