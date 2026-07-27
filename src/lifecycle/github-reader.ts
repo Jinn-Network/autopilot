@@ -16,6 +16,7 @@ import type {
   Priority,
   ProjectStatus,
 } from '../dispatcher/types.js';
+import { ISSUE_SHAPE_SET } from '../dispatcher/types.js';
 import type {
   GitHubLifecycleReader,
   PullRequestPage,
@@ -226,12 +227,22 @@ function parseSingleReviewClaimRef(raw: string, ref: GitRefName): GitOid | null 
  * world Project-board snapshot (`fetchProjectSnapshot`) reads for every
  * item, scoped to one issue via `Issue.projectItems` instead of paginating
  * the whole board (~91 pages measured on the live board).
+ *
+ * The issue type is read off the native `Issue.issueType`, not off the board:
+ * the Project's "Type" column is a read-only projection of the native type and
+ * GraphQL exposes no `ProjectV2` field by that name, so
+ * `fieldValueByName(name: "Type")` resolves to null for every item. Only REST
+ * projects the native type as a board field (`data_type: 'issue_type'`), which
+ * is why the incremental snapshot reads it from REST while every GraphQL path
+ * reads the native field: `content { ... on Issue { issueType } }` in the board
+ * snapshot, `issue { issueType }` here.
  */
 const PROJECT_ITEM_BY_ISSUE_QUERY =
 `query($owner: String!, $name: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
+      issueType { name }
       projectItems(first: 10) {
         pageInfo { hasNextPage }
         nodes {
@@ -241,18 +252,23 @@ const PROJECT_ITEM_BY_ISSUE_QUERY =
           priority:  fieldValueByName(name: "Priority")   { ... on ProjectV2ItemFieldSingleSelectValue { name } }
           effort:    fieldValueByName(name: "Effort")     { ... on ProjectV2ItemFieldSingleSelectValue { name } }
           blockedOn: fieldValueByName(name: "Blocked on") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
-          issueType: fieldValueByName(name: "Type")       { ... on ProjectV2ItemFieldSingleSelectValue { name } }
         }
       }
     }
   }
 }`;
 
+/**
+ * Same trap as `PROJECT_ITEM_BY_ISSUE_QUERY` above: the issue type must be read
+ * off the native `Issue.issueType`, never off a `fieldValueByName(name: "Type")`
+ * that GraphQL will silently resolve to null forever.
+ */
 const ISSUE_ACTION_CONTEXT_QUERY =
 `query($owner: String!, $name: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
+      issueType { name }
       projectItems(first: 10) {
         pageInfo { hasNextPage }
         nodes {
@@ -262,7 +278,6 @@ const ISSUE_ACTION_CONTEXT_QUERY =
           priority:  fieldValueByName(name: "Priority")   { ... on ProjectV2ItemFieldSingleSelectValue { name } }
           effort:    fieldValueByName(name: "Effort")     { ... on ProjectV2ItemFieldSingleSelectValue { name } }
           blockedOn: fieldValueByName(name: "Blocked on") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
-          issueType: fieldValueByName(name: "Type")       { ... on ProjectV2ItemFieldSingleSelectValue { name } }
         }
       }
       closedByPullRequestsReferences(first: 100, includeClosedPrs: true) {
@@ -280,13 +295,16 @@ interface ProjectItemByIssueNode {
   readonly priority: { readonly name: string } | null;
   readonly effort: { readonly name: string } | null;
   readonly blockedOn: { readonly name: string } | null;
-  readonly issueType: { readonly name: string } | null;
 }
+
+/** Native `Issue.issueType`; absent or null when the issue has no type set. */
+type NativeIssueTypeNode = { readonly name: string } | null | undefined;
 
 interface ProjectItemByIssueResponse {
   data: {
     repository: {
       issue: {
+        issueType: NativeIssueTypeNode;
         projectItems: {
           pageInfo: { hasNextPage: boolean };
           nodes: ProjectItemByIssueNode[];
@@ -301,6 +319,7 @@ interface IssueActionContextResponse {
     rateLimit: { cost: number; remaining: number; resetAt: string };
     repository: {
       issue: null | {
+        issueType: NativeIssueTypeNode;
         projectItems: {
           pageInfo: { hasNextPage: boolean };
           nodes: ProjectItemByIssueNode[];
@@ -320,9 +339,6 @@ const VALID_PROJECT_STATUS = new Set<string>([
 const VALID_BLOCKED_ON = new Set<string>(['Nothing', 'Human', 'Another issue']);
 const VALID_PRIORITY = new Set<string>(['P0', 'P1', 'P2', 'P3', 'P4']);
 const VALID_EFFORT = new Set<string>(['Low', 'Medium', 'High', 'XHigh', 'Max']);
-const VALID_ISSUE_TYPE = new Set<string>([
-  'feat', 'fix', 'refactor', 'spike', 'chore', 'docs', 'test', 'incident', 'design',
-]);
 
 function parseProjectStatus(name: string | undefined): ProjectStatus | null {
   return name !== undefined && VALID_PROJECT_STATUS.has(name) ? (name as ProjectStatus) : null;
@@ -344,8 +360,24 @@ function parseSelected<Value extends string>(
   return node.name as Value;
 }
 
+/**
+ * Coerce an unrecognised native issue type to `null` rather than throwing, so
+ * an organisation-defined type outside the lifecycle vocabulary makes the issue
+ * ineligible instead of aborting the cycle. Mirrors `parseShape` in
+ * `dispatcher/project-snapshot.ts`, which decodes the same native field, and
+ * shares its `ISSUE_SHAPE_SET`: re-listing the shapes here would let a tenth
+ * shape be accepted by the observer and decoded as `null` by the claim path —
+ * the exact divergence this parser exists to close.
+ */
+function parseNativeIssueType(node: NativeIssueTypeNode): IssueShape | null {
+  const name = node?.name;
+  if (typeof name !== 'string') return null;
+  return ISSUE_SHAPE_SET.has(name as IssueShape) ? (name as IssueShape) : null;
+}
+
 function decodeTargetedProjectItem(
   nodes: readonly ProjectItemByIssueNode[],
+  nativeIssueType: NativeIssueTypeNode,
   projectNumber = PROJECT_NUMBER,
 ): {
   readonly id: string;
@@ -363,7 +395,7 @@ function decodeTargetedProjectItem(
     priority: parseSelected<Priority>(node.priority, VALID_PRIORITY, 'Priority'),
     effort: parseSelected<Effort>(node.effort, VALID_EFFORT, 'Effort'),
     blockedOn: parseBlockedOn(node.blockedOn?.name),
-    issueType: parseSelected<IssueShape>(node.issueType, VALID_ISSUE_TYPE, 'Type'),
+    issueType: parseNativeIssueType(nativeIssueType),
   };
 }
 
@@ -1495,12 +1527,13 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       '-F', `number=${issueNumber}`,
     ]);
     const response = JSON.parse(raw) as ProjectItemByIssueResponse;
-    const projectItems = response.data.repository.issue?.projectItems;
+    const issue = response.data.repository.issue;
+    const projectItems = issue?.projectItems;
     if (projectItems?.pageInfo.hasNextPage === true) {
       throw new Error('Targeted Project-item pagination exceeded its fixed limit');
     }
     const nodes = projectItems?.nodes ?? [];
-    return decodeTargetedProjectItem(nodes, this.projectNumber);
+    return decodeTargetedProjectItem(nodes, issue?.issueType, this.projectNumber);
   }
 
   /**
@@ -1547,6 +1580,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     return {
       projectItem: decodeTargetedProjectItem(
         issue.projectItems.nodes,
+        issue.issueType,
         this.projectNumber,
       ),
       openPullRequestNumbers,

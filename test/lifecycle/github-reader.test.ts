@@ -476,6 +476,7 @@ describe('GhLifecycleReader', () => {
           },
           repository: {
             issue: {
+              issueType: { name: 'fix' },
               projectItems: {
                 pageInfo: { hasNextPage: false },
                 nodes: [{
@@ -485,7 +486,6 @@ describe('GhLifecycleReader', () => {
                   priority: { name: 'P1' },
                   effort: { name: 'Medium' },
                   blockedOn: { name: 'Nothing' },
-                  issueType: { name: 'fix' },
                 }],
               },
             },
@@ -507,12 +507,97 @@ describe('GhLifecycleReader', () => {
     expect(query).toContain('rateLimit { cost remaining resetAt }');
     expect(query).toContain('fieldValueByName(name: "Priority")');
     expect(query).toContain('fieldValueByName(name: "Effort")');
-    expect(query).toContain('fieldValueByName(name: "Type")');
     expect(reader.githubUsage()).toMatchObject({
       graphqlRequests: 1,
       graphqlCost: 3,
       graphqlRemaining: 4_997,
     });
+  });
+
+  it('reads the native issue type, which GraphQL never exposes as a Project field', async () => {
+    // GitHub's GraphQL API has no ProjectV2 "Type" field: the board column is a
+    // projection of the native issue type, and `fieldValueByName(name: "Type")`
+    // resolves to null on every item. Only `Issue.issueType` carries it.
+    let query = '';
+    const run: CommandRunner = async (_command, args) => {
+      query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      return JSON.stringify({
+        data: {
+          rateLimit: { cost: 1, remaining: 4_999, resetAt: '2026-07-22T13:00:00.000Z' },
+          repository: {
+            issue: {
+              issueType: { name: 'fix' },
+              projectItems: {
+                pageInfo: { hasNextPage: false },
+                nodes: [{
+                  id: 'PVTI_42',
+                  project: { number: 1 },
+                  status: { name: 'Todo' },
+                  priority: { name: 'P3' },
+                  effort: { name: 'Medium' },
+                  blockedOn: { name: 'Nothing' },
+                }],
+              },
+            },
+          },
+        },
+      });
+    };
+
+    await expect(new GhLifecycleReader(run).readProjectItemForReconciliation(42))
+      .resolves.toEqual({
+        id: 'PVTI_42',
+        status: 'Todo',
+        priority: 'P3',
+        effort: 'Medium',
+        blockedOn: 'Nothing',
+        issueType: 'fix',
+      });
+    expect(query).toContain('issueType { name }');
+    expect(query).not.toContain('fieldValueByName(name: "Type")');
+  });
+
+  it('fails closed when the native issue type is unset or unrecognised', async () => {
+    const readerFor = (issueType: unknown): GhLifecycleReader => new GhLifecycleReader(
+      async () => JSON.stringify({
+        data: {
+          rateLimit: { cost: 1, remaining: 4_999, resetAt: '2026-07-22T13:00:00.000Z' },
+          repository: {
+            issue: {
+              issueType,
+              projectItems: {
+                pageInfo: { hasNextPage: false },
+                nodes: [{
+                  id: 'PVTI_42',
+                  project: { number: 1 },
+                  status: { name: 'Todo' },
+                  priority: { name: 'P3' },
+                  effort: { name: 'Medium' },
+                  blockedOn: { name: 'Nothing' },
+                }],
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    // Genuinely unset: refuse, do not invent a shape.
+    await expect(readerFor(null).readProjectItemForReconciliation(42))
+      .resolves.toMatchObject({ issueType: null });
+    // Field absent entirely — what `issue?.issueType` actually yields when the
+    // selection is missing. Must behave like `null`, not throw on `node.name`.
+    await expect(readerFor(undefined).readProjectItemForReconciliation(42))
+      .resolves.toMatchObject({ issueType: null });
+    // Malformed `name`: refuse rather than propagate a non-shape value. The
+    // vocabulary lookup already rejects it, so this pins the outcome, not the
+    // `typeof` guard — that guard exists to narrow `name` for the cast.
+    await expect(readerFor({ name: 123 }).readProjectItemForReconciliation(42))
+      .resolves.toMatchObject({ issueType: null });
+    // Organisation-defined type outside the lifecycle vocabulary: refuse, and do
+    // not throw — an unknown type is an ineligible issue, not a broken cycle.
+    await expect(readerFor({ name: 'Bug' }).readProjectItemForReconciliation(42))
+      .resolves.toMatchObject({ issueType: null });
   });
 
   it('fails closed when the direct targeted Project-item lookup exceeds its fixed limit', async () => {
@@ -540,6 +625,7 @@ describe('GhLifecycleReader', () => {
           rateLimit: { cost: 2, remaining: 4_998, resetAt: '2026-07-22T13:00:00.000Z' },
           repository: {
             issue: {
+              issueType: { name: 'fix' },
               projectItems: {
                 pageInfo: { hasNextPage: false },
                 nodes: [{
@@ -549,7 +635,6 @@ describe('GhLifecycleReader', () => {
                   priority: { name: 'P1' },
                   effort: { name: 'Medium' },
                   blockedOn: { name: 'Nothing' },
-                  issueType: { name: 'fix' },
                 }],
               },
               closedByPullRequestsReferences: {
@@ -567,11 +652,17 @@ describe('GhLifecycleReader', () => {
     const reader = new GhLifecycleReader(run);
 
     await expect(reader.readIssueActionContextForReconciliation(42)).resolves.toEqual({
-      projectItem: expect.objectContaining({ id: 'PVTI_42', status: 'In Progress' }),
+      projectItem: expect.objectContaining({
+        id: 'PVTI_42',
+        status: 'In Progress',
+        issueType: 'fix',
+      }),
       openPullRequestNumbers: new Set([101]),
     });
     expect(query).toContain('projectItems(first: 10)');
     expect(query).toContain('closedByPullRequestsReferences(first: 100, includeClosedPrs: true)');
+    expect(query).toContain('issueType { name }');
+    expect(query).not.toContain('fieldValueByName(name: "Type")');
     expect(reader.githubUsage()).toMatchObject({ graphqlRequests: 1, graphqlCost: 2 });
   });
 
