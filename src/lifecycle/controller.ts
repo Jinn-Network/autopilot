@@ -676,6 +676,7 @@ function eventFor(
     ...('expectedHead' in action ? { head: action.expectedHead } : {}),
     action: action.kind,
     outcome: result.outcome,
+    ...(result.detail === undefined ? {} : { reason: result.detail }),
   };
 }
 

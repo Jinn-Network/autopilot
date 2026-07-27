@@ -1992,6 +1992,86 @@ describe('lifecycle controller', () => {
     expect(calls).toEqual([]);
   });
 
+  it('reports the cause of a reconciliation failure instead of a bare failed outcome', async () => {
+    // Regression: eventFor built reconciliation log events without copying
+    // ReconciliationResult.detail onto LifecycleLogEvent.reason, so every
+    // reconciliation failure rendered as a bare `failed.` while sibling action
+    // events (actionEvent) printed their reason. A live canary lost the cause
+    // of a systematic 7/7 ensure-draft-pr failure loop to this hole.
+    const calls: string[] = [];
+    const eligibleIssue: LifecycleItem = {
+      kind: 'issue',
+      issueNumber: 42,
+      v2Marked: false,
+      projectStatus: 'Todo',
+      labels: [],
+      eligible: true,
+      eligibilityReason: 'eligible',
+      eligibilityDetail: 'All implementation admission gates pass',
+    };
+    const orphanSnapshot: GitHubLifecycleSnapshot = {
+      ...snapshot(eligibleIssue),
+      branches: [{
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        headOid: HEAD,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        claim: implementation().branchClaim!,
+      }],
+      terminalClaims: [{
+        issueNumber: 42,
+        prNumber: 101,
+        headRefName: 'autopilot/42',
+        headOid: gitOid('cccccccccccccccccccccccccccccccccccccccc'),
+        claimAttempt: implementation().branchClaim!.attempt,
+        targetBase: gitRefName('next'),
+        claimFingerprint: '6f0c55eda2d8d6b32c6f24ccac605d377c48acb0d8ab41ca9dd443f16c13613b',
+        mergedAt: '2026-07-20T11:30:00.000Z',
+        mergeCommitOid: gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+      }],
+    };
+    const failure = 'Issue is absent from the lifecycle snapshot';
+    const writer: ReconciliationWriter = {
+      ...throwingWriter(calls),
+      readIssueHead: async () => HEAD,
+      readBranchHead: async () => HEAD,
+      readPullRequest: async () => null,
+      readDraftPullRequestAuthority: async () => ({ kind: 'missing' }),
+      ensureDraftPullRequest: async () => {
+        calls.push('ensureDraftPullRequest');
+        throw new Error(failure);
+      },
+    };
+
+    const report = await runLifecycleCycle('active', {
+      ...deps(eligibleIssue, calls, writer),
+      readSnapshot: async () => orphanSnapshot,
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 1, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async () => ({ outcome: 'spawned' }),
+      },
+    });
+
+    expect(calls).toContain('ensureDraftPullRequest');
+    expect(report.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        action: 'ensure-draft-pr',
+        subject: 'issue:42',
+        outcome: 'failed',
+        reason: failure,
+      }),
+    ]));
+    expect(renderLifecycleHuman(report)).toContain(
+      `ensure-draft-pr issue:42: failed (${failure}).`,
+    );
+  });
+
   it.skip('never reopens Done or otherwise merged work because its stable ref was retained', async () => {
     const calls: string[] = [];
     const doneIssue: LifecycleItem = {
