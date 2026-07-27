@@ -378,6 +378,65 @@ describe('LifecycleDiscoveryCacheStore', () => {
       .toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
   });
 
+  // The engine mints `fix` and `reconcile` branch claims for child issues
+  // (`implementation-executor.ts`). If the persistence envelope cannot encode
+  // them, the first snapshot that observes such a claim becomes unsaveable and
+  // discovery freezes on its last good cache.
+  it.each([
+    ['fix', 'fix'],
+    ['reconcile', 'reconcile'],
+  ] as const)('round-trips a child %s branch claim on PR evidence', async (_label, phase) => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const branchClaim = {
+      kind: 'branch-claim',
+      protocolVersion: 2,
+      phase,
+      issueNumber: 43,
+      prNumber: 101,
+      attempt: '22222222-2222-4222-8222-222222222222',
+      runner: 'runner-a',
+      login: 'oaksprout',
+      expectedHead: gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+      targetBase: gitRefName('next'),
+      claimedAt: '2026-07-22T09:30:00.000Z',
+    } as const;
+    const withChildClaim: LifecycleDiscoveryState = {
+      ...base,
+      evidence: {
+        ...base.evidence,
+        pullRequests: [{ ...base.evidence.pullRequests[0]!, branchClaim }],
+      },
+      openPullRequestEvidence: [{ ...base.openPullRequestEvidence[0]!, branchClaim }],
+    };
+
+    await expect(store.save(withChildClaim)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(withChildClaim);
+  });
+
+  it('round-trips a runaway-child merge-ready Human escalation', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const humanReason = {
+      phase: 'merge-ready',
+      code: 'runaway-child',
+      detail: 'Child issue fan-out exceeded its budget.',
+    } as const;
+    const escalated: LifecycleDiscoveryState = {
+      ...base,
+      evidence: {
+        ...base.evidence,
+        pullRequests: [{ ...base.evidence.pullRequests[0]!, humanReason }],
+      },
+      openPullRequestEvidence: [{ ...base.openPullRequestEvidence[0]!, humanReason }],
+    };
+
+    await expect(store.save(escalated)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(escalated);
+  });
+
   it('round-trips ci rerun evidence in snapshot and open-PR cache state', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
