@@ -27,6 +27,7 @@ import type {
 import type { GitHubUsage } from './github-usage.js';
 import { implementationClaimFingerprint } from './terminal-claim.js';
 import { COMPARE_STATUSES } from './types.js';
+import type { BranchClaim, HumanReason } from './types.js';
 import { mappingDiagnosticSignature } from './codecs.js';
 
 export const DEFAULT_AUTOPILOT_STATE_DIRECTORY = join(
@@ -192,10 +193,17 @@ const humanReasonSchema = z.union([
       'semantic-conflict',
       'codeowner-sensitive-conflict',
       'invalid-merge-progress-time',
+      'runaway-child',
     ]),
     detail: z.string(),
   }).strict(),
 ]);
+// Same mirror obligation as `branchClaimSchema` below: a Human escalation the
+// engine can raise but this envelope cannot encode freezes discovery.
+const _humanReasonIsPersistable: z.input<typeof humanReasonSchema> = (
+  undefined as unknown as HumanReason
+);
+void _humanReasonIsPersistable;
 
 const branchClaimBase = {
   kind: z.literal('branch-claim'),
@@ -209,6 +217,10 @@ const branchClaimBase = {
   claimedAt: exactTimestamp,
   phaseComplete: z.literal(true).optional(),
 } as const;
+// Mirrors the `BranchClaim` union in `types.ts`, which is the only producer of
+// persisted claims (`decodeBranchClaimTrailers`). A phase the engine can mint
+// but this envelope cannot encode does not degrade one field: it makes every
+// later snapshot unsaveable and freezes discovery on its last good cache.
 const branchClaimSchema = z.union([
   z.object({
     ...branchClaimBase,
@@ -217,11 +229,17 @@ const branchClaimSchema = z.union([
   }).strict(),
   z.object({
     ...branchClaimBase,
-    phase: z.literal('merge-prep'),
+    phase: z.enum(['fix', 'reconcile']),
     prNumber: positiveInteger,
-    targetBaseOid: oid.optional(),
   }).strict(),
 ]);
+// Fails `tsc` the moment a `BranchClaim` variant stops being persistable. Only
+// this direction is assertable: the schema widens branded ids such as `GitOid`
+// and `GitRefName` to plain strings, so the reverse assignment never holds.
+const _branchClaimIsPersistable: z.input<typeof branchClaimSchema> = (
+  undefined as unknown as BranchClaim
+);
+void _branchClaimIsPersistable;
 
 const verdictSchema = z.object({
   marker: z.string().min(1),
