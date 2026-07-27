@@ -126,16 +126,15 @@ function correlatedReviewClaim(item: PullRequestLifecycleItem) {
  * marker and requires a native APPROVED review carrying it). Deliberately a
  * strict subset: the view may never call an item merge-ready that the gate
  * would then reject for `terminal-approval`.
+ *
+ * Defers to `hasMatchingVerdict` rather than restating the SHA/marker/state
+ * conjunction: `terminal-approved` already types `claim.verdict.state` as
+ * `'APPROVE'`, so the two are equivalent, and a sixth parallel copy of "the
+ * engine approved this head" is precisely how these predicates drift apart.
  */
 export function engineApprovedAtHead(item: PullRequestLifecycleItem): boolean {
   const claim = correlatedReviewClaim(item);
-  const verdict = item.terminalVerdict;
-  return claim?.state === 'terminal-approved'
-    && claim.head === item.head
-    && verdict !== undefined
-    && verdict.head === item.head
-    && verdict.state === 'APPROVE'
-    && verdict.marker === claim.verdict.marker;
+  return claim?.state === 'terminal-approved' && hasMatchingVerdict(item, claim);
 }
 
 /**
