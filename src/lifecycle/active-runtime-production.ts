@@ -109,6 +109,11 @@ import {
   MarketplaceTaskCliAdapter,
   persistMarketplaceTaskRequest,
 } from './marketplace-task.js';
+import {
+  makeProductionMarketplaceMutationAdoptionCoordinator,
+  type ProductionMarketplaceMutationAdoptionOptions,
+} from './marketplace-mutation-adoption-production.js';
+import type { MarketplaceMutationAdoptionCoordinator } from './marketplace-mutation-adoption.js';
 
 type ProductionMarketplaceTaskAdapter = Pick<
   MarketplaceTaskCliAdapter,
@@ -225,7 +230,19 @@ export interface ProductionActiveRuntimeOptions {
   >;
   readonly marketplaceLanguage?: string;
   readonly marketplaceVerificationProfile?: string;
+  readonly makeMarketplaceMutationAdoptionCoordinator?: (
+    options: ProductionMarketplaceMutationAdoptionOptions,
+  ) => MarketplaceMutationAdoptionCoordinator;
 }
+
+export type ProductionActiveRuntime = ReturnType<typeof makeActiveRuntime> & {
+  readonly makeMarketplaceMutationAdoptionCoordinator?: (
+    input: {
+      readonly manifestPath: string;
+      readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
+    },
+  ) => MarketplaceMutationAdoptionCoordinator;
+};
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -400,7 +417,7 @@ export function makeProductionCapabilityPreflight(
 
 export function makeProductionActiveRuntime(
   options: ProductionActiveRuntimeOptions,
-): ReturnType<typeof makeActiveRuntime> {
+): ProductionActiveRuntime {
   const executionBackend = options.executionBackend ?? 'local';
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
@@ -1120,11 +1137,27 @@ export function makeProductionActiveRuntime(
     },
   });
   if (executionBackend !== 'marketplace') return activeRuntime;
+  const adoptionFactory = options.makeMarketplaceMutationAdoptionCoordinator
+    ?? makeProductionMarketplaceMutationAdoptionCoordinator;
   return {
     ...activeRuntime,
     executeReviewActions: async (actions) => actions.map(() => ({
       outcome: 'unavailable',
       reason: MARKETPLACE_REVIEW_UNAVAILABLE_DETAIL,
     })),
+    makeMarketplaceMutationAdoptionCoordinator: (input) => adoptionFactory({
+      originManifestPath: input.manifestPath,
+      repositoryPath: options.repositoryPath,
+      worktreeBase: options.worktreeBase,
+      runnerId: options.runnerId,
+      credentials: options.credentials,
+      readSnapshot: input.readSnapshot,
+      staleAfterMs: options.staleAfterMs,
+      runner,
+      environment: ambient,
+      now,
+      nextId,
+      sleep,
+    }),
   };
 }
