@@ -417,6 +417,36 @@ export function commandErrorStdout(error: unknown): string | null {
  * Retryability is decided entirely by the positive read allowlist in
  * `transient-retry.ts`; every mutation crossing this boundary keeps exactly one
  * attempt.
+ *
+ * WHY THE TWO JOBS ARE COUPLED HERE RATHER THAN COMPOSED BY CALLERS. This
+ * function now does two things — meter, and retry — and the obvious split is to
+ * export them separately and let each installer write
+ * `makeGitHubUsageCommandRunner(withTransientReadRetry(raw, …), meter)`. That is
+ * mechanically possible; it is refused because it converts two structural
+ * guarantees into call-site conventions:
+ *
+ *   - ORDER. Retry must sit BENEATH the meter. Composed the other way round —
+ *     `withTransientReadRetry(makeGitHubUsageCommandRunner(raw, meter))`, which
+ *     reads just as naturally — every retried attempt is separately metered, so
+ *     a transport blip silently inflates REST counts and re-runs the opaque
+ *     probe pair. Nothing in the type signature distinguishes the two
+ *     compositions: both are `CommandRunner`. Owning the order here makes the
+ *     wrong one unwritable.
+ *   - COVERAGE. Three call sites install this boundary — the orchestrator's
+ *     shared runner (`scripts/run-autopilot-v2.ts:496`), `GhLifecycleReader`
+ *     (`src/lifecycle/github-reader.ts:793`) and `ConditionalRestClient`
+ *     (`src/lifecycle/github-rest.ts:260`) — and each of the latter two builds
+ *     it internally for callers who passed only a raw runner. Splitting makes
+ *     every one of them re-derive the wiring, including the `onRetry` sink that
+ *     needs this exact meter; one installer that forgot would lose retry
+ *     coverage with no test failing, which is the same silent-drift failure mode
+ *     the derived-argv tests in `test/lifecycle/transient-retry.test.ts` exist to
+ *     prevent.
+ *
+ * The coupling is also narrow in substance: the retry decision itself lives
+ * entirely in `transient-retry.ts`, and this function contributes only the
+ * ordering and the `onRetry` sink. Nothing here inspects argv to decide
+ * retryability.
  */
 export function makeGitHubUsageCommandRunner(
   rawRun: CommandRunner,

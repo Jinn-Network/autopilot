@@ -10,6 +10,12 @@ import {
   GitHubUsageMeter,
   makeGitHubUsageCommandRunner,
 } from '../../src/lifecycle/github-usage.js';
+import {
+  readExactChangedFiles,
+  readExactCompareStatus,
+} from '../../src/lifecycle/github-changed-files.js';
+import { GhLifecycleReader } from '../../src/lifecycle/github-reader.js';
+import { gitOid } from '../../src/lifecycle/types.js';
 import type { CommandRunner } from '../../src/dispatcher/issue-source.js';
 
 /**
@@ -130,6 +136,39 @@ describe('classifyTransportFault', () => {
     expect(classifyTransportFault(unrelated)).toBeNull();
   });
 
+  it('never reads a MULTI-LINE echoed command line as fault evidence', () => {
+    // A GraphQL document is multi-line, so the echoed argv itself spans several
+    // lines. Stripping only to the first newline leaves the rest of the
+    // caller's own document in the evidence, and that document is caller- and
+    // target-repo-influenced text.
+    const commandLine = 'gh api graphql -f query=query{\n  connection reset by peer\n}';
+    const unrelated = Object.assign(
+      new Error(`Command failed: ${commandLine}\n`),
+      { cmd: commandLine, stderr: '' },
+    );
+    expect(classifyTransportFault(unrelated)).toBeNull();
+  });
+
+  it('refuses message evidence outright when the echoed argv boundary is unknown', () => {
+    // No `cmd` field means the argv's extent cannot be established, and the
+    // message begins with the argv. Fail closed rather than guess a boundary.
+    expect(classifyTransportFault({
+      stderr: '',
+      message: 'Command failed: gh api graphql -f query=query{\n  connection reset by peer\n}',
+    })).toBeNull();
+  });
+
+  it('still reads the stderr that follows a multi-line echoed command line', () => {
+    // The strip must remove the argv exactly, not the whole message: a real
+    // fault appended after a multi-line document is still evidence.
+    const commandLine = 'gh api graphql -f query=query{\n  repository { id }\n}';
+    const fault = Object.assign(
+      new Error(`Command failed: ${commandLine}\ndial tcp: lookup api.github.com: no such host`),
+      { cmd: commandLine },
+    );
+    expect(classifyTransportFault(fault)).toBe('DNS failure');
+  });
+
   it('falls back to the message when stderr is empty and no command line was echoed', () => {
     expect(classifyTransportFault(new Error('net/http: TLS handshake timeout')))
       .toBe('TLS handshake failure');
@@ -222,6 +261,110 @@ describe('isRetryableReadCommand', () => {
     ['an unrecognised binary', 'kubectl', ['get', 'pods']],
   ])('refuses %s', (_label, command, args) => {
     expect(isRetryableReadCommand(command, args)).toBe(false);
+  });
+});
+
+/**
+ * The allowlist cases above are hand-written argv literals, so they pin the
+ * grammar but not its FIT to the engine. A production read whose argv drifted —
+ * a new flag, a renamed subcommand, a second endpoint operand — would silently
+ * lose retry coverage while every literal above still passed.
+ *
+ * These tests close that gap by never writing an argv down: each drives a real
+ * production read with a recording runner and asserts that whatever it emitted
+ * is admitted. Change the call site and the assertion follows it.
+ *
+ * They cover the two argv-constructing shapes the metered boundary actually
+ * carries — REST `gh api` reads (the merge port's changed-file, file-listing and
+ * compare reads, `src/lifecycle/merge-executor-production.ts:241`, `:279`,
+ * `:308`) and the reader's `git -C <path> ls-remote` reads
+ * (`src/lifecycle/github-reader.ts:854`). The meter's own GraphQL quota probe is
+ * covered the same way, through the real boundary, in the accounting block
+ * below. Call sites reached only through much larger fixtures are not
+ * enumerated here; this is a guard against argv drift, not a census.
+ */
+describe('argv derived from production call sites', () => {
+  const HEAD = gitOid('1'.repeat(40));
+  const BASE = gitOid('3'.repeat(40));
+
+  function recorder(): {
+    run: CommandRunner;
+    admitted: () => Array<readonly [string, string]>;
+  } {
+    const calls: Array<readonly [string, readonly string[]]> = [];
+    return {
+      run: async (command, args) => {
+        calls.push([command, [...args]]);
+        if (args[0] === 'api' && args[1]?.includes('/compare/')) {
+          return JSON.stringify({ status: 'ahead' });
+        }
+        if (args[0] === 'api' && args[1]?.endsWith('/files?per_page=100')) {
+          return JSON.stringify([[{ filename: 'GREETING.md' }]]);
+        }
+        if (args[0] === 'api') {
+          return JSON.stringify({
+            changed_files: 1,
+            head: { sha: HEAD },
+            base: { ref: 'stack/base', sha: BASE },
+          });
+        }
+        return '';
+      },
+      // Rendered as `[argv, verdict]` pairs so a failure names the exact
+      // production argv that lost coverage rather than reporting `false`.
+      admitted: () => calls.map(([command, args]) => [
+        [command, ...args].join(' '),
+        isRetryableReadCommand(command, args) ? 'retryable' : 'NOT RETRYABLE',
+      ] as const),
+    };
+  }
+
+  it('admits every command the production exact changed-file read emits', async () => {
+    const recording = recorder();
+    await readExactChangedFiles({
+      run: recording.run,
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'stack/base',
+      context: 'Merge',
+      repositorySlug: 'o/r',
+    });
+
+    const observed = recording.admitted();
+    expect(observed).toHaveLength(2);
+    expect(observed.map(([, verdict]) => verdict)).toEqual(['retryable', 'retryable']);
+  });
+
+  it('admits every command the production exact compare read emits', async () => {
+    const recording = recorder();
+    await readExactCompareStatus({
+      run: recording.run,
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'stack/base',
+      repositorySlug: 'o/r',
+    });
+
+    const observed = recording.admitted();
+    expect(observed).toHaveLength(2);
+    expect(observed.map(([, verdict]) => verdict)).toEqual(['retryable', 'retryable']);
+  });
+
+  it("admits the reader's own git ls-remote reads", async () => {
+    const recording = recorder();
+    const reader = new GhLifecycleReader(recording.run, {
+      repositoryPath: '/repo',
+      remoteName: 'https://github.com/o/r.git',
+      repositorySlug: 'o/r',
+      runnerIsMetered: true,
+    });
+
+    await reader.readReviewClaimRefs();
+    await reader.readBranchHeadForReconciliation('autopilot/84');
+
+    const observed = recording.admitted();
+    expect(observed).toHaveLength(2);
+    expect(observed.map(([, verdict]) => verdict)).toEqual(['retryable', 'retryable']);
   });
 });
 

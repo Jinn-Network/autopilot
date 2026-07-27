@@ -115,17 +115,37 @@ function text(value: unknown): string {
   return '';
 }
 
+const COMMAND_FAILED_PREFIX = 'Command failed: ';
+
 /**
- * Node's `execFile` rejection message is `Command failed: <command> <args…>`
- * followed by stderr, so a command's own arguments are inside its message. A
- * read whose GraphQL document or search term merely contains the words
- * "connection reset by peer" must never be classified by that text, so the
- * echoed command line is stripped before the message is used at all.
+ * Node's `execFile` rejection message is `Command failed: ${cmd}\n${stderr}`,
+ * where `cmd` is the whole argument vector joined with spaces, so a command's
+ * own arguments are inside its message. A read whose GraphQL document or search
+ * term merely contains the words "connection reset by peer" must never be
+ * classified by that text, so the echoed argv is stripped before the message is
+ * used at all.
+ *
+ * The argv is stripped by LENGTH, not by scanning for a newline. An argument may
+ * itself contain newlines — every GraphQL document this engine issues is
+ * multi-line — so `cmd` spans several lines and the first newline in the message
+ * usually falls *inside* the echoed argv rather than at its end. Cutting there
+ * strips one line of the argv and leaves the rest of the caller's own document
+ * standing as "evidence".
+ *
+ * The exact extent comes from the rejection's own `cmd` field, which Node sets
+ * to the same string it interpolated (`child_process`'s `exithandler` assigns
+ * `ex.cmd = cmd`). When that field is missing, or the message does not begin
+ * with the argv Node says it does, the boundary is unknowable and the whole
+ * message is refused as evidence — the fail-closed direction, and lossless in
+ * practice: an `execFile` rejection whose `stderr` is empty has nothing after
+ * the argv anyway, and message evidence is consulted only when stderr is empty.
  */
-function messageEvidence(message: string): string {
-  if (!message.startsWith('Command failed:')) return message;
-  const newline = message.indexOf('\n');
-  return newline === -1 ? '' : message.slice(newline + 1);
+function messageEvidence(message: string, echoedArgv: string): string {
+  if (!message.startsWith(COMMAND_FAILED_PREFIX)) return message;
+  const body = message.slice(COMMAND_FAILED_PREFIX.length);
+  if (echoedArgv.length === 0 || !body.startsWith(echoedArgv)) return '';
+  const rest = body.slice(echoedArgv.length);
+  return rest.startsWith('\n') ? rest.slice(1) : rest;
 }
 
 /**
@@ -142,7 +162,9 @@ export function classifyTransportFault(error: unknown): string | null {
   const fields = error as Record<string, unknown>;
   if (/^\s*HTTP\/[0-9.]+\s+[1-5][0-9]{2}\b/m.test(text(fields.stdout))) return null;
   const stderr = text(fields.stderr);
-  const evidence = stderr.trim().length > 0 ? stderr : messageEvidence(text(fields.message));
+  const evidence = stderr.trim().length > 0
+    ? stderr
+    : messageEvidence(text(fields.message), text(fields.cmd));
   if (SERVED_RESPONSE.some((pattern) => pattern.test(evidence))) return null;
   for (const [fault, pattern] of TRANSPORT_FAULT) {
     if (pattern.test(evidence)) return fault;
