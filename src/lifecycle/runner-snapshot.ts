@@ -19,6 +19,63 @@ import { exactUtcTimestampMs } from './exact-utc-time.js';
 
 export const DEFAULT_FULL_RECONCILE_MS = 60 * 60_000;
 
+/**
+ * Every operator-facing sink for a fatal snapshot failure prints only
+ * `Error.message` (`bin/autopilot.ts` writes `autopilot: ${redactLog(message)}`,
+ * and the controller's `snapshotFailureMode: 'report'` path folds the same
+ * `.message` into the cycle report). An `AggregateError` therefore reaches the
+ * log as its bare headline and both underlying causes are silently dropped, so
+ * the causes must be folded into the headline itself.
+ *
+ * Each labelled cause is capped at this many characters: these messages carry
+ * zod issue lists that can run to tens of kilobytes, and the aggregate is a
+ * single log line. Two labelled causes plus the headline stay under ~2.2 KB.
+ */
+const SNAPSHOT_FAILURE_DETAIL_LIMIT = 1_000;
+
+/** Depth cap for nested `AggregateError.errors` and `Error.cause` chains. */
+const SNAPSHOT_FAILURE_DEPTH_LIMIT = 4;
+
+function describeSnapshotFailure(error: unknown, depth = 0): string {
+  if (!(error instanceof Error)) return String(error);
+  const name = error.name.length > 0 ? error.name : 'Error';
+  let described = `${name}: ${error.message}`;
+  if (depth < SNAPSHOT_FAILURE_DEPTH_LIMIT) {
+    if (error instanceof AggregateError) {
+      described += ` {${
+        error.errors
+          .map((nested, index) => ` (${index + 1}) ${describeSnapshotFailure(nested, depth + 1)}`)
+          .join(';')
+      } }`;
+    }
+    const cause: unknown = (error as { readonly cause?: unknown }).cause;
+    if (cause !== undefined) {
+      described += ` <- caused by ${describeSnapshotFailure(cause, depth + 1)}`;
+    }
+  }
+  return described;
+}
+
+/**
+ * Builds the message for a snapshot failure with more than one cause. Causes are
+ * labelled by the read path that produced them, because two different paths
+ * routinely fail with the same error type and the same text — an unlabelled join
+ * renders that as one indistinguishable repetition.
+ */
+export function snapshotFailureSummary(
+  headline: string,
+  causes: readonly (readonly [label: string, error: unknown])[],
+): string {
+  const described = causes.map(([label, error]) => {
+    const detail = describeSnapshotFailure(error);
+    const bounded = detail.length <= SNAPSHOT_FAILURE_DETAIL_LIMIT
+      ? detail
+      : `${detail.slice(0, SNAPSHOT_FAILURE_DETAIL_LIMIT)}… (truncated, ${detail.length} chars)`;
+    return `[${label}] ${bounded}`;
+  });
+  return `${headline}: ${described.join('; ')}`;
+}
+
 export interface SnapshotRuntimeConfig {
   readonly mode: SnapshotReadMode;
   readonly fullReconcileMs: number;
@@ -463,7 +520,10 @@ export class LifecycleSnapshotCoordinator {
     } catch (fullError) {
       throw new AggregateError(
         [authorityError, fullError],
-        'Seeded startup incremental cache authority changed and full retry failed',
+        snapshotFailureSummary(
+          'Seeded startup incremental cache authority changed and full retry failed',
+          [['incremental seed', authorityError], ['full retry', fullError]],
+        ),
       );
     }
   }
@@ -548,7 +608,10 @@ export class LifecycleSnapshotCoordinator {
           if (fallbackError instanceof LifecycleRateLimitError) throw fallbackError;
           throw new AggregateError(
             [error, fallbackError],
-            'Full reconciliation and incremental fallback both failed',
+            snapshotFailureSummary(
+              'Full reconciliation and incremental fallback both failed',
+              [['full', error], ['incremental fallback', fallbackError]],
+            ),
           );
         }
       }
