@@ -229,6 +229,10 @@ describe('hasReviewFollowUpMarkerTag', () => {
     expect(hasReviewFollowUpMarkerTag('See jinn-autopilot:review-follow-up for the format.')).toBe(false);
     expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:child pr=84 kind=review-finding -->')).toBe(false);
     expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-ups pr=84 -->')).toBe(false);
+    // The separator before `pr=` is required, not optional: the pattern is the
+    // full marker regex truncated, not a loose prefix that lets the tag run on
+    // into the first field.
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-uppr=84 -->')).toBe(false);
     expect(hasReviewFollowUpMarkerTag('')).toBe(false);
   });
 
