@@ -342,6 +342,7 @@ export function makeTargetedActionReader(
     ));
     const project = projectWithTarget(cycleSnapshot, issueNumber, item);
     const decoded = decodePullRequestSnapshot(raw);
+    if (decoded.evidenceIncompleteReason !== undefined) return null;
     let pullRequests: GitHubLifecycleSnapshot['pullRequests'];
     if (options.readOpenPullRequestIndex === undefined) {
       pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
@@ -400,7 +401,9 @@ export function makeTargetedActionReader(
         ) {
           return null;
         }
-        refreshed.push(decodePullRequestSnapshot(live));
+        const decodedLive = decodePullRequestSnapshot(live);
+        if (decodedLive.evidenceIncompleteReason !== undefined) return null;
+        refreshed.push(decodedLive);
       }
       pullRequests = [
         ...cycleSnapshot.pullRequests.filter((pr) => pr.state === 'MERGED'),
@@ -451,6 +454,7 @@ export function makeTargetedActionReader(
         return null;
       }
       const hydratedBlocker = decodePullRequestSnapshot(liveBlocker);
+      if (hydratedBlocker.evidenceIncompleteReason !== undefined) return null;
       pullRequests = pullRequests.some((pr) => pr.number === blockerNumber)
         ? pullRequests.map((pr) => pr.number === blockerNumber ? hydratedBlocker : pr)
         : [...pullRequests, hydratedBlocker];
@@ -532,6 +536,7 @@ export function makeTargetedActionReader(
           throw new Error('Targeted blocker PR authority changed');
         }
         const decodedBlocker = decodePullRequestSnapshot(liveBlocker);
+        if (decodedBlocker.evidenceIncompleteReason !== undefined) return null;
         pullRequests = cycleSnapshot.pullRequests.map((pr) => (
           pr.number === blocker.number ? decodedBlocker : pr
         ));

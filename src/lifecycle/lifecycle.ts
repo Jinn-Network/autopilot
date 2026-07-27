@@ -125,8 +125,7 @@ function humanOverlay(item: LifecycleItem): boolean {
     || item.humanReason !== undefined
     || (item.kind === 'pull-request'
       && (!branchClaimMatchesItem(item)
-        || !reviewClaimMatchesItem(item)
-        || item.reviewClaim?.state === 'human'));
+        || !reviewClaimMatchesItem(item)));
 }
 
 function underlyingPhase(item: LifecycleItem): Exclude<LifecyclePhase, 'human'> {
@@ -155,7 +154,15 @@ function underlyingPhase(item: LifecycleItem): Exclude<LifecyclePhase, 'human'> 
 
   const review = correlatedReviewClaim(item);
   const currentReview = review !== undefined && review.head === item.head;
-  if (currentReview && !['stale', 'terminal-approved', 'human'].includes(review.state)) {
+  if (
+    currentReview
+    && ![
+      'stale',
+      'terminal-approved',
+      'human',
+      'human-intent',
+    ].includes(review.state)
+  ) {
     return 'reviewing';
   }
 
@@ -223,7 +230,13 @@ function staleEvidence(
     phase === 'reviewing'
     && review !== undefined
     && review.head === item.head
-    && !['stale', 'terminal-approved', 'human'].includes(review.state)
+    && ![
+      'stale',
+      'terminal-approved',
+      'human',
+      'human-intent',
+      'mapping-reread',
+    ].includes(review.state)
   ) {
     const headTime = timestampMs(item.headChangedAt);
     const verdictTime = matchingVerdictTime(item, review);

@@ -9,8 +9,10 @@ import {
   formatAutomatedReviewMarker,
 } from '../../src/lifecycle/codecs.js';
 import {
-  makeProductionReviewSessionPort,
+  makeProductionReviewSessionPort as makeRawProductionReviewSessionPort,
+  type ProductionReviewSessionPortOptions,
 } from '../../src/lifecycle/review-session-production.js';
+import { makeReviewSessionProtocol } from '../../src/lifecycle/review-session.js';
 import {
   gitOid,
   type ReviewClaimRecord,
@@ -102,6 +104,76 @@ function manifest(): AttemptManifest {
       childStartedAt: '2026-07-20T12:00:00.000Z',
     },
   };
+}
+
+function completeMappingAuthority(
+  bound: AttemptManifest,
+  overrides: {
+    readonly blockedOn?: 'Another issue' | null;
+    readonly blockedByIssues?: readonly number[];
+    readonly stableTargetBase?: string;
+  } = {},
+) {
+  const stacked = bound.issueNumber === 2084;
+  return {
+    defaultBranch: 'next',
+    issues: [{
+      number: bound.issueNumber,
+      blockedOn: overrides.blockedOn ?? (stacked ? 'Another issue' : null),
+      blockedByIssues:
+        overrides.blockedByIssues ?? (stacked ? [2083] : []),
+    }],
+    stableBranches: stacked
+      ? [{
+          issueNumber: 2084,
+          phase: 'implement' as const,
+          head: bound.expectedHead,
+          headRefName: bound.branch,
+          targetBase: overrides.stableTargetBase ?? bound.targetBase,
+        }]
+      : [],
+  };
+}
+
+function makeProductionReviewSessionPort(
+  options: ProductionReviewSessionPortOptions = {},
+) {
+  const originalRunner = options.runner;
+  const fixtureRunner = originalRunner === undefined
+    ? undefined
+    : async (...args: Parameters<NonNullable<typeof originalRunner>>) => {
+        const output = await originalRunner(...args);
+        const [command, commandArgs] = args;
+        if (
+          command !== 'gh'
+          || commandArgs[0] !== 'pr'
+          || commandArgs[1] !== 'list'
+        ) {
+          return output;
+        }
+        const bound = options.readManifest?.('/attempt/manifest.json') ?? manifest();
+        const parsed = JSON.parse(output);
+        return JSON.stringify(parsed.map((record) => {
+          const branch = record.headRefName;
+          const branchMatch = /^autopilot\/([1-9][0-9]*)$/.exec(branch);
+          const issueNumber = record.closingIssuesReferences?.[0]?.number
+            ?? (branchMatch === null ? bound.issueNumber : Number(branchMatch[1]));
+          return {
+            ...record,
+            baseRefName: record.baseRefName
+              ?? (record.number === bound.prNumber ? bound.targetBase : 'next'),
+            body: record.body
+              ?? `<!-- jinn-autopilot:v2 issue=${issueNumber} branch=${branch} -->`,
+          };
+        }));
+      };
+  return makeRawProductionReviewSessionPort({
+    readProjectHumanAuthority: async () => false,
+    readMappingAuthority: async ({ manifest: bound }) =>
+      completeMappingAuthority(bound),
+    ...options,
+    ...(fixtureRunner === undefined ? {} : { runner: fixtureRunner }),
+  });
 }
 
 function projectSnapshot(status: 'Todo' | 'In Review' | 'Human'): string {
@@ -353,6 +425,213 @@ describe('production review session port', () => {
     });
     expect(pullRequest).not.toHaveProperty('mappingProblem');
   });
+
+  it.each([
+    {
+      name: 'complete dependency authority is unavailable',
+      authority: null,
+    },
+    {
+      name: 'the issue no longer depends on its parent',
+      authority: completeMappingAuthority({
+        ...manifest(),
+        issueNumber: 2084,
+        branch: 'autopilot/2084',
+        targetBase: 'autopilot/2083',
+      }, {
+        blockedOn: null,
+        blockedByIssues: [],
+      }),
+    },
+    {
+      name: 'the exact stable claim was retargeted',
+      authority: completeMappingAuthority({
+        ...manifest(),
+        issueNumber: 2084,
+        branch: 'autopilot/2084',
+        targetBase: 'autopilot/2083',
+      }, {
+        stableTargetBase: 'next',
+      }),
+    },
+  ])('requires coordinator mapping reread when $name', async ({ authority }) => {
+    const stackedManifest: AttemptManifest = {
+      ...manifest(),
+      issueNumber: 2084,
+      branch: 'autopilot/2084',
+      targetBase: 'autopilot/2083',
+    };
+    const port = makeRawProductionReviewSessionPort({
+      environment: {
+        GH_TOKEN: 'selected-secret',
+        JINN_AUTOPILOT_SESSION_MANIFEST: '/attempt/manifest.json',
+      },
+      readManifest: () => stackedManifest,
+      readProjectHumanAuthority: async () => false,
+      readMappingAuthority: async () => authority,
+      runner: async (cmd, args) => {
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({
+            number: 84,
+            state: 'OPEN',
+            headRefOid: HEAD,
+            headRefName: 'autopilot/2084',
+            baseRefName: 'autopilot/2083',
+            baseRefOid: BASE,
+            isDraft: false,
+            body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+            author: { login: 'implementation-bot' },
+            labels: [{ name: 'engine:review' }],
+            closingIssuesReferences: [],
+            files: [],
+          });
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+          return JSON.stringify([{
+            number: 84,
+            headRefOid: HEAD,
+            headRefName: 'autopilot/2084',
+            baseRefName: 'autopilot/2083',
+            body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
+            closingIssuesReferences: [],
+          }]);
+        }
+        if (cmd === 'git' && args.includes('ls-tree')) return '';
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.readPullRequest(84, HEAD)).resolves.toMatchObject({
+      mappingProblem: expect.stringMatching(/authority|dependency|stable|mapping/i),
+    });
+  });
+
+  it.each([
+    {
+      name: 'Project Blocked on Human remains active',
+      labels: ['engine:review'],
+      projectHumanAuthority: true,
+      mappingAuthority: null,
+      expectedStatus: 'human' as const,
+    },
+    {
+      name: 'fresh Project Human overrides non-Human mapping evidence',
+      labels: ['engine:review'],
+      projectHumanAuthority: true,
+      mappingAuthority: completeMappingAuthority(manifest()),
+      expectedStatus: 'human' as const,
+    },
+    {
+      name: 'the external Human label remains active',
+      labels: ['engine:review', 'review:needs-human'],
+      projectHumanAuthority: null,
+      mappingAuthority: null,
+      expectedStatus: 'human' as const,
+    },
+    {
+      name: 'external Human evidence is unavailable',
+      labels: ['engine:review'],
+      projectHumanAuthority: null,
+      mappingAuthority: null,
+      expectedError: /Human authority is unavailable or inconsistent/i,
+    },
+  ])(
+    'publishes no mapping reread when $name',
+    async ({
+      labels,
+      projectHumanAuthority,
+      mappingAuthority,
+      expectedStatus,
+      expectedError,
+    }) => {
+      const bound = manifest();
+      const publications: string[] = [];
+      const options = {
+        environment: {
+          GH_TOKEN: 'selected-secret',
+          JINN_AUTOPILOT_SESSION_MANIFEST: bound.paths.manifest,
+        },
+        readManifest: () => bound,
+        readMappingAuthority: async () => mappingAuthority,
+        readProjectHumanAuthority: async () => projectHumanAuthority,
+        runner: async (cmd: string, args: readonly string[]) => {
+          if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+            return JSON.stringify({
+              number: 84,
+              state: 'OPEN',
+              headRefOid: HEAD,
+              headRefName: 'autopilot/42',
+              baseRefName: 'next',
+              baseRefOid: BASE,
+              isDraft: true,
+              body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+              author: { login: 'implementation-bot' },
+              labels: labels.map((name) => ({ name })),
+              closingIssuesReferences: [{ number: 42 }],
+              files: [],
+            });
+          }
+          if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+            return JSON.stringify([{
+              number: 84,
+              headRefOid: HEAD,
+              headRefName: 'autopilot/42',
+              baseRefName: 'next',
+              body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+              closingIssuesReferences: [{ number: 42 }],
+            }]);
+          }
+          if (
+            cmd === 'gh'
+            && args[0] === 'api'
+            && args[1] === 'repos/Jinn-Network/mono/pulls/84/reviews'
+          ) {
+            return '[[]]';
+          }
+          if (cmd === 'git' && args.includes('ls-tree')) return '';
+          throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+        },
+      } as ProductionReviewSessionPortOptions & {
+        readonly readProjectHumanAuthority: () => Promise<boolean | null>;
+      };
+      const production = makeRawProductionReviewSessionPort(options);
+      const protocol = makeReviewSessionProtocol({
+        ...production,
+        readAuthority: async () => ({
+          reviewRefOid: REVIEW,
+          record: claim(),
+        }),
+        createReviewRecord: async ({ record }) => {
+          publications.push(`record:${record.state}`);
+          return RECORD;
+        },
+        publishReviewClaim: async ({
+          expectedRemoteRecordOid,
+          recordOid,
+          record,
+        }) => {
+          publications.push(`claim:${record.state}`);
+          return {
+            status: 'lost',
+            expected: expectedRemoteRecordOid,
+            published: recordOid,
+            observed: REVIEW,
+          };
+        },
+      });
+
+      const verdict = protocol.reviewVerdict(bound, 'APPROVE', 'Clean.');
+      if (expectedError === undefined) {
+        await expect(verdict).resolves.toEqual({
+          status: expectedStatus,
+          head: HEAD,
+        });
+      } else {
+        await expect(verdict).rejects.toThrow(expectedError);
+      }
+      expect(publications).toEqual([]);
+    },
+  );
 
   it('ignores a CODEOWNERS edit that only exists in the PR head tree', async () => {
     const port = makeProductionReviewSessionPort({

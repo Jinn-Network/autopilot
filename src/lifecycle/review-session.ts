@@ -38,6 +38,7 @@ export interface ReviewSessionPullRequest {
   readonly labels: readonly string[];
   readonly body: string;
   readonly approvalPolicy: 'approve-eligible' | 'human-codeowner';
+  readonly humanHold?: boolean;
   readonly mappingProblem?: string;
 }
 
@@ -369,14 +370,14 @@ async function humanIsActive(
   manifest: AttemptManifest,
   port: ReviewSessionPort,
 ): Promise<boolean> {
-  if ((await requireAuthority(manifest, port)).record.state === 'human') {
-    return true;
-  }
-  return port.hasHumanHold(
+  await requireAuthority(manifest, port);
+  const active = await port.hasHumanHold(
     manifest.issueNumber,
     manifest.prNumber!,
     manifest.expectedHead as GitOid,
   );
+  await requireAuthority(manifest, port);
+  return active;
 }
 
 async function enterHuman(
@@ -401,6 +402,17 @@ async function enterHuman(
   });
   const commentBody =
     `${marker}\n\nAutopilot parked this review for Human judgment.\n\n${reason.detail}`;
+  if (!await humanIsActive(manifest, port)) {
+    await port.setPullRequestLabel(
+      manifest.prNumber!,
+      head,
+      'review:needs-human',
+      true,
+    );
+  }
+  if (!await humanIsActive(manifest, port)) {
+    throw new Error('External Human authority was not established');
+  }
   const ensureComment = async (
     expectedReviewState: ReviewClaimRecord['state'],
   ): Promise<void> => {
@@ -447,12 +459,12 @@ async function requestMappingReread(
   let manifest = requireReviewManifest(supplied, port);
   let authority = await requireAuthority(manifest, port);
   const head = manifest.expectedHead as GitOid;
+  if (await humanIsActive(manifest, port)) return { status: 'human', head };
   const mappingRequest = {
     selectedIssueNumber: manifest.issueNumber,
     headRefName: manifest.branch,
     baseRefName: manifest.targetBase,
   };
-  if (authority.record.state === 'human') return { status: 'human', head };
   if (authority.record.state === 'mapping-reread') {
     const current = authority.record.mappingRequest;
     if (
@@ -462,9 +474,6 @@ async function requestMappingReread(
     ) {
       throw new Error('Mapping reread retry contradicts the durable request');
     }
-    return { status: 'mapping-pending', head };
-  }
-  if (authority.record.state === 'human-intent') {
     return { status: 'mapping-pending', head };
   }
   const record: ReviewClaimRecord = {

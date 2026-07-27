@@ -126,8 +126,8 @@ function graphQlPr(input: {
     comments: {
       pageInfo: { hasPreviousPage: input.commentsTruncated ?? false },
       nodes: (input.comments ?? []).map((body, index) => ({
+        fullDatabaseId: String(10_000 + index),
         body,
-        createdAt: `2026-07-20T09:0${index}:00.000Z`,
         author: input.commentAuthor === undefined ? null : { login: input.commentAuthor },
       })),
     },
@@ -1349,7 +1349,47 @@ describe('GhLifecycleReader', () => {
     };
   }
 
-  it('degrades a PR with an undecodable Human marker instead of failing the whole page', async () => {
+  it('marks incomplete non-comment PR evidence explicitly without synthesizing Human', async () => {
+    const incomplete = graphQlPr({
+      number: 200,
+      state: 'OPEN',
+      head: 'b'.repeat(40),
+      headRefName: 'feature/200',
+    });
+    incomplete.reviews.pageInfo.hasNextPage = true;
+
+    const page = await new GhLifecycleReader(pageOf(incomplete)).readPullRequests(null);
+
+    expect(page.nodes[0]).toMatchObject({
+      number: 200,
+      evidenceIncompleteReason: expect.stringMatching(/reviews.*truncated/i),
+      humanReason: null,
+    });
+  });
+
+  it('does not retain a partial closing-issue mapping when that evidence is truncated', async () => {
+    const incomplete = graphQlPr({
+      number: 203,
+      state: 'OPEN',
+      head: 'e'.repeat(40),
+      headRefName: 'feature/shared-closure',
+    });
+    incomplete.closingIssuesReferences.nodes = [{ number: 42 }];
+    incomplete.closingIssuesReferences.pageInfo.hasNextPage = true;
+
+    const page = await new GhLifecycleReader(pageOf(incomplete)).readPullRequests(null);
+
+    expect(page.nodes[0]).toMatchObject({
+      number: 203,
+      closingIssueNumbers: [],
+      closingIssueNumbersIncomplete: true,
+      evidenceIncompleteReason:
+        expect.stringMatching(/closing issue references.*truncated/i),
+      humanReason: null,
+    });
+  });
+
+  it('does not synthesize Human authority from an undecodable audit comment', async () => {
     const hostile = graphQlPr({
       number: 201,
       state: 'OPEN',
@@ -1370,17 +1410,12 @@ describe('GhLifecycleReader', () => {
 
     expect(page.nodes.map((pr) => pr.number)).toEqual([201, 202]);
     const degraded = page.nodes[0];
-    expect(degraded?.humanReason).toMatchObject({
-      phase: 'awaiting-review',
-      code: 'review-escalation',
-    });
-    expect(degraded?.humanReason?.detail).toContain('undecodable structured Human evidence');
-    expect(degraded?.branchClaimTrailers).toBeNull();
+    expect(degraded?.humanReason).toBeNull();
     expect(degraded?.reviewClaim).toBeNull();
     expect(page.nodes[1]?.humanReason).toBeNull();
   });
 
-  it('preserves an unstructured maintainer Human hold as dominant review evidence', async () => {
+  it('treats unstructured maintainer prose as lifecycle-inert audit text', async () => {
     const held = graphQlPr({
       number: 205,
       state: 'OPEN',
@@ -1392,20 +1427,14 @@ describe('GhLifecycleReader', () => {
 
     const page = await new GhLifecycleReader(pageOf(held)).readPullRequests(null);
 
-    expect(page.nodes[0]).toMatchObject({
-      humanAuthor: 'maintainer',
-      humanIssueNumber: null,
-      humanHead: null,
-      humanGeneration: null,
-      humanReason: {
-        phase: 'reviewing',
-        code: 'review-escalation',
-        detail: 'Unstructured Human hold comment on the pull request.',
-      },
-    });
+    expect(page.nodes[0]?.humanAuthor).toBeNull();
+    expect(page.nodes[0]?.humanIssueNumber).toBeNull();
+    expect(page.nodes[0]?.humanHead).toBeNull();
+    expect(page.nodes[0]?.humanGeneration).toBeNull();
+    expect(page.nodes[0]?.humanReason).toBeNull();
   });
 
-  it('degrades a PR whose Human marker pr= field contradicts its own PR number', async () => {
+  it('does not synthesize Human authority from a contradictory audit comment', async () => {
     const hostile = graphQlPr({
       number: 203,
       state: 'OPEN',
@@ -1426,11 +1455,11 @@ describe('GhLifecycleReader', () => {
     const page = await new GhLifecycleReader(pageOf(hostile, healthy)).readPullRequests(null);
 
     expect(page.nodes.map((pr) => pr.number)).toEqual([203, 204]);
-    expect(page.nodes[0]?.humanReason?.detail).toContain('contradictory structured Human evidence');
+    expect(page.nodes[0]?.humanReason).toBeNull();
     expect(page.nodes[1]?.humanReason).toBeNull();
   });
 
-  it('degrades a PR whose comments were truncated by the first-page cap', async () => {
+  it('treats truncated comments as unavailable audit, not Human authority', async () => {
     const hostile = graphQlPr({
       number: 205,
       state: 'OPEN',
@@ -1448,9 +1477,7 @@ describe('GhLifecycleReader', () => {
     const page = await new GhLifecycleReader(pageOf(hostile, healthy)).readPullRequests(null);
 
     expect(page.nodes.map((pr) => pr.number)).toEqual([205, 206]);
-    expect(page.nodes[0]?.humanReason?.detail).toContain('comments were truncated');
-    expect(page.nodes[0]?.checks).toEqual([]);
-    expect(page.nodes[0]?.reviews).toEqual([]);
+    expect(page.nodes[0]?.humanReason).toBeNull();
     expect(page.nodes[1]?.humanReason).toBeNull();
   });
 
@@ -1474,7 +1501,10 @@ describe('GhLifecycleReader', () => {
       .rejects.toThrow(/transient GitHub network failure/);
   });
 
-  function mergedOutcomesRun(nodes: ReturnType<typeof graphQlPr>[]): CommandRunner {
+  function mergedOutcomesRun(
+    nodes: ReturnType<typeof graphQlPr>[],
+    issueConnectionHasNextPage = false,
+  ): CommandRunner {
     return async (command, args) => {
       const stub = noReviewClaimRefs(command);
       if (stub !== undefined) return stub;
@@ -1486,7 +1516,7 @@ describe('GhLifecycleReader', () => {
             repository: {
               issue42: {
                 closedByPullRequestsReferences: {
-                  pageInfo: { hasNextPage: false },
+                  pageInfo: { hasNextPage: issueConnectionHasNextPage },
                   nodes,
                 },
               },
@@ -1570,7 +1600,7 @@ describe('GhLifecycleReader', () => {
     warnSpy.mockRestore();
   });
 
-  it('skips a merged PR whose closing issue references were truncated instead of failing the snapshot', async () => {
+  it('propagates global incompleteness when merged PR closure evidence is truncated', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const truncated = {
       ...graphQlPr({
@@ -1592,8 +1622,23 @@ describe('GhLifecycleReader', () => {
       .readPullRequests(null, [42]);
 
     expect(page.nodes.map((pr) => pr.number)).toEqual([99]);
+    expect(page.closingIssueEvidenceIncomplete).toBe(true);
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('closing issue references were truncated'),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('propagates global incompleteness when an issue closed-by PR page is truncated', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const page = await new GhLifecycleReader(mergedOutcomesRun([], true))
+      .readPullRequests(null, [42]);
+
+    expect(page.nodes).toEqual([]);
+    expect(page.closingIssueEvidenceIncomplete).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('closing PR outcomes were truncated'),
     );
     warnSpy.mockRestore();
   });

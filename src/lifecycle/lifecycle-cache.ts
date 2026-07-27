@@ -27,6 +27,7 @@ import type {
 import type { GitHubUsage } from './github-usage.js';
 import { implementationClaimFingerprint } from './terminal-claim.js';
 import { COMPARE_STATUSES } from './types.js';
+import { mappingDiagnosticSignature } from './codecs.js';
 
 export const DEFAULT_AUTOPILOT_STATE_DIRECTORY = join(
   homedir(),
@@ -297,6 +298,7 @@ const pullRequestSchema = z.object({
   state: z.enum(['OPEN', 'MERGED']),
   labels: z.array(z.string()),
   closingIssueNumbers: z.array(positiveInteger),
+  closingIssueNumbersIncomplete: z.literal(true).optional(),
   mergeability: z.enum(['MERGEABLE', 'CONFLICTING', 'UNKNOWN']),
   mergeStateStatus: z.string(),
   compareStatus: z.enum(COMPARE_STATUSES).optional(),
@@ -317,6 +319,7 @@ const pullRequestSchema = z.object({
     body: z.string(),
     submittedAt: exactTimestamp,
   }).strict()),
+  evidenceIncompleteReason: z.string().min(1).optional(),
   branchClaim: branchClaimSchema.optional(),
   implementationCompletionSummary: z.string().optional(),
   reviewClaim: z.object({ oid, record: reviewClaimSchema }).strict().optional(),
@@ -324,12 +327,49 @@ const pullRequestSchema = z.object({
   humanAuthor: z.string().min(1).optional(),
   humanHead: oid.optional(),
   humanGeneration: z.string().min(1).optional(),
+  humanDiagnosticIssueNumbers: z.array(positiveInteger).min(1).optional(),
+  humanDiagnosticSignature: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   humanLabelActor: z.string().min(1).optional(),
   draftActor: z.string().min(1).optional(),
   humanReason: humanReasonSchema.optional(),
   mergedAt: exactTimestamp.optional(),
   mergeCommitOid: oid.optional(),
-}).strict();
+}).strict().superRefine((pullRequest, context) => {
+  if (
+    pullRequest.closingIssueNumbersIncomplete === true
+    && (
+      pullRequest.evidenceIncompleteReason === undefined
+      || pullRequest.closingIssueNumbers.length !== 0
+    )
+  ) {
+    context.addIssue({
+      code: 'custom',
+      message: 'Incomplete PR closing-issue evidence must discard the partial mapping',
+    });
+  }
+  const hasIssues = pullRequest.humanDiagnosticIssueNumbers !== undefined;
+  const hasSignature = pullRequest.humanDiagnosticSignature !== undefined;
+  if (hasIssues !== hasSignature) {
+    context.addIssue({
+      code: 'custom',
+      message: 'Human mapping diagnostic provenance must be complete',
+    });
+    return;
+  }
+  if (!hasIssues || !hasSignature) return;
+  if (
+    pullRequest.humanReason?.code !== 'branch-mapping-ambiguous'
+    || pullRequest.humanDiagnosticSignature !== mappingDiagnosticSignature({
+      issueNumbers: pullRequest.humanDiagnosticIssueNumbers!,
+      detail: pullRequest.humanReason.detail,
+    })
+  ) {
+    context.addIssue({
+      code: 'custom',
+      message: 'Human mapping diagnostic signature is invalid',
+    });
+  }
+});
 
 const branchSchema = z.object({
   issueNumber: positiveInteger,

@@ -248,7 +248,9 @@ async function confirmReviewAcquisition(
           candidate: confirmed,
           reason: {
             phase,
-            code: 'review-escalation',
+            code: confirmed.mappingProblem === undefined
+              ? 'review-escalation'
+              : 'branch-mapping-ambiguous',
             detail: confirmed.mappingProblem
               ?? 'The current-head CODEOWNER approval policy changed during acquisition.',
           },
@@ -325,7 +327,7 @@ export async function executeReviewAction(
   ) {
     const reason: HumanReason = {
       phase: 'awaiting-review',
-      code: 'review-escalation',
+      code: 'branch-mapping-ambiguous',
       detail: candidate.mappingProblem ?? 'PR lifecycle mapping or marker is contradictory.',
     };
     await deps.escalateHuman({ candidate, reason });
@@ -364,19 +366,6 @@ export async function executeReviewAction(
   const currentHeadClaim = current?.record.head === candidate.head
     ? current.record
     : undefined;
-  if (currentHeadClaim?.state === 'human') {
-    const reason: HumanReason = {
-      phase: 'reviewing',
-      code: 'review-escalation',
-      detail: 'The exact current review generation is held for Human judgment.',
-    };
-    await deps.escalateHuman({ candidate, reason });
-    return {
-      status: 'human',
-      prNumber: candidate.number,
-      code: 'review-escalation',
-    };
-  }
   const headChangedAt = Date.parse(candidate.headChangedAt);
   const nowMs = deps.now().getTime();
   if (!Number.isFinite(headChangedAt) || headChangedAt > nowMs) {
@@ -408,6 +397,8 @@ export async function executeReviewAction(
     currentHeadClaim !== undefined
     && currentHeadClaim.state !== 'stale'
     && currentHeadClaim.state !== 'terminal-approved'
+    && currentHeadClaim.state !== 'human'
+    && currentHeadClaim.state !== 'human-intent'
     && !stale
   ) {
     return {

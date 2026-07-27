@@ -9,7 +9,6 @@ import {
   extractMergePrepCompletionSummary,
   formatAutomatedReviewMarker,
   formatHumanCommentMarker,
-  isUnstructuredHumanHoldComment,
   mappingDiagnosticSignature,
   parseAutomatedReviewMarker,
   parseHumanCommentEvidence,
@@ -343,61 +342,6 @@ describe('lifecycle metadata codecs', () => {
     });
     expect(changedSet).not.toBe(signature);
     expect(changedDetail).not.toBe(signature);
-  });
-
-  it.each([
-    'Please do not merge this PR until I investigate.',
-    "Don't merge this until I investigate.",
-    "Don't merge this PR because I can't approve it yet.",
-    'Please do not merge this PR until the docs are fixed.',
-    'Hold this PR for human review.',
-    'Hold off on merging this PR until I review it.',
-    'Please pause the merge while I check the migration.',
-    'Wait before merging; this needs a maintainer decision.',
-    'Please wait for human approval before merging.',
-    'Please merge only after human review.',
-    'Do not land this PR yet.',
-    'This must not be merged until I investigate.',
-    'This PR cannot be merged until I approve it.',
-    'This PR can’t be merged until I approve it.',
-    'This PR cannot land until I approve it.',
-    'This PR can’t land until I approve it.',
-    'This PR cannot be merged because maintainer approval is still pending.',
-    'This PR can’t land because the security audit has not completed.',
-    'This PR cannot be merged while maintainer approval is pending.',
-    'This PR cannot be merged until the previously requested security review completes.',
-    'This PR can’t be merged until the previously requested security review completes.',
-    'Please refrain from merging this PR until I check.',
-    'Please avoid merging this PR.',
-    'Block this PR until I approve it.',
-    'Merging is blocked pending maintainer review.',
-    'This PR is blocked on maintainer approval.',
-    'This PR is currently blocked pending maintainer review.',
-  ])('recognizes common explicit maintainer hold prose: %s', (body) => {
-    expect(isUnstructuredHumanHoldComment(body)).toBe(true);
-  });
-
-  it.each([
-    'Please merge this PR when CI passes.',
-    'Do not block the merge.',
-    'No human review is needed.',
-    'We do not need human review.',
-    'The hold is released; please merge this PR.',
-    'We previously asked people not to merge this PR.',
-    'Our policy discusses when maintainers should not merge pull requests.',
-    'This removes the quoted instruction “do not merge this PR until CI passes” from docs.',
-    "The release notes quote 'do not merge this PR yet' as the old behavior.",
-    'Please hold this thought; the PR is ready to merge.',
-    'This PR is blocked on CI, not maintainer approval.',
-    'This PR is not blocked on maintainer approval.',
-    'This PR cannot be merged because it is already merged.',
-    'This PR cannot land because it already landed.',
-    'This PR was previously blocked pending maintainer review.',
-    'This fixes the docs phrase “do not merge arrays”.',
-    '> Please do not merge this PR until I investigate.',
-    '```text\nPlease do not merge this PR until I investigate.\n```',
-  ])('does not invent a Human hold from affirmative, quoted, or unrelated prose: %s', (body) => {
-    expect(isUnstructuredHumanHoldComment(body)).toBe(false);
   });
 
   it('rejects string numerics in runtime ref-name helpers', () => {

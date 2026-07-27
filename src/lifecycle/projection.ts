@@ -18,6 +18,7 @@ export interface ProjectionPullRequest {
   readonly headRefName?: string;
   readonly baseRefName?: string;
   readonly scheduledIssueNumber?: number;
+  readonly resolvedIssueNumber?: number;
   readonly reviewRefOid?: GitOid;
   readonly reviewClaim?: {
     readonly head: GitOid;
@@ -85,24 +86,6 @@ export type ProjectionAction =
       readonly body: string;
     } & HeadPinned)
   | ({
-      readonly kind: 'converge-mapping-human';
-      readonly selectedIssueNumber: number;
-      readonly prNumber: number;
-      readonly expectedReviewRefOid: GitOid;
-      readonly expectedGeneration: string;
-      readonly expectedReviewState:
-        | 'active'
-        | 'verdict-intent'
-        | 'terminal-approved'
-        | 'mapping-reread'
-        | 'human-intent'
-        | 'human';
-      readonly mappingRequest?: MappingRereadRequest;
-      readonly mappingDiagnostic: MappingDiagnosticAuthority;
-      readonly marker: string;
-      readonly body: string;
-    } & HeadPinned)
-  | ({
       readonly kind: 'ensure-implementation-summary';
       readonly prNumber: number;
       readonly summary: string;
@@ -114,6 +97,7 @@ export type ProjectionAction =
       readonly expectedReviewRefOid: GitOid;
       readonly expectedGeneration: string;
       readonly expectedAuthor: string;
+      readonly mappingDiagnostic: MappingDiagnosticAuthority;
       readonly marker: string;
     } & HeadPinned)
   | ({
@@ -206,7 +190,18 @@ function planItem(
     && item.branchClaim.phaseComplete === true;
   if (item.kind !== 'pull-request') return actions;
   const obsoleteMapping = item.obsoleteMachineMappingHuman;
-  if (obsoleteMapping !== undefined) {
+  if (
+    obsoleteMapping !== undefined
+    && obsoleteMapping.mappingDiagnostic === undefined
+  ) {
+    // Unsigned legacy mapping overlays are migration input, never an
+    // automatically writable projection.
+    return [];
+  }
+  if (
+    obsoleteMapping !== undefined
+    && obsoleteMapping.mappingDiagnostic !== undefined
+  ) {
     const refOid = reviewRefByPr.get(item.prNumber);
     if (refOid !== undefined) {
       return [{
@@ -217,20 +212,17 @@ function planItem(
         expectedReviewRefOid: refOid,
         expectedGeneration: obsoleteMapping.generation,
         expectedAuthor: obsoleteMapping.author,
+        mappingDiagnostic: obsoleteMapping.mappingDiagnostic,
         marker: formatHumanCommentMarker({
           issueNumber: item.issueNumber,
           prNumber: item.prNumber,
           head: item.head,
           generation: obsoleteMapping.generation,
           reason: obsoleteMapping.reason,
-          ...(obsoleteMapping.mappingDiagnostic === undefined
-            ? {}
-            : {
-                diagnosticIssueNumbers:
-                  obsoleteMapping.mappingDiagnostic.issueNumbers,
-                diagnosticSignature:
-                  obsoleteMapping.mappingDiagnostic.signature,
-              }),
+          diagnosticIssueNumbers:
+            obsoleteMapping.mappingDiagnostic.issueNumbers,
+          diagnosticSignature:
+            obsoleteMapping.mappingDiagnostic.signature,
         }),
       }];
     }
@@ -404,6 +396,8 @@ export function planProjection(
       && claim.state === 'mapping-reread'
       && claim.mappingRequest !== undefined
       && context.snapshotComplete === true
+      && pullRequest.resolvedIssueNumber
+        === claim.mappingRequest.selectedIssueNumber
       && pullRequest.headRefName === claim.mappingRequest.headRefName
       && pullRequest.baseRefName === claim.mappingRequest.baseRefName
     ) {
@@ -420,83 +414,6 @@ export function planProjection(
       }
       continue;
     }
-    const selectedIssueNumber =
-      claim.mappingRequest?.selectedIssueNumber
-      ?? pullRequest.scheduledIssueNumber
-      ?? (canonical?.issueNumbers.length === 1
-        ? canonical.issueNumbers[0]
-        : undefined);
-    const diagnostic: MappingDiagnosticAuthority | undefined =
-      claim.mappingDiagnostic
-      ?? (
-        canonical === undefined || selectedIssueNumber === undefined
-          ? undefined
-          : {
-              selectedIssueNumber,
-              issueNumbers: [...canonical.issueNumbers],
-              detail: canonical.detail,
-              signature: canonical.signature,
-            }
-      );
-    if (
-      diagnostic === undefined
-      || !diagnostic.issueNumbers.includes(diagnostic.selectedIssueNumber)
-      || (
-        canonical !== undefined
-        && claim.state !== 'human-intent'
-        && claim.state !== 'human'
-        && (
-          canonical.signature !== diagnostic.signature
-          || canonical.detail !== diagnostic.detail
-        )
-      )
-      || (
-        claim.mappingRequest !== undefined
-        && (
-          pullRequest.headRefName !== claim.mappingRequest.headRefName
-          || pullRequest.baseRefName !== claim.mappingRequest.baseRefName
-        )
-      )
-      || claim.head !== (
-        canonical?.pullRequests.find((candidate) =>
-          candidate.number === pullRequest.number)?.head
-        ?? claim.head
-      )
-      // A legacy bare Human record has no signed intent authority and must
-      // remain fail-closed instead of adopting a newly observed diagnostic.
-      || (claim.state === 'human' && claim.mappingDiagnostic === undefined)
-    ) {
-      continue;
-    }
-    const reason: HumanReason = {
-      phase: 'reviewing',
-      code: 'branch-mapping-ambiguous',
-      detail: diagnostic.detail,
-    };
-    const marker = formatHumanCommentMarker({
-      issueNumber: diagnostic.selectedIssueNumber,
-      prNumber: pullRequest.number,
-      head: claim.head,
-      generation: claim.generation,
-      reason,
-      diagnosticIssueNumbers: diagnostic.issueNumbers,
-      diagnosticSignature: diagnostic.signature,
-    });
-    actions.push({
-      kind: 'converge-mapping-human',
-      selectedIssueNumber: diagnostic.selectedIssueNumber,
-      prNumber: pullRequest.number,
-      expectedHead: claim.head,
-      expectedReviewRefOid: pullRequest.reviewRefOid,
-      expectedGeneration: claim.generation,
-      expectedReviewState: claim.state,
-      ...(claim.mappingRequest === undefined
-        ? {}
-        : { mappingRequest: claim.mappingRequest }),
-      mappingDiagnostic: diagnostic,
-      marker,
-      body: `${marker}\n\nAutopilot parked this item for Human review.\n\n${reason.detail}`,
-    });
   }
   return { actions };
 }

@@ -481,12 +481,21 @@ describe('production active runtime preflight', () => {
     expect(events.indexOf('pid')).toBeLessThan(events.indexOf('track'));
   });
 
-  it('uses the targeted resolved-to-ambiguous reread and converges request, audit, and Human CAS', async () => {
+  it('uses only the fresh canonical diagnostic to publish a mapping reread', async () => {
     const head = gitOid('3'.repeat(40));
-    const acquisitionOids = [gitOid('4'.repeat(40)), gitOid('5'.repeat(40))];
-    const writerOids = [gitOid('6'.repeat(40)), gitOid('7'.repeat(40))];
+    const acquisitionOids = [
+      gitOid('4'.repeat(40)),
+      gitOid('5'.repeat(40)),
+      gitOid('6'.repeat(40)),
+      gitOid('7'.repeat(40)),
+      gitOid('9'.repeat(40)),
+      gitOid('a'.repeat(40)),
+      gitOid('b'.repeat(40)),
+    ];
     const generation = '33333333-3333-4333-8333-333333333333';
     const attempt = '44444444-4444-4444-8444-444444444444';
+    const resolvedGeneration = '55555555-5555-4555-8555-555555555555';
+    const resolvedAttempt = '66666666-6666-4666-8666-666666666666';
     const mappingDetails = [
       'Closing-reference mapping is duplicated or names multiple issues.',
       'PR evidence does not resolve to one known lifecycle issue.',
@@ -626,6 +635,7 @@ describe('production active runtime preflight', () => {
       }],
       diagnostics: [],
     };
+    let freshSnapshot = liveSnapshot;
     const acquisitionRecords = new Map<string, unknown>();
     let acquisitionCount = 0;
     const makeReviewActionPort = vi.fn(() => ({
@@ -652,18 +662,23 @@ describe('production active runtime preflight', () => {
         };
       },
     }));
+    let liveLabels = ['engine:review'];
+    let liveEvidenceIncompleteReason: string | undefined;
     const readPullRequestByNumber = async () => ({
       state: 'OPEN',
       headRefName: candidate.headRefName,
       headOid: head,
       baseRefName: candidate.baseRefName,
       isDraft: false,
-      labels: ['engine:review'],
+      labels: liveLabels,
       body: candidate.body,
       closingIssueNumbers: [42, 43],
       humanIssueNumber: null,
       humanReason: null,
       reviewClaim,
+      ...(liveEvidenceIncompleteReason === undefined
+        ? {}
+        : { evidenceIncompleteReason: liveEvidenceIncompleteReason }),
     });
     const active = marketplaceRuntime({
       executionBackend: 'local',
@@ -679,7 +694,7 @@ describe('production active runtime preflight', () => {
       }]),
       makeReviewActionPort,
       readPullRequestByNumber,
-      readReviewSnapshot: async () => liveSnapshot,
+      readReviewSnapshot: async () => freshSnapshot,
       readProjectItemForReconciliation: async (number) => ({
         id: `PVTI_${number}`,
         status: 'In Review',
@@ -695,75 +710,11 @@ describe('production active runtime preflight', () => {
       readBlockedByIssueNumbers: async () => [],
       nextId: vi.fn()
         .mockReturnValueOnce(generation)
-        .mockReturnValueOnce(attempt),
+        .mockReturnValueOnce(attempt)
+        .mockReturnValueOnce(resolvedGeneration)
+        .mockReturnValueOnce(resolvedAttempt),
       now: () => NOW,
       runner: async (_command, args) => {
-        if (args[0] === 'api' && args.some((arg) => arg.includes('/comments'))) {
-          return JSON.stringify([comments.map((body) => ({
-            body,
-            user: { login: 'review-bot' },
-          }))]);
-        }
-        if (args[0] === 'pr' && args[1] === 'comment') {
-          events.push('mapping-audit');
-          comments.push(args[args.indexOf('--body') + 1]!);
-          return '';
-        }
-        if (args.includes('hash-object')) return `${gitOid('8'.repeat(40))}\n`;
-        if (args.includes('write-tree')) return `${gitOid('9'.repeat(40))}\n`;
-        if (args.includes('commit-tree')) {
-          const next = writerOids[
-            reviewClaim === null
-              ? 0
-              : decodeReviewClaimPayload(reviewClaim.payload).state === 'mapping-reread'
-                ? 0
-                : 1
-          ]!;
-          return `${next}\n`;
-        }
-        if (args.includes('rev-list')) {
-          const candidateOid = args.at(-1)!;
-          return `${candidateOid} ${reviewClaim?.oid ?? ''}`;
-        }
-        if (args.includes('ls-remote')) {
-          return `${reviewClaim?.oid ?? ''}\trefs/jinn-autopilot/review-claims/v1/84\n`;
-        }
-        if (args.includes('push')) {
-          if (reviewClaim === null) throw new Error('missing review claim before push');
-          const current = decodeReviewClaimPayload(reviewClaim.payload);
-          const nextState = current.state === 'mapping-reread'
-            ? 'human-intent'
-            : 'human';
-          const nextOid = nextState === 'human-intent' ? writerOids[0]! : writerOids[1]!;
-          const mappingDiagnostic = {
-            selectedIssueNumber: 42,
-            issueNumbers: [42, 43],
-            detail: diagnosticDetail,
-            signature: diagnosticSignature,
-          };
-          reviewClaim = {
-            oid: nextOid,
-            payload: encodeReviewClaimPayload({
-              kind: 'review-claim',
-              protocolVersion: 2,
-              prNumber: 84,
-              generation,
-              attempt,
-              reviewer: 'review-bot',
-              head,
-              state: nextState,
-              mappingDiagnostic,
-              recordedAt: NOW.toISOString(),
-            }),
-          };
-          events.push(`claim:${nextState}`);
-          return '';
-        }
-        if (args.includes('read-tree') || args.includes('update-index')) return '';
-        if (args[0] === 'pr' && (args[1] === 'ready' || args[1] === 'edit')) {
-          sharedMutations.push(args.join(' '));
-          return '';
-        }
         throw new Error(`unexpected ${args.join(' ')}`);
       },
     });
@@ -776,20 +727,166 @@ describe('production active runtime preflight', () => {
     }, cycleSnapshot)).resolves.toEqual({ outcome: 'human' });
 
     expect(reviewClaim).not.toBeNull();
-    expect(comments).toEqual([
-      expect.stringContaining(
-        `code=branch-mapping-ambiguous head=${head} generation=${generation}`,
-      ),
-    ]);
+    expect(decodeReviewClaimPayload(reviewClaim!.payload)).toMatchObject({
+      state: 'mapping-reread',
+      mappingRequest: {
+        selectedIssueNumber: 42,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+      },
+    });
+    expect(comments).toEqual([]);
     expect(events).toEqual([
       'record:active',
       'claim:active',
       'record:mapping-reread',
       'claim:mapping-reread',
-      'claim:human-intent',
-      'mapping-audit',
-      'claim:human',
     ]);
+    expect(sharedMutations).toEqual([]);
+
+    reviewClaim = null;
+    freshSnapshot = cycleSnapshot;
+    comments.length = 0;
+    events.length = 0;
+    sharedMutations.length = 0;
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, cycleSnapshot)).resolves.toEqual({ outcome: 'human' });
+
+    expect(reviewClaim).toBeNull();
+    expect(comments).toEqual([]);
+    expect(events).toEqual([]);
+    expect(sharedMutations).toEqual([]);
+
+    const retainedOid = gitOid('8'.repeat(40));
+    const retainedRecord = {
+      kind: 'review-claim' as const,
+      protocolVersion: 2 as const,
+      prNumber: 84,
+      generation,
+      attempt,
+      reviewer: 'review-bot',
+      head,
+      state: 'active' as const,
+      recordedAt: '2026-07-20T11:00:00.000Z',
+    };
+    const externalAuthorityObservations: Array<{
+      readonly name: string;
+      readonly reviewClaim: typeof reviewClaim;
+      readonly events: readonly string[];
+      readonly comments: readonly string[];
+      readonly sharedMutations: readonly string[];
+    }> = [];
+    for (const authority of [
+      {
+        name: 'PR Human label',
+        labels: ['engine:review', 'review:needs-human'],
+        issueLabels: [] as string[],
+        blockedOn: 'Nothing' as const,
+      },
+      {
+        name: 'issue Human label',
+        labels: ['engine:review'],
+        issueLabels: ['autopilot:human'],
+        blockedOn: 'Nothing' as const,
+      },
+      {
+        name: 'Project Blocked on Human',
+        labels: ['engine:review'],
+        issueLabels: [] as string[],
+        blockedOn: 'Human' as const,
+      },
+    ]) {
+      reviewClaim = {
+        oid: retainedOid,
+        payload: encodeReviewClaimPayload(retainedRecord),
+      };
+      liveLabels = authority.labels;
+      freshSnapshot = {
+        ...liveSnapshot,
+        pullRequests: [{
+          ...liveSnapshot.pullRequests[0],
+          labels: authority.labels,
+        }],
+        issues: liveSnapshot.issues.map((issue) => (
+          issue.number === 42
+            ? {
+                ...issue,
+                labels: authority.issueLabels,
+                blockedOn: authority.blockedOn,
+              }
+            : issue
+        )),
+        project: {
+          ...liveSnapshot.project,
+          items: liveSnapshot.project.items.map((item) => (
+            item.number === 42
+              ? { ...item, blockedOn: authority.blockedOn }
+              : item
+          )),
+        },
+      };
+      events.length = 0;
+      comments.length = 0;
+      sharedMutations.length = 0;
+
+      await expect(active.executeAction({
+        kind: 'claim-review',
+        issueNumber: 42,
+        prNumber: 84,
+        head,
+      }, cycleSnapshot), authority.name).resolves.toEqual({ outcome: 'human' });
+      externalAuthorityObservations.push({
+        name: authority.name,
+        reviewClaim,
+        events: [...events],
+        comments: [...comments],
+        sharedMutations: [...sharedMutations],
+      });
+    }
+    expect(externalAuthorityObservations).toEqual([
+      'PR Human label',
+      'issue Human label',
+      'Project Blocked on Human',
+    ].map((name) => ({
+      name,
+      reviewClaim: {
+        oid: retainedOid,
+        payload: encodeReviewClaimPayload(retainedRecord),
+      },
+      events: [],
+      comments: [],
+      sharedMutations: [],
+    })));
+
+    reviewClaim = {
+      oid: retainedOid,
+      payload: encodeReviewClaimPayload(retainedRecord),
+    };
+    liveLabels = ['engine:review'];
+    liveEvidenceIncompleteReason = 'PR #84 labels were truncated';
+    freshSnapshot = liveSnapshot;
+    events.length = 0;
+    comments.length = 0;
+    sharedMutations.length = 0;
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, cycleSnapshot)).rejects.toThrow(/evidence.*incomplete/i);
+
+    expect(reviewClaim).toEqual({
+      oid: retainedOid,
+      payload: encodeReviewClaimPayload(retainedRecord),
+    });
+    expect(events).toEqual([]);
+    expect(comments).toEqual([]);
     expect(sharedMutations).toEqual([]);
   });
 

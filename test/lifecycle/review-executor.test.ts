@@ -298,7 +298,7 @@ describe('review action executor', () => {
     expect(h.events).toEqual([]);
   });
 
-  it('repairs a current-head Human record and never reaps or reclaims it', async () => {
+  it('reclaims a stale internal Human audit because it is not lifecycle authority', async () => {
     const h = harness({
       readCandidate: async () => candidate({
         reviewRef: {
@@ -309,14 +309,48 @@ describe('review action executor', () => {
     });
 
     await expect(executeReviewAction({ prNumber: 84 }, h.deps))
-      .resolves.toEqual({
-        status: 'human',
+      .resolves.toMatchObject({
+        status: 'spawned',
         prNumber: 84,
-        code: 'review-escalation',
       });
-    expect(h.human).toHaveLength(1);
-    expect(h.events).toEqual([]);
+    expect(h.human).toEqual([]);
+    expect(h.records).toEqual([
+      expect.objectContaining({ state: 'active', head: HEAD }),
+    ]);
+    expect(h.events).toEqual([
+      'record',
+      'claim',
+      'attempt',
+      'projection',
+      'spawn',
+      'track',
+    ]);
   });
+
+  it.each(['human', 'human-intent'] as const)(
+    'reclaims a fresh internal %s audit because only an external Human hold is authoritative',
+    async (state) => {
+      const h = harness({
+        readCandidate: async () => candidate({
+          headChangedAt: '2026-07-20T11:59:00.000Z',
+          reviewRef: {
+            oid: OLD_RECORD,
+            record: claim({
+              state,
+              recordedAt: '2026-07-20T11:59:00.000Z',
+            }),
+          },
+        }),
+      });
+
+      await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+        .resolves.toMatchObject({ status: 'spawned', prNumber: 84 });
+      expect(h.human).toEqual([]);
+      expect(h.records).toEqual([
+        expect.objectContaining({ state: 'active', head: HEAD }),
+      ]);
+    },
+  );
 
   it('repairs the Human projection when the snapshot already exposes the hold', async () => {
     const h = harness({

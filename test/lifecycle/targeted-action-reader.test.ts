@@ -352,6 +352,32 @@ describe('targeted action reader', () => {
     ]);
   });
 
+  it('returns no action authority when exact target PR evidence is incomplete', async () => {
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => 510,
+      readPullRequest: async () => rawPullRequest({
+        evidenceIncompleteReason: 'PR #101 labels were truncated',
+      }),
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Review',
+        blockedOn: 'Nothing',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [],
+    });
+
+    await expect(reader.readPullRequest(cycleSnapshot(), 101)).resolves.toBeNull();
+  });
+
   it('refreshes a newly opened unlabeled mapping competitor before review authority', async () => {
     const target = rawPullRequest();
     const competitor = rawPullRequest({

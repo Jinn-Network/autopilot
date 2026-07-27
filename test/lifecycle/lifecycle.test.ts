@@ -260,6 +260,32 @@ describe('deriveLifecycle', () => {
     });
   });
 
+  it('does not age a machine-owned mapping reread into stale while ambiguity persists', () => {
+    const [view] = deriveLifecycle(snapshot(implementation({
+      branchClaim: undefined,
+      isDraft: false,
+      headChangedAt: '2026-07-20T08:00:00.000Z',
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'reviewer',
+        head: HEAD_A,
+        state: 'mapping-reread',
+        mappingRequest: {
+          selectedIssueNumber: 42,
+          headRefName: 'autopilot/42',
+          baseRefName: 'next',
+        },
+        recordedAt: '2026-07-20T08:00:00.000Z',
+      },
+    })), NOW, STALE_AFTER).items;
+
+    expect(view).toMatchObject({ phase: 'reviewing', stale: false });
+  });
+
   it('a replacement claim on a >2h-old head gets its own full staleness window (no livelock)', () => {
     // Regression for the reaper livelock: every backlogged-PR review claim
     // generation -- not just the first one on a given head -- must start its

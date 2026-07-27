@@ -491,6 +491,14 @@ function projectionContext(
       headRefName: pr.headRefName,
       baseRefName: pr.baseRefName,
       ...((() => {
+        const mapping = snapshot.pullRequestMappings?.find((candidate) => (
+          candidate.prNumber === pr.number && candidate.status === 'resolved'
+        ));
+        return mapping?.status === 'resolved'
+          ? { resolvedIssueNumber: mapping.issueNumber }
+          : {};
+      })()),
+      ...((() => {
         const markers = [...pr.body.matchAll(
           /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/g,
         )].filter((match) => match[2] === pr.headRefName);
@@ -727,6 +735,7 @@ function activeCandidates(
     if (item.kind !== 'pull-request' || item.humanHold || item.merged) continue;
     const pr = byPr.get(item.prNumber);
     if (pr === undefined) continue;
+    if (pr.evidenceIncompleteReason !== undefined) continue;
     const compareStatus: CompareStatus = pr.compareStatus ?? (
       item.mergeState === 'behind'
         ? 'behind'

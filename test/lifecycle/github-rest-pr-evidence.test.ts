@@ -164,6 +164,15 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     await expect(probe.changed(pr({ compareStatus: undefined }))).resolves.toBe(true);
   });
 
+  it('forces refresh when cached PR evidence is explicitly incomplete', async () => {
+    const context = probeWith(equalBodies());
+
+    await expect(context.probe.changed(pr({
+      evidenceIncompleteReason: 'PR #101 reviews were truncated',
+    }))).resolves.toBe(true);
+    expect(context.calls).toEqual([]);
+  });
+
   it('uses the workflow run id from a check-run details URL', async () => {
     const bodies = equalBodies();
     bodies.checks = {
@@ -256,20 +265,41 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   it('detects a structured Human comment transition', async () => {
     const bodies = equalBodies();
     bodies.comments = [{
+      id: 1,
       body: '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=reviewing code=review-escalation -->\n\nNeeds a product decision.',
       created_at: '2026-07-22T10:02:00.000Z',
+      author_association: 'MEMBER',
     }];
 
     await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(true);
   });
 
-  it('detects an unstructured maintainer Human hold transition', async () => {
+  it('ignores unstructured maintainer prose as lifecycle authority', async () => {
     const bodies = equalBodies();
     bodies.comments = [{
+      id: 1,
       body: 'Please do not merge this PR until I investigate.',
       created_at: '2026-07-22T10:02:00.000Z',
+      author_association: 'MEMBER',
       user: { login: 'maintainer' },
     }];
+
+    await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(false);
+  });
+
+  it.each([
+    {
+      label: 'an invalid structured audit marker',
+      body: '<!-- jinn-autopilot-human:v2 pr=101 phase=reviewing code=review-escalation -->',
+    },
+    {
+      label: 'a structured audit marker for another PR',
+      body: '<!-- jinn-autopilot-human:v2 pr=999 phase=reviewing code=review-escalation -->'
+        + '\n\nA real detail sentence.',
+    },
+  ])('forces canonical refresh rather than aborting on $label', async ({ body }) => {
+    const bodies = equalBodies();
+    bodies.comments = [{ id: 1, body, user: { login: 'review-bot' } }];
 
     await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(true);
   });
@@ -285,8 +315,10 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
       labels: [{ name: 'engine:review' }, { name: 'review:needs-human' }],
     };
     bodies.comments = [{
+      id: 1,
       body: `${marker}\n\nMapping was ambiguous.`,
       created_at: '2026-07-22T10:02:00.000Z',
+      author_association: 'MEMBER',
       user: { login: 'maintenance-bot' },
     }];
     bodies.events = [{
@@ -419,6 +451,6 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
       });
     };
     const probe = new ConditionalPullRequestEvidenceProbe(new ConditionalRestClient(run));
-    await expect(probe.changed(pr())).rejects.toThrow(/truncated|pagination/i);
+    await expect(probe.changed(pr())).resolves.toBe(true);
   });
 });

@@ -251,7 +251,7 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   readonly obsoleteMachineMappingHuman?: {
     readonly generation: string;
     readonly author: string;
-    readonly mappingDiagnostic?: MappingDiagnosticAuthority;
+    readonly mappingDiagnostic: MappingDiagnosticAuthority;
     readonly reason: {
       readonly phase: 'eligible' | 'implementing' | 'awaiting-review' | 'reviewing';
       readonly code: 'branch-mapping-ambiguous';

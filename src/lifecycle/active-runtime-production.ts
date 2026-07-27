@@ -25,7 +25,6 @@ import {
   decodeReviewClaimPayload,
   formatHumanCommentMarker,
 } from './codecs.js';
-import { planProjection } from './projection.js';
 import {
   selectCredential,
   type CredentialPool,
@@ -81,6 +80,7 @@ import type {
 import { gitOid } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
+import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
 import {
   LocalSessionExecutionBackend,
   MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
@@ -419,6 +419,14 @@ export function makeProductionActiveRuntime(
     ) {
       throw new Error('Review Human escalation selected issue is outside the live diagnostic');
     }
+    if (
+      input.reason.code === 'branch-mapping-ambiguous'
+      && diagnostic === undefined
+    ) {
+      // The scheduled candidate can lag a just-completed canonical reread.
+      // Only the fresh complete snapshot may authorize a mapping pause.
+      return;
+    }
     const live = await options.readPullRequestByNumber(input.candidate.number);
     if (
       live === null
@@ -426,6 +434,51 @@ export function makeProductionActiveRuntime(
       || live.headOid !== input.candidate.head
     ) {
       throw new Error('Review Human escalation lost exact-head authority');
+    }
+    if (live.evidenceIncompleteReason !== undefined) {
+      throw new Error(
+        `Review Human escalation live PR evidence is incomplete: ${
+          live.evidenceIncompleteReason
+        }`,
+      );
+    }
+    const canonicalPr = authoritySnapshot.pullRequests.find(
+      (pr) => pr.number === input.candidate.number,
+    );
+    let canonicalMappingRequest: {
+      readonly selectedIssueNumber: number;
+      readonly headRefName: string;
+      readonly baseRefName: string;
+    } | undefined;
+    if (diagnostic !== undefined) {
+      if (canonicalPr === undefined) {
+        throw new Error('Review mapping escalation canonical PR is absent');
+      }
+      const diagnosticIssues = new Set(diagnostic.issueNumbers);
+      const externalHumanActive = (
+        [...live.labels, ...canonicalPr.labels].some((label) => (
+          label === NEEDS_HUMAN_LABEL || label === 'autopilot:human'
+        ))
+        || authoritySnapshot.issues.some((issue) => (
+          diagnosticIssues.has(issue.number)
+          && (
+            issue.blockedOn === 'Human'
+            || issue.labels?.includes(NEEDS_HUMAN_LABEL) === true
+            || issue.labels?.includes('autopilot:human') === true
+          )
+        ))
+        || authoritySnapshot.project.items.some((item) => (
+          item.contentType === 'Issue'
+          && diagnosticIssues.has(item.number)
+          && item.blockedOn === 'Human'
+        ))
+      );
+      if (externalHumanActive) return;
+      canonicalMappingRequest = {
+        selectedIssueNumber: input.candidate.issueNumber,
+        headRefName: canonicalPr.headRefName,
+        baseRefName: canonicalPr.baseRefName,
+      };
     }
     let currentRefOid = live.reviewClaim === null
       ? null
@@ -532,21 +585,12 @@ export function makeProductionActiveRuntime(
       now,
     });
     if (diagnostic !== undefined) {
-      const canonicalPr = authoritySnapshot.pullRequests.find(
-        (pr) => pr.number === input.candidate.number,
-      );
-      if (canonicalPr === undefined) {
-        throw new Error('Review mapping escalation canonical PR is absent');
+      if (canonicalMappingRequest === undefined) {
+        throw new Error('Review mapping escalation request authority is absent');
       }
-      const mappingRequest = {
-        selectedIssueNumber: input.candidate.issueNumber,
-        headRefName: canonicalPr.headRefName,
-        baseRefName: canonicalPr.baseRefName,
-      };
+      const mappingRequest = canonicalMappingRequest;
       if (
         authorityRecord.state !== 'mapping-reread'
-        && authorityRecord.state !== 'human-intent'
-        && authorityRecord.state !== 'human'
       ) {
         const requestRecord: ReviewClaimRecord = {
           kind: 'review-claim',
@@ -578,36 +622,6 @@ export function makeProductionActiveRuntime(
       ) {
         throw new Error('Review mapping reread request identity changed');
       }
-      const action = planProjection({
-        view: { items: [] },
-        pullRequests: [{
-          number: input.candidate.number,
-          headRefName: canonicalPr.headRefName,
-          baseRefName: canonicalPr.baseRefName,
-          scheduledIssueNumber: input.candidate.issueNumber,
-          reviewRefOid: currentRefOid,
-          reviewClaim: {
-            head: authorityRecord.head,
-            generation: authorityRecord.generation,
-            state: authorityRecord.state,
-            ...('mappingRequest' in authorityRecord
-              ? { mappingRequest: authorityRecord.mappingRequest }
-              : {}),
-            ...('mappingDiagnostic' in authorityRecord
-              && authorityRecord.mappingDiagnostic !== undefined
-              ? { mappingDiagnostic: authorityRecord.mappingDiagnostic }
-              : {}),
-          },
-        }],
-        orphanBranchClaims: [],
-        mappingDiagnostics: authoritySnapshot.diagnostics,
-      }).actions.find(
-        (candidate) => candidate.kind === 'converge-mapping-human',
-      );
-      if (action === undefined || action.kind !== 'converge-mapping-human') {
-        throw new Error('Review mapping escalation could not derive canonical convergence');
-      }
-      await writer.convergeMappingHuman?.(action);
       return;
     }
     const publicationReason: HumanReason = input.reason;
@@ -643,11 +657,23 @@ export function makeProductionActiveRuntime(
         authority,
       );
     };
-    // Mapping diagnostics are append-first. A failed or ambiguous comment
-    // publication therefore leaves only non-Human review-ref authority.
-    if (diagnostic !== undefined && authorityRecord.state !== 'human') {
-      await ensureComment(currentRefOid, authorityRecord.state);
-    }
+    const requireExactEscalationRef = async (): Promise<void> => {
+      const observed = await writer.readReviewRef(input.candidate.number);
+      if (
+        observed?.oid !== currentRefOid
+        || observed.head !== input.candidate.head
+      ) {
+        throw new Error('Review Human escalation lost exact review-ref authority');
+      }
+    };
+    await requireExactEscalationRef();
+    await writer.setPullRequestLabel(
+      input.candidate.number,
+      NEEDS_HUMAN_LABEL,
+      true,
+      input.candidate.head,
+    );
+    await requireExactEscalationRef();
     if (authorityRecord.state !== 'human') {
       const humanRecord: ReviewClaimRecord = {
         kind: 'review-claim',

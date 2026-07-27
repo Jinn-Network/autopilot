@@ -115,12 +115,23 @@ export interface PullRequestSnapshot {
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
   readonly closingIssueNumbers: readonly number[];
+  /**
+   * The closing-issue connection was truncated. No partial issue list may
+   * participate in mapping or global action authority.
+   */
+  readonly closingIssueNumbersIncomplete?: true;
   readonly mergeability: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
   readonly compareStatus?: CompareStatus;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
   readonly reviews: readonly NativeReviewSnapshot[];
+  /**
+   * Non-comment PR evidence could not be read completely. This is a machine
+   * availability fence, never Human authority, and must make the PR
+   * non-actionable until a later exact refresh succeeds.
+   */
+  readonly evidenceIncompleteReason?: string;
   readonly branchClaim?: BranchClaim;
   readonly implementationCompletionSummary?: string;
   readonly reviewClaim?: ReviewClaimSnapshot;
@@ -128,6 +139,8 @@ export interface PullRequestSnapshot {
   readonly humanAuthor?: string;
   readonly humanHead?: GitOid;
   readonly humanGeneration?: string;
+  readonly humanDiagnosticIssueNumbers?: readonly number[];
+  readonly humanDiagnosticSignature?: string;
   /** Actor on the latest timeline event for the current Human label. */
   readonly humanLabelActor?: string;
   /** Actor on the latest timeline event for the current draft state. */
@@ -159,12 +172,14 @@ export interface RawPullRequest {
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
   readonly closingIssueNumbers: readonly number[];
+  readonly closingIssueNumbersIncomplete?: true;
   readonly mergeability: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
   readonly compareStatus?: CompareStatus;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
   readonly reviews: readonly RawNativeReview[];
+  readonly evidenceIncompleteReason?: string;
   readonly branchClaimTrailers: string | null;
   readonly implementationCompletionSummary?: string | null;
   readonly reviewClaim: { readonly oid: string; readonly payload: string } | null;
@@ -172,6 +187,8 @@ export interface RawPullRequest {
   readonly humanAuthor?: string | null;
   readonly humanHead?: string | null;
   readonly humanGeneration?: string | null;
+  readonly humanDiagnosticIssueNumbers?: readonly number[] | null;
+  readonly humanDiagnosticSignature?: string | null;
   readonly humanLabelActor?: string | null;
   readonly draftActor?: string | null;
   readonly humanReason: HumanReason | null;
@@ -181,6 +198,11 @@ export interface RawPullRequest {
 
 export interface PullRequestPage {
   readonly nodes: readonly RawPullRequest[];
+  /**
+   * A page-bound merged-outcome or issue closed-by connection was incomplete,
+   * so no global lifecycle action may rely on the resulting issue closure.
+   */
+  readonly closingIssueEvidenceIncomplete?: true;
   readonly pageInfo: {
     readonly hasNextPage: boolean;
     readonly endCursor: string | null;
@@ -326,6 +348,18 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
         commitId: gitOid(review.commitId),
       };
     });
+    if (
+      raw.evidenceIncompleteReason !== undefined
+      && raw.evidenceIncompleteReason.trim().length === 0
+    ) {
+      throw new Error('PR evidence-incomplete reason must be non-empty');
+    }
+    if (
+      raw.closingIssueNumbersIncomplete === true
+      && raw.evidenceIncompleteReason === undefined
+    ) {
+      throw new Error('Incomplete PR closing-issue evidence requires a reason');
+    }
     const branchClaim = (() => {
       if (raw.branchClaimTrailers === null) return undefined;
       try {
@@ -352,6 +386,30 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
     const humanHead = raw.humanHead === undefined || raw.humanHead === null
       ? undefined
       : gitOid(raw.humanHead);
+    const hasHumanDiagnosticIssues = raw.humanDiagnosticIssueNumbers !== undefined
+      && raw.humanDiagnosticIssueNumbers !== null;
+    const hasHumanDiagnosticSignature = raw.humanDiagnosticSignature !== undefined
+      && raw.humanDiagnosticSignature !== null;
+    if (hasHumanDiagnosticIssues !== hasHumanDiagnosticSignature) {
+      throw new Error('Human mapping diagnostic provenance is incomplete');
+    }
+    const humanDiagnosticIssueNumbers = hasHumanDiagnosticIssues
+      ? [...raw.humanDiagnosticIssueNumbers!]
+      : undefined;
+    if (humanDiagnosticIssueNumbers !== undefined) {
+      for (const issueNumber of humanDiagnosticIssueNumbers) {
+        assertPositiveInteger(issueNumber, 'Human mapping diagnostic issue number');
+      }
+      if (
+        raw.humanReason?.code !== 'branch-mapping-ambiguous'
+        || raw.humanDiagnosticSignature !== mappingDiagnosticSignature({
+          issueNumbers: humanDiagnosticIssueNumbers,
+          detail: raw.humanReason.detail,
+        })
+      ) {
+        throw new Error('Human mapping diagnostic signature is invalid');
+      }
+    }
     return {
       number: raw.number,
       title: raw.title,
@@ -365,13 +423,21 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       isDraft: raw.isDraft,
       state: raw.state,
       labels: [...raw.labels],
-      closingIssueNumbers: [...raw.closingIssueNumbers],
+      closingIssueNumbers: raw.closingIssueNumbersIncomplete === true
+        ? []
+        : [...raw.closingIssueNumbers],
+      ...(raw.closingIssueNumbersIncomplete === true
+        ? { closingIssueNumbersIncomplete: true as const }
+        : {}),
       mergeability: raw.mergeability,
       mergeStateStatus: raw.mergeStateStatus,
       ...(raw.compareStatus === undefined ? {} : { compareStatus: raw.compareStatus }),
       checks: raw.checks.map((check) => ({ ...check })),
       ...(raw.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
       reviews,
+      ...(raw.evidenceIncompleteReason === undefined
+        ? {}
+        : { evidenceIncompleteReason: raw.evidenceIncompleteReason }),
       ...(branchClaim === undefined ? {} : { branchClaim }),
       ...(raw.implementationCompletionSummary === undefined
         || raw.implementationCompletionSummary === null
@@ -388,6 +454,12 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       ...(raw.humanGeneration === undefined || raw.humanGeneration === null
         ? {}
         : { humanGeneration: raw.humanGeneration }),
+      ...(humanDiagnosticIssueNumbers === undefined
+        ? {}
+        : {
+            humanDiagnosticIssueNumbers,
+            humanDiagnosticSignature: raw.humanDiagnosticSignature!,
+          }),
       ...(raw.humanLabelActor === undefined || raw.humanLabelActor === null
         ? {}
         : { humanLabelActor: raw.humanLabelActor }),
@@ -493,18 +565,15 @@ function lifecyclePr(
   const decisive = latestDecisiveReview(pr);
   const reviewClaim = pr.reviewClaim?.record;
   const issueLabels = [...(issue.labels ?? [])];
-  const humanSource = reviewClaim?.state === 'human'
-    && reviewClaim.head === pr.headOid
-    ? 'Current-head Human review record'
-    : issue.blockedOn === 'Human'
-      ? 'Project Blocked on: Human'
-      : pr.labels.includes('review:needs-human')
-        ? 'PR label: review:needs-human'
-        : issueLabels.includes('review:needs-human')
-          ? 'Issue label: review:needs-human'
-          : issueLabels.includes('autopilot:human')
-            ? 'Issue label: autopilot:human'
-            : undefined;
+  const humanSource = issue.blockedOn === 'Human'
+    ? 'Project Blocked on: Human'
+    : pr.labels.includes('review:needs-human')
+      ? 'PR label: review:needs-human'
+      : issueLabels.includes('review:needs-human')
+        ? 'Issue label: review:needs-human'
+        : issueLabels.includes('autopilot:human')
+          ? 'Issue label: autopilot:human'
+          : undefined;
   const implementationActive = pr.branchClaim?.phase === 'implement'
     && pr.branchClaim.phaseComplete !== true;
   const reviewPhase = reviewClaim !== undefined && reviewClaim.head === pr.headOid
@@ -529,21 +598,28 @@ function lifecyclePr(
     && machineAuthorLogins.has(pr.humanAuthor.toLowerCase())
     && pr.humanHead === pr.headOid
     && pr.humanGeneration !== undefined;
-  const activeMachineMappingComment = exactMachineMappingComment
-    && reviewClaim?.head === pr.headOid
-    && reviewClaim.generation === pr.humanGeneration
-    && reviewClaim.state === 'human';
-  // Mapping audits are append-first: until the exact matching generation
-  // advances to Human they are provisional evidence, not Human authority.
-  // Older/stale audits remain retained history and are likewise inert.
-  const inactiveMachineMappingComment = exactMachineMappingComment
-    && !activeMachineMappingComment;
-  const humanReason = inactiveMachineMappingComment
-    ? synthesizedHumanReason
-    : pr.humanReason ?? synthesizedHumanReason;
+  const reviewMappingDiagnostic = reviewClaim !== undefined
+    && 'mappingDiagnostic' in reviewClaim
+    ? reviewClaim.mappingDiagnostic
+    : undefined;
+  const signedMachineMappingComment = exactMachineMappingComment
+    && reviewMappingDiagnostic !== undefined
+    && reviewMappingDiagnostic.selectedIssueNumber === issue.number
+    && pr.humanDiagnosticSignature === reviewMappingDiagnostic.signature
+    && pr.humanReason?.detail === reviewMappingDiagnostic.detail
+    && pr.humanDiagnosticIssueNumbers !== undefined
+    && pr.humanDiagnosticIssueNumbers.length
+      === reviewMappingDiagnostic.issueNumbers.length
+    && pr.humanDiagnosticIssueNumbers.every((issueNumber, index) => (
+      issueNumber === reviewMappingDiagnostic.issueNumbers[index]
+    ));
+  // Comments and legacy machine Human records are audit/migration evidence,
+  // never lifecycle Human authority. Only maintainer-visible GitHub surfaces
+  // above may synthesize a Human hold.
+  const humanReason = synthesizedHumanReason;
   const humanHold = humanReason !== undefined;
   const obsoleteMachineMappingHuman = (
-    exactMachineMappingComment
+    signedMachineMappingComment
     && pr.humanGeneration === reviewClaim?.generation
     && !pr.labels.includes('review:needs-human')
     && !pr.isDraft
@@ -557,9 +633,7 @@ function lifecyclePr(
     ? {
         generation: reviewClaim.generation,
         author: pr.humanAuthor,
-        ...(reviewClaim.mappingDiagnostic === undefined
-          ? {}
-          : { mappingDiagnostic: reviewClaim.mappingDiagnostic }),
+        mappingDiagnostic: reviewMappingDiagnostic!,
         reason: {
           phase: pr.humanReason!.phase,
           code: 'branch-mapping-ambiguous' as const,
@@ -631,18 +705,20 @@ function resolveMappings(
       blockedOn: issue.blockedOn,
       blockedByIssues: [...issue.blockedByIssues],
     })),
-    pullRequests: prs.map((pr) => ({
-      number: pr.number,
-      state: pr.state,
-      head: pr.headOid,
-      headRefName: pr.headRefName,
-      baseRefName: pr.baseRefName,
-      closingIssueNumbers: [...pr.closingIssueNumbers],
-      body: pr.body,
-      ...(pr.humanIssueNumber === undefined
-        ? {}
-        : { humanIssueNumber: pr.humanIssueNumber }),
-    })),
+    pullRequests: prs
+      .filter((pr) => pr.closingIssueNumbersIncomplete !== true)
+      .map((pr) => ({
+        number: pr.number,
+        state: pr.state,
+        head: pr.headOid,
+        headRefName: pr.headRefName,
+        baseRefName: pr.baseRefName,
+        closingIssueNumbers: [...pr.closingIssueNumbers],
+        body: pr.body,
+        ...(pr.humanIssueNumber === undefined
+          ? {}
+          : { humanIssueNumber: pr.humanIssueNumber }),
+      })),
     stableBranches: branches.map((branch) => ({
       issueNumber: branch.issueNumber,
       phase: branch.claim.phase,
@@ -823,6 +899,7 @@ function lifecycleItems(
   machineAuthorLogins: ReadonlySet<string>,
   project: ProjectSnapshot,
   defaultBranch: string,
+  closingIssueEvidenceComplete: boolean,
 ): {
   readonly items: readonly LifecycleItem[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
@@ -848,6 +925,8 @@ function lifecycleItems(
     });
   }
   const mappings = resolveMappings(prs, branches, byIssue, defaultBranch);
+  const mappingEvidenceComplete = closingIssueEvidenceComplete
+    && prs.every((pr) => pr.closingIssueNumbersIncomplete !== true);
   const links = prLinksByIssue(prs, mappings.issueByPr);
   const stackReady = resolveStackReady([...issues], links, authorAllowlist);
   const claimBranchIssues = new Set(
@@ -866,7 +945,9 @@ function lifecycleItems(
     ...issuesWithPr,
     ...claimBranchIssues,
   ]);
-  const selected = selectReady([...issues], inFlight, authorAllowlist, stackReady);
+  const selected = mappingEvidenceComplete
+    ? selectReady([...issues], inFlight, authorAllowlist, stackReady)
+    : { ready: [], skippedForAuthor: [] };
   const ready = new Set(selected.ready.map((issue) => issue.number));
   const skippedForAuthor = new Set(selected.skippedForAuthor.map((issue) => issue.number));
   const childrenByParent = openChildrenByParent([...byIssue.values()]);
@@ -886,7 +967,12 @@ function lifecycleItems(
         : issueLabels.includes('review:needs-human')
           ? 'Issue carries review:needs-human'
           : undefined;
-    const eligibility = sourceHumanHold && selectedReady && holdDetail !== undefined
+    const eligibility = !mappingEvidenceComplete
+      ? {
+          reason: 'not-selected' as const,
+          detail: 'PR closing-issue mapping evidence is incomplete',
+        }
+      : sourceHumanHold && selectedReady && holdDetail !== undefined
       ? { reason: 'not-selected' as const, detail: holdDetail }
       : eligibilityEvidence(
         issue,
@@ -966,6 +1052,7 @@ export function composeGitHubLifecycleSnapshot(
     readonly snapshotAuthority?: 'scoped';
     readonly scopedIssueNumbers?: readonly number[];
     readonly globalOpenPipelineBacklog?: number;
+    readonly closingIssueEvidenceIncomplete?: true;
   },
 ): GitHubLifecycleSnapshot {
   isoTimestamp(options.capturedAt);
@@ -989,6 +1076,7 @@ export function composeGitHubLifecycleSnapshot(
     ),
     evidence.project,
     options.defaultBranch ?? 'next',
+    options.closingIssueEvidenceIncomplete !== true,
   );
   return deepFreeze({
     project: evidence.project,
@@ -1001,7 +1089,10 @@ export function composeGitHubLifecycleSnapshot(
     lifecycle: { items: lifecycle.items },
     capturedAt: options.capturedAt,
     snapshotMode: options.snapshotMode,
-    snapshotComplete: true,
+    snapshotComplete: options.closingIssueEvidenceIncomplete !== true
+      && evidence.pullRequests.every(
+        (pr) => pr.closingIssueNumbersIncomplete !== true,
+      ),
     lastFullReconciliationAt: options.lastFullReconciliationAt,
     githubUsage: options.githubUsage,
     ...(options.parityDifferences === undefined
@@ -1072,6 +1163,7 @@ export async function buildGitHubLifecycleSnapshot(
     .filter((item) => item.contentType === 'Issue' && item.status !== 'Done')
     .map((item) => item.number);
   const rawPrs: RawPullRequest[] = [];
+  let closingIssueEvidenceIncomplete = false;
   const maxPages = options.maxPages ?? 100;
   let cursor: string | null = null;
   const seen = new Set<string>();
@@ -1079,6 +1171,9 @@ export async function buildGitHubLifecycleSnapshot(
     if (pageNumber > maxPages) throw new Error('PR pagination exceeded safety limit');
     const page = await reader.readPullRequests(cursor, nonDoneIssueNumbers);
     rawPrs.push(...page.nodes);
+    if (page.closingIssueEvidenceIncomplete === true) {
+      closingIssueEvidenceIncomplete = true;
+    }
     if (!page.pageInfo.hasNextPage) break;
     const next = page.pageInfo.endCursor;
     if (next === null || seen.has(next)) {
@@ -1130,6 +1225,9 @@ export async function buildGitHubLifecycleSnapshot(
     snapshotMode: 'full',
     lastFullReconciliationAt: now.toISOString(),
     githubUsage,
+    ...(closingIssueEvidenceIncomplete
+      ? { closingIssueEvidenceIncomplete: true as const }
+      : {}),
     ...(options.defaultBranch === undefined ? {} : { defaultBranch: options.defaultBranch }),
   });
 }

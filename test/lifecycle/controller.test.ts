@@ -725,6 +725,42 @@ describe('lifecycle controller', () => {
     );
   });
 
+  it('never schedules an action from explicitly incomplete PR evidence', async () => {
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      isDraft: false,
+      needsReview: true,
+      approved: false,
+    });
+    const incomplete = snapshot(delivered);
+    incomplete.pullRequests[0]!.evidenceIncompleteReason =
+      'PR #101 reviews were truncated';
+    const scheduled: string[] = [];
+
+    await runLifecycleCycle('active', {
+      ...deps(delivered, []),
+      readSnapshot: async () => incomplete,
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 1, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async (action: { kind: string }) => {
+          scheduled.push(action.kind);
+          return { outcome: 'spawned' };
+        },
+      },
+    });
+
+    expect(scheduled).toEqual([]);
+  });
+
   it('dispatches from scoped authority before reading and maintaining the global snapshot', async () => {
     const delivered = implementation({
       branchClaim: {
