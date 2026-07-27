@@ -159,6 +159,21 @@ function credentialPool(): CredentialPool {
   }]);
 }
 
+function mutatingGhApiVerbsInCall(call: readonly unknown[]): string[] {
+  if (call[0] !== 'gh') return [];
+  const args = (call[1] ?? []) as readonly string[];
+  if (!args.includes('api')) return [];
+  const mutating = new Set(['POST', 'PATCH', 'PUT', 'DELETE']);
+  return args.filter((arg) => mutating.has(arg));
+}
+
+function expectNoMutatingGhApiCalls(
+  calls: readonly (readonly unknown[])[],
+): void {
+  const violations = calls.flatMap((call) => mutatingGhApiVerbsInCall(call));
+  expect(violations).toEqual([]);
+}
+
 function authorityRunner(manifest: ReturnType<typeof fixture>['manifest']) {
   return vi.fn(async (
     command: string,
@@ -726,6 +741,34 @@ describe('production default docker verification sandbox', () => {
     });
   });
 
+  it('fails closed in verify before docker when the daemon or pinned image is unavailable', async () => {
+    const dockerRunner = vi.fn();
+    const port = createProductionMarketplaceVerificationPort({
+      dockerRunner,
+      dockerInspector: {
+        inspectDaemon: async () => false,
+        inspectImage: async () => true,
+      },
+      cleanup: async () => 'confirmed',
+      prepareWorkspace: async () => {},
+      now: () => new Date('2020-01-01T00:00:00.000Z'),
+    });
+
+    await expect(port.verify({
+      profile: 'jinn-mono.v1',
+      repositoryPath: '/repo',
+      touchedPaths: ['packages/autopilot/src/engine.ts'],
+      artifactDigest: `sha256:${'a'.repeat(64)}`,
+      expectedTree: gitOid('b'.repeat(40)),
+      deadline: '2020-01-01T02:00:00.000Z',
+    })).rejects.toMatchObject({
+      reason: 'runner-failed',
+      disposition: 'stable-rejection',
+      message: expect.stringMatching(/docker daemon/i),
+    });
+    expect(dockerRunner).not.toHaveBeenCalled();
+  });
+
   it('honours bounded verification command labels from the jinn-mono.v1 plan', () => {
     const plan = buildJinnMonoV1VerificationPlan({
       repositoryPath: '/repo',
@@ -878,7 +921,7 @@ describe('production marketplace authority surfaces', () => {
     });
     expect(authority.pullRequest.humanActive).toBe(true);
     expect(readSnapshot).toHaveBeenCalled();
-    expect(runner.mock.calls.every((call) => call[0] !== 'POST')).toBe(true);
+    expectNoMutatingGhApiCalls(runner.mock.calls);
   });
 
   it('marks CODEOWNER review policy from the live review candidate', async () => {
@@ -918,6 +961,7 @@ describe('production marketplace authority surfaces', () => {
       touchedPaths: ['packages/autopilot/src/engine.ts'],
     });
     expect(authority.pullRequest.codeOwnerRequired).toBe(true);
+    expectNoMutatingGhApiCalls(runner.mock.calls);
   });
 
   it('reads authority through the implementation session manifest binding', async () => {

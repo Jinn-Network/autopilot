@@ -94,7 +94,7 @@ export type MarketplaceVerificationSandboxCleanup = (
 
 export interface ProductionMarketplaceVerificationPortOptions {
   readonly dockerRunner: MarketplaceVerificationDockerRunner;
-  readonly dockerInspector?: MarketplaceVerificationDockerInspector;
+  readonly dockerInspector: MarketplaceVerificationDockerInspector;
   readonly prepareWorkspace?: (input: {
     readonly sourcePath: string;
     readonly workspacePath: string;
@@ -407,6 +407,25 @@ export function createMarketplaceVerificationDockerSandbox(): {
   };
 }
 
+async function ensureProductionVerificationInfrastructure(
+  inspector: MarketplaceVerificationDockerInspector,
+): Promise<void> {
+  if (!(await inspector.inspectDaemon())) {
+    throw new MarketplaceVerificationError(
+      'runner-failed',
+      'stable-rejection',
+      'Docker daemon is not reachable for marketplace verification',
+    );
+  }
+  if (!(await inspector.inspectImage(JINN_MONO_V1_VERIFICATION_NODE_IMAGE))) {
+    throw new MarketplaceVerificationError(
+      'runner-failed',
+      'stable-rejection',
+      `Pinned marketplace verification image is unavailable: ${JINN_MONO_V1_VERIFICATION_NODE_IMAGE}`,
+    );
+  }
+}
+
 export function createProductionMarketplaceVerificationPort(
   options: ProductionMarketplaceVerificationPortOptions,
 ): MarketplaceMutationVerificationPort {
@@ -422,22 +441,15 @@ export function createProductionMarketplaceVerificationPort(
 
   return {
     preflight: async () => {
-      if (inspector === undefined) {
+      try {
+        await ensureProductionVerificationInfrastructure(inspector);
         return { ok: true };
+      } catch (error) {
+        if (error instanceof MarketplaceVerificationError) {
+          return { ok: false, detail: error.message };
+        }
+        throw error;
       }
-      if (!(await inspector.inspectDaemon())) {
-        return {
-          ok: false,
-          detail: 'Docker daemon is not reachable for marketplace verification',
-        };
-      }
-      if (!(await inspector.inspectImage(JINN_MONO_V1_VERIFICATION_NODE_IMAGE))) {
-        return {
-          ok: false,
-          detail: `Pinned marketplace verification image is unavailable: ${JINN_MONO_V1_VERIFICATION_NODE_IMAGE}`,
-        };
-      }
-      return { ok: true };
     },
     verify: async (input) => {
       const plan = buildJinnMonoV1VerificationPlan({
@@ -459,6 +471,8 @@ export function createProductionMarketplaceVerificationPort(
           `Marketplace adoption deadline ${input.deadline} passed before verification started`,
         );
       }
+
+      await ensureProductionVerificationInfrastructure(inspector);
 
       let sandboxActive = false;
       let failure: unknown;

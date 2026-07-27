@@ -352,6 +352,27 @@ describe('createProductionMarketplaceVerificationPort', () => {
     });
   });
 
+  it('fails closed in verify before docker when the daemon or pinned image is unavailable', async () => {
+    const dockerRunner = vi.fn(passingRunner());
+    const port = createProductionMarketplaceVerificationPort({
+      now: clock(),
+      dockerRunner,
+      dockerInspector: {
+        inspectDaemon: async () => false,
+        inspectImage: async () => true,
+      },
+      cleanup: confirmedCleanup(),
+      prepareWorkspace: async () => {},
+    });
+
+    await expect(port.verify(verifyInput)).rejects.toMatchObject({
+      reason: 'runner-failed',
+      disposition: 'stable-rejection',
+      message: expect.stringMatching(/docker daemon/i),
+    });
+    expect(dockerRunner).not.toHaveBeenCalled();
+  });
+
   it('rejects verification before starting when the adoption deadline has already passed', async () => {
     const invocations: MarketplaceVerificationDockerInvocation[] = [];
     const port = createProductionMarketplaceVerificationPort({
