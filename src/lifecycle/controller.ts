@@ -490,9 +490,44 @@ function projectionContext(
     });
   return {
     view,
+    snapshotComplete: snapshot.snapshotComplete === true,
     pullRequests: snapshot.pullRequests.map((pr) => ({
       number: pr.number,
+      headRefName: pr.headRefName,
+      baseRefName: pr.baseRefName,
+      ...((() => {
+        const mapping = snapshot.pullRequestMappings?.find((candidate) => (
+          candidate.prNumber === pr.number && candidate.status === 'resolved'
+        ));
+        return mapping?.status === 'resolved'
+          ? { resolvedIssueNumber: mapping.issueNumber }
+          : {};
+      })()),
+      ...((() => {
+        const markers = [...pr.body.matchAll(
+          /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/g,
+        )].filter((match) => match[2] === pr.headRefName);
+        return markers.length === 1
+          ? { scheduledIssueNumber: Number(markers[0]![1]) }
+          : {};
+      })()),
       ...(pr.reviewClaim === undefined ? {} : { reviewRefOid: pr.reviewClaim.oid }),
+      ...(pr.reviewClaim === undefined
+        ? {}
+        : {
+            reviewClaim: {
+              head: pr.reviewClaim.record.head,
+              generation: pr.reviewClaim.record.generation,
+              state: pr.reviewClaim.record.state,
+              ...('mappingRequest' in pr.reviewClaim.record
+                ? { mappingRequest: pr.reviewClaim.record.mappingRequest }
+                : {}),
+              ...('mappingDiagnostic' in pr.reviewClaim.record
+                && pr.reviewClaim.record.mappingDiagnostic !== undefined
+                ? { mappingDiagnostic: pr.reviewClaim.record.mappingDiagnostic }
+                : {}),
+            },
+          }),
     })),
     orphanBranchClaims,
     mappingDiagnostics: snapshot.diagnostics,
@@ -705,6 +740,7 @@ function activeCandidates(
     if (item.kind !== 'pull-request' || item.humanHold || item.merged) continue;
     const pr = byPr.get(item.prNumber);
     if (pr === undefined) continue;
+    if (pr.evidenceIncompleteReason !== undefined) continue;
     const compareStatus: CompareStatus = pr.compareStatus ?? (
       item.mergeState === 'behind'
         ? 'behind'
@@ -791,18 +827,22 @@ function activeCandidates(
         childrenEnabled: childrenOn,
       });
       if (ladder.kind === 'update-branch') {
+        if (item.expectedBaseRefName === undefined) continue;
         other.push({
           phase: 'update-branch',
           issueNumber: item.issueNumber,
           prNumber: item.prNumber,
           head: item.head,
+          expectedBaseRefName: gitRefName(item.expectedBaseRefName),
         });
       } else if (ladder.kind === 'file-reconcile-child') {
+        if (item.expectedBaseRefName === undefined) continue;
         other.push({
           phase: 'file-reconcile-child',
           issueNumber: item.issueNumber,
           prNumber: item.prNumber,
           head: item.head,
+          expectedBaseRefName: gitRefName(item.expectedBaseRefName),
           effort: ladder.effort,
         });
       }
@@ -827,11 +867,13 @@ function activeCandidates(
         }
       }
     } else if (entry.phase === 'merge-ready') {
+      if (item.expectedBaseRefName === undefined) continue;
       other.push({
         phase: 'merge',
         issueNumber: item.issueNumber,
         prNumber: item.prNumber,
         head: item.head,
+        expectedBaseRefName: gitRefName(item.expectedBaseRefName),
       });
     } else if (entry.phase === 'blocked-by-child') {
       // No new work while a child is open or head-bound RC stands; child

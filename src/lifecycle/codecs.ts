@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   gitOid,
   gitRefName,
@@ -6,6 +7,8 @@ import {
   type GitOid,
   type GitRefName,
   type HumanReason,
+  type MappingDiagnosticAuthority,
+  type MappingRereadRequest,
   type ReviewClaimRecord,
   type ReviewClaimState,
   type ReviewVerdictState,
@@ -18,6 +21,8 @@ const REVIEW_STATES: readonly ReviewClaimState[] = [
   'active',
   'verdict-intent',
   'terminal-approved',
+  'mapping-reread',
+  'human-intent',
   'human',
   'stale',
 ];
@@ -72,6 +77,86 @@ function exactKeys(record: Record<string, unknown>, allowed: readonly string[]):
   const allowedSet = new Set(allowed);
   const unknown = Object.keys(record).find((key) => !allowedSet.has(key));
   if (unknown !== undefined) throw new Error(`Unknown field: ${unknown}`);
+}
+
+function canonicalIssueNumbers(
+  values: readonly number[],
+  name = 'diagnostic issue numbers',
+  requireNonEmpty = true,
+): readonly number[] {
+  if (!Array.isArray(values)) throw new Error(`Invalid ${name}`);
+  const canonical = [...new Set(values.map((value) => positiveNumber(value, name)))]
+    .sort((left, right) => left - right);
+  if (requireNonEmpty && canonical.length === 0) throw new Error(`Invalid ${name}`);
+  return canonical;
+}
+
+export function mappingDiagnosticSignature(input: {
+  readonly issueNumbers: readonly number[];
+  readonly detail: string;
+}): string {
+  const issueNumbers = canonicalIssueNumbers(
+    input.issueNumbers,
+    'diagnostic issue numbers',
+    false,
+  );
+  const detail = safeText(input.detail, 'mapping diagnostic detail');
+  return createHash('sha256')
+    .update(JSON.stringify({ issueNumbers, detail }))
+    .digest('hex');
+}
+
+function mappingRequestFromUnknown(value: unknown): MappingRereadRequest {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid mapping request');
+  }
+  const request = value as Record<string, unknown>;
+  exactKeys(request, ['selectedIssueNumber', 'headRefName', 'baseRefName']);
+  return {
+    selectedIssueNumber: positiveNumber(
+      request.selectedIssueNumber,
+      'selected issue number',
+    ),
+    headRefName: gitRefName(safeText(request.headRefName, 'mapping head ref name')),
+    baseRefName: gitRefName(safeText(request.baseRefName, 'mapping base ref name')),
+  };
+}
+
+function mappingDiagnosticFromUnknown(value: unknown): MappingDiagnosticAuthority {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid mapping diagnostic');
+  }
+  const diagnostic = value as Record<string, unknown>;
+  exactKeys(diagnostic, [
+    'selectedIssueNumber',
+    'issueNumbers',
+    'detail',
+    'signature',
+  ]);
+  const selectedIssueNumber = positiveNumber(
+    diagnostic.selectedIssueNumber,
+    'selected issue number',
+  );
+  const issueNumbers = canonicalIssueNumbers(
+    diagnostic.issueNumbers as readonly number[],
+  );
+  if (!issueNumbers.includes(selectedIssueNumber)) {
+    throw new Error('Mapping diagnostic does not contain the selected issue');
+  }
+  const detail = safeText(diagnostic.detail, 'mapping diagnostic detail');
+  if (
+    typeof diagnostic.signature !== 'string'
+    || !/^[0-9a-f]{64}$/.test(diagnostic.signature)
+    || diagnostic.signature !== mappingDiagnosticSignature({ issueNumbers, detail })
+  ) {
+    throw new Error('Invalid mapping diagnostic signature');
+  }
+  return {
+    selectedIssueNumber,
+    issueNumbers,
+    detail,
+    signature: diagnostic.signature,
+  };
 }
 
 function validateBranchClaim(claim: BranchClaim): BranchClaim {
@@ -254,6 +339,8 @@ function reviewRecordFromUnknown(
     'state',
     'recordedAt',
     'verdict',
+    'mappingRequest',
+    'mappingDiagnostic',
   ]);
   if (
     (requireRuntimeDiscriminator && record.kind !== 'review-claim')
@@ -266,6 +353,12 @@ function reviewRecordFromUnknown(
     throw new Error('Invalid review claim state');
   }
   const state = record.state as ReviewClaimState;
+  const mappingRequest = record.mappingRequest === undefined
+    ? undefined
+    : mappingRequestFromUnknown(record.mappingRequest);
+  const mappingDiagnostic = record.mappingDiagnostic === undefined
+    ? undefined
+    : mappingDiagnosticFromUnknown(record.mappingDiagnostic);
   let verdict: ReviewClaimRecord['verdict'];
   if (record.verdict !== undefined) {
     if (typeof record.verdict !== 'object' || record.verdict === null || Array.isArray(record.verdict)) {
@@ -292,6 +385,15 @@ function reviewRecordFromUnknown(
   if (!['verdict-intent', 'terminal-approved'].includes(state) && verdict !== undefined) {
     throw new Error(`Contradictory verdict fields for ${state}`);
   }
+  if ((state === 'mapping-reread') !== (mappingRequest !== undefined)) {
+    throw new Error(`${state} has contradictory mapping request metadata`);
+  }
+  if (
+    (state === 'human-intent' && mappingDiagnostic === undefined)
+    || (!['human-intent', 'human'].includes(state) && mappingDiagnostic !== undefined)
+  ) {
+    throw new Error(`${state} has contradictory mapping diagnostic metadata`);
+  }
   const common = {
     kind: 'review-claim' as const,
     protocolVersion: 2 as const,
@@ -312,6 +414,15 @@ function reviewRecordFromUnknown(
       verdict: { ...verdict!, state: 'APPROVE' },
     };
   }
+  if (state === 'mapping-reread') {
+    return { ...common, state, mappingRequest: mappingRequest! };
+  }
+  if (state === 'human-intent') {
+    return { ...common, state, mappingDiagnostic: mappingDiagnostic! };
+  }
+  if (state === 'human' && mappingDiagnostic !== undefined) {
+    return { ...common, state, mappingDiagnostic };
+  }
   return { ...common, state };
 }
 
@@ -327,6 +438,10 @@ export function encodeReviewClaimPayload(record: ReviewClaimRecord): string {
     state: valid.state,
     recordedAt: valid.recordedAt,
     ...(valid.verdict === undefined ? {} : { verdict: valid.verdict }),
+    ...('mappingRequest' in valid ? { mappingRequest: valid.mappingRequest } : {}),
+    ...('mappingDiagnostic' in valid && valid.mappingDiagnostic !== undefined
+      ? { mappingDiagnostic: valid.mappingDiagnostic }
+      : {}),
   };
   return JSON.stringify(payload);
 }
@@ -407,11 +522,15 @@ export function parseAutomatedReviewMarker(marker: string): AutomatedReviewMarke
 export interface HumanCommentEvidence {
   readonly issueNumber?: number;
   readonly prNumber: number;
+  readonly head?: GitOid;
+  readonly generation?: string;
+  readonly diagnosticIssueNumbers?: readonly number[];
+  readonly diagnosticSignature?: string;
   readonly reason: HumanReason;
 }
 
 const HUMAN_MARKER_PATTERN =
-  /^<!-- jinn-autopilot-human:v2(?: issue=([1-9][0-9]*))? pr=([1-9][0-9]*) phase=([a-z-]+) code=([a-z-]+) -->$/;
+  /^<!-- jinn-autopilot-human:v2(?: issue=([1-9][0-9]*))? pr=([1-9][0-9]*) phase=([a-z-]+) code=([a-z-]+)(?: head=([0-9a-f]{40}) generation=([0-9a-f-]+))?(?: issues=([1-9][0-9]*(?:,[1-9][0-9]*)*) diagnostic=([0-9a-f]{64}))? -->$/;
 
 function humanReason(phase: string, code: string, detail: string): HumanReason {
   if (
@@ -429,6 +548,7 @@ function humanReason(phase: string, code: string, detail: string): HumanReason {
     (phase === 'awaiting-review' || phase === 'reviewing')
     && [
       'review-escalation',
+      'branch-mapping-ambiguous',
       'reviewer-identity-unavailable',
       'invalid-review-progress-time',
     ].includes(code)
@@ -452,14 +572,55 @@ function humanReason(phase: string, code: string, detail: string): HumanReason {
 export function formatHumanCommentMarker(input: {
   readonly issueNumber?: number;
   readonly prNumber: number;
+  readonly head?: GitOid;
+  readonly generation?: string;
+  readonly diagnosticIssueNumbers?: readonly number[];
+  readonly diagnosticSignature?: string;
   readonly reason: HumanReason;
 }): string {
   if (input.issueNumber !== undefined) positiveNumber(input.issueNumber, 'issue number');
   positiveNumber(input.prNumber, 'PR number');
   humanReason(input.reason.phase, input.reason.code, input.reason.detail);
+  if ((input.head === undefined) !== (input.generation === undefined)) {
+    throw new Error('Human comment provenance requires both head and generation');
+  }
+  if (input.head !== undefined) gitOid(input.head);
+  if (input.generation !== undefined) uuid(input.generation, 'generation');
+  if (
+    (input.diagnosticIssueNumbers === undefined)
+    !== (input.diagnosticSignature === undefined)
+  ) {
+    throw new Error('Human mapping diagnostic requires both issues and signature');
+  }
+  let diagnostic = '';
+  if (
+    input.diagnosticIssueNumbers !== undefined
+    && input.diagnosticSignature !== undefined
+  ) {
+    if (input.reason.code !== 'branch-mapping-ambiguous') {
+      throw new Error('Only mapping Human comments may carry a diagnostic signature');
+    }
+    const issueNumbers = canonicalIssueNumbers(input.diagnosticIssueNumbers);
+    if (
+      input.issueNumber === undefined
+      || !issueNumbers.includes(input.issueNumber)
+      || input.diagnosticSignature !== mappingDiagnosticSignature({
+        issueNumbers,
+        detail: input.reason.detail,
+      })
+    ) {
+      throw new Error('Invalid Human mapping diagnostic signature');
+    }
+    diagnostic = ` issues=${issueNumbers.join(',')} diagnostic=${input.diagnosticSignature}`;
+  }
   return `<!-- jinn-autopilot-human:v2`
     + (input.issueNumber === undefined ? '' : ` issue=${input.issueNumber}`)
-    + ` pr=${input.prNumber} phase=${input.reason.phase} code=${input.reason.code} -->`;
+    + ` pr=${input.prNumber} phase=${input.reason.phase} code=${input.reason.code}`
+    + (input.head === undefined
+      ? ''
+      : ` head=${input.head} generation=${input.generation}`)
+    + diagnostic
+    + ' -->';
 }
 
 export function parseHumanCommentEvidence(body: string): HumanCommentEvidence | null {
@@ -467,17 +628,54 @@ export function parseHumanCommentEvidence(body: string): HumanCommentEvidence | 
   if (marker === undefined) return null;
   const match = HUMAN_MARKER_PATTERN.exec(marker);
   if (match === null) return null;
-  const [, issueRaw, prRaw, phase, code] = match;
+  const [
+    ,
+    issueRaw,
+    prRaw,
+    phase,
+    code,
+    headRaw,
+    generationRaw,
+    diagnosticIssuesRaw,
+    diagnosticSignature,
+  ] = match;
   if (prRaw === undefined || phase === undefined || code === undefined) return null;
   const detail = paragraphs.at(-1)?.trim() ?? '';
   if (detail.length === 0 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(detail)) {
     throw new Error('Invalid Human reason detail');
+  }
+  const reason = humanReason(phase, code, detail);
+  let diagnosticIssueNumbers: readonly number[] | undefined;
+  if (diagnosticIssuesRaw !== undefined && diagnosticSignature !== undefined) {
+    try {
+      diagnosticIssueNumbers = canonicalIssueNumbers(
+        diagnosticIssuesRaw.split(',').map(Number),
+      );
+      if (
+        issueRaw === undefined
+        || !diagnosticIssueNumbers.includes(Number(issueRaw))
+        || reason.code !== 'branch-mapping-ambiguous'
+        || mappingDiagnosticSignature({
+          issueNumbers: diagnosticIssueNumbers,
+          detail,
+        }) !== diagnosticSignature
+      ) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
   }
   return {
     ...(issueRaw === undefined
       ? {}
       : { issueNumber: positiveInteger(issueRaw, 'issue number') }),
     prNumber: positiveInteger(prRaw, 'PR number'),
-    reason: humanReason(phase, code, detail),
+    ...(headRaw === undefined ? {} : { head: gitOid(headRaw) }),
+    ...(generationRaw === undefined ? {} : { generation: uuid(generationRaw, 'generation') }),
+    ...(diagnosticIssueNumbers === undefined
+      ? {}
+      : { diagnosticIssueNumbers, diagnosticSignature }),
+    reason,
   };
 }

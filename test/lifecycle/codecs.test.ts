@@ -8,7 +8,10 @@ import {
   encodeReviewClaimPayload,
   extractMergePrepCompletionSummary,
   formatAutomatedReviewMarker,
+  formatHumanCommentMarker,
+  mappingDiagnosticSignature,
   parseAutomatedReviewMarker,
+  parseHumanCommentEvidence,
   reviewClaimRef,
 } from '../../src/lifecycle/codecs.js';
 import {
@@ -64,6 +67,50 @@ describe('lifecycle metadata codecs', () => {
       ...wireRecord,
       verdict: { ...record.verdict, state: 'REQUEST_CHANGES' },
     }))).toThrow(/terminal-approved.*APPROVE/);
+  });
+
+  it('round-trips durable mapping reread and signed Human intent review claims', () => {
+    const common = {
+      kind: 'review-claim' as const,
+      protocolVersion: 2 as const,
+      prNumber: 101,
+      generation: '22222222-2222-4222-8222-222222222222',
+      attempt: '33333333-3333-4333-8333-333333333333',
+      reviewer: 'jinn-reviewer',
+      head: OID_A,
+      recordedAt: '2026-07-20T10:05:00.000Z',
+    };
+    const mappingRequest = {
+      selectedIssueNumber: 42,
+      headRefName: 'autopilot/42',
+      baseRefName: 'next',
+    };
+    const mappingDiagnostic = {
+      selectedIssueNumber: 42,
+      issueNumbers: [42, 43],
+      detail: 'PR #101 maps both issues.',
+      signature: mappingDiagnosticSignature({
+        issueNumbers: [42, 43],
+        detail: 'PR #101 maps both issues.',
+      }),
+    };
+
+    for (const record of [
+      { ...common, state: 'mapping-reread' as const, mappingRequest },
+      { ...common, state: 'human-intent' as const, mappingDiagnostic },
+      { ...common, state: 'human' as const, mappingDiagnostic },
+    ]) {
+      expect(decodeReviewClaimPayload(encodeReviewClaimPayload(record))).toEqual(record);
+    }
+    const { kind: _kind, ...wireCommon } = common;
+    expect(() => decodeReviewClaimPayload(JSON.stringify({
+      ...wireCommon,
+      state: 'human-intent',
+      mappingDiagnostic: {
+        ...mappingDiagnostic,
+        signature: 'f'.repeat(64),
+      },
+    }))).toThrow(/signature/i);
   });
 
   it('rejects malformed protocol values instead of coercing them', () => {
@@ -217,6 +264,84 @@ describe('lifecycle metadata codecs', () => {
       verdict: 'REQUEST_CHANGES',
     });
     expect(() => parseAutomatedReviewMarker(`${marker} trailing`)).toThrow(/review marker/);
+  });
+
+  it('round-trips exact head and generation provenance in a mapping Human marker', () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const reason = {
+      phase: 'implementing' as const,
+      code: 'branch-mapping-ambiguous' as const,
+      detail: 'Mapping was ambiguous.',
+    };
+    const marker = formatHumanCommentMarker({
+      issueNumber: 42,
+      prNumber: 101,
+      head: OID_A,
+      generation,
+      reason,
+    });
+
+    expect(marker).toBe(
+      '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=implementing '
+      + 'code=branch-mapping-ambiguous '
+      + 'head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '
+      + 'generation=22222222-2222-4222-8222-222222222222 -->',
+    );
+    expect(parseHumanCommentEvidence(`${marker}\n\nMapping was ambiguous.`)).toEqual({
+      issueNumber: 42,
+      prNumber: 101,
+      head: OID_A,
+      generation,
+      reason,
+    });
+  });
+
+  it('binds the complete canonical mapping diagnostic into the Human marker', () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const reason = {
+      phase: 'reviewing' as const,
+      code: 'branch-mapping-ambiguous' as const,
+      detail: 'PR #101 maps both issues.',
+    };
+    const signature = mappingDiagnosticSignature({
+      issueNumbers: [43, 42, 43],
+      detail: reason.detail,
+    });
+    expect(signature).toBe(
+      mappingDiagnosticSignature({ issueNumbers: [42, 43], detail: reason.detail }),
+    );
+    const marker = formatHumanCommentMarker({
+      issueNumber: 42,
+      prNumber: 101,
+      head: OID_A,
+      generation,
+      reason,
+      diagnosticIssueNumbers: [42, 43],
+      diagnosticSignature: signature,
+    });
+    expect(marker).toContain(`diagnostic=${signature}`);
+    expect(parseHumanCommentEvidence(`${marker}\n\n${reason.detail}`)).toEqual({
+      issueNumber: 42,
+      prNumber: 101,
+      head: OID_A,
+      generation,
+      diagnosticIssueNumbers: [42, 43],
+      diagnosticSignature: signature,
+      reason,
+    });
+    expect(
+      parseHumanCommentEvidence(`${marker}\n\nA different diagnostic.`),
+    ).toBeNull();
+    const changedSet = mappingDiagnosticSignature({
+      issueNumbers: [42, 44],
+      detail: reason.detail,
+    });
+    const changedDetail = mappingDiagnosticSignature({
+      issueNumbers: [42, 43],
+      detail: 'Different detail.',
+    });
+    expect(changedSet).not.toBe(signature);
+    expect(changedDetail).not.toBe(signature);
   });
 
   it('rejects string numerics in runtime ref-name helpers', () => {

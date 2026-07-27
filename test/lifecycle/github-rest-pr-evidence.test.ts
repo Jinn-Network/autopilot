@@ -76,6 +76,7 @@ function equalBodies(): Record<string, unknown> {
     },
     reviews: [],
     comments: [],
+    events: [],
     checks: {
       total_count: 1,
       check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }],
@@ -109,6 +110,8 @@ function probeWith(
       ? 'reviews'
       : endpoint.includes('/comments?')
         ? 'comments'
+        : endpoint.includes('/events?')
+          ? 'events'
         : endpoint.includes('/check-runs?')
           ? 'checks'
           : 'statuses';
@@ -138,17 +141,17 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     expect(parser?.('https://github.com/Jinn-Network/mono/runs/999')).toBeUndefined();
   });
 
-  it('normalizes a cold 200 against full evidence, then reuses all four ETags on 304', async () => {
+  it('normalizes a cold 200 against full evidence, then reuses every ETag on 304', async () => {
     const context = probeWith(equalBodies(), true);
 
     await expect(context.probe.changed(pr())).resolves.toBe(false);
     await expect(context.probe.changed(pr())).resolves.toBe(false);
 
-    expect(context.calls).toHaveLength(10);
+    expect(context.calls).toHaveLength(12);
     expect(context.meter.read()).toMatchObject({
-      restRequests: 10,
-      restNotModified: 5,
-      cacheHits: 5,
+      restRequests: 12,
+      restNotModified: 6,
+      cacheHits: 6,
     });
   });
 
@@ -159,6 +162,15 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     ));
 
     await expect(probe.changed(pr({ compareStatus: undefined }))).resolves.toBe(true);
+  });
+
+  it('forces refresh when cached PR evidence is explicitly incomplete', async () => {
+    const context = probeWith(equalBodies());
+
+    await expect(context.probe.changed(pr({
+      evidenceIncompleteReason: 'PR #101 reviews were truncated',
+    }))).resolves.toBe(true);
+    expect(context.calls).toEqual([]);
   });
 
   it('uses the workflow run id from a check-run details URL', async () => {
@@ -253,11 +265,82 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   it('detects a structured Human comment transition', async () => {
     const bodies = equalBodies();
     bodies.comments = [{
+      id: 1,
       body: '<!-- jinn-autopilot-human:v2 issue=42 pr=101 phase=reviewing code=review-escalation -->\n\nNeeds a product decision.',
       created_at: '2026-07-22T10:02:00.000Z',
+      author_association: 'MEMBER',
     }];
 
     await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(true);
+  });
+
+  it('ignores unstructured maintainer prose as lifecycle authority', async () => {
+    const bodies = equalBodies();
+    bodies.comments = [{
+      id: 1,
+      body: 'Please do not merge this PR until I investigate.',
+      created_at: '2026-07-22T10:02:00.000Z',
+      author_association: 'MEMBER',
+      user: { login: 'maintainer' },
+    }];
+
+    await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(false);
+  });
+
+  it.each([
+    {
+      label: 'an invalid structured audit marker',
+      body: '<!-- jinn-autopilot-human:v2 pr=101 phase=reviewing code=review-escalation -->',
+    },
+    {
+      label: 'a structured audit marker for another PR',
+      body: '<!-- jinn-autopilot-human:v2 pr=999 phase=reviewing code=review-escalation -->'
+        + '\n\nA real detail sentence.',
+    },
+  ])('forces canonical refresh rather than aborting on $label', async ({ body }) => {
+    const bodies = equalBodies();
+    bodies.comments = [{ id: 1, body, user: { login: 'review-bot' } }];
+
+    await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(true);
+  });
+
+  it('detects a changed current Human label actor even when the label remains present', async () => {
+    const generation = '22222222-2222-4222-8222-222222222222';
+    const marker = '<!-- jinn-autopilot-human:v2 issue=42 pr=101 '
+      + 'phase=implementing code=branch-mapping-ambiguous '
+      + `head=${HEAD} generation=${generation} -->`;
+    const bodies = equalBodies();
+    bodies.detail = {
+      ...(bodies.detail as Record<string, unknown>),
+      labels: [{ name: 'engine:review' }, { name: 'review:needs-human' }],
+    };
+    bodies.comments = [{
+      id: 1,
+      body: `${marker}\n\nMapping was ambiguous.`,
+      created_at: '2026-07-22T10:02:00.000Z',
+      author_association: 'MEMBER',
+      user: { login: 'maintenance-bot' },
+    }];
+    bodies.events = [{
+      event: 'labeled',
+      created_at: '2026-07-22T10:03:00.000Z',
+      actor: { login: 'maintainer' },
+      label: { name: 'review:needs-human' },
+    }];
+
+    await expect(probeWith(bodies).probe.changed(pr({
+      labels: ['engine:review', 'review:needs-human'],
+      humanIssueNumber: 42,
+      humanAuthor: 'maintenance-bot',
+      humanHead: gitOid(HEAD),
+      humanGeneration: generation,
+      humanLabelActor: 'maintenance-bot',
+      humanReason: {
+        phase: 'implementing',
+        code: 'branch-mapping-ambiguous',
+        detail: 'Mapping was ambiguous.',
+      },
+    }))).resolves.toBe(true);
   });
 
   it.each([
@@ -368,6 +451,6 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
       });
     };
     const probe = new ConditionalPullRequestEvidenceProbe(new ConditionalRestClient(run));
-    await expect(probe.changed(pr())).rejects.toThrow(/truncated|pagination/i);
+    await expect(probe.changed(pr())).resolves.toBe(true);
   });
 });

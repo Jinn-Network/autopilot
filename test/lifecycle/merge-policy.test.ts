@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyMergePolicy } from '../../src/lifecycle/active-scheduler.js';
-import { gitOid } from '../../src/lifecycle/types.js';
+import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('a'.repeat(40));
 
@@ -12,6 +12,7 @@ describe('repository merge policy', () => {
       issueNumber: 2,
       prNumber: 20,
       head: HEAD,
+      expectedBaseRefName: gitRefName('next'),
     },
   ];
 

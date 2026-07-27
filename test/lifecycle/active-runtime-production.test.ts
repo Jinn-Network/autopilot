@@ -23,6 +23,11 @@ import {
 } from '../../src/lifecycle/capability-attestation.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
 import {
+  decodeReviewClaimPayload,
+  encodeReviewClaimPayload,
+  mappingDiagnosticSignature,
+} from '../../src/lifecycle/codecs.js';
+import {
   gitOid,
   gitRefName,
 } from '../../src/lifecycle/types.js';
@@ -671,6 +676,415 @@ describe('production active runtime preflight', () => {
     expect(trackAttemptChild).toHaveBeenCalledTimes(1);
     expect(events[0]).toBe('spawn');
     expect(events.indexOf('pid')).toBeLessThan(events.indexOf('track'));
+  });
+
+  it('uses only the fresh canonical diagnostic to publish a mapping reread', async () => {
+    const head = gitOid('3'.repeat(40));
+    const acquisitionOids = [
+      gitOid('4'.repeat(40)),
+      gitOid('5'.repeat(40)),
+      gitOid('6'.repeat(40)),
+      gitOid('7'.repeat(40)),
+      gitOid('9'.repeat(40)),
+      gitOid('a'.repeat(40)),
+      gitOid('b'.repeat(40)),
+    ];
+    const generation = '33333333-3333-4333-8333-333333333333';
+    const attempt = '44444444-4444-4444-8444-444444444444';
+    const resolvedGeneration = '55555555-5555-4555-8555-555555555555';
+    const resolvedAttempt = '66666666-6666-4666-8666-666666666666';
+    const mappingDetails = [
+      'Closing-reference mapping is duplicated or names multiple issues.',
+      'PR evidence does not resolve to one known lifecycle issue.',
+    ];
+    const diagnosticDetail =
+      'Ambiguous lifecycle mapping between issue(s) #42, #43 and PR(s) #84: '
+      + mappingDetails.join('; ');
+    const candidate = {
+      issueNumber: 42,
+      number: 84,
+      open: true,
+      head,
+      headChangedAt: '2026-07-20T08:00:00.000Z',
+      headRefName: gitRefName('autopilot/42'),
+      baseRefName: gitRefName('next'),
+      draft: false,
+      author: 'implementation-bot',
+      labels: ['engine:review'],
+      body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      humanHold: false,
+      approvalPolicy: 'approve-eligible',
+      nativeReviews: [],
+      mappingProblem: mappingDetails.join(' '),
+    };
+    const diagnosticSignature = mappingDiagnosticSignature({
+      issueNumbers: [42, 43],
+      detail: diagnosticDetail,
+    });
+    let reviewClaim: { oid: string; payload: string } | null = null;
+    const comments: string[] = [];
+    const sharedMutations: string[] = [];
+    const events: string[] = [];
+    const liveSnapshot = {
+      snapshotComplete: true,
+      capturedAt: '2026-07-20T12:00:00.000Z',
+      project: {
+        items: [42, 43].map((number) => ({
+          id: `PVTI_${number}`,
+          number,
+          contentType: 'Issue',
+          status: 'In Review',
+          priority: 'P1',
+          effort: 'Medium',
+          blockedOn: 'Nothing',
+          issueType: 'feat',
+          blockedByIssues: [],
+          sprintIterationId: null,
+        })),
+        rateLimit: { remaining: 4_000, used: 1, resetAt: '2026-07-20T13:00:00.000Z' },
+        currentSprintIterationId: null,
+      },
+      issues: [
+        {
+          number: 42,
+          title: 'first',
+          shape: 'feat',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Medium',
+          priority: 'P1',
+          status: 'In Review',
+          onBoard: true,
+          author: 'implementation-bot',
+          projectItemId: 'PVTI_42',
+          inCurrentSprint: false,
+        },
+        {
+          number: 43,
+          title: 'second',
+          shape: 'feat',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Medium',
+          priority: 'P1',
+          status: 'In Review',
+          onBoard: true,
+          author: 'implementation-bot',
+          projectItemId: 'PVTI_43',
+          inCurrentSprint: false,
+        },
+      ],
+      branches: [],
+      lifecycle: { items: [] },
+      pullRequests: [{
+        number: 84,
+        title: 'ambiguous',
+        body: candidate.body,
+        author: candidate.author,
+        baseRefName: candidate.baseRefName,
+        headRefName: candidate.headRefName,
+        headOid: head,
+        headCommittedAt: candidate.headChangedAt,
+        isDraft: false,
+        state: 'OPEN',
+        labels: ['engine:review'],
+        closingIssueNumbers: [42, 43],
+        mergeability: 'UNKNOWN',
+        mergeStateStatus: 'BLOCKED',
+        checks: [],
+        reviews: [],
+      }],
+      pullRequestMappings: [{
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [42, 43],
+        details: mappingDetails,
+      }],
+      diagnostics: [{
+        code: 'branch-mapping-ambiguous',
+        detail: diagnosticDetail,
+        issueNumbers: [42, 43],
+        signature: diagnosticSignature,
+        issues: [
+          { number: 42, projectStatus: 'In Review' },
+          { number: 43, projectStatus: 'In Review' },
+        ],
+        pullRequests: [{
+          number: 84,
+          head,
+          draft: false,
+          labels: ['engine:review'],
+        }],
+      }],
+    };
+    const cycleSnapshot = {
+      ...liveSnapshot,
+      pullRequests: [{
+        ...liveSnapshot.pullRequests[0],
+        closingIssueNumbers: [42],
+      }],
+      pullRequestMappings: [{
+        status: 'resolved',
+        prNumber: 84,
+        issueNumber: 42,
+        expectedBaseRefName: 'next',
+        evidence: 'closing-reference',
+      }],
+      diagnostics: [],
+    };
+    let freshSnapshot = liveSnapshot;
+    const acquisitionRecords = new Map<string, unknown>();
+    let acquisitionCount = 0;
+    const makeReviewActionPort = vi.fn(() => ({
+      readCandidate: async () => candidate,
+      createReviewRecord: async ({ record }) => {
+        events.push(`record:${record.state}`);
+        const oid = acquisitionOids[acquisitionCount++]!;
+        acquisitionRecords.set(oid, record);
+        return oid;
+      },
+      publishReviewClaim: async ({ recordOid, expectedRemoteRecordOid }) => {
+        const record = acquisitionRecords.get(recordOid);
+        if (record === undefined) throw new Error('missing acquisition record');
+        reviewClaim = {
+          oid: recordOid,
+          payload: encodeReviewClaimPayload(record),
+        };
+        events.push(`claim:${record.state}`);
+        return {
+          status: 'won',
+          expected: expectedRemoteRecordOid,
+          published: recordOid,
+          observed: recordOid,
+        };
+      },
+    }));
+    let liveLabels = ['engine:review'];
+    let liveEvidenceIncompleteReason: string | undefined;
+    const readPullRequestByNumber = async () => ({
+      state: 'OPEN',
+      headRefName: candidate.headRefName,
+      headOid: head,
+      baseRefName: candidate.baseRefName,
+      isDraft: false,
+      labels: liveLabels,
+      body: candidate.body,
+      closingIssueNumbers: [42, 43],
+      humanIssueNumber: null,
+      humanReason: null,
+      reviewClaim,
+      ...(liveEvidenceIncompleteReason === undefined
+        ? {}
+        : { evidenceIncompleteReason: liveEvidenceIncompleteReason }),
+    });
+    const active = marketplaceRuntime({
+      executionBackend: 'local',
+      environment: {},
+      credentials: new CredentialPool([{
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'implementation-secret',
+      }, {
+        login: 'review-bot',
+        normalizedLogin: 'review-bot',
+        reviewToken: 'review-secret',
+      }]),
+      makeReviewActionPort,
+      readPullRequestByNumber,
+      readReviewSnapshot: async () => freshSnapshot,
+      readProjectItemForReconciliation: async (number) => ({
+        id: `PVTI_${number}`,
+        status: 'In Review',
+        blockedOn: 'Nothing',
+      }),
+      readIssueByNumber: async (number) => ({
+        number,
+        title: number === 42 ? 'first' : 'second',
+        open: true,
+        author: 'implementation-bot',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [],
+      nextId: vi.fn()
+        .mockReturnValueOnce(generation)
+        .mockReturnValueOnce(attempt)
+        .mockReturnValueOnce(resolvedGeneration)
+        .mockReturnValueOnce(resolvedAttempt),
+      now: () => NOW,
+      runner: async (_command, args) => {
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, cycleSnapshot)).resolves.toEqual({ outcome: 'human' });
+
+    expect(reviewClaim).not.toBeNull();
+    expect(decodeReviewClaimPayload(reviewClaim!.payload)).toMatchObject({
+      state: 'mapping-reread',
+      mappingRequest: {
+        selectedIssueNumber: 42,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+      },
+    });
+    expect(comments).toEqual([]);
+    expect(events).toEqual([
+      'record:active',
+      'claim:active',
+      'record:mapping-reread',
+      'claim:mapping-reread',
+    ]);
+    expect(sharedMutations).toEqual([]);
+
+    reviewClaim = null;
+    freshSnapshot = cycleSnapshot;
+    comments.length = 0;
+    events.length = 0;
+    sharedMutations.length = 0;
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, cycleSnapshot)).resolves.toEqual({ outcome: 'human' });
+
+    expect(reviewClaim).toBeNull();
+    expect(comments).toEqual([]);
+    expect(events).toEqual([]);
+    expect(sharedMutations).toEqual([]);
+
+    const retainedOid = gitOid('8'.repeat(40));
+    const retainedRecord = {
+      kind: 'review-claim' as const,
+      protocolVersion: 2 as const,
+      prNumber: 84,
+      generation,
+      attempt,
+      reviewer: 'review-bot',
+      head,
+      state: 'active' as const,
+      recordedAt: '2026-07-20T11:00:00.000Z',
+    };
+    const externalAuthorityObservations: Array<{
+      readonly name: string;
+      readonly reviewClaim: typeof reviewClaim;
+      readonly events: readonly string[];
+      readonly comments: readonly string[];
+      readonly sharedMutations: readonly string[];
+    }> = [];
+    for (const authority of [
+      {
+        name: 'PR Human label',
+        labels: ['engine:review', 'review:needs-human'],
+        issueLabels: [] as string[],
+        blockedOn: 'Nothing' as const,
+      },
+      {
+        name: 'issue Human label',
+        labels: ['engine:review'],
+        issueLabels: ['autopilot:human'],
+        blockedOn: 'Nothing' as const,
+      },
+      {
+        name: 'Project Blocked on Human',
+        labels: ['engine:review'],
+        issueLabels: [] as string[],
+        blockedOn: 'Human' as const,
+      },
+    ]) {
+      reviewClaim = {
+        oid: retainedOid,
+        payload: encodeReviewClaimPayload(retainedRecord),
+      };
+      liveLabels = authority.labels;
+      freshSnapshot = {
+        ...liveSnapshot,
+        pullRequests: [{
+          ...liveSnapshot.pullRequests[0],
+          labels: authority.labels,
+        }],
+        issues: liveSnapshot.issues.map((issue) => (
+          issue.number === 42
+            ? {
+                ...issue,
+                labels: authority.issueLabels,
+                blockedOn: authority.blockedOn,
+              }
+            : issue
+        )),
+        project: {
+          ...liveSnapshot.project,
+          items: liveSnapshot.project.items.map((item) => (
+            item.number === 42
+              ? { ...item, blockedOn: authority.blockedOn }
+              : item
+          )),
+        },
+      };
+      events.length = 0;
+      comments.length = 0;
+      sharedMutations.length = 0;
+
+      await expect(active.executeAction({
+        kind: 'claim-review',
+        issueNumber: 42,
+        prNumber: 84,
+        head,
+      }, cycleSnapshot), authority.name).resolves.toEqual({ outcome: 'human' });
+      externalAuthorityObservations.push({
+        name: authority.name,
+        reviewClaim,
+        events: [...events],
+        comments: [...comments],
+        sharedMutations: [...sharedMutations],
+      });
+    }
+    expect(externalAuthorityObservations).toEqual([
+      'PR Human label',
+      'issue Human label',
+      'Project Blocked on Human',
+    ].map((name) => ({
+      name,
+      reviewClaim: {
+        oid: retainedOid,
+        payload: encodeReviewClaimPayload(retainedRecord),
+      },
+      events: [],
+      comments: [],
+      sharedMutations: [],
+    })));
+
+    reviewClaim = {
+      oid: retainedOid,
+      payload: encodeReviewClaimPayload(retainedRecord),
+    };
+    liveLabels = ['engine:review'];
+    liveEvidenceIncompleteReason = 'PR #84 labels were truncated';
+    freshSnapshot = liveSnapshot;
+    events.length = 0;
+    comments.length = 0;
+    sharedMutations.length = 0;
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, cycleSnapshot)).rejects.toThrow(/evidence.*incomplete/i);
+
+    expect(reviewClaim).toEqual({
+      oid: retainedOid,
+      payload: encodeReviewClaimPayload(retainedRecord),
+    });
+    expect(events).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(sharedMutations).toEqual([]);
   });
 
   it('rejects active mode when no live capability attestation is configured', async () => {

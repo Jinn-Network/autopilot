@@ -18,6 +18,7 @@ import {
   type GitHubLifecycleSnapshot,
   type RawPullRequest,
 } from './snapshot.js';
+import type { PullRequestIndexEntry } from './github-rest-discovery.js';
 
 export interface TargetedNativeIssue {
   readonly number: number;
@@ -53,9 +54,13 @@ export interface TargetedIssueActionContext {
 
 export interface TargetedActionReaderOptions {
   readonly authorAllowlist: ReadonlySet<string>;
+  readonly machineAuthorLogins?: ReadonlySet<string>;
+  readonly defaultBranch?: string;
   readonly rateLimitFloor: number;
   readonly readGraphQlRemaining: () => Promise<number>;
   readonly readPullRequest: (prNumber: number) => Promise<RawPullRequest | null>;
+  /** Complete REST index used to refresh every canonical mapping contender. */
+  readonly readOpenPullRequestIndex?: () => Promise<readonly PullRequestIndexEntry[]>;
   readonly readProjectItem: (issueNumber: number) => Promise<TargetedProjectItem | null>;
   readonly readIssue: (issueNumber: number) => Promise<TargetedNativeIssue | null>;
   readonly readBlockedByIssueNumbers: (issueNumber: number) => Promise<readonly number[]>;
@@ -133,9 +138,6 @@ function issueNumbers(raw: RawPullRequest): readonly number[] {
   const marker = /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/
     .exec(raw.body);
   if (marker?.[1] !== undefined) numbers.add(Number(marker[1]));
-  if (raw.humanIssueNumber !== undefined && raw.humanIssueNumber !== null) {
-    numbers.add(raw.humanIssueNumber);
-  }
   return [...numbers];
 }
 
@@ -199,6 +201,8 @@ function composeTargeted(
     readonly pullRequests?: GitHubLifecycleSnapshot['pullRequests'];
   },
   authorAllowlist: ReadonlySet<string>,
+  machineAuthorLogins: ReadonlySet<string>,
+  defaultBranch: string,
 ): GitHubLifecycleSnapshot {
   completeCycle(cycle);
   return composeGitHubLifecycleSnapshot({
@@ -209,6 +213,8 @@ function composeTargeted(
     terminalClaims: cycle.terminalClaims,
   }, {
     authorAllowlist,
+    machineAuthorLogins,
+    defaultBranch,
     capturedAt: cycle.capturedAt,
     snapshotMode: cycle.snapshotMode ?? 'incremental',
     lastFullReconciliationAt: cycle.lastFullReconciliationAt,
@@ -226,6 +232,8 @@ function composeTargeted(
 export function makeTargetedActionReader(
   options: TargetedActionReaderOptions,
 ): TargetedActionReader {
+  const defaultBranch = options.defaultBranch ?? 'next';
+  const machineAuthorLogins = options.machineAuthorLogins ?? new Set<string>();
   const reserve = async (points: number): Promise<void> => {
     assertRateLimitReserve(
       await options.readGraphQlRemaining(),
@@ -331,14 +339,81 @@ export function makeTargetedActionReader(
     ));
     const project = projectWithTarget(cycleSnapshot, issueNumber, item);
     const decoded = decodePullRequestSnapshot(raw);
-    let pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
-      ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
-      : [...cycleSnapshot.pullRequests, decoded];
+    if (decoded.evidenceIncompleteReason !== undefined) return null;
+    let pullRequests: GitHubLifecycleSnapshot['pullRequests'];
+    if (options.readOpenPullRequestIndex === undefined) {
+      pullRequests = cycleSnapshot.pullRequests.some((pr) => pr.number === prNumber)
+        ? cycleSnapshot.pullRequests.map((pr) => pr.number === prNumber ? decoded : pr)
+        : [...cycleSnapshot.pullRequests, decoded];
+    } else {
+      const index = await options.readOpenPullRequestIndex();
+      const indexed = new Map<number, PullRequestIndexEntry>();
+      for (const entry of index) {
+        positiveNumber(entry.number, 'Open PR index number');
+        if (entry.state !== 'OPEN' || indexed.has(entry.number)) {
+          throw new Error('Complete open PR index is contradictory');
+        }
+        indexed.set(entry.number, entry);
+      }
+      const targetIndex = indexed.get(prNumber);
+      if (
+        targetIndex === undefined
+        || targetIndex.headOid !== raw.headOid
+        || targetIndex.headRefName !== raw.headRefName
+        || targetIndex.baseRefName !== raw.baseRefName
+      ) {
+        return null;
+      }
+      const cycleOpen = new Map(cycleSnapshot.pullRequests
+        .filter((pr) => pr.state === 'OPEN')
+        .map((pr) => [pr.number, pr]));
+      const refreshed: GitHubLifecycleSnapshot['pullRequests'][number][] = [];
+      for (const entry of [...indexed.values()].sort((left, right) => left.number - right.number)) {
+        if (entry.number === prNumber) {
+          refreshed.push(decoded);
+          continue;
+        }
+        const prior = cycleOpen.get(entry.number);
+        if (
+          prior !== undefined
+          && prior.updatedAt !== undefined
+          && prior.updatedAt === entry.updatedAt
+          && prior.headOid === entry.headOid
+          && prior.headRefName === entry.headRefName
+          && prior.baseRefName === entry.baseRefName
+          && prior.isDraft === entry.isDraft
+        ) {
+          refreshed.push(prior);
+          continue;
+        }
+        await reserve(TARGETED_PR_RESERVE);
+        const live = await options.readPullRequest(entry.number);
+        if (
+          live === null
+          || live.state !== 'OPEN'
+          || live.number !== entry.number
+          || live.headOid !== entry.headOid
+          || live.headRefName !== entry.headRefName
+          || live.baseRefName !== entry.baseRefName
+        ) {
+          return null;
+        }
+        const decodedLive = decodePullRequestSnapshot(live);
+        if (decodedLive.evidenceIncompleteReason !== undefined) return null;
+        refreshed.push(decodedLive);
+      }
+      pullRequests = [
+        ...cycleSnapshot.pullRequests.filter((pr) => pr.state === 'MERGED'),
+        ...refreshed,
+      ];
+    }
     if (!hydrateRecoveryBlockers) {
       return composeTargeted(
         cycleSnapshot,
         { project, issues, pullRequests },
         options.authorAllowlist,
+        machineAuthorLogins,
+        defaultBranch,
       );
     }
     const dependencySet = new Set(dependencies);
@@ -376,6 +451,7 @@ export function makeTargetedActionReader(
         return null;
       }
       const hydratedBlocker = decodePullRequestSnapshot(liveBlocker);
+      if (hydratedBlocker.evidenceIncompleteReason !== undefined) return null;
       pullRequests = pullRequests.some((pr) => pr.number === blockerNumber)
         ? pullRequests.map((pr) => pr.number === blockerNumber ? hydratedBlocker : pr)
         : [...pullRequests, hydratedBlocker];
@@ -396,6 +472,8 @@ export function makeTargetedActionReader(
       cycleSnapshot,
       { project, issues, pullRequests },
       options.authorAllowlist,
+      machineAuthorLogins,
+      defaultBranch,
     );
   };
   return {
@@ -455,6 +533,7 @@ export function makeTargetedActionReader(
           throw new Error('Targeted blocker PR authority changed');
         }
         const decodedBlocker = decodePullRequestSnapshot(liveBlocker);
+        if (decodedBlocker.evidenceIncompleteReason !== undefined) return null;
         pullRequests = cycleSnapshot.pullRequests.map((pr) => (
           pr.number === blocker.number ? decodedBlocker : pr
         ));
@@ -487,6 +566,8 @@ export function makeTargetedActionReader(
           cycleSnapshot,
           { project, issues, pullRequests },
           options.authorAllowlist,
+          machineAuthorLogins,
+          defaultBranch,
         ),
       };
     },

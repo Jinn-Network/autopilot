@@ -163,28 +163,121 @@ function exactPullRequestDetail(
   };
 }
 
-function latestHuman(value: unknown, prNumber: number): {
+function latestHuman(
+  value: unknown,
+  prNumber: number,
+): {
   readonly issueNumber?: number;
+  readonly author?: string;
+  readonly head?: PullRequestSnapshot['humanHead'];
+  readonly generation?: string;
+  readonly diagnosticIssueNumbers?: readonly number[];
+  readonly diagnosticSignature?: string;
   readonly reason: NonNullable<PullRequestSnapshot['humanReason']>;
 } | null {
-  const evidence = rows(value, 'PR comments').map((raw, index) => {
+  const comments = rows(value, 'PR comments').map((raw, index) => {
     const comment = record(raw, `PR comment ${index}`);
-    const createdAt = exactTimestamp(comment.created_at, `PR comment ${index}.created_at`);
-    const parsed = parseHumanCommentEvidence(string(comment.body, `PR comment ${index}.body`));
-    if (parsed !== null && parsed.prNumber !== prNumber) {
+    const id = nonNegativeInteger(comment.id, `PR comment ${index}.id`);
+    if (id === 0) throw new GitHubRestSchemaError(`PR comment ${index}.id must be positive`);
+    const body = string(comment.body, `PR comment ${index}.body`);
+    const user = typeof comment.user === 'object' && comment.user !== null
+      ? comment.user as Record<string, unknown>
+      : undefined;
+    const author = typeof user?.login === 'string' && user.login.length > 0
+      ? user.login
+      : undefined;
+    return { id: String(id), body, author };
+  });
+
+  let structured: {
+    readonly id: bigint;
+    readonly parsed: NonNullable<ReturnType<typeof parseHumanCommentEvidence>>;
+    readonly author?: string;
+  } | undefined;
+  const structuredIds = new Set<string>();
+  for (const [index, comment] of comments.entries()) {
+    const parsed = parseHumanCommentEvidence(comment.body);
+    if (parsed === null) {
+      if (comment.body.includes('<!-- jinn-autopilot-human:')) {
+        throw new GitHubRestSchemaError(
+          `PR comment ${index} has an invalid structured Human marker or diagnostic signature`,
+        );
+      }
+      continue;
+    }
+    if (parsed.prNumber !== prNumber) {
       throw new GitHubRestSchemaError(
         `PR comment ${index} Human marker names PR #${parsed.prNumber}, expected #${prNumber}`,
       );
     }
-    return parsed === null ? null : { createdAt, parsed };
-  }).filter((entry): entry is NonNullable<typeof entry> => entry !== null)
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
-  if (evidence === undefined) return null;
+    if (structuredIds.has(comment.id)) {
+      throw new GitHubRestSchemaError('PR comments have duplicate database IDs');
+    }
+    structuredIds.add(comment.id);
+    const candidate = {
+      id: BigInt(comment.id),
+      parsed,
+      ...(comment.author === undefined ? {} : { author: comment.author }),
+    };
+    if (structured === undefined || structured.id < candidate.id) structured = candidate;
+  }
+  if (structured === undefined) return null;
   return {
-    ...(evidence.parsed.issueNumber === undefined
+    ...(structured.parsed.issueNumber === undefined
       ? {}
-      : { issueNumber: evidence.parsed.issueNumber }),
-    reason: evidence.parsed.reason,
+      : { issueNumber: structured.parsed.issueNumber }),
+    ...(structured.author === undefined ? {} : { author: structured.author }),
+    ...(structured.parsed.head === undefined ? {} : { head: structured.parsed.head }),
+    ...(structured.parsed.generation === undefined
+      ? {}
+      : { generation: structured.parsed.generation }),
+    ...(structured.parsed.diagnosticIssueNumbers === undefined
+      ? {}
+      : {
+          diagnosticIssueNumbers: structured.parsed.diagnosticIssueNumbers,
+          diagnosticSignature: structured.parsed.diagnosticSignature,
+        }),
+    reason: structured.parsed.reason,
+  };
+}
+
+function currentSurfaceActors(
+  value: unknown,
+  humanLabelPresent: boolean,
+  draft: boolean,
+): {
+  readonly humanLabelActor?: string;
+  readonly draftActor?: string;
+} {
+  const events = rows(value, 'PR events').flatMap((raw, index) => {
+    const event = record(raw, `PR event ${index}`);
+    const kind = nonEmptyString(event.event, `PR event ${index}.event`);
+    if (!['labeled', 'unlabeled', 'convert_to_draft', 'ready_for_review'].includes(kind)) {
+      return [];
+    }
+    const createdAt = exactTimestamp(event.created_at, `PR event ${index}.created_at`);
+    const actor = event.actor === null
+      ? undefined
+      : nonEmptyString(record(event.actor, `PR event ${index}.actor`).login, `PR event ${index}.actor.login`);
+    const label = kind === 'labeled' || kind === 'unlabeled'
+      ? nonEmptyString(record(event.label, `PR event ${index}.label`).name, `PR event ${index}.label.name`)
+      : undefined;
+    return [{ kind, createdAt, actor, label }];
+  }).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const latestLabel = [...events].reverse().find((event) => (
+    (event.kind === 'labeled' || event.kind === 'unlabeled')
+    && event.label === 'review:needs-human'
+  ));
+  const latestDraft = [...events].reverse().find((event) => (
+    event.kind === 'convert_to_draft' || event.kind === 'ready_for_review'
+  ));
+  return {
+    ...(humanLabelPresent && latestLabel?.kind === 'labeled' && latestLabel.actor !== undefined
+      ? { humanLabelActor: latestLabel.actor }
+      : {}),
+    ...(draft && latestDraft?.kind === 'convert_to_draft' && latestDraft.actor !== undefined
+      ? { draftActor: latestDraft.actor }
+      : {}),
   };
 }
 
@@ -284,6 +377,7 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
 
   async changed(pr: PullRequestSnapshot): Promise<boolean> {
     if (pr.state !== 'OPEN') return false;
+    if (pr.evidenceIncompleteReason !== undefined) return true;
     if (
       pr.mergeability === 'MERGEABLE'
       && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus)
@@ -315,6 +409,9 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
     const commentResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/issues/${pr.number}/comments?per_page=100&page=1`,
     );
+    const eventResponse = await this.rest.getJson(
+      `repos/${this.repositorySlug}/issues/${pr.number}/events?per_page=100&page=1`,
+    );
     const checkResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/commits/${pr.headOid}/check-runs?per_page=100&page=1`,
     );
@@ -323,9 +420,22 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
     );
     const detail = exactPullRequestDetail(detailRaw, pr);
     const currentReviews = reviews(completeBody(reviewResponse, 'PR reviews'));
-    const currentHuman = latestHuman(
-      completeBody(commentResponse, 'PR comments'),
-      pr.number,
+    let currentHuman: ReturnType<typeof latestHuman>;
+    try {
+      currentHuman = latestHuman(
+        completeBody(commentResponse, 'PR comments'),
+        pr.number,
+      );
+    } catch {
+      // Comments are audit/migration evidence only. If that audit surface is
+      // malformed or truncated, force a canonical refresh; never let comment
+      // prose or marker shape abort the lifecycle cycle.
+      return true;
+    }
+    const currentActors = currentSurfaceActors(
+      completeBody(eventResponse, 'PR events'),
+      detail.labels.includes('review:needs-human'),
+      detail.isDraft,
     );
     const currentChecks = [
       ...checkRuns(completeBody(checkResponse, 'check runs')),
@@ -335,8 +445,21 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       ? null
       : {
           ...(pr.humanIssueNumber === undefined ? {} : { issueNumber: pr.humanIssueNumber }),
+          ...(pr.humanAuthor === undefined ? {} : { author: pr.humanAuthor }),
+          ...(pr.humanHead === undefined ? {} : { head: pr.humanHead }),
+          ...(pr.humanGeneration === undefined ? {} : { generation: pr.humanGeneration }),
+          ...(pr.humanDiagnosticIssueNumbers === undefined
+            ? {}
+            : {
+                diagnosticIssueNumbers: pr.humanDiagnosticIssueNumbers,
+                diagnosticSignature: pr.humanDiagnosticSignature,
+              }),
           reason: pr.humanReason,
         };
+    const cachedActors = {
+      ...(pr.humanLabelActor === undefined ? {} : { humanLabelActor: pr.humanLabelActor }),
+      ...(pr.draftActor === undefined ? {} : { draftActor: pr.draftActor }),
+    };
     const cachedDetail = {
       title: pr.title,
       body: pr.body,
@@ -353,6 +476,7 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
         !== JSON.stringify({ ...cachedDetail, labels: [...cachedDetail.labels].sort() })
       || canonical(currentReviews) !== canonical(pr.reviews)
       || JSON.stringify(currentHuman) !== JSON.stringify(cachedHuman)
+      || JSON.stringify(currentActors) !== JSON.stringify(cachedActors)
       || canonicalChecks(currentChecks) !== canonicalChecks(pr.checks);
   }
 }

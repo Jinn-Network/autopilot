@@ -29,11 +29,43 @@ function snapshot(): GitHubLifecycleSnapshot {
     project: {
       rateLimit: { remaining: 5000, used: 1, resetAt: '2026-07-20T13:00:00.000Z' },
       currentSprintIterationId: null,
-      items: [],
+      items: [{
+        id: 'PVTI_issue_42',
+        number: 42,
+        contentType: 'Issue',
+        status: 'In Review',
+        priority: 'P1',
+        effort: 'High',
+        blockedOn: 'Nothing',
+        issueType: 'feat',
+        blockedByIssues: [],
+        sprintIterationId: null,
+      }],
     },
-    issues: [],
+    issues: [{
+      number: 42,
+      title: 'Review me',
+      labels: [],
+      shape: 'feat',
+      blockedOn: 'Nothing',
+      blockedByIssues: [],
+      effort: 'High',
+      priority: 'P1',
+      status: 'In Review',
+      onBoard: true,
+      author: 'implementation-bot',
+      projectItemId: 'PVTI_issue_42',
+      inCurrentSprint: false,
+    }],
     branches: [],
     diagnostics: [],
+    pullRequestMappings: [{
+      status: 'resolved',
+      prNumber: 84,
+      issueNumber: 42,
+      expectedBaseRefName: 'next',
+      evidence: 'closing-reference',
+    }],
     pullRequests: [{
       number: 84,
       title: 'Review me',
@@ -253,6 +285,111 @@ describe('production review acquisition port', () => {
     });
   });
 
+  it('does not treat stale painter-owned Project Status Human as authority', async () => {
+    const current = snapshot();
+    const staleStatus: GitHubLifecycleSnapshot = {
+      ...current,
+      lifecycle: {
+        items: current.lifecycle.items.map((item) => (
+          item.kind === 'pull-request'
+            ? { ...item, projectStatus: 'Human' as const }
+            : item
+        )),
+      },
+    };
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => staleStatus,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async (command, args) => {
+        expect(command).toBe('gh');
+        if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+          return JSON.stringify({
+            changed_files: 0,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: '4'.repeat(40) },
+          });
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      humanHold: false,
+      issueNumber: 42,
+    });
+  });
+
+  it('fails closed on the canonical structured mapping result during acquisition and confirmation', async () => {
+    const ambiguous: GitHubLifecycleSnapshot = {
+      ...snapshot(),
+      pullRequestMappings: [{
+        status: 'ambiguous',
+        prNumber: 84,
+        issueNumbers: [42, 84],
+        details: ['PR #84 marker and dependency evidence contradict each other'],
+      }],
+    };
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => ambiguous,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async (command, args) => {
+        expect(command).toBe('gh');
+        if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+          return JSON.stringify({
+            changed_files: 0,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: '4'.repeat(40) },
+          });
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      mappingProblem: 'PR #84 marker and dependency evidence contradict each other',
+    });
+    await expect(port.confirmAcquisition({
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW,
+    })).resolves.toMatchObject({
+      mappingProblem: 'PR #84 marker and dependency evidence contradict each other',
+    });
+  });
+
+  it('fails closed when the target PR has no canonical mapping result', async () => {
+    const missing: GitHubLifecycleSnapshot = {
+      ...snapshot(),
+      pullRequestMappings: [],
+    };
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => missing,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async () => {
+        throw new Error('missing canonical authority must not reach changed-file reads');
+      },
+    });
+
+    await expect(port.readCandidate(84)).resolves.toBeNull();
+    await expect(port.confirmAcquisition({
+      prNumber: 84,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW,
+    })).resolves.toBeNull();
+  });
+
   it('forces Human approval policy when REST total disproves file completeness', async () => {
     const port = makeProductionReviewActionPort({
       repositoryPath: '/repo',
@@ -319,6 +456,82 @@ describe('production review acquisition port', () => {
     expect(push?.env).toMatchObject({ GH_TOKEN: 'selected-secret' });
     expect(push?.env?.GITHUB_TOKEN).toBe('');
     expect(push?.args.join(' ')).not.toContain('selected-secret');
+  });
+
+  it('leaves the exact review ref and shared surfaces unchanged when native issue Human arrives before claim publication', async () => {
+    let current = snapshot();
+    let remoteReviewRef = REVIEW;
+    const sharedMutations: string[] = [];
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => current,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async (cmd, args) => {
+        if (
+          cmd === 'gh'
+          && args[0] === 'api'
+          && args.some((arg) => arg.endsWith('/pulls/84'))
+        ) {
+          return JSON.stringify({
+            changed_files: 0,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: '4'.repeat(40) },
+          });
+        }
+        if (cmd === 'git' && args.includes('rev-list')) {
+          return `${RECORD} ${REVIEW}\n`;
+        }
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          return `${remoteReviewRef}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (cmd === 'git' && args.includes('push')) {
+          sharedMutations.push('review-ref');
+          remoteReviewRef = RECORD;
+          return '';
+        }
+        if (
+          cmd === 'gh'
+          && (
+            (args[0] === 'pr' && ['edit', 'ready'].includes(args[1] ?? ''))
+            || (args[0] === 'project' && args[1] === 'item-edit')
+            || (args[0] === 'issue' && ['comment', 'edit'].includes(args[1] ?? ''))
+          )
+        ) {
+          sharedMutations.push(`${args[0]} ${args[1]}`);
+          return '';
+        }
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+    const candidate = await port.readCandidate(84);
+    expect(candidate?.humanHold).toBe(false);
+    current = {
+      ...current,
+      issues: current.issues.map((issue) => (
+        issue.number === 42
+          ? { ...issue, labels: ['autopilot:human'] }
+          : issue
+      )),
+    };
+    const selection = pool().select({
+      phase: 'review',
+      prAuthor: 'implementation-bot',
+    });
+    if (selection.status !== 'selected') throw new Error('fixture selection failed');
+
+    await expect(port.publishReviewClaim({
+      prNumber: 84,
+      recordParent: REVIEW,
+      expectedRemoteRecordOid: REVIEW,
+      recordOid: RECORD,
+      credential: selection.credential,
+    })).rejects.toThrow(/Human is dominant/i);
+
+    expect(remoteReviewRef).toBe(REVIEW);
+    expect(sharedMutations).toEqual([]);
   });
 
   it('creates review attempts bound to generation, ref OID, and approval policy', async () => {
@@ -437,4 +650,95 @@ describe('production review acquisition port', () => {
       })).resolves.toBeUndefined();
     },
   );
+
+  it('leaves the exact review ref and shared surfaces unchanged when native issue Human arrives before projection', async () => {
+    let current = snapshot();
+    let labels: string[] = [];
+    let remoteReviewRef = REVIEW;
+    const sharedMutations: string[] = [];
+    const port = makeProductionReviewActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/worktrees',
+      runnerId: 'runner-a',
+      readSnapshot: async () => current,
+      changedFiles: async () => [],
+      codeownersText: () => '',
+      runner: async (cmd, args) => {
+        if (
+          cmd === 'gh'
+          && args[0] === 'api'
+          && args.some((arg) => arg.endsWith('/pulls/84'))
+        ) {
+          return JSON.stringify({
+            changed_files: 0,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: '4'.repeat(40) },
+          });
+        }
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          return `${remoteReviewRef}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (cmd === 'git' && args.includes('push')) {
+          sharedMutations.push('review-ref');
+          remoteReviewRef = RECORD;
+          return '';
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({
+            headRefOid: HEAD,
+            labels: labels.map((name) => ({ name })),
+            isDraft: false,
+          });
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'edit') {
+          sharedMutations.push('engine:review');
+          labels = [...labels, 'engine:review'];
+          return '';
+        }
+        if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+          return projectSnapshot('In Review');
+        }
+        if (cmd === 'gh' && args[0] === 'project' && args[1] === 'item-edit') {
+          sharedMutations.push('Project Status');
+          return '';
+        }
+        if (
+          cmd === 'gh'
+          && (
+            (args[0] === 'pr' && args[1] === 'ready')
+            || (args[0] === 'issue' && ['comment', 'edit'].includes(args[1] ?? ''))
+          )
+        ) {
+          sharedMutations.push(`${args[0]} ${args[1]}`);
+          return '';
+        }
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+    const candidate = await port.readCandidate(84);
+    if (candidate === null) throw new Error('fixture candidate missing');
+    expect(candidate.humanHold).toBe(false);
+    current = {
+      ...current,
+      issues: current.issues.map((issue) => (
+        issue.number === 42
+          ? { ...issue, labels: ['autopilot:human'] }
+          : issue
+      )),
+    };
+    const selection = pool().select({
+      phase: 'review',
+      prAuthor: 'implementation-bot',
+    });
+    if (selection.status !== 'selected') throw new Error('fixture selection failed');
+
+    await expect(port.repairProjection({
+      candidate,
+      expectedReviewRefOid: REVIEW,
+      credential: selection.credential,
+    })).rejects.toThrow(/Human is dominant/i);
+
+    expect(sharedMutations).toEqual([]);
+    expect(remoteReviewRef).toBe(REVIEW);
+  });
 });

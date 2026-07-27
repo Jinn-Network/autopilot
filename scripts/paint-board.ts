@@ -32,13 +32,28 @@ import {
   type PaintFacts,
 } from '../src/lifecycle/board-painter.js';
 import { parseChildMarker } from '../src/lifecycle/child-issues.js';
+import { decodeBranchClaimTrailers } from '../src/lifecycle/codecs.js';
+import { resolveStructuredPullRequestMappings } from '../src/lifecycle/pr-mapping.js';
+import { gitOid } from '../src/lifecycle/types.js';
 import type { AutopilotConfig } from '../src/config/config.js';
 
 interface OpenPrRow {
   readonly number: number;
+  readonly headRefOid: string;
+  readonly headRefName: string;
+  readonly baseRefName: string;
+  readonly body: string;
   readonly isDraft: boolean;
   readonly labels: readonly { readonly name: string }[];
   readonly closingIssuesReferences: readonly { readonly number: number }[];
+}
+
+interface ClaimBranchRow {
+  readonly issueNumber: number;
+  readonly headOid: string;
+  readonly headRefName: string;
+  readonly phase?: 'implement' | 'fix' | 'reconcile';
+  readonly targetBase?: string;
 }
 
 interface IssueRow {
@@ -102,7 +117,7 @@ function withToken(
   });
 }
 
-interface PaintBoardRuntimeOptions {
+export interface PaintBoardRuntimeOptions {
   readonly repositorySlug: string;
   readonly repositoryOwner: string;
   readonly repositoryName: string;
@@ -114,6 +129,7 @@ interface PaintBoardRuntimeOptions {
   'Todo' | 'In Progress' | 'Human' | 'In Review' | 'Done',
   string
   >>;
+  readonly defaultBranch: string;
 }
 
 function legacyPaintBoardOptions(): PaintBoardRuntimeOptions {
@@ -132,6 +148,7 @@ function legacyPaintBoardOptions(): PaintBoardRuntimeOptions {
       'In Review': '',
       Done: '',
     },
+    defaultBranch: 'next',
   };
 }
 
@@ -155,6 +172,7 @@ export function paintBoardOptionsFromConfig(
       'In Review': config.project.fields.status.options.inReview,
       Done: config.project.fields.status.options.done,
     },
+    defaultBranch: config.repository.defaultBranch,
   };
 }
 
@@ -167,15 +185,16 @@ async function listOpenPullRequests(
     '--repo', options.repositorySlug,
     '--state', 'open',
     '--limit', '500',
-    '--json', 'number,isDraft,labels,closingIssuesReferences',
+    '--json',
+    'number,headRefOid,headRefName,baseRefName,body,isDraft,labels,closingIssuesReferences',
   ]);
   return JSON.parse(raw) as OpenPrRow[];
 }
 
-async function listClaimBranchIssueNumbers(
+async function listClaimBranches(
   run: CommandRunner,
   options: PaintBoardRuntimeOptions,
-): Promise<ReadonlySet<number>> {
+): Promise<readonly ClaimBranchRow[]> {
   const raw = await run('gh', [
     'api',
     `repos/${options.repositorySlug}/git/matching-refs/heads/autopilot/`,
@@ -186,14 +205,42 @@ async function listClaimBranchIssueNumbers(
   const pages = Array.isArray(parsed) ? parsed : [];
   const refs = pages.flatMap((page) => (Array.isArray(page) ? page : [])) as Array<{
     ref?: string;
+    object?: { sha?: string };
   }>;
-  const numbers = new Set<number>();
+  const branches: ClaimBranchRow[] = [];
   for (const ref of refs) {
     const match = /^refs\/heads\/autopilot\/([1-9][0-9]*)$/.exec(ref.ref ?? '');
     if (match === null) continue;
-    numbers.add(Number(match[1]));
+    const issueNumber = Number(match[1]);
+    const headOid = ref.object?.sha;
+    if (headOid === undefined) continue;
+    let claim: ReturnType<typeof decodeBranchClaimTrailers> | undefined;
+    try {
+      const message = await run('gh', [
+        'api',
+        `repos/${options.repositorySlug}/commits/${headOid}`,
+        '--jq', '.commit.message',
+      ]);
+      claim = decodeBranchClaimTrailers(message);
+    } catch {
+      // Branch existence still paints in-progress; an undecodable claim is
+      // deliberately excluded from canonical PR mapping authority.
+    }
+    branches.push({
+      issueNumber,
+      headOid,
+      headRefName: `autopilot/${issueNumber}`,
+      ...(claim === undefined
+        || claim.issueNumber !== issueNumber
+        || claim.expectedHead !== gitOid(headOid)
+        ? {}
+        : {
+            phase: claim.phase,
+            targetBase: claim.targetBase,
+          }),
+    });
   }
-  return numbers;
+  return branches;
 }
 
 async function listOpenChildIssues(
@@ -286,25 +333,56 @@ export async function runPaintBoard(
   const snapshot = await fetchProjectSnapshot(run, {
     projectOwner: configured.projectOwner,
     projectNumber: configured.projectNumber,
+    repositorySlug: configured.repositorySlug,
   });
   const boardIssues = snapshot.items.filter((item) => item.contentType === 'Issue');
   const issueNumbers = boardIssues.map((item) => item.number);
 
-  const [openPrs, claimIssues, childIssues, issueRows] = await Promise.all([
+  const [openPrs, claimBranches, childIssues, issueRows] = await Promise.all([
     listOpenPullRequests(run, configured),
-    listClaimBranchIssueNumbers(run, configured),
+    listClaimBranches(run, configured),
     listOpenChildIssues(run, configured),
     fetchIssueRows(run, issueNumbers, configured),
   ]);
 
+  const mappings = resolveStructuredPullRequestMappings({
+    defaultBranch: configured.defaultBranch,
+    issues: boardIssues.map((issue) => ({
+      number: issue.number,
+      blockedOn: issue.blockedOn,
+      blockedByIssues: [...issue.blockedByIssues],
+    })),
+    pullRequests: openPrs.map((pr) => ({
+      number: pr.number,
+      state: 'OPEN',
+      head: gitOid(pr.headRefOid),
+      headRefName: pr.headRefName,
+      baseRefName: pr.baseRefName,
+      closingIssueNumbers: pr.closingIssuesReferences.map((issue) => issue.number),
+      body: pr.body,
+    })),
+    stableBranches: claimBranches.flatMap((branch) => (
+      branch.phase === undefined || branch.targetBase === undefined
+        ? []
+        : [{
+            issueNumber: branch.issueNumber,
+            phase: branch.phase,
+            head: gitOid(branch.headOid),
+            headRefName: branch.headRefName,
+            targetBase: branch.targetBase,
+          }]
+    )),
+  });
   const openPrByIssue = new Map<number, OpenPrRow>();
   const issueByOpenPr = new Map<number, number>();
-  for (const pr of openPrs) {
-    for (const issue of pr.closingIssuesReferences) {
-      openPrByIssue.set(issue.number, pr);
-      issueByOpenPr.set(pr.number, issue.number);
-    }
+  for (const mapping of mappings) {
+    if (mapping.status !== 'resolved') continue;
+    const pr = openPrs.find((candidate) => candidate.number === mapping.prNumber);
+    if (pr === undefined) continue;
+    openPrByIssue.set(mapping.issueNumber, pr);
+    issueByOpenPr.set(pr.number, mapping.issueNumber);
   }
+  const claimIssues = new Set(claimBranches.map((branch) => branch.issueNumber));
 
   const parentPrsFromChildren: number[] = [];
   const parsedChildren: Array<{ childNumber: number; parentPr: number }> = [];

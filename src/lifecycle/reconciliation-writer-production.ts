@@ -9,6 +9,7 @@ import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
 import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 import type { BlockedOn, ProjectStatus } from '../dispatcher/types.js';
 import {
   IMPLEMENTATION_SUMMARY_END,
@@ -17,16 +18,22 @@ import {
 import {
   decodeReviewClaimPayload,
   encodeReviewClaimPayload,
+  mappingDiagnosticSignature,
+  parseHumanCommentEvidence,
 } from './codecs.js';
 import {
   gitPublicationArgs,
+  selectCredential,
+  type CredentialPool,
   type SelectedCredential,
 } from './credentials.js';
 import { makeGitProtocolPort } from './git-protocol.js';
 import { readIssueCommentBodies } from './github-comments.js';
 import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import { withSelectedCredential } from './production-auth.js';
+import { resolveStructuredPullRequestMappings } from './pr-mapping.js';
 import type {
+  ReconciliationHumanCommentAuthority,
   ReconciliationPullRequestState,
   ReconciliationReviewRefState,
   ReconciliationWriter,
@@ -60,7 +67,15 @@ export interface ReconciliationPullRequestNode {
   readonly body: string;
   readonly closingIssueNumbers: readonly number[];
   readonly humanIssueNumber?: number | null;
+  readonly humanAuthor?: string | null;
+  readonly humanHead?: string | null;
+  readonly humanGeneration?: string | null;
+  readonly humanDiagnosticIssueNumbers?: readonly number[] | null;
+  readonly humanDiagnosticSignature?: string | null;
+  readonly humanLabelActor?: string | null;
+  readonly draftActor?: string | null;
   readonly humanReason?: HumanReason | null;
+  readonly evidenceIncompleteReason?: string;
   readonly reviewClaim: { readonly oid: string; readonly payload: string } | null;
 }
 
@@ -73,6 +88,14 @@ export interface ReconciliationProjectItemNode {
   readonly id: string;
   readonly status: ProjectStatus | null;
   readonly blockedOn: BlockedOn | null;
+}
+
+/** Exact stable-branch ref plus the claim trailers at that ref's ancestry. */
+export interface ReconciliationBranchClaimNode {
+  readonly issueNumber: number;
+  readonly headRefName: string;
+  readonly headOid: string;
+  readonly claimTrailers: string;
 }
 
 export interface ProductionReconciliationWriterOptions {
@@ -101,6 +124,14 @@ export interface ProductionReconciliationWriterOptions {
   ) => Promise<ReconciliationProjectItemNode | null>;
   /** Exact git-transport branch/ref read. Never backed by a world snapshot. */
   readonly readBranchHeadByName: (headRefName: string) => Promise<GitOid | null>;
+  /**
+   * Exact stable-branch claim read. Mapping-Human publication revalidates
+   * claim identity as well as the ref OID so a same-head parent/base rewrite
+   * cannot satisfy stale diagnostic authority.
+   */
+  readonly readBranchClaimByName?: (
+    headRefName: string,
+  ) => Promise<ReconciliationBranchClaimNode | null>;
   readonly readIssueByNumber: (issueNumber: number) => Promise<TargetedNativeIssue | null>;
   readonly readBlockedByIssueNumbers: (issueNumber: number) => Promise<readonly number[]>;
   readonly readOpenPullRequestsByIssue: (
@@ -110,7 +141,11 @@ export interface ProductionReconciliationWriterOptions {
   readonly readIssueActionContext: (
     issueNumber: number,
   ) => Promise<TargetedIssueActionContext>;
+  readonly readCanonicalSnapshot?: (
+    prNumber: number,
+  ) => Promise<GitHubLifecycleSnapshot | null>;
   readonly credential: SelectedCredential;
+  readonly credentials?: CredentialPool;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
   readonly now?: () => Date;
@@ -185,6 +220,7 @@ function reviewRefStateFromRaw(
   return {
     oid: gitOid(claim.oid),
     head: record.head,
+    generation: record.generation,
     state: record.state,
   };
 }
@@ -231,23 +267,6 @@ function exactDraftIdentity(
     && gitOid(pullRequest.headOid) === expected.head
     && pullRequest.baseRefName === expected.baseRefName
     && pullRequest.body === expected.body;
-}
-
-function humanDominatesPullRequest(
-  snapshot: GitHubLifecycleSnapshot,
-  prNumber: number,
-): boolean {
-  const pr = snapshot.pullRequests.find((candidate) => candidate.number === prNumber);
-  const lifecycle = snapshot.lifecycle.items.find((item) =>
-    item.kind === 'pull-request' && item.prNumber === prNumber);
-  return pr?.labels.includes(NEEDS_HUMAN_LABEL) === true
-    || (
-      lifecycle?.kind === 'pull-request'
-      && (
-        lifecycle.humanHold === true
-        || lifecycle.projectStatus === 'Human'
-      )
-    );
 }
 
 function nextReviewRecord(
@@ -309,10 +328,19 @@ function makeProductionReconciliationWriterWithScope(
     actionAuthority?.issues.clear();
   };
   const readRawPr = (prNumber: number): Promise<ReconciliationPullRequestNode | null> => {
-    if (actionAuthority === null) return options.readPullRequestByNumber(prNumber);
+    const load = async (): Promise<ReconciliationPullRequestNode | null> => {
+      const raw = await options.readPullRequestByNumber(prNumber);
+      if (raw?.evidenceIncompleteReason !== undefined) {
+        throw new Error(
+          `PR #${prNumber} evidence is incomplete: ${raw.evidenceIncompleteReason}`,
+        );
+      }
+      return raw;
+    };
+    if (actionAuthority === null) return load();
     const cached = actionAuthority.pullRequests.get(prNumber);
     if (cached !== undefined) return cached;
-    const read = options.readPullRequestByNumber(prNumber);
+    const read = load();
     actionAuthority.pullRequests.set(prNumber, read);
     return read;
   };
@@ -339,70 +367,190 @@ function makeProductionReconciliationWriterWithScope(
     operation,
     runner,
   );
+  const repairCredentialForAuthor = (author: string): SelectedCredential => {
+    const normalizedAuthor = author.toLowerCase();
+    if (options.credentials === undefined) {
+      if (options.credential.normalizedLogin !== normalizedAuthor) {
+        throw new Error(`Configured repair credential for ${author} is unavailable`);
+      }
+      return options.credential;
+    }
+    const selection = selectCredential(
+      options.credentials.restrictedTo([author]),
+      { phase: 'implement' },
+    );
+    if (
+      selection.status !== 'selected'
+      || selection.credential.normalizedLogin !== normalizedAuthor
+    ) {
+      throw new Error(`Configured repair credential for ${author} is unavailable`);
+    }
+    return selection.credential;
+  };
+  const machineAuthorLogins = new Set([
+    options.credential.normalizedLogin,
+    ...(options.credentials?.logins().map((login) => login.toLowerCase()) ?? []),
+  ]);
+  interface HumanCommentRow {
+    readonly id: string;
+    readonly body: string;
+    readonly author?: string;
+  }
+  const decodeHumanCommentRows = (raw: string): readonly HumanCommentRow[] => {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) throw new Error('Malformed mapping Human comment readback');
+    const entries = parsed.every((entry) => Array.isArray(entry))
+      ? parsed.flat()
+      : parsed;
+    return entries.map((entry) => {
+      if (typeof entry !== 'object' || entry === null) {
+        throw new Error('Malformed mapping Human comment readback');
+      }
+      const comment = entry as {
+        readonly id?: unknown;
+        readonly body?: unknown;
+        readonly user?: { readonly login?: unknown } | null;
+      };
+      if (
+        typeof comment.id !== 'number'
+        || !Number.isSafeInteger(comment.id)
+        || comment.id <= 0
+        || typeof comment.body !== 'string'
+        || (
+          comment.user?.login !== undefined
+          && typeof comment.user.login !== 'string'
+        )
+      ) {
+        throw new Error('Malformed mapping Human comment readback');
+      }
+      return {
+        id: String(comment.id),
+        body: comment.body,
+        ...(typeof comment.user?.login === 'string'
+          ? { author: comment.user.login }
+          : {}),
+      };
+    });
+  };
+  const isRetiredMappingAudit = (
+    input: {
+      readonly issueNumber: number;
+      readonly prNumber: number;
+      readonly expectedHead: GitOid;
+      readonly expectedGeneration: string;
+    },
+    body: string,
+    author: unknown,
+  ): boolean => {
+    if (
+      typeof author !== 'string'
+      || !machineAuthorLogins.has(author.toLowerCase())
+    ) {
+      return false;
+    }
+    const evidence = parseHumanCommentEvidence(body);
+    return evidence?.reason.code === 'branch-mapping-ambiguous'
+      && evidence.issueNumber === input.issueNumber
+      && evidence.prNumber === input.prNumber
+      && evidence.head === input.expectedHead
+      && evidence.generation !== undefined
+      && evidence.generation !== input.expectedGeneration;
+  };
   type LiveMapping =
     | { readonly kind: 'normal'; readonly issueNumber: number }
-    | { readonly kind: 'diagnostic' };
+    | {
+        readonly kind: 'diagnostic';
+        readonly issueNumbers: readonly number[];
+        readonly details: readonly string[];
+      };
+  const sameList = <Value>(
+    left: readonly Value[],
+    right: readonly Value[],
+  ): boolean => left.length === right.length
+    && left.every((value, index) => value === right[index]);
   const validateLiveMapping = (
     prNumber: number,
     raw: ReconciliationPullRequestNode,
   ): LiveMapping => {
-    const lifecycle = options.cycleSnapshot.lifecycle.items.find((item) => (
-      item.kind === 'pull-request' && item.prNumber === prNumber
-    ));
     const cyclePr = options.cycleSnapshot.pullRequests.find((pr) => pr.number === prNumber);
-    const diagnostics = options.cycleSnapshot.diagnostics.filter((diagnostic) => (
-      diagnostic.pullRequests.some((pr) => pr.number === prNumber)
-    ));
-    if (lifecycle?.kind !== 'pull-request') {
-      const diagnosticPrs = diagnostics.flatMap((diagnostic) => (
-        diagnostic.pullRequests.filter((pr) => pr.number === prNumber)
-      ));
-      if (
-        cyclePr !== undefined
-        && diagnostics.length === 1
-        && diagnosticPrs.length === 1
-        && diagnosticPrs[0]!.head === gitOid(raw.headOid)
-        && cyclePr.headOid === gitOid(raw.headOid)
-        && cyclePr.headRefName === raw.headRefName
-      ) {
-        return { kind: 'diagnostic' };
-      }
-      throw new Error(`Live PR #${prNumber} mapping is absent from cycle context`);
-    }
     if (cyclePr === undefined) {
       throw new Error(`Live PR #${prNumber} mapping is absent from cycle context`);
     }
-    const issueNumber = lifecycle.issueNumber;
-    const closing = new Set(raw.closingIssueNumbers);
     if (
-      closing.size !== raw.closingIssueNumbers.length
-      || closing.size !== 1
-      || !closing.has(issueNumber)
+      cyclePr.headOid !== gitOid(raw.headOid)
+      || cyclePr.headRefName !== raw.headRefName
+      || cyclePr.baseRefName !== raw.baseRefName
     ) {
-      throw new Error(`Live PR #${prNumber} closing-ref mapping no longer names issue #${issueNumber}`);
+      throw new Error(`Live PR #${prNumber} exact mapping branch, head, or base changed`);
     }
-    const markers = autopilotMarkers(raw.body);
+    const liveMappings = resolveStructuredPullRequestMappings({
+      defaultBranch,
+      issues: options.cycleSnapshot.issues.map((issue) => ({
+        number: issue.number,
+        blockedOn: issue.blockedOn,
+        blockedByIssues: [...issue.blockedByIssues],
+      })),
+      pullRequests: options.cycleSnapshot.pullRequests.map((pr) => (
+        pr.number === prNumber
+          ? {
+              number: prNumber,
+              state: raw.state,
+              head: gitOid(raw.headOid),
+              headRefName: raw.headRefName,
+              baseRefName: raw.baseRefName,
+              closingIssueNumbers: [...raw.closingIssueNumbers],
+              body: raw.body,
+            }
+          : {
+              number: pr.number,
+              state: pr.state,
+              head: pr.headOid,
+              headRefName: pr.headRefName,
+              baseRefName: pr.baseRefName,
+              closingIssueNumbers: [...pr.closingIssueNumbers],
+              body: pr.body,
+            }
+      )),
+      stableBranches: options.cycleSnapshot.branches.map((branch) => ({
+        issueNumber: branch.issueNumber,
+        phase: branch.claim.phase,
+        head: branch.headOid,
+        headRefName: branch.headRefName,
+        targetBase: branch.claim.targetBase,
+      })),
+    });
+    const live = liveMappings.find((mapping) => mapping.prNumber === prNumber);
+    const recordedCycle = options.cycleSnapshot.pullRequestMappings?.find(
+      (mapping) => mapping.prNumber === prNumber,
+    );
+    if (recordedCycle === undefined) {
+      throw new Error(`Live PR #${prNumber} canonical mapping is absent from cycle context`);
+    }
+    const cycle = recordedCycle;
     if (
-      raw.headRefName !== cyclePr.headRefName
-      || markers.length !== 1
-      || markers[0]!.issueNumber !== issueNumber
-      || markers[0]!.headRefName !== raw.headRefName
+      live?.status === 'resolved'
+      && cycle?.status === 'resolved'
+      && live.issueNumber === cycle.issueNumber
+      && live.expectedBaseRefName === cycle.expectedBaseRefName
     ) {
-      throw new Error(`Live PR #${prNumber} marker mapping no longer names issue #${issueNumber}`);
+      return { kind: 'normal', issueNumber: live.issueNumber };
     }
     if (
-      raw.humanIssueNumber !== undefined
-      && raw.humanIssueNumber !== null
-      && raw.humanIssueNumber !== issueNumber
+      live?.status === 'ambiguous'
+      && cycle?.status === 'ambiguous'
+      && sameList(live.issueNumbers, cycle.issueNumbers)
+      && sameList(live.details, cycle.details)
     ) {
-      throw new Error(`Live PR #${prNumber} Human mapping no longer names issue #${issueNumber}`);
+      return {
+        kind: 'diagnostic',
+        issueNumbers: [...live.issueNumbers],
+        details: [...live.details],
+      };
     }
-    if (raw.humanReason !== undefined && raw.humanReason !== null) {
-      if (raw.humanIssueNumber !== issueNumber) {
-        throw new Error(`Live PR #${prNumber} Human reason has no exact issue mapping`);
-      }
-    }
-    return { kind: 'normal', issueNumber };
+    const detail = live?.status === 'ambiguous'
+      ? live.details.join(' ')
+      : 'mapping result is absent';
+    throw new Error(`Live PR #${prNumber} canonical mapping changed: ${detail}`);
   };
   const readMappedRawPr = async (
     prNumber: number,
@@ -415,6 +563,59 @@ function makeProductionReconciliationWriterWithScope(
     pullRequestStateFromRaw(await readMappedRawPr(prNumber));
   const readReview = async (prNumber: number) =>
     reviewRefStateFromRaw(await readMappedRawPr(prNumber));
+  const validateHumanCommentAuthority = (
+    prNumber: number,
+    raw: ReconciliationPullRequestNode,
+    mapping: LiveMapping,
+    authority: ReconciliationHumanCommentAuthority,
+  ): void => {
+    if (
+      raw.state !== 'OPEN'
+      || gitOid(raw.headOid) !== authority.expectedHead
+    ) {
+      throw new Error('Human comment reconciliation lost exact-head authority');
+    }
+    const claim = raw.reviewClaim;
+    if (claim === null) {
+      throw new Error('Human comment reconciliation review-ref authority is absent');
+    }
+    const record = decodeReviewClaimPayload(claim.payload);
+    if (
+      gitOid(claim.oid) !== authority.expectedReviewRefOid
+      || record.prNumber !== prNumber
+      || record.head !== authority.expectedHead
+      || record.generation !== authority.expectedGeneration
+      || record.state !== (authority.expectedReviewState ?? 'human')
+    ) {
+      throw new Error('Human comment reconciliation lost exact review-ref authority');
+    }
+    const diagnostic = options.cycleSnapshot.diagnostics.find((candidate) => (
+      candidate.pullRequests.some((pr) => (
+        pr.number === prNumber && pr.head === authority.expectedHead
+      ))
+    ));
+    if (
+      authority.expectedDiagnosticIssueNumbers !== undefined
+      || authority.expectedDiagnosticDetail !== undefined
+    ) {
+      if (
+        mapping.kind !== 'diagnostic'
+        || diagnostic === undefined
+        || authority.expectedDiagnosticDetail !== diagnostic.detail
+        || !sameList(
+          authority.expectedDiagnosticIssueNumbers ?? [],
+          diagnostic.issueNumbers,
+        )
+        || !diagnostic.issueNumbers.includes(authority.issueNumber)
+      ) {
+        throw new Error('Human comment reconciliation diagnostic authority changed');
+      }
+      return;
+    }
+    if (mapping.kind !== 'normal' || mapping.issueNumber !== authority.issueNumber) {
+      throw new Error('Human comment reconciliation issue mapping changed');
+    }
+  };
   const liveIssueHead = async (issueNumber: number): Promise<GitOid | null> => {
     const lifecyclePr = options.cycleSnapshot.lifecycle.items.find((item) => (
       item.kind === 'pull-request' && item.issueNumber === issueNumber
@@ -441,22 +642,46 @@ function makeProductionReconciliationWriterWithScope(
     supplied?: ReconciliationPullRequestNode | null,
   ): Promise<boolean> => {
     const raw = supplied === undefined ? await readMappedRawPr(prNumber) : supplied;
-    const mapping = raw === null ? null : validateLiveMapping(prNumber, raw);
-    if (mapping?.kind === 'diagnostic') return true;
-    if (humanDominatesPullRequest(options.cycleSnapshot, prNumber)) return true;
-    if (raw?.labels.includes(NEEDS_HUMAN_LABEL) === true) return true;
-    if (raw?.humanReason !== undefined && raw.humanReason !== null) return true;
-    const lifecycle = options.cycleSnapshot.lifecycle.items.find((item) => (
-      item.kind === 'pull-request' && item.prNumber === prNumber
-    ));
-    if (lifecycle?.kind !== 'pull-request') return true;
-    const project = await readProjectItem(lifecycle.issueNumber);
-    return project === null || project.status === 'Human' || project.blockedOn === 'Human';
+    if (raw === null) return true;
+    const mapping = validateLiveMapping(prNumber, raw);
+    if (mapping.kind === 'diagnostic') return true;
+    const [project, nativeIssue] = await Promise.all([
+      readProjectItem(mapping.issueNumber),
+      options.readIssueByNumber(mapping.issueNumber),
+    ]);
+    if (
+      project === null
+      || nativeIssue === null
+      || nativeIssue.number !== mapping.issueNumber
+      || !nativeIssue.open
+    ) return true;
+    return hasExternalHumanAuthority({
+      pullRequestLabels: raw.labels,
+      nativeIssueLabels: nativeIssue.labels,
+      projectBlockedOn: project.blockedOn,
+    });
   };
+  const sameMappingDiagnostic = (
+    left: import('./types.js').MappingDiagnosticAuthority,
+    right: import('./types.js').MappingDiagnosticAuthority,
+  ): boolean => left.selectedIssueNumber === right.selectedIssueNumber
+    && left.detail === right.detail
+    && left.signature === right.signature
+    && sameList(left.issueNumbers, right.issueNumbers);
+  const recordHasMappingDiagnostic = (
+    record: ReviewClaimRecord,
+    diagnostic: import('./types.js').MappingDiagnosticAuthority,
+  ): boolean => (
+    (record.state === 'human-intent' || record.state === 'human')
+    && record.mappingDiagnostic !== undefined
+    && sameMappingDiagnostic(record.mappingDiagnostic, diagnostic)
+  );
   const updateReviewRef = async (
     prNumber: number,
     expectedReviewRefOid: GitOid,
     desired: 'terminal-approved' | 'stale',
+    allowObsoleteMappingHuman = false,
+    mutationCredential?: SelectedCredential,
   ): Promise<void> => {
     const beforeRaw = await readMappedRawPr(prNumber);
     const beforeClaim = beforeRaw?.reviewClaim;
@@ -470,7 +695,10 @@ function makeProductionReconciliationWriterWithScope(
     const beforeRecord = decodeReviewClaimPayload(beforeClaim.payload);
     // The immutable cycle supplies lifecycle context; targeted PR and Project
     // reads refresh the mutable Human-dominance evidence.
-    if (await liveHumanDominatesPullRequest(prNumber, beforeRaw)) {
+    if (
+      !allowObsoleteMappingHuman
+      && await liveHumanDominatesPullRequest(prNumber, beforeRaw)
+    ) {
       throw new Error('Human is dominant over review-ref reconciliation');
     }
     if (
@@ -484,7 +712,12 @@ function makeProductionReconciliationWriterWithScope(
       desired,
       now().toISOString(),
     );
-    await selected(async ({ askpass, run }) => {
+    const authenticate = mutationCredential === undefined
+      ? selected
+      : <Value>(
+          operation: Parameters<typeof withSelectedCredential<Value>>[2],
+        ) => withSelectedCredential(mutationCredential, ambient, operation, runner);
+    await authenticate(async ({ askpass, run }) => {
       const directory = mkdtempSync(join(tmpdir(), 'jinn-reconcile-review-'));
       const payloadPath = join(directory, 'jinn-autopilot-review.json');
       const indexPath = join(directory, 'index');
@@ -589,7 +822,7 @@ function makeProductionReconciliationWriterWithScope(
       if (expectedHead !== undefined && beforePr?.head !== expectedHead) {
         throw new Error('Pull-request draft reconciliation lost exact-head authority');
       }
-      if (!draft && await liveHumanDominatesPullRequest(prNumber, beforeRaw)) {
+      if (await liveHumanDominatesPullRequest(prNumber, beforeRaw)) {
         throw new Error('Human is dominant over pull-request draft reconciliation');
       }
       if (mapping?.kind === 'diagnostic' && !draft) {
@@ -649,7 +882,13 @@ function makeProductionReconciliationWriterWithScope(
       ));
     },
 
-    async hasHumanComment(prNumber, marker) {
+    async hasHumanComment(prNumber, marker, authority) {
+      const raw = await readRawPr(prNumber);
+      if (raw === null) {
+        throw new Error('Human comment reconciliation pull request is absent');
+      }
+      const mapping = validateLiveMapping(prNumber, raw);
+      validateHumanCommentAuthority(prNumber, raw, mapping, authority);
       return selected(async ({ run }) => {
         const bodies = await readIssueCommentBodies(
           run,
@@ -660,15 +899,20 @@ function makeProductionReconciliationWriterWithScope(
       });
     },
 
-    async ensureHumanComment(prNumber, marker, body, expectedHead) {
+    async ensureHumanComment(prNumber, marker, body, authority) {
       if (!body.includes(marker)) {
         throw new Error('Human comment body is missing its exact marker');
       }
       const beforeRaw = await readMappedRawPr(prNumber);
-      const before = pullRequestStateFromRaw(beforeRaw);
-      if (expectedHead !== undefined && before?.head !== expectedHead) {
-        throw new Error('Human comment reconciliation lost exact-head authority');
+      if (beforeRaw === null) {
+        throw new Error('Human comment reconciliation pull request is absent');
       }
+      validateHumanCommentAuthority(
+        prNumber,
+        beforeRaw,
+        validateLiveMapping(prNumber, beforeRaw),
+        authority,
+      );
       await selected(async ({ run }) => {
         const hasMarker = async () => (
           await readIssueCommentBodies(run, prNumber, repositorySlug)
@@ -683,8 +927,15 @@ function makeProductionReconciliationWriterWithScope(
           },
           async () => {
             if (!await hasMarker()) return false;
-            const after = await readPr(prNumber);
-            return expectedHead === undefined || after?.head === expectedHead;
+            const after = await readRawPr(prNumber);
+            if (after === null) return false;
+            validateHumanCommentAuthority(
+              prNumber,
+              after,
+              validateLiveMapping(prNumber, after),
+              authority,
+            );
+            return true;
           },
           'Human comment reconciliation was ambiguous',
         );
@@ -698,6 +949,9 @@ function makeProductionReconciliationWriterWithScope(
       }
       if (pr === null || pr.state !== 'OPEN' || gitOid(pr.headOid) !== expectedHead) {
         throw new Error('Implementation summary head changed');
+      }
+      if (await liveHumanDominatesPullRequest(prNumber, pr)) {
+        throw new Error('Human is dominant over implementation summary reconciliation');
       }
       const desired = completionBody(pr.body, summary);
       if (desired === pr.body) return;
@@ -766,7 +1020,10 @@ function makeProductionReconciliationWriterWithScope(
       if (projectItem === null) {
         throw new Error('Draft PR reconciliation issue is missing from Project');
       }
-      if (projectItem.status === 'Human' || projectItem.blockedOn === 'Human') {
+      if (hasExternalHumanAuthority({
+        nativeIssueLabels: nativeIssue.labels,
+        projectBlockedOn: projectItem.blockedOn,
+      })) {
         throw new Error('Human is dominant over draft PR reconciliation');
       }
       if (
@@ -888,6 +1145,303 @@ function makeProductionReconciliationWriterWithScope(
     },
 
     readReviewRef: readReview,
+
+    async repairObsoleteMappingHuman(input) {
+      const diagnostic = input.mappingDiagnostic;
+      if (
+        diagnostic === undefined
+        || diagnostic.selectedIssueNumber !== input.issueNumber
+        || !diagnostic.issueNumbers.includes(input.issueNumber)
+        || diagnostic.signature !== mappingDiagnosticSignature({
+          issueNumbers: diagnostic.issueNumbers,
+          detail: diagnostic.detail,
+        })
+      ) {
+        throw new Error(
+          'Unsigned legacy mapping Human repair requires an explicit signed migration',
+        );
+      }
+      if (options.readCanonicalSnapshot === undefined) {
+        throw new Error('Complete canonical repair authority is unavailable');
+      }
+      const repairCredential = repairCredentialForAuthor(input.expectedAuthor);
+      const runAsRepairAuthor = <Value>(
+        operation: Parameters<typeof withSelectedCredential<Value>>[2],
+      ) => withSelectedCredential(repairCredential, ambient, operation, runner);
+      interface HumanCommentRead {
+        readonly exactIds: readonly number[];
+        readonly otherStructured: boolean;
+      }
+      const readHumanComments = async (
+        run: Parameters<Parameters<typeof selected>[0]>[0]['run'],
+      ): Promise<HumanCommentRead> => {
+        const raw = await run('gh', [
+          'api', `repos/${repositorySlug}/issues/${input.prNumber}/comments`,
+          '--paginate', '--slurp',
+        ]);
+        const comments = decodeHumanCommentRows(raw);
+        const exactIds: number[] = [];
+        let otherStructured = false;
+        for (const comment of comments) {
+          const author = comment.author;
+          let structured = null;
+          try {
+            structured = parseHumanCommentEvidence(comment.body);
+          } catch {
+            otherStructured = true;
+            continue;
+          }
+          const exact = author?.toLowerCase() === input.expectedAuthor.toLowerCase()
+            && structured?.issueNumber === input.issueNumber
+            && structured.prNumber === input.prNumber
+            && structured.head === input.expectedHead
+            && structured.generation === input.expectedGeneration
+            && structured.reason.code === 'branch-mapping-ambiguous'
+            && structured.reason.detail === diagnostic.detail
+            && structured.diagnosticSignature === diagnostic.signature
+            && sameList(
+              structured.diagnosticIssueNumbers ?? [],
+              diagnostic.issueNumbers,
+            )
+            && comment.body.includes(input.marker);
+          if (exact) {
+            exactIds.push(Number(comment.id));
+            continue;
+          }
+          if (isRetiredMappingAudit(input, comment.body, author)) continue;
+          if (
+            structured !== null
+            || comment.body.includes('<!-- jinn-autopilot-human:')
+          ) {
+            otherStructured = true;
+          }
+        }
+        return { exactIds, otherStructured };
+      };
+
+      const fence = async (
+        expectedReviewState: 'human' | 'stale',
+        requireInitialOid = false,
+      ): Promise<ReconciliationPullRequestNode> => {
+        invalidateActionAuthority();
+        const [canonical, raw, project, nativeIssue, liveDependencies, commentRead] =
+          await Promise.all([
+            options.readCanonicalSnapshot!(input.prNumber),
+            options.readPullRequestByNumber(input.prNumber),
+            options.readProjectItemForReconciliation(input.issueNumber),
+            options.readIssueByNumber(input.issueNumber),
+            options.readBlockedByIssueNumbers(input.issueNumber),
+            runAsRepairAuthor(({ run }) => readHumanComments(run)),
+          ]);
+        const cycleMapping = options.cycleSnapshot.pullRequestMappings?.find(
+          (mapping) => mapping.prNumber === input.prNumber,
+        );
+        const liveMapping = canonical?.pullRequestMappings?.find(
+          (mapping) => mapping.prNumber === input.prNumber,
+        );
+        const livePr = canonical?.pullRequests.find((pr) => pr.number === input.prNumber);
+        const liveIssue = canonical?.issues.find((issue) => issue.number === input.issueNumber);
+        if (
+          canonical?.snapshotComplete !== true
+          || cycleMapping?.status !== 'resolved'
+          || liveMapping?.status !== 'resolved'
+          || liveMapping.issueNumber !== input.issueNumber
+          || liveMapping.expectedBaseRefName !== cycleMapping.expectedBaseRefName
+          || livePr?.state !== 'OPEN'
+          || livePr.headOid !== input.expectedHead
+          || livePr.baseRefName !== liveMapping.expectedBaseRefName
+          || raw === null
+          || raw.state !== 'OPEN'
+          || gitOid(raw.headOid) !== input.expectedHead
+          || raw.baseRefName !== liveMapping.expectedBaseRefName
+          || liveIssue === undefined
+          || project === null
+          || nativeIssue === null
+          || !nativeIssue.open
+          || hasExternalHumanAuthority({
+            pullRequestLabels: raw.labels,
+            nativeIssueLabels: nativeIssue.labels,
+            projectBlockedOn: project.blockedOn,
+          })
+        ) {
+          throw new Error('Obsolete mapping Human canonical or Human authority changed');
+        }
+        const expectedDependencies = [...liveIssue.blockedByIssues]
+          .sort((left, right) => left - right);
+        const observedDependencies = [...liveDependencies]
+          .sort((left, right) => left - right);
+        if (
+          expectedDependencies.length !== observedDependencies.length
+          || expectedDependencies.some((number, index) => (
+            number !== observedDependencies[index]
+          ))
+        ) {
+          throw new Error('Obsolete mapping Human dependency authority changed');
+        }
+        const claim = raw.reviewClaim;
+        if (claim === null) {
+          throw new Error('Obsolete mapping Human review-ref authority is absent');
+        }
+        const record = decodeReviewClaimPayload(claim.payload);
+        if (
+          (requireInitialOid && gitOid(claim.oid) !== input.expectedReviewRefOid)
+          || record.generation !== input.expectedGeneration
+          || record.head !== input.expectedHead
+          || record.state !== expectedReviewState
+          || (
+            expectedReviewState === 'human'
+            && !recordHasMappingDiagnostic(record, diagnostic)
+          )
+        ) {
+          throw new Error('Obsolete mapping Human review-ref provenance authority changed');
+        }
+        const labelPresent = raw.labels.includes(NEEDS_HUMAN_LABEL);
+        if (
+          (
+            labelPresent
+            || raw.isDraft
+            || raw.humanIssueNumber !== input.issueNumber
+            || raw.humanAuthor?.toLowerCase() !== input.expectedAuthor.toLowerCase()
+            || raw.humanHead !== input.expectedHead
+            || raw.humanGeneration !== input.expectedGeneration
+            || raw.humanDiagnosticSignature !== diagnostic.signature
+            || !sameList(
+              raw.humanDiagnosticIssueNumbers ?? [],
+              diagnostic.issueNumbers,
+            )
+            || raw.humanReason?.code !== 'branch-mapping-ambiguous'
+            || raw.humanReason.detail !== diagnostic.detail
+            || commentRead.exactIds.length !== 1
+            || commentRead.otherStructured
+          )
+        ) {
+          throw new Error('Obsolete mapping Human overlay provenance changed');
+        }
+        return raw;
+      };
+
+      const before = await fence('human', true).catch(async (error) => {
+        const retry = await fence('stale', true).catch(() => null);
+        if (retry !== null) return retry;
+        throw error;
+      });
+      const beforeRecord = decodeReviewClaimPayload(before.reviewClaim!.payload);
+      if (beforeRecord.state === 'human') {
+        await updateReviewRef(
+          input.prNumber,
+          input.expectedReviewRefOid,
+          'stale',
+          true,
+          repairCredential,
+        );
+      }
+      await fence('stale');
+    },
+
+    async readObsoleteMappingHumanRepairState(input) {
+      const diagnostic = input.mappingDiagnostic;
+      if (
+        diagnostic === undefined
+        || diagnostic.selectedIssueNumber !== input.issueNumber
+        || !diagnostic.issueNumbers.includes(input.issueNumber)
+        || diagnostic.signature !== mappingDiagnosticSignature({
+          issueNumbers: diagnostic.issueNumbers,
+          detail: diagnostic.detail,
+        })
+      ) {
+        return { complete: false };
+      }
+      if (options.readCanonicalSnapshot === undefined) return { complete: false };
+      const repairCredential = repairCredentialForAuthor(input.expectedAuthor);
+      invalidateActionAuthority();
+      const [canonical, raw, commentsRaw] = await Promise.all([
+        options.readCanonicalSnapshot(input.prNumber),
+        options.readPullRequestByNumber(input.prNumber),
+        withSelectedCredential(repairCredential, ambient, ({ run }) => run('gh', [
+          'api', `repos/${repositorySlug}/issues/${input.prNumber}/comments`,
+          '--paginate', '--slurp',
+        ]), runner),
+      ]);
+      const mapping = canonical?.pullRequestMappings?.find(
+        (candidate) => candidate.prNumber === input.prNumber,
+      );
+      const claim = raw?.reviewClaim === null || raw?.reviewClaim === undefined
+        ? undefined
+        : decodeReviewClaimPayload(raw.reviewClaim.payload);
+      let rows: readonly HumanCommentRow[];
+      try {
+        rows = decodeHumanCommentRows(commentsRaw);
+      } catch {
+        return { complete: false };
+      }
+      let exactComments = 0;
+      let otherStructuredComments = 0;
+      for (const comment of rows) {
+        let structured: ReturnType<typeof parseHumanCommentEvidence>;
+        try {
+          structured = parseHumanCommentEvidence(comment.body);
+        } catch {
+          otherStructuredComments += 1;
+          continue;
+        }
+        const exact = comment.body.includes(input.marker)
+          && comment.author?.toLowerCase() === input.expectedAuthor.toLowerCase()
+          && structured?.issueNumber === input.issueNumber
+          && structured.prNumber === input.prNumber
+          && structured.head === input.expectedHead
+          && structured.generation === input.expectedGeneration
+          && structured.reason.code === 'branch-mapping-ambiguous'
+          && structured.reason.detail === diagnostic.detail
+          && structured.diagnosticSignature === diagnostic.signature
+          && sameList(
+            structured.diagnosticIssueNumbers ?? [],
+            diagnostic.issueNumbers,
+          );
+        if (exact) {
+          exactComments += 1;
+          continue;
+        }
+        try {
+          if (
+            isRetiredMappingAudit(
+              input,
+              comment.body,
+              comment.author,
+            )
+          ) {
+            continue;
+          }
+          if (
+            structured !== null
+            || comment.body.includes('<!-- jinn-autopilot-human:')
+          ) {
+            otherStructuredComments += 1;
+          }
+        } catch {
+          otherStructuredComments += 1;
+        }
+      }
+      return {
+        complete: canonical?.snapshotComplete === true
+          && mapping?.status === 'resolved'
+          && mapping.issueNumber === input.issueNumber
+          && raw?.state === 'OPEN'
+          && gitOid(raw.headOid) === input.expectedHead
+          && !raw.labels.includes(NEEDS_HUMAN_LABEL)
+          && !raw.isDraft
+          && claim?.head === input.expectedHead
+          && claim.generation === input.expectedGeneration
+          && claim.state === 'stale'
+          && raw.humanDiagnosticSignature === diagnostic.signature
+          && sameList(
+            raw.humanDiagnosticIssueNumbers ?? [],
+            diagnostic.issueNumbers,
+          )
+          && raw.humanReason?.detail === diagnostic.detail
+          && exactComments === 1
+          && otherStructuredComments === 0,
+      };
+    },
 
     markReviewStale: (prNumber, expectedReviewRefOid) =>
       updateReviewRef(prNumber, expectedReviewRefOid, 'stale'),

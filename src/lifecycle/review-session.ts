@@ -38,6 +38,7 @@ export interface ReviewSessionPullRequest {
   readonly labels: readonly string[];
   readonly body: string;
   readonly approvalPolicy: 'approve-eligible' | 'human-codeowner';
+  readonly humanHold?: boolean;
   readonly mappingProblem?: string;
 }
 
@@ -91,11 +92,17 @@ export interface ReviewSessionPort {
   hasHumanComment(
     prNumber: number,
     expectedHead: GitOid,
+    expectedReviewRefOid: GitOid,
+    expectedGeneration: string,
+    expectedReviewState: ReviewClaimRecord['state'],
     body: string,
   ): Promise<boolean>;
   ensureHumanComment(
     prNumber: number,
     expectedHead: GitOid,
+    expectedReviewRefOid: GitOid,
+    expectedGeneration: string,
+    expectedReviewState: ReviewClaimRecord['state'],
     marker: string,
     body: string,
   ): Promise<void>;
@@ -125,6 +132,7 @@ export type ReviewVerdictResult =
       readonly followUpNumbers?: readonly number[];
     }
   | { readonly status: 'human'; readonly head: GitOid }
+  | { readonly status: 'mapping-pending'; readonly head: GitOid }
   | { readonly status: 'stale' | 'ambiguous'; readonly head: GitOid };
 
 export type ReviewFindingsResult =
@@ -135,6 +143,7 @@ export type ReviewFindingsResult =
       readonly created: boolean;
     }
   | { readonly status: 'human'; readonly head: GitOid }
+  | { readonly status: 'mapping-pending'; readonly head: GitOid }
   | { readonly status: 'stale' | 'ambiguous'; readonly head: GitOid };
 
 export interface ReviewSessionProtocol {
@@ -198,24 +207,35 @@ function authorityMatchesManifest(
     && record.head === manifest.expectedHead;
 }
 
+type PullRequestAuthorityProblem =
+  | { readonly kind: 'mapping'; readonly detail: string }
+  | { readonly kind: 'human'; readonly detail: string };
+
 function pullRequestAuthorityProblem(
   manifest: AttemptManifest,
   pullRequest: ReviewSessionPullRequest,
-): string | undefined {
-  const marker =
-    `<!-- jinn-autopilot:v2 issue=${manifest.issueNumber} branch=${manifest.branch} -->`;
-  if (!pullRequest.open) return 'The review pull request is no longer open.';
-  if (pullRequest.mappingProblem !== undefined) return pullRequest.mappingProblem;
+): PullRequestAuthorityProblem | undefined {
+  if (!pullRequest.open) {
+    return { kind: 'human', detail: 'The review pull request is no longer open.' };
+  }
+  if (pullRequest.mappingProblem !== undefined) {
+    return { kind: 'mapping', detail: pullRequest.mappingProblem };
+  }
   if (
     pullRequest.issueNumber !== manifest.issueNumber
     || pullRequest.headRefName !== manifest.branch
     || pullRequest.baseRefName !== manifest.targetBase
-    || !pullRequest.body.includes(marker)
   ) {
-    return 'The unique PR, issue, branch, base, or lifecycle-marker mapping changed.';
+    return {
+      kind: 'mapping',
+      detail: 'The unique canonical PR, issue, branch, or base mapping changed.',
+    };
   }
   if (pullRequest.approvalPolicy !== manifest.reviewApprovalPolicy) {
-    return 'The current-head CODEOWNER approval policy changed.';
+    return {
+      kind: 'human',
+      detail: 'The current-head CODEOWNER approval policy changed.',
+    };
   }
   return undefined;
 }
@@ -249,7 +269,7 @@ async function requirePullRequest(
 
 function nextRecord(
   manifest: AttemptManifest,
-  state: ReviewClaimRecord['state'],
+  state: 'active' | 'verdict-intent' | 'terminal-approved' | 'human' | 'stale',
   now: Date,
   verdict?: { readonly state: ReviewVerdictState; readonly marker: string },
 ): ReviewClaimRecord {
@@ -347,18 +367,20 @@ async function humanIsActive(
   manifest: AttemptManifest,
   port: ReviewSessionPort,
 ): Promise<boolean> {
-  return port.hasHumanHold(
+  await requireAuthority(manifest, port);
+  const active = await port.hasHumanHold(
     manifest.issueNumber,
     manifest.prNumber!,
     manifest.expectedHead as GitOid,
   );
+  await requireAuthority(manifest, port);
+  return active;
 }
 
 async function enterHuman(
   supplied: AttemptManifest,
   detail: string,
   port: ReviewSessionPort,
-  observedPullRequest?: ReviewSessionPullRequest,
 ): Promise<{ readonly status: 'human'; readonly head: GitOid }> {
   let manifest = requireReviewManifest(supplied, port);
   let authority = await requireAuthority(manifest, port);
@@ -367,6 +389,48 @@ async function enterHuman(
     phase: 'reviewing',
     code: 'review-escalation',
     detail,
+  };
+  const marker = formatHumanCommentMarker({
+    issueNumber: manifest.issueNumber,
+    prNumber: manifest.prNumber!,
+    head,
+    generation: manifest.reviewGeneration!,
+    reason,
+  });
+  const commentBody =
+    `${marker}\n\nAutopilot parked this review for Human judgment.\n\n${reason.detail}`;
+  if (!await humanIsActive(manifest, port)) {
+    await port.setPullRequestLabel(
+      manifest.prNumber!,
+      head,
+      'review:needs-human',
+      true,
+    );
+  }
+  if (!await humanIsActive(manifest, port)) {
+    throw new Error('External Human authority was not established');
+  }
+  const ensureComment = async (
+    expectedReviewState: ReviewClaimRecord['state'],
+  ): Promise<void> => {
+    if (!await port.hasHumanComment(
+      manifest.prNumber!,
+      head,
+      authority.reviewRefOid,
+      manifest.reviewGeneration!,
+      expectedReviewState,
+      commentBody,
+    )) {
+      await port.ensureHumanComment(
+        manifest.prNumber!,
+        head,
+        authority.reviewRefOid,
+        manifest.reviewGeneration!,
+        expectedReviewState,
+        marker,
+        commentBody,
+      );
+    }
   };
   if (authority.record.state !== 'human') {
     const humanRecord = nextRecord(manifest, 'human', port.now());
@@ -377,33 +441,66 @@ async function enterHuman(
     manifest = requireReviewManifest(manifest, port);
     authority = await requireAuthority(manifest, port);
   }
-  const marker = formatHumanCommentMarker({
-    issueNumber: manifest.issueNumber,
-    prNumber: manifest.prNumber!,
-    reason,
-  });
-  const commentBody =
-    `${marker}\n\nAutopilot parked this review for Human judgment.\n\n${detail}`;
-  const pullRequest = observedPullRequest ?? await readExactPullRequest(manifest, port);
-  if (pullRequest.open && !pullRequest.draft) {
-    await port.setPullRequestDraft(manifest.prNumber!, head, true);
-  }
-  if (!pullRequest.labels.includes('engine:review')) {
-    await port.setPullRequestLabel(manifest.prNumber!, head, 'engine:review', true);
-  }
-  if (!pullRequest.labels.includes('review:needs-human')) {
-    await port.setPullRequestLabel(manifest.prNumber!, head, 'review:needs-human', true);
-  }
-  if (!await port.hasHumanComment(manifest.prNumber!, head, commentBody)) {
-    await port.ensureHumanComment(
-      manifest.prNumber!,
-      head,
-      marker,
-      commentBody,
-    );
-  }
-  // Stage 3: Human Status paint is painter-owned; label+marker are authority.
+  await ensureComment('human');
   return { status: 'human', head };
+}
+
+type MappingRereadResult =
+  | { readonly status: 'mapping-pending' | 'human'; readonly head: GitOid }
+  | { readonly status: 'stale' | 'ambiguous'; readonly head: GitOid };
+
+async function requestMappingReread(
+  supplied: AttemptManifest,
+  port: ReviewSessionPort,
+): Promise<MappingRereadResult> {
+  let manifest = requireReviewManifest(supplied, port);
+  let authority = await requireAuthority(manifest, port);
+  const head = manifest.expectedHead as GitOid;
+  if (await humanIsActive(manifest, port)) return { status: 'human', head };
+  const mappingRequest = {
+    selectedIssueNumber: manifest.issueNumber,
+    headRefName: manifest.branch,
+    baseRefName: manifest.targetBase,
+  };
+  if (authority.record.state === 'mapping-reread') {
+    const current = authority.record.mappingRequest;
+    if (
+      current.selectedIssueNumber !== mappingRequest.selectedIssueNumber
+      || current.headRefName !== mappingRequest.headRefName
+      || current.baseRefName !== mappingRequest.baseRefName
+    ) {
+      throw new Error('Mapping reread retry contradicts the durable request');
+    }
+    return { status: 'mapping-pending', head };
+  }
+  const record: ReviewClaimRecord = {
+    kind: 'review-claim',
+    protocolVersion: 2,
+    prNumber: manifest.prNumber!,
+    generation: manifest.reviewGeneration!,
+    attempt: manifest.attemptId,
+    reviewer: manifest.selectedLogin,
+    head,
+    state: 'mapping-reread',
+    mappingRequest,
+    recordedAt: port.now().toISOString(),
+  };
+  const published = await publishRecord(manifest, authority, record, port);
+  if (published.status !== 'published') {
+    return { status: published.status, head };
+  }
+  manifest = requireReviewManifest(manifest, port);
+  authority = await requireAuthority(manifest, port);
+  if (
+    authority.record.state !== 'mapping-reread'
+    || authority.record.mappingRequest.selectedIssueNumber
+      !== mappingRequest.selectedIssueNumber
+    || authority.record.mappingRequest.headRefName !== mappingRequest.headRefName
+    || authority.record.mappingRequest.baseRefName !== mappingRequest.baseRefName
+  ) {
+    throw new Error('Mapping reread request did not retain exact authority');
+  }
+  return { status: 'mapping-pending', head };
 }
 
 async function requireNoNativeChangeRequests(
@@ -464,7 +561,9 @@ async function reviewVerdict(
   const head = manifest.expectedHead as GitOid;
   const authorityProblem = pullRequestAuthorityProblem(manifest, pullRequest);
   if (authorityProblem !== undefined) {
-    return enterHuman(manifest, authorityProblem, port, pullRequest);
+    return authorityProblem.kind === 'mapping'
+      ? requestMappingReread(manifest, port)
+      : enterHuman(manifest, authorityProblem.detail, port);
   }
   if (await humanIsActive(manifest, port)) return { status: 'human', head };
   if (state === 'APPROVE' && manifest.reviewApprovalPolicy === 'human-codeowner') {
@@ -621,7 +720,9 @@ async function reviewFindings(
   const head = manifest.expectedHead as GitOid;
   const authorityProblem = pullRequestAuthorityProblem(manifest, pullRequest);
   if (authorityProblem !== undefined) {
-    return enterHuman(manifest, authorityProblem, port, pullRequest);
+    return authorityProblem.kind === 'mapping'
+      ? requestMappingReread(manifest, port)
+      : enterHuman(manifest, authorityProblem.detail, port);
   }
   if (await humanIsActive(manifest, port)) return { status: 'human', head };
   if (authority.record.state !== 'active' && authority.record.state !== 'verdict-intent') {
@@ -640,7 +741,6 @@ async function reviewFindings(
       `Runaway child guard: ${child.priorCount} prior review-finding children `
       + `on PR #${manifest.prNumber}; parking for Human.`,
       port,
-      pullRequest,
     );
   }
 

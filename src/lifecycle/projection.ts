@@ -1,6 +1,5 @@
 import type { ProjectStatus } from '../dispatcher/types.js';
 import { DEFAULT_CONFIG } from '../dispatcher/types.js';
-import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
 import { formatHumanCommentMarker } from './codecs.js';
 import type {
   GitOid,
@@ -9,11 +8,25 @@ import type {
   LifecyclePhase,
   LifecycleView,
   LifecycleViewItem,
+  MappingDiagnosticAuthority,
+  MappingRereadRequest,
+  ReviewClaimState,
 } from './types.js';
 
 export interface ProjectionPullRequest {
   readonly number: number;
+  readonly headRefName?: string;
+  readonly baseRefName?: string;
+  readonly scheduledIssueNumber?: number;
+  readonly resolvedIssueNumber?: number;
   readonly reviewRefOid?: GitOid;
+  readonly reviewClaim?: {
+    readonly head: GitOid;
+    readonly generation: string;
+    readonly state: ReviewClaimState;
+    readonly mappingRequest?: MappingRereadRequest;
+    readonly mappingDiagnostic?: MappingDiagnosticAuthority;
+  };
 }
 
 export interface OrphanBranchClaim {
@@ -40,6 +53,7 @@ export interface ProjectionContext {
   readonly pullRequests: readonly ProjectionPullRequest[];
   readonly orphanBranchClaims: readonly OrphanBranchClaim[];
   readonly mappingDiagnostics?: readonly LifecycleMappingDiagnostic[];
+  readonly snapshotComplete?: boolean;
 }
 
 interface HeadPinned {
@@ -62,8 +76,12 @@ export type ProjectionAction =
     } & HeadPinned)
   | ({
       readonly kind: 'ensure-human-comment';
-      readonly issueNumber?: number;
+      readonly issueNumber: number;
       readonly prNumber: number;
+      readonly expectedReviewRefOid: GitOid;
+      readonly expectedGeneration: string;
+      readonly expectedDiagnosticIssueNumbers?: readonly number[];
+      readonly expectedDiagnosticDetail?: string;
       readonly marker: string;
       readonly body: string;
     } & HeadPinned)
@@ -71,6 +89,16 @@ export type ProjectionAction =
       readonly kind: 'ensure-implementation-summary';
       readonly prNumber: number;
       readonly summary: string;
+    } & HeadPinned)
+  | ({
+      readonly kind: 'repair-obsolete-mapping-human';
+      readonly issueNumber: number;
+      readonly prNumber: number;
+      readonly expectedReviewRefOid: GitOid;
+      readonly expectedGeneration: string;
+      readonly expectedAuthor: string;
+      readonly mappingDiagnostic: MappingDiagnosticAuthority;
+      readonly marker: string;
     } & HeadPinned)
   | ({
       readonly kind: 'mark-review-stale';
@@ -113,11 +141,17 @@ function activeMutation(view: LifecycleViewItem): boolean {
     && item.reviewClaim.verdict.state === 'REQUEST_CHANGES';
 }
 
-function humanMarker(view: LifecycleViewItem): { marker: string; body: string } | null {
+function humanMarker(
+  view: LifecycleViewItem,
+  reviewRefOid: GitOid | undefined,
+): Extract<ProjectionAction, { kind: 'ensure-human-comment' }> | null {
   if (
     view.phase !== 'human'
     || view.humanReason === undefined
     || view.item.kind !== 'pull-request'
+    || reviewRefOid === undefined
+    || view.item.reviewClaim?.state !== 'human'
+    || view.item.reviewClaim.head !== view.item.head
   ) {
     return null;
   }
@@ -125,9 +159,17 @@ function humanMarker(view: LifecycleViewItem): { marker: string; body: string } 
   const marker = formatHumanCommentMarker({
     issueNumber: view.item.issueNumber,
     prNumber: view.item.prNumber,
+    head: view.item.head,
+    generation: view.item.reviewClaim.generation,
     reason,
   });
   return {
+    kind: 'ensure-human-comment',
+    issueNumber: view.item.issueNumber,
+    prNumber: view.item.prNumber,
+    expectedHead: view.item.head,
+    expectedReviewRefOid: reviewRefOid,
+    expectedGeneration: view.item.reviewClaim.generation,
     marker,
     body: `${marker}\n\nAutopilot parked this item for Human review.\n\n${reason.detail}`,
   };
@@ -136,7 +178,7 @@ function humanMarker(view: LifecycleViewItem): { marker: string; body: string } 
 function planItem(
   view: LifecycleViewItem,
   reviewRefByPr: ReadonlyMap<number, GitOid>,
-  labels: { readonly review: string; readonly human: string },
+  labels: { readonly review: string },
 ): ProjectionAction[] {
   const item = view.item;
   if (!item.v2Marked && view.phase !== 'human') return [];
@@ -147,6 +189,49 @@ function planItem(
     && item.branchClaim?.phase === 'implement'
     && item.branchClaim.phaseComplete === true;
   if (item.kind !== 'pull-request') return actions;
+  const obsoleteMapping = item.obsoleteMachineMappingHuman;
+  if (
+    obsoleteMapping !== undefined
+    && obsoleteMapping.mappingDiagnostic === undefined
+  ) {
+    // Unsigned legacy mapping overlays are migration input, never an
+    // automatically writable projection.
+    return [];
+  }
+  if (
+    obsoleteMapping !== undefined
+    && obsoleteMapping.mappingDiagnostic !== undefined
+  ) {
+    const refOid = reviewRefByPr.get(item.prNumber);
+    if (refOid !== undefined) {
+      return [{
+        kind: 'repair-obsolete-mapping-human',
+        issueNumber: item.issueNumber,
+        prNumber: item.prNumber,
+        expectedHead: item.head,
+        expectedReviewRefOid: refOid,
+        expectedGeneration: obsoleteMapping.generation,
+        expectedAuthor: obsoleteMapping.author,
+        mappingDiagnostic: obsoleteMapping.mappingDiagnostic,
+        marker: formatHumanCommentMarker({
+          issueNumber: item.issueNumber,
+          prNumber: item.prNumber,
+          head: item.head,
+          generation: obsoleteMapping.generation,
+          reason: obsoleteMapping.reason,
+          diagnosticIssueNumbers:
+            obsoleteMapping.mappingDiagnostic.issueNumbers,
+          diagnosticSignature:
+            obsoleteMapping.mappingDiagnostic.signature,
+        }),
+      }];
+    }
+  }
+
+  if (view.phase === 'human') {
+    const comment = humanMarker(view, reviewRefByPr.get(item.prNumber));
+    return comment === null ? [] : [comment];
+  }
 
   if (implementationComplete && item.implementationSummary !== undefined) {
     actions.push({
@@ -205,31 +290,8 @@ function planItem(
     }
   }
 
-  const wantsHumanLabel = view.phase === 'human';
-  if (item.labels.includes(labels.human) !== wantsHumanLabel) {
-    actions.push({
-      kind: 'set-pr-label',
-      prNumber: item.prNumber,
-      expectedHead: item.head,
-      label: labels.human,
-      present: wantsHumanLabel,
-    });
-  }
-  const comment = humanMarker(view);
-  if (comment !== null) {
-    actions.push({
-      kind: 'ensure-human-comment',
-      issueNumber: item.issueNumber,
-      prNumber: item.prNumber,
-      expectedHead: item.head,
-      ...comment,
-    });
-  }
-
   if (implementationComplete) {
-    const requiresPreviousSuccess = view.phase === 'human'
-      ? {}
-      : { requiresPreviousSuccess: true as const };
+    const requiresPreviousSuccess = { requiresPreviousSuccess: true as const };
     if (!item.labels.includes(labels.review)) {
       actions.push({
         kind: 'set-pr-label',
@@ -252,7 +314,7 @@ function planItem(
     }
   }
 
-  if (view.phase === 'human' || !item.v2Marked) return actions;
+  if (!item.v2Marked) return actions;
   // Stage 3: stale implementation reclaim is claim-branch / scheduler driven;
   // Status Todo paint moved to the board painter (no requeue-implementation).
   if (view.stale && view.phase === 'reviewing') {
@@ -274,12 +336,10 @@ export function planProjection(
   context: ProjectionContext,
   options: {
     readonly reviewLabel?: string;
-    readonly humanLabel?: string;
   } = {},
 ): ProjectionPlan {
   const labels = {
     review: options.reviewLabel ?? DEFAULT_CONFIG.engineReviewLabel,
-    human: options.humanLabel ?? NEEDS_HUMAN_LABEL,
   };
   const reviewRefByPr = new Map<number, GitOid>();
   for (const pr of context.pullRequests) {
@@ -317,47 +377,42 @@ export function planProjection(
       baseRefName: claim.baseRefName,
     });
   }
+  const diagnosticByPr = new Map<number, LifecycleMappingDiagnostic>();
   for (const diagnostic of context.mappingDiagnostics ?? []) {
-    const reason: HumanReason = {
-      phase: 'implementing',
-      code: 'branch-mapping-ambiguous',
-      detail: diagnostic.detail,
-    };
-    for (const pr of diagnostic.pullRequests) {
-      if (!pr.labels.includes(labels.review)) {
+    for (const pr of diagnostic.pullRequests) diagnosticByPr.set(pr.number, diagnostic);
+  }
+  for (const pullRequest of context.pullRequests) {
+    const claim = pullRequest.reviewClaim;
+    if (
+      claim === undefined
+      || pullRequest.reviewRefOid === undefined
+      || claim.state === 'stale'
+    ) {
+      continue;
+    }
+    const canonical = diagnosticByPr.get(pullRequest.number);
+    if (
+      canonical === undefined
+      && claim.state === 'mapping-reread'
+      && claim.mappingRequest !== undefined
+      && context.snapshotComplete === true
+      && pullRequest.resolvedIssueNumber
+        === claim.mappingRequest.selectedIssueNumber
+      && pullRequest.headRefName === claim.mappingRequest.headRefName
+      && pullRequest.baseRefName === claim.mappingRequest.baseRefName
+    ) {
+      if (!actions.some((action) => (
+        action.kind === 'mark-review-stale'
+        && action.prNumber === pullRequest.number
+      ))) {
         actions.push({
-          kind: 'set-pr-label',
-          prNumber: pr.number,
-          expectedHead: pr.head,
-          label: labels.review,
-          present: true,
+          kind: 'mark-review-stale',
+          prNumber: pullRequest.number,
+          expectedHead: claim.head,
+          expectedReviewRefOid: pullRequest.reviewRefOid,
         });
       }
-      if (!pr.draft) {
-        actions.push({
-          kind: 'set-pr-draft',
-          prNumber: pr.number,
-          expectedHead: pr.head,
-          draft: true,
-        });
-      }
-      if (!pr.labels.includes(labels.human)) {
-        actions.push({
-          kind: 'set-pr-label',
-          prNumber: pr.number,
-          expectedHead: pr.head,
-          label: labels.human,
-          present: true,
-        });
-      }
-      const marker = formatHumanCommentMarker({ prNumber: pr.number, reason });
-      actions.push({
-        kind: 'ensure-human-comment',
-        prNumber: pr.number,
-        expectedHead: pr.head,
-        marker,
-        body: `${marker}\n\nAutopilot parked this item for Human review.\n\n${reason.detail}`,
-      });
+      continue;
     }
   }
   return { actions };

@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
+import { loadAutopilotConfig } from '../config/config.js';
 import {
   parseOwnedPrefixes,
   touchesCodeOwnedPath,
@@ -18,6 +19,7 @@ import {
 } from './attempt-workspace.js';
 import {
   decodeReviewClaimPayload,
+  decodeBranchClaimTrailers,
   encodeReviewClaimPayload,
   formatAutomatedReviewMarker,
 } from './codecs.js';
@@ -29,6 +31,9 @@ import {
 } from './credentials.js';
 import { makeGitProtocolPort } from './git-protocol.js';
 import { validateCanonicalGitHubHttpsRemote } from './implementation-executor.js';
+import { GhLifecycleReader } from './github-reader.js';
+import { ConditionalRestClient } from './github-rest.js';
+import { GitHubRestDiscoveryReader } from './github-rest-discovery.js';
 import { fileChildIssue } from './child-issues.js';
 import { makeProductionChildIssuePort } from './child-issues-production.js';
 import { fileReviewFollowUps } from './review-follow-ups.js';
@@ -40,9 +45,18 @@ import {
 import type { ReviewSessionPort } from './review-session.js';
 import type { ReviewNativeReview } from './review-executor.js';
 import {
+  resolveStructuredPullRequestMappings,
+  type StructuredMappingInput,
+  type StructuredMappingPullRequest,
+} from './pr-mapping.js';
+import {
   gitOid,
   type GitOid,
 } from './types.js';
+import {
+  hasExternalHumanAuthority,
+  hasExternalHumanLabel,
+} from './human-authority.js';
 
 export interface ProductionReviewSessionPortOptions {
   readonly runner?: CommandRunner;
@@ -51,6 +65,30 @@ export interface ProductionReviewSessionPortOptions {
   readonly readManifest?: (path: string) => AttemptManifest;
   readonly writeMetadataFile?: (payload: string) => string;
   readonly removeMetadataFile?: (path: string) => void;
+  /**
+   * Complete dependency/stable-claim authority for the canonical PR mapping
+   * resolver. Tests/coordinators may inject a cycle-scoped reader; production
+   * otherwise builds the same authority from fresh targeted reads.
+   */
+  readonly readMappingAuthority?: (input: {
+    readonly manifest: AttemptManifest;
+    readonly pullRequests: readonly StructuredMappingPullRequest[];
+  }) => Promise<Pick<
+    StructuredMappingInput,
+    'defaultBranch' | 'issues' | 'stableBranches'
+  > | null>;
+  /**
+   * Fresh Project `Blocked on: Human` authority for the manifest issue.
+   * This remains readable when the broader mapping graph is unavailable.
+   * `null` means the external Human boundary could not be read completely.
+   */
+  readonly readProjectHumanAuthority?: (input: {
+    readonly manifest: AttemptManifest;
+  }) => Promise<boolean | null>;
+  /** Fresh native issue Human-label authority for the manifest issue. */
+  readonly readNativeIssueHumanAuthority?: (input: {
+    readonly manifest: AttemptManifest;
+  }) => Promise<boolean | null>;
 }
 
 export function makeProductionReviewSessionPort(
@@ -112,6 +150,163 @@ export function makeProductionReviewSessionPort(
   ], extra);
   const secureGitRunner = (manifest: AttemptManifest) =>
     (_command: 'git', args: readonly string[]) => runGit(manifest, args);
+  const defaultProjectHumanAuthority = async (
+    manifest: AttemptManifest,
+  ): Promise<boolean | null> => {
+    try {
+      const loaded = await loadAutopilotConfig(manifest.repository.root, ambient);
+      const sessionRunner: CommandRunner = (command, args, commandOptions) => {
+        const extra = Object.fromEntries(
+          Object.entries(commandOptions?.env ?? {})
+            .filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+        );
+        return run(manifest, command, [...args], extra);
+      };
+      const reader = new GhLifecycleReader(sessionRunner, {
+        repositoryPath: manifest.repository.root,
+        remoteName: loaded.config.repository.remote.url,
+        repositorySlug: loaded.config.repository.slug,
+        projectOwner: loaded.config.project.owner,
+        projectNumber: loaded.config.project.number,
+      });
+      const project = await reader.readProjectItemForReconciliation(
+        manifest.issueNumber,
+      );
+      return project === null ? null : project.blockedOn === 'Human';
+    } catch {
+      return null;
+    }
+  };
+  const defaultNativeIssueHumanAuthority = async (
+    manifest: AttemptManifest,
+  ): Promise<boolean | null> => {
+    try {
+      const value = JSON.parse(await run(manifest, 'gh', [
+        'issue', 'view', String(manifest.issueNumber),
+        '--repo', REPO,
+        '--json', 'number,state,labels',
+      ])) as {
+        readonly number?: unknown;
+        readonly state?: unknown;
+        readonly labels?: unknown;
+      };
+      if (
+        value.number !== manifest.issueNumber
+        || !['OPEN', 'CLOSED'].includes(String(value.state))
+        || !Array.isArray(value.labels)
+      ) return null;
+      const labels = value.labels.map((label) => (
+        typeof label === 'object' && label !== null
+          ? (label as { readonly name?: unknown }).name
+          : undefined
+      ));
+      if (labels.some((label) => typeof label !== 'string')) return null;
+      return hasExternalHumanLabel(labels as string[]);
+    } catch {
+      return null;
+    }
+  };
+  const defaultMappingAuthority = async (
+    manifest: AttemptManifest,
+    pullRequests: readonly StructuredMappingPullRequest[],
+  ): Promise<Pick<
+    StructuredMappingInput,
+    'defaultBranch' | 'issues' | 'stableBranches'
+  > | null> => {
+    try {
+      const loaded = await loadAutopilotConfig(manifest.repository.root, ambient);
+      const sessionRunner: CommandRunner = (command, args, commandOptions) => {
+        const extra = Object.fromEntries(
+          Object.entries(commandOptions?.env ?? {})
+            .filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+        );
+        return run(manifest, command, [...args], extra);
+      };
+      const reader = new GhLifecycleReader(sessionRunner, {
+        repositoryPath: manifest.repository.root,
+        remoteName: loaded.config.repository.remote.url,
+        repositorySlug: loaded.config.repository.slug,
+        projectOwner: loaded.config.project.owner,
+        projectNumber: loaded.config.project.number,
+      });
+      const discovery = new GitHubRestDiscoveryReader(
+        new ConditionalRestClient(sessionRunner),
+        {
+          repositorySlug: loaded.config.repository.slug,
+          repositoryRestDatabaseId: loaded.config.repository.restDatabaseId,
+          projectOwner: loaded.config.project.owner,
+          projectNumber: loaded.config.project.number,
+        },
+      );
+      const issueNumbers = new Set<number>([manifest.issueNumber]);
+      const addStableNumber = (ref: string): void => {
+        const match = /^autopilot\/([1-9][0-9]*)$/.exec(ref);
+        if (match?.[1] !== undefined) issueNumbers.add(Number(match[1]));
+      };
+      for (const pullRequest of pullRequests) {
+        for (const number of pullRequest.closingIssueNumbers) issueNumbers.add(number);
+        addStableNumber(pullRequest.headRefName);
+        addStableNumber(pullRequest.baseRefName);
+        for (const match of pullRequest.body.matchAll(
+          /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=[^ >]+ -->/g,
+        )) {
+          issueNumbers.add(Number(match[1]));
+        }
+      }
+
+      const issues: StructuredMappingInput['issues'][number][] = [];
+      const pending = [...issueNumbers];
+      const read = new Set<number>();
+      while (pending.length > 0) {
+        const issueNumber = pending.shift()!;
+        if (read.has(issueNumber)) continue;
+        read.add(issueNumber);
+        if (read.size > 1_000) return null;
+        const [project, blockedByIssues] = await Promise.all([
+          reader.readProjectItemForReconciliation(issueNumber),
+          discovery.readBlockedByIssueNumbersForAction(issueNumber),
+        ]);
+        if (project === null) return null;
+        issues.push({
+          number: issueNumber,
+          blockedOn: project.blockedOn,
+          blockedByIssues,
+        });
+        for (const dependency of blockedByIssues) {
+          if (!read.has(dependency)) pending.push(dependency);
+        }
+      }
+
+      const stableBranches: StructuredMappingInput['stableBranches'][number][] = [];
+      for (const issue of issues) {
+        const raw = await reader.readBranchClaimForReconciliation(
+          `autopilot/${issue.number}`,
+        );
+        if (raw === null) continue;
+        const claim = decodeBranchClaimTrailers(raw.claimTrailers);
+        if (
+          claim.issueNumber !== issue.number
+          || claim.expectedHead !== gitOid(raw.headOid)
+        ) {
+          return null;
+        }
+        stableBranches.push({
+          issueNumber: issue.number,
+          phase: claim.phase,
+          head: claim.expectedHead,
+          headRefName: raw.headRefName,
+          targetBase: claim.targetBase,
+        });
+      }
+      return {
+        defaultBranch: loaded.config.repository.defaultBranch,
+        issues,
+        stableBranches,
+      };
+    } catch {
+      return null;
+    }
+  };
   const validateIdentity = async (manifest: AttemptManifest): Promise<void> => {
     const login = (await run(manifest, 'gh', ['api', 'user', '--jq', '.login'])).trim();
     if (login.toLowerCase() !== manifest.selectedLogin.toLowerCase()) {
@@ -210,6 +405,8 @@ export function makeProductionReviewSessionPort(
     readonly number: number;
     readonly head: GitOid;
     readonly branch: string;
+    readonly baseRefName: string;
+    readonly body: string;
     readonly closingIssueNumbers: readonly number[];
   }> => {
     let value: unknown;
@@ -226,8 +423,12 @@ export function makeProductionReviewSessionPort(
       const record = entry as Record<string, unknown>;
       if (
         typeof record.number !== 'number'
+        || !Number.isSafeInteger(record.number)
+        || record.number <= 0
         || typeof record.headRefOid !== 'string'
         || typeof record.headRefName !== 'string'
+        || typeof record.baseRefName !== 'string'
+        || typeof record.body !== 'string'
         || !Array.isArray(record.closingIssuesReferences)
       ) {
         throw new Error('Malformed open review PR mapping readback');
@@ -245,6 +446,8 @@ export function makeProductionReviewSessionPort(
         number: record.number,
         head: gitOid(record.headRefOid),
         branch: record.headRefName,
+        baseRefName: record.baseRefName,
+        body: record.body,
         closingIssueNumbers,
       };
     });
@@ -259,39 +462,126 @@ export function makeProductionReviewSessionPort(
       '--json',
       'number,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,labels,body,author,closingIssuesReferences,files',
     ]));
-    const markerMatches = [...pullRequest.body.matchAll(
-      /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/g,
-    )];
-    const markerIssue = markerMatches.length === 1
-      ? Number(markerMatches[0]![1])
-      : undefined;
-    const markerBranch = markerMatches.length === 1
-      ? markerMatches[0]![2]
-      : undefined;
-    const issueNumber = markerIssue
-      ?? (pullRequest.closingIssueNumbers.length === 1
-        ? pullRequest.closingIssueNumbers[0]!
-        : manifest.issueNumber);
     const openPullRequests = parseOpenPullRequests(await run(manifest, 'gh', [
       'pr', 'list', '--repo', REPO, '--state', 'open', '--limit', '1000',
-      '--json', 'number,headRefName,headRefOid,closingIssuesReferences',
+      '--json', 'number,headRefName,baseRefName,headRefOid,body,closingIssuesReferences',
     ]));
-    const linked = openPullRequests.filter((candidate) => (
-      candidate.branch === pullRequest.headRefName
-      || candidate.closingIssueNumbers.includes(issueNumber)
-    ));
-    const mappingProblem = (
-      markerMatches.length !== 1
-      || markerIssue !== issueNumber
-      || markerBranch !== pullRequest.headRefName
-      || pullRequest.closingIssueNumbers.length !== 1
-      || pullRequest.closingIssueNumbers[0] !== issueNumber
-      || linked.length !== 1
-      || linked[0]?.number !== pullRequest.number
-      || linked[0]?.head !== pullRequest.head
-    )
-      ? 'The current PR does not have a unique open PR, issue, and branch mapping.'
-      : undefined;
+    const listedTarget = openPullRequests.filter(
+      (candidate) => candidate.number === pullRequest.number,
+    );
+    const duplicateNumbers = new Set<number>();
+    const seenNumbers = new Set<number>();
+    for (const candidate of openPullRequests) {
+      if (seenNumbers.has(candidate.number)) duplicateNumbers.add(candidate.number);
+      seenNumbers.add(candidate.number);
+    }
+    const targetListConsistent = listedTarget.length === 1
+      && listedTarget[0]!.head === pullRequest.head
+      && listedTarget[0]!.branch === pullRequest.headRefName
+      && listedTarget[0]!.baseRefName === pullRequest.baseRefName
+      && listedTarget[0]!.body === pullRequest.body
+      && JSON.stringify(listedTarget[0]!.closingIssueNumbers)
+        === JSON.stringify(pullRequest.closingIssueNumbers);
+    const mappingPullRequests: StructuredMappingPullRequest[] =
+      openPullRequests.map((candidate) => ({
+        number: candidate.number,
+        state: 'OPEN',
+        head: candidate.number === pullRequest.number
+          ? pullRequest.head
+          : candidate.head,
+        headRefName: candidate.number === pullRequest.number
+          ? pullRequest.headRefName
+          : candidate.branch,
+        baseRefName: candidate.number === pullRequest.number
+          ? pullRequest.baseRefName
+          : candidate.baseRefName,
+        closingIssueNumbers: candidate.number === pullRequest.number
+          ? pullRequest.closingIssueNumbers
+          : candidate.closingIssueNumbers,
+        body: candidate.number === pullRequest.number
+          ? pullRequest.body
+          : candidate.body,
+      }));
+    let mappingProblem: string | undefined;
+    let issueNumber = manifest.issueNumber;
+    let mappingAuthority: Pick<
+      StructuredMappingInput,
+      'defaultBranch' | 'issues' | 'stableBranches'
+    > | null = null;
+    if (
+      openPullRequests.length >= 1_000
+      || duplicateNumbers.size > 0
+      || !targetListConsistent
+      || pullRequest.number !== prNumber
+      || pullRequest.number !== manifest.prNumber
+      || !pullRequest.open
+    ) {
+      mappingProblem =
+        'Complete open pull-request mapping authority is unavailable or inconsistent.';
+    } else {
+      try {
+        mappingAuthority = options.readMappingAuthority === undefined
+          ? await defaultMappingAuthority(manifest, mappingPullRequests)
+          : await options.readMappingAuthority({
+              manifest,
+              pullRequests: mappingPullRequests,
+            });
+      } catch {
+        mappingAuthority = null;
+      }
+      if (mappingAuthority === null) {
+        mappingProblem =
+          'Complete dependency and stable-branch mapping authority is unavailable.';
+      } else {
+        const resolution = resolveStructuredPullRequestMappings({
+          ...mappingAuthority,
+          pullRequests: mappingPullRequests,
+        }).find((candidate) => candidate.prNumber === pullRequest.number);
+        if (resolution === undefined) {
+          mappingProblem = 'Canonical pull-request mapping authority is absent.';
+        } else if (resolution.status === 'ambiguous') {
+          mappingProblem = resolution.details.join(' ');
+        } else {
+          issueNumber = resolution.issueNumber;
+          if (
+            resolution.issueNumber !== manifest.issueNumber
+            || resolution.expectedBaseRefName !== pullRequest.baseRefName
+            || resolution.expectedBaseRefName !== manifest.targetBase
+            || pullRequest.head !== manifest.expectedHead
+            || pullRequest.headRefName !== manifest.branch
+          ) {
+            mappingProblem =
+              'Canonical pull-request mapping changed from the manifest authority.';
+          }
+        }
+      }
+    }
+    const externalHumanLabel = hasExternalHumanLabel(pullRequest.labels);
+    let projectHumanAuthority: boolean | null | undefined;
+    let nativeIssueHumanAuthority: boolean | null | undefined;
+    if (!externalHumanLabel) {
+      try {
+        [projectHumanAuthority, nativeIssueHumanAuthority] = await Promise.all([
+          options.readProjectHumanAuthority === undefined
+            ? defaultProjectHumanAuthority(manifest)
+            : options.readProjectHumanAuthority({ manifest }),
+          options.readNativeIssueHumanAuthority === undefined
+            ? defaultNativeIssueHumanAuthority(manifest)
+            : options.readNativeIssueHumanAuthority({ manifest }),
+        ]);
+      } catch {
+        projectHumanAuthority = null;
+        nativeIssueHumanAuthority = null;
+      }
+      if (
+        projectHumanAuthority === null
+        || nativeIssueHumanAuthority === null
+      ) {
+        throw new Error(
+          'Complete external Human authority is unavailable or inconsistent.',
+        );
+      }
+    }
     const treePaths = (await runGit(manifest, [
       'ls-tree', '-r', '--name-only', pullRequest.base,
     ])).trim().split('\n').filter(Boolean);
@@ -321,6 +611,12 @@ export function makeProductionReviewSessionPort(
       labels: pullRequest.labels,
       body: pullRequest.body,
       approvalPolicy,
+      humanHold: externalHumanLabel || hasExternalHumanAuthority({
+        nativeIssueLabels: nativeIssueHumanAuthority === true
+          ? ['autopilot:human']
+          : [],
+        projectBlockedOn: projectHumanAuthority === true ? 'Human' : null,
+      }),
       ...(mappingProblem === undefined ? {} : { mappingProblem }),
     };
   };
@@ -476,7 +772,7 @@ export function makeProductionReviewSessionPort(
       throw new Error('Review ready boundary lost exact terminal authority');
     }
     const pullRequest = await requireHead(manifest, prNumber, expectedHead);
-    if (pullRequest.labels.includes('review:needs-human')) {
+    if (pullRequest.humanHold === true) {
       throw new Error('Review ready boundary stopped because Human is dominant');
     }
     const reviews = await readNativeReviews(manifest, prNumber, expectedHead);
@@ -548,9 +844,7 @@ export function makeProductionReviewSessionPort(
     async hasHumanHold(_issueNumber, prNumber, expectedHead) {
       const manifest = currentManifest();
       const pullRequest = await requireHead(manifest, prNumber, expectedHead);
-      // Stage 1: hold authority is the PR label only. Project Status / Blocked
-      // on are paint or human-intent surfaces owned elsewhere.
-      return pullRequest.labels.includes('review:needs-human');
+      return pullRequest.humanHold === true;
     },
 
     async createReviewRecord({ manifest, parent, record }) {
@@ -665,24 +959,60 @@ export function makeProductionReviewSessionPort(
       );
     },
 
-    async hasHumanComment(prNumber, expectedHead, body) {
+    async hasHumanComment(
+      prNumber,
+      expectedHead,
+      expectedReviewRefOid,
+      expectedGeneration,
+      expectedReviewState,
+      body,
+    ) {
       const manifest = currentManifest();
       await requireHead(manifest, prNumber, expectedHead);
+      const authority = await readAuthority(manifest);
+      if (
+        authority.reviewRefOid !== expectedReviewRefOid
+        || authority.record.head !== expectedHead
+        || authority.record.generation !== expectedGeneration
+        || authority.record.state !== expectedReviewState
+      ) {
+        throw new Error('Review Human comment lost exact review-ref authority');
+      }
       return (await readCommentBodies(manifest, prNumber)).includes(body);
     },
 
-    async ensureHumanComment(prNumber, expectedHead, marker, body) {
+    async ensureHumanComment(
+      prNumber,
+      expectedHead,
+      expectedReviewRefOid,
+      expectedGeneration,
+      expectedReviewState,
+      marker,
+      body,
+    ) {
       const manifest = currentManifest();
       if (!body.includes(marker)) {
         throw new Error('Review Human comment body is missing its exact marker');
       }
-      await requireHead(manifest, prNumber, expectedHead);
+      const requireExactAuthority = async (): Promise<void> => {
+        await requireHead(manifest, prNumber, expectedHead);
+        const authority = await readAuthority(manifest);
+        if (
+          authority.reviewRefOid !== expectedReviewRefOid
+          || authority.record.head !== expectedHead
+          || authority.record.generation !== expectedGeneration
+          || authority.record.state !== expectedReviewState
+        ) {
+          throw new Error('Review Human comment lost exact review-ref authority');
+        }
+      };
+      await requireExactAuthority();
       await mutateWithExactReadback(
         () => run(manifest, 'gh', [
           'pr', 'comment', String(prNumber), '--repo', REPO, '--body', body,
         ]),
         async () => {
-          await requireHead(manifest, prNumber, expectedHead);
+          await requireExactAuthority();
           return (await readCommentBodies(manifest, prNumber)).includes(body);
         },
         'Review Human comment was ambiguous',

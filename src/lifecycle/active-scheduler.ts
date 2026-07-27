@@ -44,12 +44,14 @@ export type ActiveCandidate =
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
     }
   | {
       readonly phase: 'file-reconcile-child';
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
       readonly effort: 'low' | 'medium' | 'high';
     }
   | {
@@ -69,6 +71,7 @@ export type ActiveCandidate =
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
     };
 
 export interface ActiveSchedulingInput {
@@ -215,6 +218,7 @@ export function scheduleActiveActions(
         issueNumber: candidate.issueNumber,
         prNumber: candidate.prNumber,
         head: candidate.head,
+        expectedBaseRefName: candidate.expectedBaseRefName,
       });
       continue;
     }
@@ -224,6 +228,7 @@ export function scheduleActiveActions(
         issueNumber: candidate.issueNumber,
         prNumber: candidate.prNumber,
         head: candidate.head,
+        expectedBaseRefName: candidate.expectedBaseRefName,
         effort: candidate.effort,
       });
       continue;
@@ -258,6 +263,7 @@ export function scheduleActiveActions(
       issueNumber: candidate.issueNumber,
       prNumber: candidate.prNumber,
       head: candidate.head,
+      expectedBaseRefName: candidate.expectedBaseRefName,
     });
   }
 

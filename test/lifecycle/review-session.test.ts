@@ -181,7 +181,10 @@ function harness(options: {
       approvalPolicy: options.policy ?? 'approve-eligible',
     }),
     readNativeReviews: async () => native,
-    hasHumanHold: async () => humanChecks.shift() ?? project === 'Human',
+    hasHumanHold: async () => (
+      humanChecks.shift()
+      ?? (labels.has('review:needs-human') || project === 'Human')
+    ),
     createReviewRecord: async ({ record: next }) => {
       events.push(`record:${next.state}`);
       if (next.state === 'verdict-intent') return INTENT;
@@ -236,8 +239,23 @@ function harness(options: {
       expect(body.length).toBeGreaterThan(0);
       return { number: 9001, created: true };
     },
-    hasHumanComment: async (_pr, _head, body) => comments.has(body),
-    ensureHumanComment: async (_pr, _head, _marker, body) => {
+    hasHumanComment: async (
+      _pr,
+      _head,
+      _ref,
+      _generation,
+      _state,
+      body,
+    ) => comments.has(body),
+    ensureHumanComment: async (
+      _pr,
+      _head,
+      _ref,
+      _generation,
+      _state,
+      _marker,
+      body,
+    ) => {
       events.push('human-comment');
       comments.add(body);
     },
@@ -253,6 +271,7 @@ function harness(options: {
     set authority(next: ReviewSessionAuthority) { authority = next; },
     get draft() { return draft; },
     get labels() { return labels; },
+    get comments() { return comments; },
     get project() { return project; },
     get native() { return native; },
     set localHead(next: GitOid) { localHead = next; },
@@ -580,16 +599,26 @@ describe('review session protocol', () => {
     expect(h.events).toEqual([]);
   });
 
-  it('parks review attempts with structured Human evidence without clearing existing holds', async () => {
+  it('parks review attempts on the external Human label before writing internal audit evidence', async () => {
     const h = harness({ state: 'active', draft: true });
     await expect(h.protocol.human(h.manifest, 'Needs architectural judgment.'))
       .resolves.toMatchObject({ status: 'human', head: HEAD });
-    expect(h.events.slice(0, 2)).toEqual(['record:human', 'claim:human']);
+    expect(h.events.slice(0, 3)).toEqual([
+      'label:review:needs-human:true',
+      'record:human',
+      'claim:human',
+    ]);
     expect(h.events).toContain('human-comment');
-    expect(h.events).not.toContain('draft:false');
+    expect(h.events.some((event) => event.startsWith('draft:'))).toBe(false);
+    expect(h.labels.has('review:needs-human')).toBe(true);
+    expect([...h.comments]).toEqual([
+      expect.stringContaining(
+        `head=${HEAD} generation=22222222-2222-4222-8222-222222222222`,
+      ),
+    ]);
   });
 
-  it('does not project Human until the exact-parent Human review record wins', async () => {
+  it('retains external Human authority when the internal audit record loses its CAS', async () => {
     const h = harness({ state: 'active', draft: false });
     h.port.publishReviewClaim = async ({ recordOid, expectedRemoteRecordOid }) => ({
       status: 'lost',
@@ -600,12 +629,142 @@ describe('review session protocol', () => {
 
     await expect(h.protocol.human(h.manifest, 'Needs judgment.'))
       .rejects.toThrow(/Human.*record|authority/i);
-    expect(h.events).toEqual(['record:human']);
+    expect(h.events).toEqual([
+      'label:review:needs-human:true',
+      'record:human',
+    ]);
+    expect(h.labels.has('review:needs-human')).toBe(true);
+  });
+
+  it('delegates a lost mapping to the coordinator without publishing Human state', async () => {
+    const h = harness({ state: 'active', draft: true });
+    const read = h.port.readPullRequest;
+    h.port.readPullRequest = async (...args) => ({
+      ...await read(...args),
+      mappingProblem: 'PR now maps to both issue #42 and issue #43.',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'mapping-pending', head: HEAD });
+
+    expect(h.events).toEqual(['record:mapping-reread', 'claim:mapping-reread']);
+    expect(h.authority.record).toMatchObject({
+      state: 'mapping-reread',
+      mappingRequest: {
+        selectedIssueNumber: 42,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+      },
+    });
+    expect([...h.comments]).toEqual([]);
+    expect(h.events.some((event) => event.startsWith('draft:'))).toBe(false);
+    expect(h.events.some((event) => event.startsWith('label:'))).toBe(false);
+  });
+
+  it('accepts a canonical closing-reference mapping without a lifecycle marker', async () => {
+    const h = harness({ state: 'active', draft: false });
+    const read = h.port.readPullRequest;
+    h.port.readPullRequest = async (...args) => ({
+      ...await read(...args),
+      body: 'Closes #42',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+    expect(h.events).not.toContain('record:mapping-reread');
+    expect(h.events).not.toContain('claim:mapping-reread');
   });
 
   it.each([
     {
+      name: 'verdict',
+      run: (h: ReturnType<typeof harness>) => (
+        h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.')
+      ),
+    },
+    {
+      name: 'findings',
+      run: (h: ReturnType<typeof harness>) => (
+        h.protocol.reviewFindings!(h.manifest, '## Findings\n\n- Fix the race.')
+      ),
+    },
+  ])(
+    'preserves exact external Human authority before a $name mapping reread',
+    async ({ run }) => {
+      const h = harness({ state: 'active', draft: true });
+      h.labels.add('review:needs-human');
+      const read = h.port.readPullRequest;
+      h.port.readPullRequest = async (...args) => ({
+        ...await read(...args),
+        mappingProblem: 'PR now maps to both issue #42 and issue #43.',
+      });
+
+      await expect(run(h)).resolves.toMatchObject({ status: 'human', head: HEAD });
+
+      expect(h.authority.reviewRefOid).toBe(ACTIVE);
+      expect(h.authority.record.state).toBe('active');
+      expect(h.events).toEqual([]);
+    },
+  );
+
+  it('restarts idempotently from an already published mapping reread request', async () => {
+    const h = harness({
+      state: 'mapping-reread',
+      draft: true,
+    });
+    h.authority = {
+      ...h.authority,
+      record: record('mapping-reread', {
+        mappingRequest: {
+          selectedIssueNumber: 42,
+          headRefName: 'autopilot/42',
+          baseRefName: 'next',
+        },
+      }),
+    };
+    const read = h.port.readPullRequest;
+    h.port.readPullRequest = async (...args) => ({
+      ...await read(...args),
+      mappingProblem: 'PR now maps to both issue #42 and issue #43.',
+    });
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'mapping-pending', head: HEAD });
+
+    expect(h.events).toEqual([]);
+    expect([...h.comments]).toEqual([]);
+  });
+
+  it.each(['human', 'human-intent'] as const)(
+    'replaces legacy internal %s audit state with a machine-owned mapping reread',
+    async (state) => {
+      const h = harness({ state, draft: true });
+      const read = h.port.readPullRequest;
+      h.port.readPullRequest = async (...args) => ({
+        ...await read(...args),
+        mappingProblem: 'PR now maps to both issue #42 and issue #43.',
+      });
+
+      await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+        .resolves.toMatchObject({ status: 'mapping-pending', head: HEAD });
+
+      expect(h.events).toEqual(['record:mapping-reread', 'claim:mapping-reread']);
+      expect(h.authority.record).toMatchObject({
+        state: 'mapping-reread',
+        mappingRequest: {
+          selectedIssueNumber: 42,
+          headRefName: 'autopilot/42',
+          baseRefName: 'next',
+        },
+      });
+    },
+  );
+
+  it.each([
+    {
       name: 'closed PR',
+      expectedStatus: 'human',
+      expectedState: 'human',
       mutate: (pullRequest: Awaited<ReturnType<ReviewSessionPort['readPullRequest']>>) => ({
         ...pullRequest,
         open: false,
@@ -613,6 +772,8 @@ describe('review session protocol', () => {
     },
     {
       name: 'changed issue mapping',
+      expectedStatus: 'mapping-pending',
+      expectedState: 'mapping-reread',
       mutate: (pullRequest: Awaited<ReturnType<ReviewSessionPort['readPullRequest']>>) => ({
         ...pullRequest,
         issueNumber: 43,
@@ -621,19 +782,25 @@ describe('review session protocol', () => {
     },
     {
       name: 'changed CODEOWNER policy',
+      expectedStatus: 'human',
+      expectedState: 'human',
       mutate: (pullRequest: Awaited<ReturnType<ReviewSessionPort['readPullRequest']>>) => ({
         ...pullRequest,
         approvalPolicy: 'human-codeowner' as const,
       }),
     },
-  ])('enters durable Human when verdict authority sees a $name', async ({ mutate }) => {
+  ])('parks safely when verdict authority sees a $name', async ({
+    mutate,
+    expectedStatus,
+    expectedState,
+  }) => {
     const h = harness({ draft: true });
     const read = h.port.readPullRequest;
     h.port.readPullRequest = async (...args) => mutate(await read(...args));
 
     await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
-      .resolves.toMatchObject({ status: 'human' });
-    expect(h.authority.record.state).toBe('human');
+      .resolves.toMatchObject({ status: expectedStatus });
+    expect(h.authority.record.state).toBe(expectedState);
     expect(h.events).not.toContain(`native:APPROVE:${HEAD}`);
   });
 

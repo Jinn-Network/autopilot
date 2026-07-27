@@ -43,6 +43,7 @@ function implementation(
     projectStatus: 'Todo',
     labels: ['engine:review'],
     head: HEAD,
+    expectedBaseRefName: 'next',
     headChangedAt: '2026-07-20T11:00:00.000Z',
     isDraft: false,
     merged: false,
@@ -724,6 +725,42 @@ describe('lifecycle controller', () => {
     );
   });
 
+  it('never schedules an action from explicitly incomplete PR evidence', async () => {
+    const delivered = implementation({
+      branchClaim: {
+        ...implementation().branchClaim,
+        phaseComplete: true,
+      },
+      isDraft: false,
+      needsReview: true,
+      approved: false,
+    });
+    const incomplete = snapshot(delivered);
+    incomplete.pullRequests[0]!.evidenceIncompleteReason =
+      'PR #101 reviews were truncated';
+    const scheduled: string[] = [];
+
+    await runLifecycleCycle('active', {
+      ...deps(delivered, []),
+      readSnapshot: async () => incomplete,
+      active: {
+        preflight: async () => ({ ok: true }),
+        readLocalState: () => ({
+          remaining: { implementation: 1, review: 1 },
+          availableLogins: ['reviewer-bot'],
+          implementationPreferredLogin: 'reviewer-bot',
+        }),
+        implementationBackpressureThreshold: 10,
+        executeAction: async (action: { kind: string }) => {
+          scheduled.push(action.kind);
+          return { outcome: 'spawned' };
+        },
+      },
+    });
+
+    expect(scheduled).toEqual([]);
+  });
+
   it('dispatches from scoped authority before reading and maintaining the global snapshot', async () => {
     const delivered = implementation({
       branchClaim: {
@@ -1281,12 +1318,14 @@ describe('lifecycle controller', () => {
       issueNumber: 42,
       prNumber: 101,
       head: HEAD,
+      expectedBaseRefName: 'next',
     }]);
   });
 
-  it('schedules update-branch instead of merge when CLEAN has exact behind evidence', async () => {
+  it('retains the canonical parent base when a stacked PR is behind', async () => {
     const clean = implementation({
       projectStatus: 'In Review',
+      expectedBaseRefName: 'stack/custom-parent',
       approved: true,
       needsReview: false,
       mergeState: 'behind',
@@ -1301,7 +1340,7 @@ describe('lifecycle controller', () => {
         runner: 'runner-a',
         login: 'implementer',
         expectedHead: HEAD,
-        targetBase: gitRefName('next'),
+        targetBase: gitRefName('stack/custom-parent'),
         claimedAt: '2026-07-20T11:00:00.000Z',
       },
       checks: [{
@@ -1333,6 +1372,7 @@ describe('lifecycle controller', () => {
     const behindSnapshot = snapshot(clean);
     behindSnapshot.pullRequests[0] = {
       ...behindSnapshot.pullRequests[0]!,
+      baseRefName: 'stack/custom-parent',
       mergeability: 'MERGEABLE',
       mergeStateStatus: 'CLEAN',
       compareStatus: 'behind',
@@ -1351,6 +1391,7 @@ describe('lifecycle controller', () => {
       issueNumber: 42,
       prNumber: 101,
       head: HEAD,
+      expectedBaseRefName: 'stack/custom-parent',
     }]);
   });
 
@@ -1419,12 +1460,13 @@ describe('lifecycle controller', () => {
     expect(writerCalls).toEqual([]);
   });
 
-  it('routes exact diverged evidence through update-branch instead of merge', async () => {
+  it('retains the canonical parent base when a stacked PR needs reconciliation', async () => {
     const clean = implementation({
       projectStatus: 'In Review',
+      expectedBaseRefName: 'stack/custom-parent',
       approved: true,
       needsReview: false,
-      mergeState: 'clean',
+      mergeState: 'conflict',
       branchClaim: {
         kind: 'branch-claim',
         protocolVersion: 2,
@@ -1436,7 +1478,7 @@ describe('lifecycle controller', () => {
         runner: 'runner-a',
         login: 'implementer',
         expectedHead: HEAD,
-        targetBase: gitRefName('next'),
+        targetBase: gitRefName('stack/custom-parent'),
         claimedAt: '2026-07-20T11:00:00.000Z',
       },
       checks: [{ source: 'check-run', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
@@ -1463,8 +1505,9 @@ describe('lifecycle controller', () => {
     const falseClean = snapshot(clean);
     falseClean.pullRequests[0] = {
       ...falseClean.pullRequests[0]!,
-      mergeability: 'MERGEABLE',
-      mergeStateStatus: 'CLEAN',
+      baseRefName: 'stack/custom-parent',
+      mergeability: 'CONFLICTING',
+      mergeStateStatus: 'DIRTY',
       compareStatus: 'diverged',
       checks: clean.checks!,
     };
@@ -1477,10 +1520,12 @@ describe('lifecycle controller', () => {
     });
 
     expect(actions).toEqual([{
-      kind: 'update-branch',
+      kind: 'file-reconcile-child',
       issueNumber: 42,
       prNumber: 101,
       head: HEAD,
+      expectedBaseRefName: 'stack/custom-parent',
+      effort: 'medium',
     }]);
   });
 

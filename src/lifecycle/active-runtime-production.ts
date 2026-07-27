@@ -26,7 +26,10 @@ import {
   type TrackableAttemptChild,
 } from './attempt-workspace.js';
 import { makeActiveRuntime } from './active-runtime.js';
-import { formatHumanCommentMarker } from './codecs.js';
+import {
+  decodeReviewClaimPayload,
+  formatHumanCommentMarker,
+} from './codecs.js';
 import {
   selectCredential,
   type CredentialPool,
@@ -64,6 +67,7 @@ import { withSelectedCredential } from './production-auth.js';
 import {
   makeProductionReconciliationWriter,
   type ReconciliationProjectItemNode,
+  type ReconciliationBranchClaimNode,
   type ReconciliationPullRequestNode,
 } from './reconciliation-writer-production.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
@@ -72,9 +76,17 @@ import type {
   TargetedNativeIssue,
   TargetedOpenPullRequest,
 } from './targeted-action-reader.js';
-import type { GitOid, HumanReason, NewWorkAction } from './types.js';
+import type {
+  GitOid,
+  HumanReason,
+  NewWorkAction,
+  ReviewClaimRecord,
+} from './types.js';
+import { gitOid } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
+import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 import {
   LocalSessionExecutionBackend,
   MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
@@ -153,6 +165,9 @@ export interface ProductionActiveRuntimeOptions {
     issueNumber: number,
   ) => Promise<ReconciliationProjectItemNode | null>;
   readonly readBranchHeadByName: (headRefName: string) => Promise<GitOid | null>;
+  readonly readBranchClaimByName: (
+    headRefName: string,
+  ) => Promise<ReconciliationBranchClaimNode | null>;
   readonly readIssueByNumber: (issueNumber: number) => Promise<TargetedNativeIssue | null>;
   readonly readBlockedByIssueNumbers: (issueNumber: number) => Promise<readonly number[]>;
   readonly readOpenPullRequestsByIssue: (
@@ -503,19 +518,182 @@ export function makeProductionActiveRuntime(
     credentials: CredentialPool,
     cycleSnapshot: GitHubLifecycleSnapshot,
   ): Promise<void> => {
-    const selection = selectCredential(credentials, { phase: 'implement' });
+    const authoritySnapshot = await options.readReviewSnapshot(
+      cycleSnapshot,
+      input.candidate.number,
+    );
+    if (authoritySnapshot === null || authoritySnapshot.snapshotComplete !== true) {
+      throw new Error('Review Human escalation live mapping authority is unavailable');
+    }
+    const diagnostic = authoritySnapshot.diagnostics.find((candidate) => (
+      candidate.pullRequests.some((pr) => (
+        pr.number === input.candidate.number
+        && pr.head === input.candidate.head
+      ))
+    ));
+    if (
+      diagnostic !== undefined
+      && !diagnostic.issueNumbers.includes(input.candidate.issueNumber)
+    ) {
+      throw new Error('Review Human escalation selected issue is outside the live diagnostic');
+    }
+    if (
+      input.reason.code === 'branch-mapping-ambiguous'
+      && diagnostic === undefined
+    ) {
+      // The scheduled candidate can lag a just-completed canonical reread.
+      // Only the fresh complete snapshot may authorize a mapping pause.
+      return;
+    }
+    const live = await options.readPullRequestByNumber(input.candidate.number);
+    if (
+      live === null
+      || live.state !== 'OPEN'
+      || live.headOid !== input.candidate.head
+    ) {
+      throw new Error('Review Human escalation lost exact-head authority');
+    }
+    if (live.evidenceIncompleteReason !== undefined) {
+      throw new Error(
+        `Review Human escalation live PR evidence is incomplete: ${
+          live.evidenceIncompleteReason
+        }`,
+      );
+    }
+    const canonicalPr = authoritySnapshot.pullRequests.find(
+      (pr) => pr.number === input.candidate.number,
+    );
+    let canonicalMappingRequest: {
+      readonly selectedIssueNumber: number;
+      readonly headRefName: string;
+      readonly baseRefName: string;
+    } | undefined;
+    if (diagnostic !== undefined) {
+      if (canonicalPr === undefined) {
+        throw new Error('Review mapping escalation canonical PR is absent');
+      }
+      const diagnosticIssues = new Set(diagnostic.issueNumbers);
+      const externalHumanActive = (
+        hasExternalHumanAuthority({
+          pullRequestLabels: [...live.labels, ...canonicalPr.labels],
+        })
+        || authoritySnapshot.issues.some((issue) => (
+          diagnosticIssues.has(issue.number)
+          && hasExternalHumanAuthority({
+            nativeIssueLabels: issue.labels,
+            projectBlockedOn: issue.blockedOn,
+          })
+        ))
+        || authoritySnapshot.project.items.some((item) => (
+          item.contentType === 'Issue'
+          && diagnosticIssues.has(item.number)
+          && hasExternalHumanAuthority({ projectBlockedOn: item.blockedOn })
+        ))
+      );
+      if (externalHumanActive) return;
+      canonicalMappingRequest = {
+        selectedIssueNumber: input.candidate.issueNumber,
+        headRefName: canonicalPr.headRefName,
+        baseRefName: canonicalPr.baseRefName,
+      };
+    }
+    let currentRefOid = live.reviewClaim === null
+      ? null
+      : gitOid(live.reviewClaim.oid);
+    const currentRecord = live.reviewClaim === null
+      ? undefined
+      : decodeReviewClaimPayload(live.reviewClaim.payload);
+    const currentHeadRecord = currentRecord?.head === input.candidate.head
+      ? currentRecord
+      : undefined;
+    const candidateAuthor = authoritySnapshot.pullRequests.find(
+      (pr) => pr.number === input.candidate.number,
+    )?.author;
+    const eligibleCredentials = currentHeadRecord === undefined
+      ? credentials
+      : credentials.restrictedTo([currentHeadRecord.reviewer]);
+    const selection = selectCredential(eligibleCredentials, {
+      phase: 'review',
+      ...(candidateAuthor === undefined ? {} : { prAuthor: candidateAuthor }),
+    });
     if (selection.status !== 'selected') throw new Error(selection.detail);
+    const generation = currentHeadRecord?.generation ?? nextId();
+    const attempt = currentHeadRecord?.attempt ?? nextId();
+    const reviewer = currentHeadRecord?.reviewer ?? selection.login;
+    const port = reviewActionPort({
+      repositoryPath: options.repositoryPath,
+      worktreeBase: options.worktreeBase,
+      runnerId: options.runnerId,
+      remoteName,
+      readSnapshot: (prNumber) => options.readReviewSnapshot(authoritySnapshot, prNumber),
+      runner,
+      environment: ambient,
+      repositorySlug: options.repositorySlug,
+      repositoryUrl: options.repositoryUrl,
+      projectMapping: options.projectMapping,
+    });
+    const publishRecord = async (
+      record: ReviewClaimRecord,
+      parent: GitOid | null,
+      failure: string,
+    ): Promise<GitOid> => {
+      const recordOid = await port.createReviewRecord({
+        record,
+        parent,
+        credential: selection.credential,
+      });
+      const outcome = await port.publishReviewClaim({
+        prNumber: input.candidate.number,
+        recordParent: parent,
+        expectedRemoteRecordOid: parent,
+        recordOid,
+        credential: selection.credential,
+      });
+      if (
+        (outcome.status !== 'won' && outcome.status !== 'already-applied')
+        || outcome.observed !== recordOid
+      ) {
+        throw new Error(failure);
+      }
+      return recordOid;
+    };
+    let authorityRecord = currentHeadRecord;
+    if (authorityRecord === undefined || currentRefOid === null) {
+      authorityRecord = {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: input.candidate.number,
+        generation,
+        attempt,
+        reviewer,
+        head: input.candidate.head,
+        state: 'active',
+        recordedAt: now().toISOString(),
+      };
+      currentRefOid = await publishRecord(
+        authorityRecord,
+        currentRefOid,
+        'Review escalation did not establish exact non-Human authority',
+      );
+    }
+    if (currentRefOid === null) {
+      throw new Error('Review Human escalation review-ref authority is absent');
+    }
     const writer = makeProductionReconciliationWriter({
       repositoryPath: options.repositoryPath,
-      cycleSnapshot,
+      cycleSnapshot: authoritySnapshot,
       readPullRequestByNumber: options.readPullRequestByNumber,
       readProjectItemForReconciliation: options.readProjectItemForReconciliation,
       readBranchHeadByName: options.readBranchHeadByName,
+      readBranchClaimByName: options.readBranchClaimByName,
       readIssueByNumber: options.readIssueByNumber,
       readBlockedByIssueNumbers: options.readBlockedByIssueNumbers,
       readOpenPullRequestsByIssue: options.readOpenPullRequestsByIssue,
       readIssueActionContext: options.readIssueActionContext,
+      readCanonicalSnapshot: (prNumber) =>
+        options.readReviewSnapshot(authoritySnapshot, prNumber),
       credential: selection.credential,
+      credentials,
       runner,
       environment: ambient,
       repositorySlug: options.repositorySlug,
@@ -523,35 +701,116 @@ export function makeProductionActiveRuntime(
       defaultBranch: options.defaultBranch,
       now,
     });
-    const before = await writer.readPullRequest(input.candidate.number);
-    if (before?.head !== input.candidate.head) {
-      throw new Error('Review Human escalation lost exact-head authority');
+    if (diagnostic !== undefined) {
+      if (canonicalMappingRequest === undefined) {
+        throw new Error('Review mapping escalation request authority is absent');
+      }
+      const mappingRequest = canonicalMappingRequest;
+      if (
+        authorityRecord.state !== 'mapping-reread'
+      ) {
+        const requestRecord: ReviewClaimRecord = {
+          kind: 'review-claim',
+          protocolVersion: 2,
+          prNumber: input.candidate.number,
+          generation,
+          attempt,
+          reviewer,
+          head: input.candidate.head,
+          state: 'mapping-reread',
+          mappingRequest,
+          recordedAt: now().toISOString(),
+        };
+        currentRefOid = await publishRecord(
+          requestRecord,
+          currentRefOid,
+          'Review mapping reread request did not win exact-parent authority',
+        );
+        authorityRecord = requestRecord;
+      }
+      if (
+        authorityRecord.state === 'mapping-reread'
+        && (
+          authorityRecord.mappingRequest.selectedIssueNumber
+            !== mappingRequest.selectedIssueNumber
+          || authorityRecord.mappingRequest.headRefName !== mappingRequest.headRefName
+          || authorityRecord.mappingRequest.baseRefName !== mappingRequest.baseRefName
+        )
+      ) {
+        throw new Error('Review mapping reread request identity changed');
+      }
+      return;
     }
+    const publicationReason: HumanReason = input.reason;
     const marker = formatHumanCommentMarker({
       issueNumber: input.candidate.issueNumber,
       prNumber: input.candidate.number,
-      reason: input.reason,
+      head: input.candidate.head,
+      generation,
+      reason: publicationReason,
     });
-    // Authority order: draft → hold label → marker comment.
-    // Decision paths read label+marker; Status paint is painter-owned (Stage 3).
-    await writer.setPullRequestDraft(
-      input.candidate.number,
-      true,
-      input.candidate.head,
-    );
+    const commentBody =
+      `${marker}\n\nAutopilot parked this item for Human review.\n\n${publicationReason.detail}`;
+    const commentAuthority = (
+      expectedReviewRefOid: GitOid,
+      expectedReviewState: ReviewClaimRecord['state'],
+    ) => ({
+      issueNumber: input.candidate.issueNumber,
+      expectedHead: input.candidate.head,
+      expectedReviewRefOid,
+      expectedGeneration: generation,
+      expectedReviewState,
+    });
+    const ensureComment = async (
+      expectedReviewRefOid: GitOid,
+      expectedReviewState: ReviewClaimRecord['state'],
+    ): Promise<void> => {
+      const authority = commentAuthority(expectedReviewRefOid, expectedReviewState);
+      if (await writer.hasHumanComment(input.candidate.number, marker, authority)) return;
+      await writer.ensureHumanComment(
+        input.candidate.number,
+        marker,
+        commentBody,
+        authority,
+      );
+    };
+    const requireExactEscalationRef = async (): Promise<void> => {
+      const observed = await writer.readReviewRef(input.candidate.number);
+      if (
+        observed?.oid !== currentRefOid
+        || observed.head !== input.candidate.head
+      ) {
+        throw new Error('Review Human escalation lost exact review-ref authority');
+      }
+    };
+    await requireExactEscalationRef();
     await writer.setPullRequestLabel(
       input.candidate.number,
-      'review:needs-human',
+      NEEDS_HUMAN_LABEL,
       true,
       input.candidate.head,
     );
-    await writer.ensureHumanComment(
-      input.candidate.number,
-      marker,
-      `${marker}\n\n${input.reason.detail}`,
-      input.candidate.head,
-    );
-    // Stage 3: Human Status paint is painter-owned; label+marker are authority.
+    await requireExactEscalationRef();
+    if (authorityRecord.state !== 'human') {
+      const humanRecord: ReviewClaimRecord = {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: input.candidate.number,
+        generation,
+        attempt,
+        reviewer,
+        head: input.candidate.head,
+        state: 'human',
+        recordedAt: now().toISOString(),
+      };
+      currentRefOid = await publishRecord(
+        humanRecord,
+        currentRefOid,
+        'Review Human escalation did not win exact-parent authority',
+      );
+      authorityRecord = humanRecord;
+    }
+    await ensureComment(currentRefOid, 'human');
   };
 
   const activeRuntime = makeActiveRuntime({
@@ -692,11 +951,12 @@ export function makeProductionActiveRuntime(
       merge: (action, credentials, cycleSnapshot) => executeMergeAction({
         prNumber: action.prNumber,
         expectedHead: action.head,
+        expectedBaseRefName: action.expectedBaseRefName,
       }, {
         ...makeProductionMergeActionPort({
           readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
           authorAllowlist: options.authorAllowlist,
-          expectedBaseRefName: options.defaultBranch,
+          expectedBaseRefName: action.expectedBaseRefName,
           repositorySlug: options.repositorySlug,
           projectOwner: options.projectMapping?.owner,
           projectNumber: options.projectMapping?.number,
@@ -715,7 +975,7 @@ export function makeProductionActiveRuntime(
           ...makeProductionMergeActionPort({
             readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
-            expectedBaseRefName: options.defaultBranch,
+            expectedBaseRefName: action.expectedBaseRefName,
             repositorySlug: options.repositorySlug,
             projectOwner: options.projectMapping?.owner,
             projectNumber: options.projectMapping?.number,
@@ -742,7 +1002,7 @@ export function makeProductionActiveRuntime(
           ...makeProductionMergeActionPort({
             readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
-            expectedBaseRefName: options.defaultBranch,
+            expectedBaseRefName: action.expectedBaseRefName,
             repositorySlug: options.repositorySlug,
             projectOwner: options.projectMapping?.owner,
             projectNumber: options.projectMapping?.number,

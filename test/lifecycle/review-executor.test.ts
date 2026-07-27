@@ -298,7 +298,7 @@ describe('review action executor', () => {
     expect(h.events).toEqual([]);
   });
 
-  it('repairs a current-head Human record and never reaps or reclaims it', async () => {
+  it('reclaims a stale internal Human audit because it is not lifecycle authority', async () => {
     const h = harness({
       readCandidate: async () => candidate({
         reviewRef: {
@@ -309,14 +309,48 @@ describe('review action executor', () => {
     });
 
     await expect(executeReviewAction({ prNumber: 84 }, h.deps))
-      .resolves.toEqual({
-        status: 'human',
+      .resolves.toMatchObject({
+        status: 'spawned',
         prNumber: 84,
-        code: 'review-escalation',
       });
-    expect(h.human).toHaveLength(1);
-    expect(h.events).toEqual([]);
+    expect(h.human).toEqual([]);
+    expect(h.records).toEqual([
+      expect.objectContaining({ state: 'active', head: HEAD }),
+    ]);
+    expect(h.events).toEqual([
+      'record',
+      'claim',
+      'attempt',
+      'projection',
+      'spawn',
+      'track',
+    ]);
   });
+
+  it.each(['human', 'human-intent'] as const)(
+    'reclaims a fresh internal %s audit because only an external Human hold is authoritative',
+    async (state) => {
+      const h = harness({
+        readCandidate: async () => candidate({
+          headChangedAt: '2026-07-20T11:59:00.000Z',
+          reviewRef: {
+            oid: OLD_RECORD,
+            record: claim({
+              state,
+              recordedAt: '2026-07-20T11:59:00.000Z',
+            }),
+          },
+        }),
+      });
+
+      await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+        .resolves.toMatchObject({ status: 'spawned', prNumber: 84 });
+      expect(h.human).toEqual([]);
+      expect(h.records).toEqual([
+        expect.objectContaining({ state: 'active', head: HEAD }),
+      ]);
+    },
+  );
 
   it('repairs the Human projection when the snapshot already exposes the hold', async () => {
     const h = harness({
@@ -367,14 +401,13 @@ describe('review action executor', () => {
     expect(h.records[0]?.reviewer).toBe('one-bot');
   });
 
-  it('fails contradictory mapping, Human evidence, self-review, and wrong draft policy closed', async () => {
+  it('fails canonical ambiguity, Human evidence, self-review, and wrong draft policy closed', async () => {
     const cases: ReviewActionCandidate[] = [
-      candidate({ issueNumber: 43 }),
+      candidate({ mappingProblem: 'Canonical mapping changed to issue #43.' }),
       candidate({ humanHold: true }),
       candidate({ author: 'review-bot' }),
       candidate({ draft: true }),
       candidate({ open: false }),
-      candidate({ body: '<!-- malformed -->' }),
     ];
     for (const current of cases) {
       const h = harness({ readCandidate: async () => current });
@@ -382,6 +415,29 @@ describe('review action executor', () => {
       expect(result.status).not.toBe('spawned');
       expect(h.events).not.toContain('spawn');
     }
+  });
+
+  it('executes an unambiguous canonical closing-reference mapping without a lifecycle marker', async () => {
+    const noMarker = candidate({
+      headRefName: gitRefName('feature/42'),
+      body: 'Closes #42',
+    });
+    const h = harness({
+      readCandidate: async () => noMarker,
+      confirmAcquisition: async ({ expectedHead, expectedReviewRefOid }) => ({
+        ...noMarker,
+        head: expectedHead,
+        reviewRef: {
+          oid: expectedReviewRefOid,
+          record: claim(),
+        },
+      }),
+    });
+
+    await expect(executeReviewAction({ prNumber: 84, expectedHead: HEAD }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned', prNumber: 84 });
+    expect(h.human).toEqual([]);
+    expect(h.events).toContain('spawn');
   });
 
   it('binds attempt authority and approval policy before projection and runtime spawn', async () => {

@@ -1,7 +1,7 @@
 import { DEFAULT_CONFIG } from '../dispatcher/types.js';
 import type { ProjectionAction, ProjectionPlan } from './projection.js';
 import { LifecycleRateLimitError } from './snapshot.js';
-import type { GitOid } from './types.js';
+import type { GitOid, MappingDiagnosticAuthority } from './types.js';
 
 export interface ReconciliationPullRequestState {
   readonly head: GitOid;
@@ -12,12 +12,25 @@ export interface ReconciliationPullRequestState {
 export interface ReconciliationReviewRefState {
   readonly oid: GitOid;
   readonly head: GitOid;
+  readonly generation?: string;
   readonly state:
     | 'active'
     | 'verdict-intent'
     | 'terminal-approved'
+    | 'mapping-reread'
+    | 'human-intent'
     | 'human'
     | 'stale';
+}
+
+export interface ReconciliationHumanCommentAuthority {
+  readonly issueNumber: number;
+  readonly expectedHead: GitOid;
+  readonly expectedReviewRefOid: GitOid;
+  readonly expectedGeneration: string;
+  readonly expectedReviewState?: ReconciliationReviewRefState['state'];
+  readonly expectedDiagnosticIssueNumbers?: readonly number[];
+  readonly expectedDiagnosticDetail?: string;
 }
 
 export type ReconciliationDraftPullRequestAuthority =
@@ -47,12 +60,16 @@ export interface ReconciliationWriter {
     present: boolean,
     expectedHead?: GitOid,
   ): Promise<void>;
-  hasHumanComment(prNumber: number, marker: string): Promise<boolean>;
+  hasHumanComment(
+    prNumber: number,
+    marker: string,
+    authority: ReconciliationHumanCommentAuthority,
+  ): Promise<boolean>;
   ensureHumanComment(
     prNumber: number,
     marker: string,
     body: string,
-    expectedHead?: GitOid,
+    authority: ReconciliationHumanCommentAuthority,
   ): Promise<void>;
   ensureImplementationSummary(
     prNumber: number,
@@ -73,6 +90,26 @@ export interface ReconciliationWriter {
   }): Promise<void>;
   readReviewRef(prNumber: number): Promise<ReconciliationReviewRefState | null>;
   markReviewStale(prNumber: number, expectedReviewRefOid: GitOid): Promise<void>;
+  repairObsoleteMappingHuman?(input: {
+    readonly issueNumber: number;
+    readonly prNumber: number;
+    readonly expectedHead: GitOid;
+    readonly expectedReviewRefOid: GitOid;
+    readonly expectedGeneration: string;
+    readonly expectedAuthor: string;
+    readonly mappingDiagnostic: MappingDiagnosticAuthority;
+    readonly marker: string;
+  }): Promise<void>;
+  readObsoleteMappingHumanRepairState?(input: {
+    readonly issueNumber: number;
+    readonly prNumber: number;
+    readonly expectedHead: GitOid;
+    readonly expectedReviewRefOid: GitOid;
+    readonly expectedGeneration: string;
+    readonly expectedAuthor: string;
+    readonly mappingDiagnostic: MappingDiagnosticAuthority;
+    readonly marker: string;
+  }): Promise<{ readonly complete: boolean }>;
   completeVerdictIntent(
     prNumber: number,
     expectedReviewRefOid: GitOid,
@@ -185,7 +222,7 @@ async function ensureComment(
   if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
     return { action, outcome: 'changed-head' };
   }
-  if (await writer.hasHumanComment(action.prNumber, action.marker)) {
+  if (await writer.hasHumanComment(action.prNumber, action.marker, action)) {
     return { action, outcome: 'already-applied' };
   }
   if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
@@ -196,12 +233,12 @@ async function ensureComment(
       action.prNumber,
       action.marker,
       action.body,
-      action.expectedHead,
+      action,
     );
     return { action, outcome: 'applied' };
   } catch (error) {
     try {
-      if (await writer.hasHumanComment(action.prNumber, action.marker)) {
+      if (await writer.hasHumanComment(action.prNumber, action.marker, action)) {
         return { action, outcome: 'already-applied' };
       }
     } catch {
@@ -356,6 +393,45 @@ async function updateReviewRef(
   }
 }
 
+async function repairObsoleteMappingHuman(
+  action: Extract<ProjectionAction, { kind: 'repair-obsolete-mapping-human' }>,
+  writer: ReconciliationWriter,
+): Promise<ReconciliationResult> {
+  if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
+    return { action, outcome: 'changed-head' };
+  }
+  const before = await writer.readReviewRef(action.prNumber);
+  if (before?.head !== action.expectedHead) return { action, outcome: 'changed-head' };
+  if (
+    before.oid !== action.expectedReviewRefOid
+    || before.generation !== action.expectedGeneration
+    || (before.state !== 'human' && before.state !== 'stale')
+  ) {
+    return { action, outcome: 'lost-race' };
+  }
+  try {
+    if (writer.repairObsoleteMappingHuman === undefined) {
+      throw new Error('Obsolete mapping Human repair is unavailable');
+    }
+    await writer.repairObsoleteMappingHuman(action);
+    if (!await prHeadMatches(writer, action.prNumber, action.expectedHead)) {
+      return { action, outcome: 'changed-head' };
+    }
+    const after = await writer.readReviewRef(action.prNumber);
+    const cleanup = writer.readObsoleteMappingHumanRepairState === undefined
+      ? { complete: false }
+      : await writer.readObsoleteMappingHumanRepairState(action);
+    return after?.head === action.expectedHead
+      && after.generation === action.expectedGeneration
+      && after.state === 'stale'
+      && cleanup.complete
+      ? { action, outcome: 'applied' }
+      : { action, outcome: 'lost-race' };
+  } catch (error) {
+    return { action, outcome: 'failed', detail: message(error) };
+  }
+}
+
 async function executeOne(
   action: ProjectionAction,
   writer: ReconciliationWriter,
@@ -371,6 +447,8 @@ async function executeOne(
       return ensureImplementationSummary(action, writer);
     case 'ensure-draft-pr':
       return ensureDraftPr(action, writer);
+    case 'repair-obsolete-mapping-human':
+      return repairObsoleteMappingHuman(action, writer);
     case 'mark-review-stale':
     case 'complete-verdict-intent':
       return updateReviewRef(action, writer);

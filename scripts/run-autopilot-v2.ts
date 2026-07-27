@@ -496,6 +496,9 @@ export async function runAutopilotV2(
   runner = makeGitHubUsageCommandRunner(runner, usageMeter, {
     rateLimitFloor: DEFAULT_FLOOR,
   });
+  const machineAuthorLogins = new Set(
+    (credentials?.logins() ?? []).map((login) => login.toLowerCase()),
+  );
   // jinn-mono#1883-follow-up: review-claim refs (refs/jinn-autopilot/...) are
   // read over the git transport, not GraphQL (GitHub's `ref(qualifiedName:)`
   // permanently returns null for this custom namespace — proven live).
@@ -532,6 +535,8 @@ export async function runAutopilotV2(
       loaded.config.repository.slug,
     ),
     authorAllowlist: allowlist,
+    machineAuthorLogins,
+    defaultBranch: loaded.config.repository.defaultBranch,
   }, stateDirectory);
   // A persistent observe loop is a runner and takes the same authoritative
   // startup full as recover/active. Only one-shot, read-only status may
@@ -560,9 +565,12 @@ export async function runAutopilotV2(
   };
   const targeted = makeTargetedActionReader({
     authorAllowlist: allowlist,
+    machineAuthorLogins,
+    defaultBranch: loaded.config.repository.defaultBranch,
     rateLimitFloor: DEFAULT_FLOOR,
     readGraphQlRemaining: currentGraphQlRemaining,
     readPullRequest: (prNumber) => reader.readPullRequestForReconciliation(prNumber),
+    readOpenPullRequestIndex: () => restDiscovery.readOpenPullRequestIndex(),
     readProjectItem: (issueNumber) => reader.readProjectItemForReconciliation(issueNumber),
     readIssue: (issueNumber) => restDiscovery.readIssueForAction(issueNumber),
     readBlockedByIssueNumbers: (issueNumber) =>
@@ -599,6 +607,8 @@ export async function runAutopilotV2(
       ),
     readBranchHeadByName: (headRefName: string) =>
       reader.readBranchHeadForReconciliation(headRefName),
+    readBranchClaimByName: (headRefName: string) =>
+      reader.readBranchClaimForReconciliation(headRefName),
     readIssueByNumber: (issueNumber: number) => restDiscovery.readIssueForAction(issueNumber),
     readBlockedByIssueNumbers: (issueNumber: number) =>
       restDiscovery.readBlockedByIssueNumbersForAction(issueNumber),
@@ -663,7 +673,10 @@ export async function runAutopilotV2(
             repositoryPath,
             cycleSnapshot,
             ...reconciliationTargets,
+            readCanonicalSnapshot: (prNumber) =>
+              targeted.readPullRequest(cycleSnapshot, prNumber),
             credential: selection.credential,
+            credentials,
             runner,
             environment: runtimeEnvironment,
             repositorySlug: loaded.config.repository.slug,

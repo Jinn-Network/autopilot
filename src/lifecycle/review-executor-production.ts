@@ -40,6 +40,7 @@ import {
   type GitOid,
 } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 
 export interface ProductionReviewActionPortOptions {
   readonly repositoryPath: string;
@@ -170,6 +171,62 @@ export function makeProductionReviewActionPort(
     return Buffer.from(contents.content.replaceAll('\n', ''), 'base64')
       .toString('utf8');
   };
+  const readFreshExternalHumanAuthority = async (input: {
+    readonly prNumber: number;
+    readonly expectedIssueNumber?: number;
+    readonly pullRequestLabels?: readonly string[];
+  }): Promise<boolean> => {
+    const snapshot = await options.readSnapshot(input.prNumber);
+    if (snapshot === null) {
+      throw new Error('Fresh review Human authority is unavailable');
+    }
+    const mapping = snapshot.pullRequestMappings?.find(
+      (entry) => entry.prNumber === input.prNumber,
+    );
+    if (
+      mapping?.status !== 'resolved'
+      || (
+        input.expectedIssueNumber !== undefined
+        && mapping.issueNumber !== input.expectedIssueNumber
+      )
+    ) {
+      throw new Error('Fresh review Human authority lost canonical mapping');
+    }
+    const pullRequest = snapshot.pullRequests.find(
+      (candidate) => candidate.number === input.prNumber,
+    );
+    const nativeIssue = snapshot.issues.find(
+      (issue) => issue.number === mapping.issueNumber,
+    );
+    const projectItem = snapshot.project.items.find((item) => (
+      item.contentType === 'Issue' && item.number === mapping.issueNumber
+    ));
+    if (
+      pullRequest === undefined
+      || pullRequest.state !== 'OPEN'
+      || nativeIssue === undefined
+      || projectItem === undefined
+    ) {
+      throw new Error('Fresh review Human authority is incomplete');
+    }
+    return hasExternalHumanAuthority({
+      pullRequestLabels: [
+        ...pullRequest.labels,
+        ...(input.pullRequestLabels ?? []),
+      ],
+      nativeIssueLabels: nativeIssue.labels,
+      projectBlockedOn: projectItem.blockedOn,
+    });
+  };
+  const assertFreshExternalHumanAuthorityClear = async (input: {
+    readonly prNumber: number;
+    readonly expectedIssueNumber?: number;
+    readonly pullRequestLabels?: readonly string[];
+  }): Promise<void> => {
+    if (await readFreshExternalHumanAuthority(input)) {
+      throw new Error('Review stopped because Human is dominant');
+    }
+  };
   const candidateFromSnapshot = async (
     snapshot: GitHubLifecycleSnapshot,
     prNumber: number,
@@ -178,14 +235,20 @@ export function makeProductionReviewActionPort(
     if (pr === undefined) return null;
     const lifecycle = snapshot.lifecycle.items.find((item) =>
       item.kind === 'pull-request' && item.prNumber === prNumber);
-    const diagnostic = snapshot.diagnostics.find((entry) =>
-      entry.pullRequests.some((candidate) => candidate.number === prNumber));
-    const marker = /<!-- jinn-autopilot:v2 issue=([1-9][0-9]*) branch=([^ >]+) -->/
-      .exec(pr.body);
-    const issueNumber = lifecycle?.issueNumber
-      ?? diagnostic?.issueNumbers[0]
-      ?? (marker === null ? undefined : Number(marker[1]));
+    const structuredMapping = snapshot.pullRequestMappings?.find(
+      (entry) => entry.prNumber === prNumber,
+    );
+    if (structuredMapping === undefined) return null;
+    const issueNumber = structuredMapping?.status === 'resolved'
+      ? structuredMapping.issueNumber
+      : structuredMapping?.status === 'ambiguous'
+        ? structuredMapping.issueNumbers[0]
+        : undefined;
     if (issueNumber === undefined) return null;
+    const nativeIssue = snapshot.issues.find((issue) => issue.number === issueNumber);
+    const projectItem = snapshot.project.items.find((item) => (
+      item.contentType === 'Issue' && item.number === issueNumber
+    ));
     const changedFiles = await readExactChangedFiles({
       run: runner,
       prNumber,
@@ -224,9 +287,11 @@ export function makeProductionReviewActionPort(
       author: pr.author,
       labels: [...pr.labels],
       body: pr.body,
-      humanHold: lifecycle?.humanHold === true
-        || lifecycle?.projectStatus === 'Human'
-        || pr.labels.includes('review:needs-human'),
+      humanHold: hasExternalHumanAuthority({
+        pullRequestLabels: pr.labels,
+        nativeIssueLabels: nativeIssue?.labels,
+        projectBlockedOn: projectItem?.blockedOn,
+      }),
       approvalPolicy: humanSurface ? 'human-codeowner' : 'approve-eligible',
       nativeReviews: pr.reviews.map((review) => ({
         reviewer: review.reviewer,
@@ -239,7 +304,9 @@ export function makeProductionReviewActionPort(
         ? {}
         : { reviewRef: { oid: reviewClaim.oid, record: reviewClaim.record } }),
       ...(terminalApprovalMatches ? { terminalApprovalMatches: true } : {}),
-      ...(diagnostic === undefined ? {} : { mappingProblem: diagnostic.detail }),
+      ...(structuredMapping?.status === 'ambiguous'
+        ? { mappingProblem: structuredMapping.details.join(' ') }
+        : {}),
     };
   };
   const createMetadataCommit = async (
@@ -293,7 +360,7 @@ export function makeProductionReviewActionPort(
       expectedRemoteRecordOid,
       recordOid,
       credential,
-    }) => withCredential(credential, (askpass, environment) => {
+    }) => withCredential(credential, async (askpass, environment) => {
       const secureRunner = (
         _command: 'git',
         args: readonly string[],
@@ -302,6 +369,7 @@ export function makeProductionReviewActionPort(
         '-C', options.repositoryPath,
         ...args,
       ], { env: environment });
+      await assertFreshExternalHumanAuthorityClear({ prNumber });
       return makeGitProtocolPort(secureRunner, {
         remote: repositoryUrl,
       }).publishReviewClaim({
@@ -369,9 +437,13 @@ export function makeProductionReviewActionPort(
           throw new Error('Review projection PR authority changed');
         }
         const labels = pr.labels!.map((label) => label.name);
-        if (labels.includes('review:needs-human')) {
-          throw new Error('Review projection stopped because Human is dominant');
-        }
+        await assertFreshExternalHumanAuthorityClear({
+          prNumber: candidate.number,
+          expectedIssueNumber: candidate.issueNumber,
+          pullRequestLabels: labels.filter(
+            (label): label is string => typeof label === 'string',
+          ),
+        });
         if (!labels.includes('engine:review')) {
           await mutateWithExactReadback(
             () => gh('gh', [
@@ -394,7 +466,7 @@ export function makeProductionReviewActionPort(
         const item = project.items.find((entry) =>
           entry.contentType === 'Issue' && entry.number === candidate.issueNumber);
         if (item === undefined) throw new Error('Review issue is missing from Project');
-        if (item.status === 'Human' || item.blockedOn === 'Human') {
+        if (item.blockedOn === 'Human') {
           throw new Error('Review projection stopped because Human is dominant');
         }
         if (item.status !== 'In Review') {

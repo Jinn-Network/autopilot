@@ -99,6 +99,8 @@ export type ReviewClaimState =
   | 'active'
   | 'verdict-intent'
   | 'terminal-approved'
+  | 'mapping-reread'
+  | 'human-intent'
   | 'human'
   | 'stale';
 
@@ -107,6 +109,25 @@ export type ReviewVerdictState = 'APPROVE' | 'REQUEST_CHANGES';
 export interface ReviewVerdict {
   readonly marker: string;
   readonly state: ReviewVerdictState;
+}
+
+/**
+ * Bounded identity captured by an isolated review worker when its scheduled
+ * PR mapping no longer proves unique. It deliberately carries no diagnostic:
+ * only the coordinator's complete canonical snapshot may produce one.
+ */
+export interface MappingRereadRequest {
+  readonly selectedIssueNumber: number;
+  readonly headRefName: string;
+  readonly baseRefName: string;
+}
+
+/** Exact, deterministic authority for one canonical mapping diagnostic. */
+export interface MappingDiagnosticAuthority {
+  readonly selectedIssueNumber: number;
+  readonly issueNumbers: readonly number[];
+  readonly detail: string;
+  readonly signature: string;
 }
 
 interface ReviewClaimBase {
@@ -122,7 +143,22 @@ interface ReviewClaimBase {
 
 export type ReviewClaimRecord =
   | (ReviewClaimBase & {
-      readonly state: 'active' | 'human' | 'stale';
+      readonly state: 'active' | 'stale';
+      readonly verdict?: never;
+    })
+  | (ReviewClaimBase & {
+      readonly state: 'mapping-reread';
+      readonly mappingRequest: MappingRereadRequest;
+      readonly verdict?: never;
+    })
+  | (ReviewClaimBase & {
+      readonly state: 'human-intent';
+      readonly mappingDiagnostic: MappingDiagnosticAuthority;
+      readonly verdict?: never;
+    })
+  | (ReviewClaimBase & {
+      readonly state: 'human';
+      readonly mappingDiagnostic?: MappingDiagnosticAuthority;
       readonly verdict?: never;
     })
   | (ReviewClaimBase & {
@@ -148,6 +184,7 @@ export type HumanReason =
       readonly phase: 'awaiting-review' | 'reviewing';
       readonly code:
         | 'review-escalation'
+        | 'branch-mapping-ambiguous'
         | 'reviewer-identity-unavailable'
         | 'invalid-review-progress-time';
       readonly detail: string;
@@ -205,6 +242,22 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   readonly kind: 'pull-request';
   readonly prNumber: number;
   readonly head: GitOid;
+  /** Base authority derived independently from configured default/dependency evidence. */
+  readonly expectedBaseRefName?: string;
+  /**
+   * Exact machine-authored mapping hold that may be repaired under review-ref
+   * CAS after the canonical mapping has become uniquely resolvable.
+   */
+  readonly obsoleteMachineMappingHuman?: {
+    readonly generation: string;
+    readonly author: string;
+    readonly mappingDiagnostic: MappingDiagnosticAuthority;
+    readonly reason: {
+      readonly phase: 'eligible' | 'implementing' | 'awaiting-review' | 'reviewing';
+      readonly code: 'branch-mapping-ambiguous';
+      readonly detail: string;
+    };
+  };
   readonly headChangedAt: string;
   readonly isDraft: boolean;
   readonly merged: boolean;
@@ -232,6 +285,7 @@ export interface LifecycleMappingDiagnostic {
   readonly code: 'branch-mapping-ambiguous';
   readonly detail: string;
   readonly issueNumbers: readonly number[];
+  readonly signature: string;
   readonly issues: readonly {
     readonly number: number;
     readonly projectStatus: LifecycleItemBase['projectStatus'];
@@ -303,12 +357,14 @@ export type NewWorkAction =
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
     }
   | {
       readonly kind: 'file-reconcile-child';
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
       readonly effort: 'low' | 'medium' | 'high';
     }
   | {
@@ -328,6 +384,7 @@ export type NewWorkAction =
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
     };
 
 export type RecoveryAction =

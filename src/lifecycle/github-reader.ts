@@ -48,7 +48,7 @@ const COMMIT_HISTORY_PAGE_SIZE = 100;
 const MAX_COMMIT_HISTORY_PAGES = 100;
 
 const PR_FIELDS = `
-        number title body baseRefName headRefName headRefOid isDraft state
+        number title body updatedAt baseRefName headRefName headRefOid isDraft state
         author { login }
         labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
         closingIssuesReferences(first: 20) { pageInfo { hasNextPage } nodes { number } }
@@ -69,7 +69,17 @@ const PR_FIELDS = `
         }
         comments(last: 100) {
           pageInfo { hasPreviousPage }
-          nodes { body createdAt }
+          nodes { fullDatabaseId body author { login } }
+        }
+        timelineItems(last: 100, itemTypes: [LABELED_EVENT, UNLABELED_EVENT, CONVERT_TO_DRAFT_EVENT, READY_FOR_REVIEW_EVENT]) {
+          pageInfo { hasPreviousPage }
+          nodes {
+            __typename
+            ... on LabeledEvent { actor { login } createdAt label { name } }
+            ... on UnlabeledEvent { actor { login } createdAt label { name } }
+            ... on ConvertToDraftEvent { actor { login } createdAt }
+            ... on ReadyForReviewEvent { actor { login } createdAt }
+          }
         }
         statusCheckRollup {
           contexts(first: 100) {
@@ -101,7 +111,7 @@ const MERGED_PR_FIELDS = `
 const PR_QUERY = `query($owner: String!, $name: String!, $cursor: String) {
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
-    pullRequests(first: ${PR_PAGE_SIZE}, after: $cursor, states: [OPEN], labels: ["engine:review"], orderBy: {field: UPDATED_AT, direction: DESC}) {
+    pullRequests(first: ${PR_PAGE_SIZE}, after: $cursor, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         ${PR_FIELDS}
@@ -380,6 +390,7 @@ interface GraphQlPr {
   number: number;
   title: string;
   body: string;
+  updatedAt: string;
   author: { login?: string } | null;
   baseRefName: string;
   headRefName: string;
@@ -414,7 +425,24 @@ interface GraphQlPr {
   };
   comments: {
     pageInfo: { hasPreviousPage: boolean };
-    nodes: Array<{ body: string; createdAt: string }>;
+    nodes: Array<{
+      fullDatabaseId: string;
+      body: string;
+      author?: { login?: string } | null;
+    }>;
+  };
+  timelineItems: {
+    pageInfo: { hasPreviousPage: boolean };
+    nodes: Array<{
+      __typename:
+        | 'LabeledEvent'
+        | 'UnlabeledEvent'
+        | 'ConvertToDraftEvent'
+        | 'ReadyForReviewEvent';
+      actor: { login?: string } | null;
+      createdAt: string;
+      label?: { name: string };
+    }>;
   };
   statusCheckRollup: {
     contexts: {
@@ -509,14 +537,14 @@ function matchingBranchTrailers(
  * `readPullRequests` / `readMergedOutcomes`.
  */
 export class PrEvidenceInconsistentError extends Error {
-  constructor(readonly prNumber: number, message: string) {
+  constructor(
+    readonly prNumber: number,
+    message: string,
+    readonly closingIssueNumbersIncomplete = false,
+  ) {
     super(message);
     this.name = 'PrEvidenceInconsistentError';
   }
-}
-
-function toErrorMessage(value: unknown): string {
-  return value instanceof Error ? value.message : String(value);
 }
 
 function assertCompletePrNode(pr: GraphQlPr): void {
@@ -527,13 +555,14 @@ function assertCompletePrNode(pr: GraphQlPr): void {
     throw new PrEvidenceInconsistentError(
       pr.number,
       `PR #${pr.number} closing issue references were truncated`,
+      true,
     );
   }
   if (pr.reviews.pageInfo.hasNextPage) {
     throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} reviews were truncated`);
   }
-  if (pr.comments.pageInfo.hasPreviousPage) {
-    throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} comments were truncated`);
+  if (pr.timelineItems.pageInfo.hasPreviousPage) {
+    throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} timeline was truncated`);
   }
   if (pr.statusCheckRollup?.contexts.pageInfo.hasNextPage === true) {
     throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} checks were truncated`);
@@ -557,6 +586,7 @@ function assertCompleteMergedPrNode(pr: GraphQlMergedPr): void {
     throw new PrEvidenceInconsistentError(
       pr.number,
       `PR #${pr.number} closing issue references were truncated`,
+      true,
     );
   }
 }
@@ -599,13 +629,17 @@ function rawMergedPullRequest(pr: GraphQlMergedPr): RawPullRequest {
     branchClaimTrailers: null,
     reviewClaim: null,
     humanIssueNumber: null,
+    humanAuthor: null,
     humanReason: null,
     mergedAt: pr.mergedAt,
     mergeCommitOid: pr.mergeCommit?.oid ?? null,
   };
 }
 
-function inconsistentPullRequest(pr: GraphQlPr, detail: string): RawPullRequest {
+function inconsistentPullRequest(
+  pr: GraphQlPr,
+  error: PrEvidenceInconsistentError,
+): RawPullRequest {
   return {
     number: pr.number,
     title: pr.title,
@@ -618,15 +652,22 @@ function inconsistentPullRequest(pr: GraphQlPr, detail: string): RawPullRequest 
     isDraft: pr.isDraft,
     state: 'OPEN',
     labels: pr.labels.nodes.map((label) => label.name),
-    closingIssueNumbers: pr.closingIssuesReferences.nodes.map((issue) => issue.number),
+    closingIssueNumbers: error.closingIssueNumbersIncomplete
+      ? []
+      : pr.closingIssuesReferences.nodes.map((issue) => issue.number),
+    ...(error.closingIssueNumbersIncomplete
+      ? { closingIssueNumbersIncomplete: true as const }
+      : {}),
     mergeability: pr.mergeable,
     mergeStateStatus: pr.mergeStateStatus,
     checks: [],
     reviews: [],
+    evidenceIncompleteReason: error.message,
     branchClaimTrailers: null,
     reviewClaim: null,
     humanIssueNumber: null,
-    humanReason: { phase: 'awaiting-review', code: 'review-escalation', detail },
+    humanAuthor: null,
+    humanReason: null,
     mergedAt: pr.mergedAt,
     mergeCommitOid: pr.mergeCommit?.oid ?? null,
   };
@@ -829,6 +870,35 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       throw new Error(`Branch ${branch} readback is malformed`);
     }
     return gitOid(fields[0]);
+  }
+
+  async readBranchClaimForReconciliation(
+    headRefName: string,
+  ): Promise<RawBranchClaim | null> {
+    const branch = gitRefName(headRefName);
+    const match = /^autopilot\/([1-9][0-9]*)$/.exec(branch);
+    if (match?.[1] === undefined) {
+      throw new Error(`Branch ${branch} is not a stable Autopilot issue branch`);
+    }
+    const head = await this.readBranchHeadForReconciliation(branch);
+    if (head === null) return null;
+    const claims = await this.branchClaimsFromRefs([{
+      name: `refs/heads/${branch}`,
+      oid: head,
+    }]);
+    if (claims.length > 1) {
+      throw new Error(`Branch ${branch} claim readback is ambiguous`);
+    }
+    const claim = claims[0];
+    if (
+      claim === undefined
+      || claim.issueNumber !== Number(match[1])
+      || claim.headRefName !== branch
+      || claim.headOid !== head
+    ) {
+      return null;
+    }
+    return claim;
   }
 
   async readGraphQlRemaining(): Promise<number> {
@@ -1180,24 +1250,78 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         submittedAt: review.submittedAt,
       };
     });
-    let humanEvidence: ReturnType<typeof parseHumanCommentEvidence> | undefined;
+    let humanEvidence: (
+      NonNullable<ReturnType<typeof parseHumanCommentEvidence>>
+      & { readonly author?: string }
+    ) | undefined;
     try {
-      humanEvidence = [...pr.comments.nodes]
-        .reverse()
-        .map((comment) => parseHumanCommentEvidence(comment.body))
-        .find((evidence) => evidence !== null);
-    } catch (cause) {
-      throw new PrEvidenceInconsistentError(
-        pr.number,
-        `PR #${pr.number} has undecodable structured Human evidence: ${toErrorMessage(cause)}`,
-      );
+      if (pr.comments.pageInfo.hasPreviousPage) {
+        throw new Error('structured comment audit is truncated');
+      }
+      let structured: {
+        readonly id: bigint;
+        readonly evidence: NonNullable<ReturnType<typeof parseHumanCommentEvidence>>
+          & { readonly author?: string };
+      } | undefined;
+      const structuredIds = new Set<string>();
+      for (const comment of pr.comments.nodes) {
+        const evidence = parseHumanCommentEvidence(comment.body);
+        if (evidence === null) {
+          if (comment.body.includes('<!-- jinn-autopilot-human:')) {
+            throw new Error('invalid structured Human marker or diagnostic signature');
+          }
+          continue;
+        }
+        if (
+          !/^[1-9][0-9]*$/.test(comment.fullDatabaseId)
+          || structuredIds.has(comment.fullDatabaseId)
+        ) {
+          throw new Error('invalid structured Human comment database ID order');
+        }
+        structuredIds.add(comment.fullDatabaseId);
+        const candidate = {
+          id: BigInt(comment.fullDatabaseId),
+          evidence: {
+            ...evidence,
+            ...(comment.author?.login === undefined
+              ? {}
+              : { author: comment.author.login }),
+          },
+        };
+        if (structured === undefined || structured.id < candidate.id) {
+          structured = candidate;
+        }
+      }
+      humanEvidence = structured?.evidence;
+    } catch {
+      // Comments are audit-only. Malformed, contradictory, or truncated
+      // comment evidence disables signed migration repair for this read, but
+      // must not replace the PR's lifecycle authority.
+      humanEvidence = undefined;
     }
     if (humanEvidence !== undefined && humanEvidence.prNumber !== pr.number) {
-      throw new PrEvidenceInconsistentError(
-        pr.number,
-        `PR #${pr.number} has contradictory structured Human evidence`,
-      );
+      humanEvidence = undefined;
     }
+    const latestHumanLabelEvent = [...pr.timelineItems.nodes]
+      .reverse()
+      .find((event) => (
+        (event.__typename === 'LabeledEvent' || event.__typename === 'UnlabeledEvent')
+        && event.label?.name === 'review:needs-human'
+      ));
+    const latestDraftEvent = [...pr.timelineItems.nodes]
+      .reverse()
+      .find((event) => (
+        event.__typename === 'ConvertToDraftEvent'
+        || event.__typename === 'ReadyForReviewEvent'
+      ));
+    const humanLabelActor = pr.labels.nodes.some((label) => label.name === 'review:needs-human')
+      && latestHumanLabelEvent?.__typename === 'LabeledEvent'
+      ? latestHumanLabelEvent.actor?.login
+      : undefined;
+    const draftActor = pr.isDraft
+      && latestDraftEvent?.__typename === 'ConvertToDraftEvent'
+      ? latestDraftEvent.actor?.login
+      : undefined;
     return {
       number: pr.number,
       title: pr.title,
@@ -1207,6 +1331,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       headRefName: pr.headRefName,
       headOid: pr.headRefOid,
       headCommittedAt: latest.committedDate,
+      updatedAt: pr.updatedAt,
       isDraft: pr.isDraft,
       state: pr.state,
       labels: pr.labels.nodes.map((label) => label.name),
@@ -1221,6 +1346,15 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         ? await this.reviewClaim(pr.number, reviewClaimListing)
         : null,
       humanIssueNumber: humanEvidence?.issueNumber ?? null,
+      humanAuthor: humanEvidence?.author ?? null,
+      humanHead: humanEvidence?.head ?? null,
+      humanGeneration: humanEvidence?.generation ?? null,
+      humanDiagnosticIssueNumbers:
+        humanEvidence?.diagnosticIssueNumbers ?? null,
+      humanDiagnosticSignature:
+        humanEvidence?.diagnosticSignature ?? null,
+      humanLabelActor: humanLabelActor ?? null,
+      draftActor: draftActor ?? null,
       humanReason: humanEvidence?.reason ?? null,
       mergedAt: pr.mergedAt,
       mergeCommitOid: pr.mergeCommit?.oid ?? null,
@@ -1241,12 +1375,16 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   private async readMergedOutcomes(
     nonDoneIssueNumbers: readonly number[],
     reviewClaimListing: ReadonlyMap<number, GitOid>,
-  ): Promise<RawPullRequest[]> {
+  ): Promise<{
+    readonly nodes: readonly RawPullRequest[];
+    readonly closingIssueEvidenceIncomplete: boolean;
+  }> {
     const unique = [...new Set(nonDoneIssueNumbers)].sort((left, right) => left - right);
     for (const number of unique) {
       if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Invalid issue number');
     }
     const merged: RawPullRequest[] = [];
+    let closingIssueEvidenceIncomplete = false;
     for (let offset = 0; offset < unique.length; offset += MERGED_ISSUE_BATCH_SIZE) {
       const batch = unique.slice(offset, offset + MERGED_ISSUE_BATCH_SIZE);
       const query = mergedOutcomesQuery(batch);
@@ -1266,6 +1404,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
             `[github-reader] skipping merged outcomes for issue #${number} (continuing): `
               + `closing PR outcomes were truncated`,
           );
+          closingIssueEvidenceIncomplete = true;
           continue;
         }
         for (const pr of connection.nodes) {
@@ -1276,7 +1415,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
             merged.push(
               await this.rawPullRequest(full, true, reviewClaimListing).catch((error: unknown) => {
                 if (!(error instanceof PrEvidenceInconsistentError)) throw error;
-                return inconsistentPullRequest(full, error.message);
+                return inconsistentPullRequest(full, error);
               }),
             );
             continue;
@@ -1291,6 +1430,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
             merged.push(rawMergedPullRequest(pr));
           } catch (error: unknown) {
             if (!(error instanceof PrEvidenceInconsistentError)) throw error;
+            closingIssueEvidenceIncomplete = true;
             console.warn(
               `[github-reader] skipping merged PR #${pr.number} evidence (continuing): `
                 + error.message,
@@ -1299,7 +1439,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         }
       }
     }
-    return merged;
+    return { nodes: merged, closingIssueEvidenceIncomplete };
   }
 
   private async readPullRequestByNumber(prNumber: number): Promise<GraphQlPr> {
@@ -1330,7 +1470,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     if (raw.state === 'CLOSED') return null;
     return this.rawPullRequest(raw, true).catch((error: unknown) => {
       if (!(error instanceof PrEvidenceInconsistentError)) throw error;
-      return inconsistentPullRequest(raw, error.message);
+      return inconsistentPullRequest(raw, error);
     });
   }
 
@@ -1433,21 +1573,27 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     const openNodes = await Promise.all(connection.nodes.map((pr) => (
       this.rawPullRequest(pr, true, reviewClaimListing).catch((error: unknown) => {
         if (!(error instanceof PrEvidenceInconsistentError)) throw error;
-        return inconsistentPullRequest(pr, error.message);
+        return inconsistentPullRequest(pr, error);
       })
     ))).then((nodes) => nodes.map((pr) => (
       ciRerunRecorded.has(`${pr.number}/${pr.headOid}`)
         ? { ...pr, ciRerunRecorded: true as const }
         : pr
     )));
-    const mergedNodes = cursor === null
+    const mergedOutcomes = cursor === null
       ? await this.readMergedOutcomes(nonDoneIssueNumbers, reviewClaimListing)
-      : [];
+      : { nodes: [], closingIssueEvidenceIncomplete: false };
     const byNumber = new Map<number, RawPullRequest>();
-    for (const pr of [...openNodes, ...mergedNodes]) {
+    for (const pr of [...openNodes, ...mergedOutcomes.nodes]) {
       if (!byNumber.has(pr.number)) byNumber.set(pr.number, pr);
     }
-    return { nodes: [...byNumber.values()], pageInfo: connection.pageInfo };
+    return {
+      nodes: [...byNumber.values()],
+      pageInfo: connection.pageInfo,
+      ...(mergedOutcomes.closingIssueEvidenceIncomplete
+        ? { closingIssueEvidenceIncomplete: true as const }
+        : {}),
+    };
   }
 
   private async branchClaimsFromRefs(

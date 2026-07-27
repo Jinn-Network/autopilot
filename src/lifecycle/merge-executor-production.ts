@@ -22,6 +22,7 @@ import type {
 } from './snapshot.js';
 import { decodeCompareStatus, gitOid, gitRefName } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
+import { hasExternalHumanAuthority } from './human-authority.js';
 
 export interface ProductionMergeActionPortOptions {
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
@@ -56,6 +57,31 @@ function effectiveCurrentHeadReviews(
   return [...latest.values()];
 }
 
+function hasExactCanonicalMergeAuthority(
+  snapshot: GitHubLifecycleSnapshot,
+  prNumber: number,
+  head: string,
+  expectedBaseRefName: string,
+): boolean {
+  if (snapshot.snapshotComplete !== true) return false;
+  const pr = snapshot.pullRequests.find((entry) => entry.number === prNumber);
+  const lifecycle = snapshot.lifecycle.items.find((entry) => (
+    entry.kind === 'pull-request' && entry.prNumber === prNumber
+  ));
+  const mappings = snapshot.pullRequestMappings?.filter(
+    (entry) => entry.prNumber === prNumber,
+  ) ?? [];
+  const mapping = mappings.length === 1 ? mappings[0] : undefined;
+  return pr?.state === 'OPEN'
+    && pr.headOid === head
+    && pr.baseRefName === expectedBaseRefName
+    && lifecycle?.kind === 'pull-request'
+    && lifecycle.head === head
+    && mapping?.status === 'resolved'
+    && mapping.issueNumber === lifecycle.issueNumber
+    && mapping.expectedBaseRefName === expectedBaseRefName;
+}
+
 export function makeProductionMergeActionPort(
   options: ProductionMergeActionPortOptions,
 ): ProductionMergeActionPort {
@@ -73,14 +99,26 @@ export function makeProductionMergeActionPort(
     if (pr === undefined) return null;
     const lifecycle = snapshot.lifecycle.items.find((entry) =>
       entry.kind === 'pull-request' && entry.prNumber === prNumber);
-    const diagnostic = snapshot.diagnostics.find((entry) =>
-      entry.pullRequests.some((candidate) => candidate.number === prNumber));
-    if (lifecycle?.kind !== 'pull-request') return null;
+    if (
+      lifecycle?.kind !== 'pull-request'
+      || !hasExactCanonicalMergeAuthority(
+        snapshot,
+        prNumber,
+        pr.headOid,
+        expectedBase,
+      )
+    ) return null;
+    const nativeIssue = (snapshot.issues ?? []).find((issue) => (
+      issue.number === lifecycle.issueNumber
+    ));
+    const projectItem = (snapshot.project?.items ?? []).find((item) => (
+      item.contentType === 'Issue' && item.number === lifecycle.issueNumber
+    ));
     const changedFiles = await readExactChangedFiles({
       run: runner,
       prNumber: pr.number,
       expectedHead: pr.headOid,
-      expectedBaseRefName: pr.baseRefName,
+      expectedBaseRefName: expectedBase,
       context: 'Merge',
       repositorySlug,
     });
@@ -142,12 +180,14 @@ export function makeProductionMergeActionPort(
       expectedBaseRefName: expectedBase,
       draft: pr.isDraft,
       labels: [...pr.labels],
-      humanHold: lifecycle.humanHold === true
-        || lifecycle.projectStatus === 'Human'
-        || pr.labels.includes('review:needs-human'),
+      humanHold: hasExternalHumanAuthority({
+        pullRequestLabels: pr.labels,
+        nativeIssueLabels: nativeIssue?.labels,
+        projectBlockedOn: projectItem?.blockedOn,
+      }),
       author: pr.author,
       authorAllowed: options.authorAllowlist.has(pr.author.toLowerCase()),
-      uniqueIssueMapping: diagnostic === undefined,
+      uniqueIssueMapping: true,
       terminalApprovalMatches,
       ...(lifecycle.reviewClaim?.reviewer === undefined
         ? {}
@@ -172,8 +212,54 @@ export function makeProductionMergeActionPort(
 
   return {
     readCandidate,
-    mergeExactHead: ({ prNumber, head, credential }): Promise<ExactMergeOutcome> =>
+    mergeExactHead: ({
+      prNumber,
+      head,
+      expectedBaseRefName,
+      credential,
+    }): Promise<ExactMergeOutcome> =>
       withCredential(credential, async ({ run }) => {
+        const canonical = await options.readSnapshot();
+        const canonicalPr = canonical.pullRequests.find(
+          (entry) => entry.number === prNumber,
+        );
+        if (canonicalPr !== undefined && canonicalPr.headOid !== head) {
+          return { status: 'changed-head', head: canonicalPr.headOid };
+        }
+        if (!hasExactCanonicalMergeAuthority(
+          canonical,
+          prNumber,
+          head,
+          expectedBaseRefName,
+        )) {
+          return {
+            status: 'rejected',
+            head,
+            reason: 'Canonical mapping authority changed before the exact-head merge',
+          };
+        }
+        const authority = JSON.parse(await run('gh', [
+          'pr', 'view', String(prNumber), '--repo', repositorySlug,
+          '--json', 'state,headRefOid,baseRefName',
+        ])) as {
+          state?: unknown;
+          headRefOid?: unknown;
+          baseRefName?: unknown;
+        };
+        if (typeof authority.headRefOid === 'string' && authority.headRefOid !== head) {
+          return { status: 'changed-head', head: gitOid(authority.headRefOid) };
+        }
+        if (
+          authority.state !== 'OPEN'
+          || authority.headRefOid !== head
+          || authority.baseRefName !== expectedBaseRefName
+        ) {
+          return {
+            status: 'rejected',
+            head,
+            reason: 'Merge base authority changed before the exact-head merge',
+          };
+        }
         try {
           const response = JSON.parse(await run('gh', [
             'api', '-X', 'PUT', `repos/${repositorySlug}/pulls/${prNumber}/merge`,
@@ -192,15 +278,17 @@ export function makeProductionMergeActionPort(
         }
         const readback = JSON.parse(await run('gh', [
           'pr', 'view', String(prNumber), '--repo', repositorySlug,
-          '--json', 'state,headRefOid,mergeCommit',
+          '--json', 'state,headRefOid,baseRefName,mergeCommit',
         ])) as {
           state?: unknown;
           headRefOid?: unknown;
+          baseRefName?: unknown;
           mergeCommit?: { oid?: unknown } | null;
         };
         if (
           readback.state === 'MERGED'
           && readback.headRefOid === head
+          && readback.baseRefName === expectedBaseRefName
           && typeof readback.mergeCommit?.oid === 'string'
         ) {
           return {
