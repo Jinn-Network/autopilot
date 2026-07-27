@@ -84,6 +84,16 @@ export type MarketplaceMutationAdoptionBoundary =
   | 'receipt-comment-created'
   | 'receipt-persisted';
 
+export class MarketplaceAdoptionCrashInjectionError extends Error {
+  readonly boundary: MarketplaceMutationAdoptionBoundary;
+
+  constructor(boundary: MarketplaceMutationAdoptionBoundary) {
+    super(`crash after ${boundary}`);
+    this.name = 'MarketplaceAdoptionCrashInjectionError';
+    this.boundary = boundary;
+  }
+}
+
 export interface MarketplaceMutationAuthority {
   readonly manifest: AttemptManifest;
   readonly remoteHead: GitOid;
@@ -185,7 +195,7 @@ function errorDetail(error: unknown): string {
 }
 
 function isAdoptionCrashInjection(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith('crash after ');
+  return error instanceof MarketplaceAdoptionCrashInjectionError;
 }
 
 function receiptSafeDetail(detail: string): string {
@@ -560,6 +570,7 @@ function adoptionCutoff(session: AutopilotSessionCapsule): number {
 function rejectedReceipt(
   parsed: ParsedObservation | Omit<ParsedObservation, 'patch' | 'artifact'>,
   failure: StableFailure,
+  _authority: MarketplaceMutationAuthority,
   now: () => Date,
 ): AutopilotAdoptionReceipt {
   return AutopilotAdoptionReceiptSchema.parse({
@@ -675,7 +686,7 @@ async function stableReject(
       touchedPaths,
     );
   }
-  const receipt = rejectedReceipt(parsed, failure, nowFn(deps));
+  const receipt = rejectedReceipt(parsed, failure, publicationAuthority, nowFn(deps));
   const facts = rejectedFacts(parsed, publicationAuthority, failure.reason);
   try {
     const publication = await publishAdoptionReceipt(facts, receipt, deps.receipts);
@@ -718,7 +729,7 @@ async function stableReject(
       receipt: rejectedReceipt(parsed, {
         reason: 'receipt-contradiction',
         detail: errorDetail(error),
-      }, nowFn(deps)),
+      }, publicationAuthority, nowFn(deps)),
     };
   }
 }

@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   makeProductionCapabilityPreflight,
-  buildMarketplaceRecoveryLifecycleSnapshot,
+  makeMarketplaceRecoveryReadSnapshot,
 } from '../../src/lifecycle/active-runtime-production.js';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
@@ -541,36 +541,50 @@ describe('marketplace solution recovery', () => {
     expect(result).toEqual({ ok: true });
   });
 
-  it('builds recovery snapshots with resolved PR mappings from manifest facts', () => {
+  it('reads recovery snapshots from targeted PR authority instead of fabricating mappings', async () => {
     const harness = new Harness('implement', 'submitted');
     const manifest = readAttemptManifest(harness.manifestPath);
-    const snapshot = buildMarketplaceRecoveryLifecycleSnapshot({
-      manifest,
-      capturedAt: NOW.toISOString(),
-      issue: {
-        number: 2001,
+    const cycleSnapshot = snapshot();
+    const targetedSnapshot = {
+      ...cycleSnapshot,
+      pullRequestMappings: [{
+        status: 'ambiguous' as const,
+        prNumber: 2101,
+        issueNumbers: [2001, 2002],
+        details: ['PR maps to multiple issues'],
+      }],
+      pullRequests: [{
+        number: 2101,
         title: 'Implement contracts',
-        open: true,
+        body: '',
         author: 'jinn-autopilot',
-        labels: [],
-      },
-      projectItem: {
-        id: 'PVTI_issue',
-        status: 'Todo',
-        priority: 'P1',
-        effort: 'High',
-        blockedOn: 'Nothing',
-        issueType: 'feat',
-      },
+        baseRefName: 'next',
+        headRefName: 'codex/issue-2001',
+        headOid: gitOid(manifest.expectedHead),
+        headCommittedAt: NOW.toISOString(),
+        isDraft: false,
+        state: 'OPEN' as const,
+        labels: ['review:needs-human'],
+        closingIssueNumbers: [2001],
+        mergeability: 'UNKNOWN' as const,
+        mergeStateStatus: 'BLOCKED' as const,
+        checks: [],
+        reviews: [],
+      }],
+    } satisfies GitHubLifecycleSnapshot;
+    const readCycleSnapshot = vi.fn(async () => cycleSnapshot);
+    const readTargetedPullRequestSnapshot = vi.fn(async () => targetedSnapshot);
+    const readRecoverySnapshot = makeMarketplaceRecoveryReadSnapshot({
+      manifestPath: harness.manifestPath,
+      readCycleSnapshot,
+      readTargetedPullRequestSnapshot,
     });
-    expect(snapshot.pullRequestMappings).toEqual([{
-      status: 'resolved',
-      prNumber: 2101,
-      issueNumber: 2001,
-      expectedBaseRefName: 'next',
-      evidence: 'closing-reference',
-    }]);
-    expect(snapshot.pullRequests?.[0]?.headOid).toBe(gitOid(manifest.expectedHead));
+
+    await expect(readRecoverySnapshot()).resolves.toBe(targetedSnapshot);
+    expect(readCycleSnapshot).toHaveBeenCalledTimes(1);
+    expect(readTargetedPullRequestSnapshot).toHaveBeenCalledWith(cycleSnapshot, 2101);
+    expect(targetedSnapshot.pullRequestMappings?.[0]?.status).toBe('ambiguous');
+    expect(targetedSnapshot.pullRequests?.[0]?.labels).toEqual(['review:needs-human']);
   });
 
   it('fails closed on contradictory recovery manifest paths', async () => {

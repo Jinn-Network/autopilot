@@ -34,10 +34,9 @@ import {
 } from '../src/lifecycle/marketplace-task.js';
 import {
   assertMarketplaceRuntimeProfile,
-  buildMarketplaceRecoveryLifecycleSnapshot,
+  makeMarketplaceRecoveryReadSnapshot,
   makeProductionMarketplaceAdoptionRecoveryCoordinator,
 } from '../src/lifecycle/active-runtime-production.js';
-import { readAttemptManifest } from '../src/lifecycle/attempt-workspace.js';
 import { releaseMarketplaceReviewAnchor } from '../src/lifecycle/marketplace-review-anchor.js';
 import { makeProductionReviewSessionPort } from '../src/lifecycle/review-session-production.js';
 import type { GitHubLifecycleSnapshot } from '../src/lifecycle/snapshot.js';
@@ -662,22 +661,13 @@ export async function runAutopilotV2(
         });
   const makeRecoveryReadSnapshot = (
     manifestPath: string,
-  ): (() => Promise<GitHubLifecycleSnapshot>) => {
-    return async (): Promise<GitHubLifecycleSnapshot> => {
-      const manifest = readAttemptManifest(manifestPath);
-      const capturedAt = new Date().toISOString();
-      const [issueEntry, projectItem] = await Promise.all([
-        restDiscovery.readIssueForAction(manifest.issueNumber),
-        reader.readProjectItemForReconciliation(manifest.issueNumber),
-      ]);
-      return buildMarketplaceRecoveryLifecycleSnapshot({
-        manifest,
-        capturedAt,
-        issue: issueEntry,
-        projectItem,
-      });
-    };
-  };
+  ): (() => Promise<GitHubLifecycleSnapshot>) =>
+    makeMarketplaceRecoveryReadSnapshot({
+      manifestPath,
+      readCycleSnapshot,
+      readTargetedPullRequestSnapshot: (cycleSnapshot, prNumber) =>
+        targeted.readPullRequest(cycleSnapshot, prNumber),
+    });
   const recoverSubmittedMarketplaceAdoptions =
     marketplaceExecutionBackend === undefined
       ? undefined

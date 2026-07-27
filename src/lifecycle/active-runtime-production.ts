@@ -23,6 +23,7 @@ import {
 } from '../dispatcher/cursor-runtime.js';
 import {
   listRunnerLiveAttempts,
+  readAttemptManifest,
   trackAttemptChild,
   type TrackableAttemptChild,
 } from './attempt-workspace.js';
@@ -72,9 +73,6 @@ import {
   type ReconciliationPullRequestNode,
 } from './reconciliation-writer-production.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
-import type { ActionIssueEntry } from './github-rest-discovery.js';
-import type { AttemptManifest } from './attempt-workspace.js';
-import { EMPTY_GITHUB_USAGE } from './github-usage.js';
 import type {
   TargetedIssueActionContext,
   TargetedNativeIssue,
@@ -92,8 +90,6 @@ import type {
   ReviewClaimRecord,
 } from './types.js';
 import { gitOid } from './types.js';
-import type { SnapshotItem } from '../dispatcher/project-snapshot.js';
-import type { PolledIssue } from '../dispatcher/types.js';
 import type { ProjectMapping } from '../config/config.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
 import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
@@ -1225,125 +1221,31 @@ export function makeProductionActiveRuntime(
   };
 }
 
-export interface MarketplaceRecoverySnapshotInput {
-  readonly manifest: AttemptManifest;
-  readonly capturedAt: string;
-  readonly issue?: ActionIssueEntry | null;
-  readonly projectItem?: {
-    readonly id: string;
-    readonly status: PolledIssue['status'];
-    readonly priority: PolledIssue['priority'];
-    readonly effort: PolledIssue['effort'];
-    readonly blockedOn: PolledIssue['blockedOn'];
-    readonly issueType: PolledIssue['shape'];
-  } | null;
-}
-
-export function buildMarketplaceRecoveryLifecycleSnapshot(
-  input: MarketplaceRecoverySnapshotInput,
-): GitHubLifecycleSnapshot {
-  const { manifest, capturedAt, issue, projectItem } = input;
-  const issueNumber = manifest.issueNumber;
-  const prNumber = manifest.prNumber;
-  const expectedHead = gitOid(manifest.expectedHead);
-  const issues: PolledIssue[] = issue === null || issue === undefined || issueNumber === undefined
-    ? []
-    : [{
-      number: issue.number,
-      title: issue.title,
-      labels: [...issue.labels],
-      shape: projectItem?.issueType ?? null,
-      blockedOn: projectItem?.blockedOn ?? null,
-      blockedByIssues: [],
-      effort: projectItem?.effort ?? null,
-      priority: projectItem?.priority ?? null,
-      status: projectItem?.status ?? null,
-      onBoard: projectItem !== null && projectItem !== undefined,
-      author: issue.author,
-      projectItemId: projectItem?.id ?? null,
-      inCurrentSprint: false,
-    }];
-  const items: SnapshotItem[] = projectItem === null
-    || projectItem === undefined
-    || issueNumber === undefined
-    ? []
-    : [{
-      id: projectItem.id,
-      number: issueNumber,
-      contentType: 'Issue',
-      status: projectItem.status,
-      priority: projectItem.priority,
-      effort: projectItem.effort,
-      blockedOn: projectItem.blockedOn,
-      issueType: projectItem.issueType,
-      blockedByIssues: [],
-      sprintIterationId: null,
-    }];
-  const pullRequests = prNumber === undefined
-    ? []
-    : [{
-      number: prNumber,
-      title: issue?.title ?? `PR #${prNumber}`,
-      body: '',
-      author: issue?.author ?? manifest.selectedLogin,
-      baseRefName: 'next',
-      headRefName: `codex/issue-${issueNumber ?? prNumber}`,
-      headOid: expectedHead,
-      headCommittedAt: capturedAt,
-      isDraft: false,
-      state: 'OPEN' as const,
-      labels: [],
-      closingIssueNumbers: issueNumber === undefined ? [] : [issueNumber],
-      mergeability: 'UNKNOWN' as const,
-      mergeStateStatus: 'BLOCKED' as const,
-      checks: [],
-      reviews: [],
-    }];
-  const pullRequestMappings = prNumber === undefined || issueNumber === undefined
-    ? []
-    : [{
-      status: 'resolved' as const,
+export function makeMarketplaceRecoveryReadSnapshot(input: {
+  readonly manifestPath: string;
+  readonly readCycleSnapshot: () => Promise<GitHubLifecycleSnapshot>;
+  readonly readTargetedPullRequestSnapshot: (
+    cycleSnapshot: GitHubLifecycleSnapshot,
+    prNumber: number,
+  ) => Promise<GitHubLifecycleSnapshot | null>;
+}): () => Promise<GitHubLifecycleSnapshot> {
+  return async (): Promise<GitHubLifecycleSnapshot> => {
+    const manifest = readAttemptManifest(input.manifestPath);
+    const prNumber = manifest.prNumber;
+    if (prNumber === undefined) {
+      throw new Error('Marketplace recovery requires a pull request number');
+    }
+    const cycleSnapshot = await input.readCycleSnapshot();
+    const targetedSnapshot = await input.readTargetedPullRequestSnapshot(
+      cycleSnapshot,
       prNumber,
-      issueNumber,
-      expectedBaseRefName: 'next',
-      evidence: 'closing-reference' as const,
-    }];
-  const lifecycleItems = prNumber === undefined || issueNumber === undefined
-    ? []
-    : [{
-      kind: 'pull-request' as const,
-      issueNumber,
-      prNumber,
-      v2Marked: true,
-      projectStatus: projectItem?.status ?? 'Todo',
-      labels: [],
-      head: expectedHead,
-      headChangedAt: capturedAt,
-      isDraft: false,
-      merged: false,
-      needsReview: true,
-      approved: false,
-      mergeState: 'clean' as const,
-    }];
-  return {
-    capturedAt,
-    snapshotComplete: true,
-    issues,
-    project: {
-      items,
-      rateLimit: {
-        remaining: 5_000,
-        used: 0,
-        resetAt: capturedAt,
-      },
-      currentSprintIterationId: null,
-    },
-    pullRequests,
-    branches: [],
-    diagnostics: [],
-    lifecycle: { items: lifecycleItems },
-    pullRequestMappings,
-    githubUsage: EMPTY_GITHUB_USAGE,
+    );
+    if (targetedSnapshot === null) {
+      throw new Error(
+        `Targeted PR authority for #${prNumber} is unavailable during marketplace recovery`,
+      );
+    }
+    return targetedSnapshot;
   };
 }
 

@@ -35,6 +35,7 @@ import type {
 } from '../../src/lifecycle/marketplace-execution-state.js';
 import {
   makeMarketplaceMutationAdoptionCoordinator,
+  MarketplaceAdoptionCrashInjectionError,
   type MarketplaceMutationAdoptionBoundary,
   type MarketplaceMutationAuthority,
   type MarketplaceMutationAuthorityPort,
@@ -701,7 +702,7 @@ export class Harness implements
     this.boundaries.push(boundary);
     if (this.crashBoundary === boundary) {
       this.crashBoundary = undefined;
-      throw new Error(`crash after ${boundary}`);
+      throw new MarketplaceAdoptionCrashInjectionError(boundary);
     }
   }
 
@@ -1145,6 +1146,20 @@ describe('marketplace mutation adoption recovery', () => {
     expect(harness.commitMutations).toBe(1);
     harness.clock = () => new Date('2026-07-27T13:30:00.000Z');
     await expect(adopt(harness)).resolves.toMatchObject({ status: 'accepted' });
+  });
+
+  it('treats genuine crash-after errors as receipt contradictions, not test injections', async () => {
+    const harness = new Harness();
+    harness.remoteHead = STALE;
+    harness.prHead = STALE;
+    harness.createPrComment = async () => {
+      throw new Error('crash after receipt-persisted during unrelated tooling');
+    };
+    await expect(adopt(harness)).resolves.toMatchObject({
+      status: 'rejected',
+      reason: 'receipt-contradiction',
+    });
+    expect(harness.humanMutations).toBe(1);
   });
 
   it('rejects at adoption cutoff before durable effects', async () => {

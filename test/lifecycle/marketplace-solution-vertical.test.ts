@@ -26,6 +26,7 @@ import type {
 } from '../../src/lifecycle/marketplace-execution-state.js';
 import {
   makeMarketplaceMutationAdoptionCoordinator,
+  MarketplaceAdoptionCrashInjectionError,
   type MarketplaceMutationAdoptionBoundary,
   type MarketplaceMutationAuthority,
   type MarketplaceMutationAuthorityPort,
@@ -530,7 +531,7 @@ class RealGitVerticalHarness implements
     this.boundaries.push(boundary);
     if (this.crashBoundary === boundary) {
       this.crashBoundary = undefined;
-      throw new Error(`crash after ${boundary}`);
+      throw new MarketplaceAdoptionCrashInjectionError(boundary);
     }
   }
 

@@ -135,7 +135,15 @@ async function verifyReceiptFacts(
   const { expected, receipt } = input;
   if (receipt.role !== expected.role) return false;
   if (receipt.prNumber !== expected.prNumber) return false;
-  if (receipt.expectedHead !== expected.publicationHead) return false;
+  if (
+    receipt.expectedHead !== expected.publicationHead
+    && !(
+      expected.disposition === 'rejected'
+      && expected.reason === 'stale-head'
+    )
+  ) {
+    return false;
+  }
   if (expected.disposition === 'accepted') {
     if (receipt.disposition !== 'accepted') return false;
     return receipt.resultingHead === expected.resultingHead
@@ -510,7 +518,6 @@ describe('publishAdoptionReceipt', () => {
     }) as MutablePorts;
     const receipt = rejectedReceipt({
       reason: 'stale-head',
-      expectedHead: newHead,
       detail: 'Pull-request head advanced before publication.',
     });
 
@@ -524,6 +531,10 @@ describe('publishAdoptionReceipt', () => {
     );
 
     expect(ports.createCalls[0]?.expectedHead).toBe(newHead);
+    const published = AutopilotAdoptionReceiptSchema.parse(
+      JSON.parse(ports.createCalls[0]?.body.split('\n')[3] ?? '{}'),
+    );
+    expect(published.expectedHead).toBe(PUBLICATION_HEAD);
   });
 
   it('does not mutate marketplace adoption manifests before exact readback', async () => {

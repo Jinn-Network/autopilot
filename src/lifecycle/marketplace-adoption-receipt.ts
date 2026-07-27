@@ -211,10 +211,6 @@ async function resolvePublicationFacts(
     return {
       ...expected,
       publicationHead: currentHead,
-      correlation: {
-        ...expected.correlation,
-        expectedHead: currentHead,
-      },
     };
   }
   throw new Error('Marketplace adoption receipt publication head does not match the pull request');
