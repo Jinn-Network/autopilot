@@ -1648,7 +1648,10 @@ function githubUsageSummary(usage: GitHubUsage): string {
     + `${usage.graphqlRequests} evidence requests, `
     + `${usage.graphqlRemaining ?? 'unknown'} remaining; `
     + `REST ${usage.restRequests} requests, ${usage.restNotModified} not modified, `
-    + `${usage.cacheHits} cache hits.`;
+    + `${usage.cacheHits} cache hits.`
+    + (usage.transientRetries === undefined || usage.transientRetries === 0
+      ? ''
+      : ` Retried reads: ${usage.transientRetries} transport faults.`);
 }
 
 // Accounting incompleteness is observability, not failure: GitHub's

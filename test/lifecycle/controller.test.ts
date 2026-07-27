@@ -2536,3 +2536,33 @@ describe.skip('board-archive sweep wiring (jinn-mono#1883)', () => {
       .toContain('Board archive sweep: failed (boom).');
   });
 });
+
+describe('operator usage summary', () => {
+  it('tells the operator how many reads a cycle retried through transport faults', () => {
+    // This line is the only place an operator learns that a cycle papered over
+    // network faults; a retried cycle must never read as a clean one. Asserted
+    // against a real meter so the summary and the meter cannot drift apart.
+    const base = {
+      status: 'ok' as const,
+      mode: 'recover' as const,
+      cycleId: 'cycle-1',
+      runnerId: 'runner-a',
+      capturedAt: NOW.toISOString(),
+      snapshotMode: 'full' as const,
+      snapshotComplete: true,
+      lastFullReconciliationAt: NOW.toISOString(),
+      items: [],
+      orphanBranchClaims: [],
+      diagnostics: [],
+      events: [],
+    };
+    const retried = new GitHubUsageMeter();
+    retried.recordTransientReadRetry('gh', 'TLS handshake failure');
+    retried.recordTransientReadRetry('git', 'connection reset');
+
+    expect(renderLifecycleHuman({ ...base, githubUsage: retried.read() }))
+      .toContain('Retried reads: 2 transport faults.');
+    expect(renderLifecycleHuman({ ...base, githubUsage: new GitHubUsageMeter().read() }))
+      .not.toContain('Retried reads:');
+  });
+});

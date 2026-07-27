@@ -192,6 +192,33 @@ describe('LifecycleDiscoveryCacheStore', () => {
       .not.toMatch(/GH_TOKEN|credential|authorization/i);
   });
 
+  it('round-trips the usage of a cycle that retried a read through a transport fault', async () => {
+    // The envelope schema is `.strict()`, so a cycle whose meter counted a
+    // retry can only be persisted while `transientRetries` is declared on it.
+    // Dropping the field would make every retried cycle's cache unreadable.
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const retried: LifecycleDiscoveryState = {
+      ...base,
+      evidence: {
+        ...base.evidence,
+        githubUsage: {
+          ...base.evidence.githubUsage,
+          accountingComplete: false,
+          incompleteReason: '1 read was retried through a transport fault '
+            + "(latest: gh, TLS handshake failure); the faulted attempts' quota "
+            + 'cost is unevidenced',
+          transientRetries: 2,
+        },
+      },
+    };
+
+    await store.save(retried);
+
+    await expect(store.load()).resolves.toEqual(retried);
+  });
+
   it('exposes only the validated durable cadence marker without a network dependency', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
