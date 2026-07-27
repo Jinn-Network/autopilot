@@ -63,6 +63,20 @@ export function formatReviewFollowUpMarker(
   return `<!-- ${REVIEW_FOLLOW_UP_MARKER_TAG} pr=${parentPr} head=${normalizedHead} index=${index} -->`;
 }
 
+/**
+ * True when the body carries a *marker-shaped* review-follow-up comment — an
+ * HTML comment opening with the tag. Prose that merely names the tag does not
+ * match. Callers pair this with {@link parseReviewFollowUpMarker} to tell
+ * "no marker" apart from "marker present but malformed".
+ */
+const REVIEW_FOLLOW_UP_MARKER_TAG_RE = new RegExp(
+  `<!--\\s*${REVIEW_FOLLOW_UP_MARKER_TAG}(?![\\w:-])`,
+);
+
+export function hasReviewFollowUpMarkerTag(body: string): boolean {
+  return REVIEW_FOLLOW_UP_MARKER_TAG_RE.test(body);
+}
+
 export function parseReviewFollowUpMarker(
   body: string,
 ): { readonly parentPr: number; readonly head: string; readonly index: number } | null {

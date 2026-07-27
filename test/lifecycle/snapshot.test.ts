@@ -15,6 +15,7 @@ import {
   type GitHubLifecycleReader,
   type PullRequestPage,
 } from '../../src/lifecycle/snapshot.js';
+import { GhLifecycleReader } from '../../src/lifecycle/github-reader.js';
 import { deriveLifecycle, planCycle } from '../../src/lifecycle/lifecycle.js';
 import { FULL_SCAN_RESERVE } from '../../src/lifecycle/github-usage.js';
 import { planProjection } from '../../src/lifecycle/projection.js';
@@ -2174,16 +2175,161 @@ describe('buildGitHubLifecycleSnapshot', () => {
     });
   });
 
-  it('releases a review follow-up whose parent PR was closed without merging', async () => {
-    // A closed-unmerged parent is structurally identical to an absent one: the
-    // world snapshot never carries CLOSED PRs. Asserted separately so the
-    // decision is covered by name and cannot be changed silently.
+  // R6: the earlier version of this case re-used the `nodes: []` fixture and so
+  // only re-asserted the absent case under a different name. `state` is typed
+  // `'OPEN' | 'MERGED'`, so a CLOSED parent can only be produced by driving a
+  // real `state: 'CLOSED'` node through GhLifecycleReader — which is where the
+  // drop actually lives (github-reader.ts, `if (pr.state === 'CLOSED') continue`).
+  it('drops a CLOSED parent PR in the reader, leaving its review follow-up eligible', async () => {
+    const run = async (command: string, args: string[]): Promise<string> => {
+      if (command === 'git') return '';
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('closedByPullRequestsReferences')) {
+        return JSON.stringify({
+          data: {
+            rateLimit: { cost: 1, remaining: 4_999, resetAt: '2026-07-20T13:00:00.000Z' },
+            repository: {
+              issue50: {
+                closedByPullRequestsReferences: {
+                  pageInfo: { hasNextPage: false },
+                  // Only `state` is read before the CLOSED drop.
+                  nodes: [{ number: 101, state: 'CLOSED' }],
+                },
+              },
+            },
+          },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: { cost: 1, remaining: 4_999, resetAt: '2026-07-20T13:00:00.000Z' },
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    };
+    const page = await new GhLifecycleReader(run).readPullRequests(null, [50]);
+    // The reader, not the gate, is what makes a closed-unmerged parent absent.
+    expect(page.nodes.some((pr) => pr.number === 101)).toBe(false);
+
     const source = reader({
       readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(101)],
+      readPullRequests: async () => page,
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.pullRequests.some((pr) => pr.number === 101)).toBe(false);
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
+  // R1: the explainer branch must sit BELOW the whole cascade. Shipped above
+  // `authorDisallowed` it reported the parent PR for issues that were actually
+  // untriaged or author-disallowed, hiding the real failure. The untriaged
+  // window is real: review-follow-ups-production.ts creates the issue and only
+  // then calls ensureTriageComplete. Mutant M9 (move the branch back above the
+  // cascade) survived without these two cases.
+  it('reports the triage failure, not the parent PR, for an untriaged review follow-up', async () => {
+    const untriaged = { ...followUpIssue(101), shape: null };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, untriaged],
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.pullRequests.find((pr) => pr.number === 101)?.state).toBe('OPEN');
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'not-selected',
+      eligibilityDetail: 'Issue Type is not set',
+    });
+  });
+
+  it('reports author-disallowed, not the parent PR, for a disallowed review follow-up', async () => {
+    const disallowed = { ...followUpIssue(101), author: 'untrusted' };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, disallowed],
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.pullRequests.find((pr) => pr.number === 101)?.state).toBe('OPEN');
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'author-disallowed',
+    });
+  });
+
+  // R7: a marker-shaped comment that does not parse now fails closed, matching
+  // the framing the gate always claimed. Before this it fell through to
+  // `eligible: true` — a truncated marker was strictly weaker than no marker.
+  it('holds a review follow-up whose marker comment is present but unparseable', async () => {
+    const truncated = {
+      ...followUpIssue(101),
+      body: '<!-- jinn-autopilot:review-follow-up pr=101 head=abc -->\n\nFollow-up.',
+    };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, truncated],
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    const followUp = snapshot.lifecycle.items.find((item) => item.issueNumber === 50);
+    expect(followUp).toMatchObject({ eligible: false, eligibilityReason: 'not-selected' });
+    expect(followUp?.eligibilityDetail).toContain('could not be parsed');
+    // Distinct from the parent-open reason so the two never blur.
+    expect(followUp?.eligibilityDetail).not.toContain('#101');
+  });
+
+  it('fails closed on an unparseable marker even when no such PR exists', async () => {
+    // The `pr=` value is unreadable, so parent state cannot be consulted at
+    // all; the hold does not depend on a PR being present.
+    const truncated = {
+      ...followUpIssue(909),
+      body: '<!-- jinn-autopilot:review-follow-up pr=909 -->\n\nFollow-up.',
+    };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, truncated],
       readPullRequests: async () => ({
         nodes: [],
         pageInfo: { hasNextPage: false, endCursor: null },
       }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'not-selected',
+    });
+  });
+
+  it('does not fail closed on prose that merely names the review-follow-up marker tag', async () => {
+    // The fail-closed trigger is a marker-shaped HTML comment, not the tag
+    // string — engine issues discuss `jinn-autopilot:review-follow-up` in prose.
+    const prose = {
+      ...followUpIssue(101),
+      body: 'Document the jinn-autopilot:review-follow-up marker format.',
+    };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, prose],
     });
 
     const snapshot = await buildGitHubLifecycleSnapshot(source, {

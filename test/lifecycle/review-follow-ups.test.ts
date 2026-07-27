@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_REVIEW_FOLLOW_UPS_PER_PASS,
   fileReviewFollowUps,
+  hasReviewFollowUpMarkerTag,
   formatReviewFollowUpMarker,
   parseReviewFollowUpMarker,
   parseReviewFollowUpsPayload,
@@ -188,5 +189,22 @@ describe('fileReviewFollowUps', () => {
       }),
     ).rejects.toThrow(/child marker|jinn-autopilot:child/i);
     expect(created).toHaveLength(0);
+  });
+});
+
+describe('hasReviewFollowUpMarkerTag', () => {
+  // Separates "no marker" from "marker present but malformed" so eligibility
+  // can fail closed on the second without gating ordinary issues.
+  it('matches a marker-shaped comment, well formed or not', () => {
+    expect(hasReviewFollowUpMarkerTag(formatReviewFollowUpMarker(84, HEAD, 0))).toBe(true);
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-up pr=84 -->')).toBe(true);
+    expect(hasReviewFollowUpMarkerTag('<!--jinn-autopilot:review-follow-up garbage-->')).toBe(true);
+  });
+
+  it('does not match prose, a different tag, or a longer tag name', () => {
+    expect(hasReviewFollowUpMarkerTag('See jinn-autopilot:review-follow-up for the format.')).toBe(false);
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:child pr=84 kind=review-finding -->')).toBe(false);
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-ups pr=84 -->')).toBe(false);
+    expect(hasReviewFollowUpMarkerTag('')).toBe(false);
   });
 });
