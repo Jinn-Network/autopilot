@@ -266,6 +266,11 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
   const INDEXER_CLOSURE = [
     'packages/sdk', 'packages/indexer', 'packages/indexer-enrichment',
   ];
+  const ALL_MONO_WORKSPACES = [
+    'apps/broadcast-bot', 'client', 'contracts', 'packages/autopilot',
+    'packages/core', 'packages/indexer', 'packages/indexer-enrichment',
+    'packages/layer', 'packages/plugin', 'packages/sdk',
+  ];
 
   // One literal expected array per supported root. A closure computed rather
   // than asserted is a closure nobody has read: these literals are the
@@ -341,6 +346,20 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
     expect(plan.workspaces).toContain('packages/sdk');
     expect(plan.workspaces).not.toContain('packages/indexer');
     expect(plan.workspaces).not.toContain('packages/indexer-enrichment');
+  });
+
+  // A package.json edit can declare a dependency the literal graph does not
+  // encode. Widening to the full workspace set is the conservative mitigation
+  // until Task 5b can distinguish registry outages from lockfile drift.
+  it('widens closure to every workspace when a package.json or yarn.lock is touched', () => {
+    const plan = buildJinnMonoV1VerificationPlan({
+      repositoryPath: REPO,
+      touchedPaths: ['apps/broadcast-bot/package.json', 'packages/sdk/src/index.ts'],
+    });
+
+    expect(new Set(plan.workspaces)).toEqual(new Set(ALL_MONO_WORKSPACES));
+    expect(plan.workspaces).toHaveLength(ALL_MONO_WORKSPACES.length);
+    expect(plan.atRiskWorkspaces).toEqual(plan.workspaces);
   });
 
   // The at-risk/prerequisite split has to be readable off the plan, not
@@ -472,23 +491,6 @@ describe('marketplaceVerificationPlanDigest', () => {
     expect(there).toBe(here);
   });
 
-  // Reuse compares evidence, and the plan digest is what stands in for "the
-  // same work was done". A digest blind to the workspace selection lets
-  // evidence from a one-workspace run satisfy a later, wider plan.
-  it('changes when the workspace selection changes', () => {
-    const narrow = marketplaceVerificationPlanDigest(
-      buildJinnMonoV1VerificationPlan({ repositoryPath: REPO, touchedPaths }),
-    );
-    const other = marketplaceVerificationPlanDigest(
-      buildJinnMonoV1VerificationPlan({
-        repositoryPath: REPO,
-        touchedPaths: ['contracts/src/Jinn.sol'],
-      }),
-    );
-
-    expect(other).not.toBe(narrow);
-  });
-
   // The digest must cover the exact argv, not merely which workspaces ran.
   // Otherwise a plan that silently swapped `--immutable` away would reuse the
   // evidence of a plan that had it.
@@ -502,6 +504,45 @@ describe('marketplaceVerificationPlanDigest', () => {
     };
 
     expect(marketplaceVerificationPlanDigest(loosened))
+      .not.toBe(marketplaceVerificationPlanDigest(plan));
+  });
+
+  it('changes when a command program name changes', () => {
+    const plan = buildJinnMonoV1VerificationPlan({ repositoryPath: REPO, touchedPaths });
+    const swapped = {
+      ...plan,
+      commands: plan.commands.map((entry, index) => (
+        index === 1 ? { ...entry, command: 'npx' } : entry
+      )),
+    };
+
+    expect(marketplaceVerificationPlanDigest(swapped))
+      .not.toBe(marketplaceVerificationPlanDigest(plan));
+  });
+
+  it('changes when a command label changes', () => {
+    const plan = buildJinnMonoV1VerificationPlan({ repositoryPath: REPO, touchedPaths });
+    const relabeled = {
+      ...plan,
+      commands: plan.commands.map((entry, index) => (
+        index === 1 ? { ...entry, label: 'typecheck:packages/autopilot:probe' } : entry
+      )),
+    };
+
+    expect(marketplaceVerificationPlanDigest(relabeled))
+      .not.toBe(marketplaceVerificationPlanDigest(plan));
+  });
+
+  it('changes when a command repository-relative cwd changes', () => {
+    const plan = buildJinnMonoV1VerificationPlan({ repositoryPath: REPO, touchedPaths });
+    const relocated = {
+      ...plan,
+      commands: plan.commands.map((entry, index) => (
+        index === 1 ? { ...entry, cwd: `${REPO}/elsewhere` } : entry
+      )),
+    };
+
+    expect(marketplaceVerificationPlanDigest(relocated))
       .not.toBe(marketplaceVerificationPlanDigest(plan));
   });
 
@@ -637,6 +678,46 @@ describe('createSequentialMarketplaceVerificationPort', () => {
       disposition: 'stable-rejection',
     });
     expect(attempted).toEqual(['install', 'typecheck:packages/autopilot']);
+  });
+
+  // Install is the only network-enabled command. A registry outage exits
+  // non-zero too, and blaming that on the solver publishes a rejection receipt
+  // for a patch whose verification never actually ran.
+  it('classifies an install non-zero exit as recoverable rather than a verdict', async () => {
+    const port = createSequentialMarketplaceVerificationPort({
+      now: clock(),
+      run: async ({ command }) => (
+        command.label === 'install'
+          ? { exitCode: 1, stdoutDigest: digestOf('a'), stderrDigest: digestOf('b') }
+          : { exitCode: 0, stdoutDigest: digestOf('c'), stderrDigest: digestOf('d') }
+      ),
+    });
+
+    await expect(port.verify(verifyInput)).rejects.toMatchObject({
+      name: 'MarketplaceVerificationError',
+      reason: 'command-failed',
+      disposition: 'recoverable',
+    });
+  });
+
+  // The deadline guard must reject malformed timestamps before any command
+  // runs, and classify them as abandoned rather than a solver verdict.
+  it('abandons when the adoption deadline is not an exact UTC timestamp', async () => {
+    const attempted: string[] = [];
+    const port = createSequentialMarketplaceVerificationPort({
+      run: async ({ command }) => {
+        attempted.push(command.label);
+        return { exitCode: 0, stdoutDigest: digestOf('a'), stderrDigest: digestOf('b') };
+      },
+    });
+
+    await expect(port.verify({ ...verifyInput, deadline: 'not-a-timestamp' }))
+      .rejects.toMatchObject({
+        name: 'MarketplaceVerificationError',
+        reason: 'invalid-deadline',
+        disposition: 'abandoned',
+      });
+    expect(attempted).toEqual([]);
   });
 
   // Starting a sandbox whose adoption window already closed burns minutes of

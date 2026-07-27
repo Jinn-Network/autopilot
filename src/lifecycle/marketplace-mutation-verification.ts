@@ -254,6 +254,16 @@ function workspaceOf(rawPath: string): JinnMonoWorkspace {
   return entry.path;
 }
 
+function touchesPackageManifestOrLockfile(rawPaths: readonly string[]): boolean {
+  return rawPaths.some((rawPath) => {
+    const path = canonicalPath(rawPath);
+    return path === 'package.json'
+      || path === 'yarn.lock'
+      || path.endsWith('/package.json')
+      || path.endsWith('/yarn.lock');
+  });
+}
+
 /**
  * Build the plan from the touched paths alone.
  *
@@ -279,9 +289,17 @@ export function buildJinnMonoV1VerificationPlan(input: {
       'Marketplace patch selects no jinn-mono.v1 workspace to verify',
     );
   }
-  const atRiskSet = closure(touched, dependentsOf);
-  const atRiskWorkspaces = dependencyFirstOrder(atRiskSet);
-  const workspaces = dependencyFirstOrder(closure(atRiskSet, dependenciesOf));
+  const allWorkspaces = JINN_MONO_V1_WORKSPACES.map((entry) => entry.path);
+  const widenToAllWorkspaces = touchesPackageManifestOrLockfile(input.touchedPaths);
+  const atRiskSet = widenToAllWorkspaces
+    ? new Set(allWorkspaces)
+    : closure(touched, dependentsOf);
+  const atRiskWorkspaces = widenToAllWorkspaces
+    ? dependencyFirstOrder(new Set(allWorkspaces))
+    : dependencyFirstOrder(atRiskSet);
+  const workspaces = widenToAllWorkspaces
+    ? atRiskWorkspaces
+    : dependencyFirstOrder(closure(atRiskSet, dependenciesOf));
   const workspaceCwd = (workspace: JinnMonoWorkspace): string =>
     `${input.repositoryPath}/${workspace}`;
   return {
@@ -431,9 +449,10 @@ export function createSequentialMarketplaceVerificationPort(options: {
           );
         }
         if (result.exitCode !== 0) {
+          const isInstall = command.label === 'install';
           throw new MarketplaceVerificationError(
             'command-failed',
-            'stable-rejection',
+            isInstall ? 'recoverable' : 'stable-rejection',
             `Marketplace verification command ${command.label} exited ${result.exitCode}`,
           );
         }
