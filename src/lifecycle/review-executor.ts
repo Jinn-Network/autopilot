@@ -131,6 +131,37 @@ export interface ReviewExecutorDeps {
   sleep(ms: number): Promise<void>;
 }
 
+export interface AcquiredExactHeadReviewClaim {
+  readonly prNumber: number;
+  readonly head: GitOid;
+  readonly reviewRefOid: GitOid;
+  readonly attemptId: string;
+  readonly generation: string;
+  readonly reviewer: string;
+  readonly approvalPolicy: ReviewApprovalPolicy;
+  readonly manifestPath: string;
+  readonly paths: Pick<
+    AttemptPaths,
+    'worktree' | 'manifest' | 'log' | 'ghConfigDir' | 'askpass'
+  >;
+}
+
+export type ReviewClaimAcquisitionDeps = Omit<
+  ReviewExecutorDeps,
+  'startSession'
+>;
+
+export type ReviewClaimAcquisitionResult =
+  | {
+      readonly status: 'acquired';
+      readonly claim: AcquiredExactHeadReviewClaim;
+      readonly confirmed: ReviewActionCandidate;
+    }
+  | {
+      readonly status: 'already-approved' | 'ineligible' | 'human' | 'lost' | 'ambiguous';
+      readonly detail: string;
+    };
+
 export type ReviewExecutionResult =
   | {
       readonly status: 'spawned';
@@ -283,13 +314,13 @@ async function confirmReviewAcquisition(
   return { outcome: 'ambiguous' };
 }
 
-export async function executeReviewAction(
+export async function acquireExactHeadReviewClaim(
   action: {
     readonly prNumber: number;
     readonly expectedHead?: GitOid;
   },
-  deps: ReviewExecutorDeps,
-): Promise<ReviewExecutionResult> {
+  deps: ReviewClaimAcquisitionDeps,
+): Promise<ReviewClaimAcquisitionResult> {
   if (!Number.isSafeInteger(action.prNumber) || action.prNumber <= 0) {
     throw new Error('Review action requires a positive PR number');
   }
@@ -301,14 +332,12 @@ export async function executeReviewAction(
   ) {
     return {
       status: 'ineligible',
-      prNumber: action.prNumber,
       detail: candidate === null ? 'Pull request is missing.' : 'Pull request is not open.',
     };
   }
   if (action.expectedHead !== undefined && candidate.head !== action.expectedHead) {
     return {
       status: 'ineligible',
-      prNumber: candidate.number,
       detail: 'Pull request head changed after scheduling.',
     };
   }
@@ -321,8 +350,7 @@ export async function executeReviewAction(
     await deps.escalateHuman({ candidate, reason });
     return {
       status: 'human',
-      prNumber: candidate.number,
-      code: 'review-escalation',
+      detail: candidate.mappingProblem,
     };
   }
   if (candidate.humanHold) {
@@ -334,8 +362,7 @@ export async function executeReviewAction(
     await deps.escalateHuman({ candidate, reason });
     return {
       status: 'human',
-      prNumber: candidate.number,
-      code: 'review-escalation',
+      detail: 'Human authority is active; repair its durable projection before stopping.',
     };
   }
   const current = candidate.reviewRef;
@@ -346,8 +373,7 @@ export async function executeReviewAction(
   ) {
     return {
       status: 'already-approved',
-      prNumber: candidate.number,
-      head: candidate.head,
+      detail: 'Pull request already has a matching terminal approval.',
     };
   }
 
@@ -359,7 +385,6 @@ export async function executeReviewAction(
   if (!Number.isFinite(headChangedAt) || headChangedAt > nowMs) {
     return {
       status: 'ineligible',
-      prNumber: candidate.number,
       detail: 'Review progress timestamp is invalid.',
     };
   }
@@ -374,7 +399,6 @@ export async function executeReviewAction(
     if (!Number.isFinite(acquisitionTime) || acquisitionTime > nowMs) {
       return {
         status: 'ineligible',
-        prNumber: candidate.number,
         detail: 'Review claim acquisition timestamp is invalid.',
       };
     }
@@ -391,14 +415,12 @@ export async function executeReviewAction(
   ) {
     return {
       status: 'ineligible',
-      prNumber: candidate.number,
       detail: 'The exact PR head already has an active review generation.',
     };
   }
   if (candidate.draft) {
     return {
       status: 'ineligible',
-      prNumber: candidate.number,
       detail: 'Draft pull requests are not claimable for review.',
     };
   }
@@ -410,7 +432,6 @@ export async function executeReviewAction(
   if (selection.status !== 'selected') {
     return {
       status: 'ineligible',
-      prNumber: candidate.number,
       detail: selection.detail,
     };
   }
@@ -442,7 +463,7 @@ export async function executeReviewAction(
     credential: selection.credential,
   });
   if (outcome.status === 'lost') {
-    return { status: 'lost', prNumber: candidate.number };
+    return { status: 'lost', detail: 'Review claim publication lost exact ref authority.' };
   }
   if (
     outcome.status === 'ambiguous'
@@ -450,7 +471,7 @@ export async function executeReviewAction(
     || outcome.published !== recordOid
     || outcome.observed !== recordOid
   ) {
-    return { status: 'ambiguous', prNumber: candidate.number };
+    return { status: 'ambiguous', detail: 'Review claim publication is ambiguous.' };
   }
 
   const attempt = await deps.createAttempt({
@@ -487,46 +508,107 @@ export async function executeReviewAction(
     await deps.escalateHuman({ candidate: acquisition.candidate, reason: acquisition.reason });
     return {
       status: 'human',
-      prNumber: candidate.number,
-      code: 'review-escalation',
+      detail: acquisition.reason.detail,
     };
   }
   if (acquisition.outcome === 'lost') {
-    return { status: 'lost', prNumber: candidate.number };
+    return { status: 'lost', detail: 'Review claim confirmation lost exact ref authority.' };
   }
   if (acquisition.outcome === 'ambiguous') {
-    return { status: 'ambiguous', prNumber: candidate.number };
+    return { status: 'ambiguous', detail: 'Review claim confirmation is ambiguous.' };
   }
   const confirmed = acquisition.confirmed;
+  return {
+    status: 'acquired',
+    claim: {
+      prNumber: candidate.number,
+      head: candidate.head,
+      reviewRefOid: recordOid,
+      attemptId,
+      generation,
+      reviewer: selection.login,
+      approvalPolicy: candidate.approvalPolicy,
+      manifestPath: attempt.paths.manifest,
+      paths: attempt.paths,
+    },
+    confirmed,
+  };
+}
+
+export async function executeReviewAction(
+  action: {
+    readonly prNumber: number;
+    readonly expectedHead?: GitOid;
+  },
+  deps: ReviewExecutorDeps,
+): Promise<ReviewExecutionResult> {
+  const acquired = await acquireExactHeadReviewClaim(action, deps);
+  if (acquired.status === 'already-approved') {
+    const candidate = await deps.readCandidate(action.prNumber);
+    if (candidate === null) {
+      return {
+        status: 'ineligible',
+        prNumber: action.prNumber,
+        detail: 'Pull request is missing.',
+      };
+    }
+    return {
+      status: 'already-approved',
+      prNumber: candidate.number,
+      head: candidate.head,
+    };
+  }
+  if (acquired.status !== 'acquired') {
+    const prNumber = action.prNumber;
+    switch (acquired.status) {
+      case 'ineligible':
+        return { status: 'ineligible', prNumber, detail: acquired.detail };
+      case 'human':
+        return { status: 'human', prNumber, code: 'review-escalation' };
+      case 'lost':
+        return { status: 'lost', prNumber };
+      case 'ambiguous':
+        return { status: 'ambiguous', prNumber };
+    }
+  }
+  const { claim, confirmed } = acquired;
+  const manifestPaths = claim.paths;
+  const selection = selectCredential(deps.credentials, {
+    phase: 'review',
+    prAuthor: confirmed.author,
+  });
+  if (selection.status !== 'selected') {
+    throw new Error('Review claim acquisition credential is unavailable');
+  }
   const environment = buildSanitizedChildEnv(
     deps.ambientEnvironment,
     selection.credential,
     {
-      ghConfigDir: attempt.paths.ghConfigDir,
-      askpassPath: attempt.paths.askpass,
-      manifestPath: attempt.paths.manifest,
+      ghConfigDir: manifestPaths.ghConfigDir,
+      askpassPath: manifestPaths.askpass,
+      manifestPath: manifestPaths.manifest,
     },
   );
   const started = await deps.startSession({
     kind: 'exact-head-review',
     backend: 'local',
-    manifestPath: attempt.paths.manifest,
-    attemptId,
-    issueNumber: candidate.issueNumber,
-    prNumber: candidate.number,
-    branch: candidate.headRefName,
-    targetBase: candidate.baseRefName,
-    worktreePath: attempt.paths.worktree,
-    logPath: attempt.paths.log,
-    reviewedHead: candidate.head,
-    reviewerLogin: selection.login,
+    manifestPath: manifestPaths.manifest,
+    attemptId: claim.attemptId,
+    issueNumber: confirmed.issueNumber,
+    prNumber: claim.prNumber,
+    branch: confirmed.headRefName,
+    targetBase: confirmed.baseRefName,
+    worktreePath: manifestPaths.worktree,
+    logPath: manifestPaths.log,
+    reviewedHead: claim.head,
+    reviewerLogin: claim.reviewer,
     local: {
       spawnInput: {
-        attemptId,
+        attemptId: claim.attemptId,
         candidate: confirmed,
         environment,
-        worktreePath: attempt.paths.worktree,
-        logPath: attempt.paths.log,
+        worktreePath: manifestPaths.worktree,
+        logPath: manifestPaths.log,
       },
     },
   });
@@ -535,12 +617,12 @@ export async function executeReviewAction(
   }
   return {
     status: 'spawned',
-    prNumber: candidate.number,
-    head: candidate.head,
-    reviewRefOid: recordOid,
-    attemptId,
-    generation,
-    reviewer: selection.login,
-    approvalPolicy: candidate.approvalPolicy,
+    prNumber: claim.prNumber,
+    head: claim.head,
+    reviewRefOid: claim.reviewRefOid,
+    attemptId: claim.attemptId,
+    generation: claim.generation,
+    reviewer: claim.reviewer,
+    approvalPolicy: claim.approvalPolicy,
   };
 }

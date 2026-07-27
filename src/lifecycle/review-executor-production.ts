@@ -18,7 +18,19 @@ import { fetchProjectSnapshot } from '../dispatcher/project-snapshot.js';
 import type {
   CreateAttemptOptions,
 } from './attempt-workspace.js';
-import { createAttemptWorkspace } from './attempt-workspace.js';
+import {
+  buildEvaluatorLegReviewPreparedExecution,
+  createAttemptWorkspace,
+  readAttemptManifest,
+} from './attempt-workspace.js';
+import {
+  makeMarketplaceReviewAnchorPort,
+  type MarketplaceReviewAnchorOrigin,
+  type MarketplaceReviewAnchorPort,
+} from './marketplace-review-anchor.js';
+import { makeProductionReviewSessionPort } from './review-session-production.js';
+import type { CredentialPool } from './credentials.js';
+import { randomUUID } from 'node:crypto';
 import { encodeReviewClaimPayload } from './codecs.js';
 import {
   gitPublicationArgs,
@@ -31,6 +43,7 @@ import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import type {
   ReviewActionCandidate,
   ReviewAttemptBinding,
+  ReviewClaimAcquisitionDeps,
   ReviewExecutorDeps,
 } from './review-executor.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
@@ -574,3 +587,99 @@ export function makeProductionReviewActionPort(
 }
 
 export type { ReviewActionCandidate };
+
+export interface ProductionMarketplaceReviewAnchorPortOptions
+  extends ProductionReviewActionPortOptions {
+  readonly origin: MarketplaceReviewAnchorOrigin;
+  readonly credentials: CredentialPool;
+  readonly staleAfterMs: number;
+  readonly nextAttemptId?: () => string;
+  readonly nextGeneration?: () => string;
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
+export function makeProductionMarketplaceReviewAnchorPort(
+  options: ProductionMarketplaceReviewAnchorPortOptions,
+): MarketplaceReviewAnchorPort {
+  const runner = options.runner ?? defaultRunner;
+  const ambient = options.environment ?? process.env;
+  const now = options.now ?? (() => new Date());
+  const nextId = options.nextAttemptId ?? (() => randomUUID());
+  const reviewPort = makeProductionReviewActionPort(options);
+  const v2Base = join(options.worktreeBase, 'v2');
+  const releasePort = makeProductionReviewSessionPort({
+    repositoryPath: options.repositoryPath,
+    worktreeBase: options.worktreeBase,
+    runnerId: options.runnerId,
+    runner,
+    environment: ambient,
+    repositorySlug: options.repositorySlug,
+    repositoryUrl: options.repositoryUrl,
+    projectMapping: options.projectMapping,
+  });
+  const claimAcquisition: ReviewClaimAcquisitionDeps = {
+    ...reviewPort,
+    credentials: options.credentials,
+    ambientEnvironment: ambient,
+    nextAttemptId: nextId,
+    nextGeneration: nextId,
+    runnerId: options.runnerId,
+    now,
+    sleep: options.sleep ?? (async () => {}),
+    staleAfterMs: options.staleAfterMs,
+    escalateHuman: async () => {},
+    createAttempt: async (input) => {
+      const subject = `pr-${input.prNumber}`;
+      const attemptDir = join(
+        v2Base,
+        options.runnerId,
+        'review',
+        `${subject}-${input.attemptId}`,
+      );
+      const manifest = await createAttemptWorkspace({
+        repositoryPath: options.repositoryPath,
+        worktreeBase: options.worktreeBase,
+        runnerId: options.runnerId,
+        phase: 'review',
+        subject,
+        issueNumber: input.issueNumber,
+        prNumber: input.prNumber,
+        branch: input.branch,
+        targetBase: input.targetBase,
+        expectedHead: input.expectedHead,
+        claimOid: input.claimOid,
+        reviewGeneration: input.reviewGeneration,
+        reviewRefOid: input.reviewRefOid,
+        reviewApprovalPolicy: input.approvalPolicy,
+        selectedLogin: input.selectedLogin,
+        credential: input.credential,
+        attemptId: input.attemptId,
+        remoteName: options.remoteName ?? 'jinn-autopilot-v2',
+        execution: buildEvaluatorLegReviewPreparedExecution(
+          attemptDir,
+          options.origin.originRequestDigest,
+          now,
+        ),
+        now,
+      }, runner);
+      return {
+        attemptId: manifest.attemptId,
+        paths: {
+          worktree: manifest.paths.worktree,
+          manifest: manifest.paths.manifest,
+          log: manifest.paths.log,
+          ghConfigDir: manifest.paths.ghConfigDir,
+          askpass: manifest.paths.askpass,
+        },
+      };
+    },
+  };
+  return makeMarketplaceReviewAnchorPort({
+    v2Base,
+    releasePort,
+    now,
+    claimAcquisition,
+    createEvaluatorReviewWorkspace: async ({ claim }) =>
+      readAttemptManifest(claim.manifestPath),
+  });
+}

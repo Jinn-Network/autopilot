@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
 import {
+  acquireExactHeadReviewClaim,
   executeReviewAction,
   type ReviewActionCandidate,
   type ReviewExecutorDeps,
@@ -662,6 +663,23 @@ describe('review action executor', () => {
       expect(result.status).not.toBe('spawned');
       expect(h.events).not.toContain('spawn');
     }
+  });
+
+  it('acquires an exact-head claim without starting a local session', async () => {
+    const h = harness();
+    const result = await acquireExactHeadReviewClaim({ prNumber: 84, expectedHead: HEAD }, h.deps);
+    expect(result.status).toBe('acquired');
+    if (result.status !== 'acquired') return;
+    expect(result.claim).toMatchObject({
+      prNumber: 84,
+      head: HEAD,
+      attemptId: ATTEMPT_A,
+      generation: GENERATION_A,
+      reviewer: 'review-bot',
+      approvalPolicy: 'approve-eligible',
+    });
+    expect(h.events).toEqual(['record', 'claim', 'attempt', 'projection']);
+    expect(h.events).not.toContain('spawn');
   });
 
   it('does not re-review a matching terminal approval, but may claim a terminal older head', async () => {

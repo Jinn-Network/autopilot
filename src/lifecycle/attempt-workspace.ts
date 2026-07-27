@@ -41,11 +41,13 @@ import {
   type SelectedCredential,
 } from './credentials.js';
 import {
+  MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION,
   MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION,
   decodeMarketplaceEvaluatorLegExecutionState,
   decodeMarketplaceExecutionV3State,
   type MarketplaceEvaluatorLegExecutionState,
   type MarketplaceExecutionV3State,
+  type MarketplaceReviewAnchorEvidence,
 } from './marketplace-execution-state.js';
 
 export type AttemptPhase = 'implement' | 'review';
@@ -2899,11 +2901,138 @@ export async function createAttemptWorkspace(
   return manifest;
 }
 
+function sameManifestPath(left: string, right: string): boolean {
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return left === right;
+  }
+}
+
 function directories(path: string): string[] {
   if (!existsSync(path)) return [];
   return readdirSync(path, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => join(path, entry.name));
+}
+
+export interface MarketplaceEvaluatorLegReviewCriteria {
+  readonly originManifestPath: string;
+  readonly originV2AttemptId: string;
+  readonly originRequestDigest: string;
+  readonly prNumber: number;
+  readonly expectedHead: GitOid;
+}
+
+export function buildEvaluatorLegReviewPreparedExecution(
+  attemptDir: string,
+  originRequestDigest: string,
+  now: () => Date = () => new Date(),
+): AttemptExecution {
+  const preparedAt = now().toISOString();
+  isoTimestamp(preparedAt);
+  const agentSoftDeadline = new Date(Date.parse(preparedAt) + 3_600_000).toISOString();
+  const adoptionDeadline = new Date(Date.parse(preparedAt) + 7_200_000).toISOString();
+  isoTimestamp(agentSoftDeadline);
+  isoTimestamp(adoptionDeadline);
+  return {
+    backend: 'marketplace',
+    state: {
+      schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+      status: 'prepared',
+      requestPath: join(attemptDir, 'evaluator-leg.request.json'),
+      requestDigest: originRequestDigest,
+      solverNetSelectionPath: join(attemptDir, 'evaluator-leg.solvernet-selection.json'),
+      preparedAt,
+      agentSoftDeadline,
+      adoptionDeadline,
+    },
+  };
+}
+
+export function findMarketplaceEvaluatorLegReviews(
+  v2Base: string,
+  criteria: MarketplaceEvaluatorLegReviewCriteria,
+): AttemptManifest[] {
+  const matches: AttemptManifest[] = [];
+  if (!existsSync(v2Base)) return matches;
+  for (const runnerDir of directories(v2Base)) {
+    const reviewDir = join(runnerDir, 'review');
+    for (const attemptDir of directories(reviewDir)) {
+      const manifestPath = join(attemptDir, 'manifest.json');
+      try {
+        const manifest = readAttemptManifest(manifestPath);
+        if (
+          manifest.phase !== 'review'
+          || manifest.execution.backend !== 'marketplace'
+        ) continue;
+        const state = manifest.execution.state;
+        if (state.schemaVersion !== MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) continue;
+        if (state.status === 'released') continue;
+        if (
+          state.originV2AttemptId === criteria.originV2AttemptId
+          && state.originRequestDigest === criteria.originRequestDigest
+          && state.prNumber === criteria.prNumber
+          && state.expectedHead === criteria.expectedHead
+          && (
+            state.originManifestPath === criteria.originManifestPath
+            || sameManifestPath(state.originManifestPath, criteria.originManifestPath)
+          )
+        ) {
+          matches.push(manifest);
+        }
+      } catch {
+        // Malformed manifests cannot prove a linked evaluator leg.
+      }
+    }
+  }
+  return matches;
+}
+
+export function findMarketplaceEvaluatorReviewByAttemptId(
+  v2Base: string,
+  attemptId: string,
+): AttemptManifest | null {
+  if (!existsSync(v2Base)) return null;
+  for (const runnerDir of directories(v2Base)) {
+    const reviewDir = join(runnerDir, 'review');
+    for (const attemptDir of directories(reviewDir)) {
+      const manifestPath = join(attemptDir, 'manifest.json');
+      try {
+        const manifest = readAttemptManifest(manifestPath);
+        if (manifest.attemptId === attemptId && manifest.phase === 'review') {
+          return manifest;
+        }
+      } catch {
+        // Malformed manifests cannot prove a linked evaluator review.
+      }
+    }
+  }
+  return null;
+}
+
+export function anchorEvidenceFromEvaluatorManifest(
+  manifest: AttemptManifest,
+): MarketplaceReviewAnchorEvidence {
+  if (
+    manifest.execution.backend !== 'marketplace'
+    || manifest.execution.state.schemaVersion !== MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION
+    || manifest.execution.state.status !== 'anchored'
+    || manifest.reviewGeneration === undefined
+    || manifest.reviewRefOid === undefined
+  ) {
+    throw new Error('Evaluator review manifest is not anchored');
+  }
+  const state = manifest.execution.state;
+  return {
+    attemptId: manifest.attemptId,
+    manifestPath: manifest.paths.manifest,
+    head: state.expectedHead,
+    generation: state.generation,
+    refOid: state.reviewRefOid,
+    reviewer: state.reviewer,
+    anchoredAt: state.anchoredAt,
+  };
 }
 
 export function countRunnerLiveAttempts(
@@ -2946,6 +3075,12 @@ function isRunnerLiveAttempt(
   manifest: AttemptManifest,
   isPidAlive: (pid: number) => boolean,
 ): boolean {
+  if (
+    manifest.execution.backend === 'marketplace'
+    && manifest.execution.state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION
+  ) {
+    return manifest.execution.state.status === 'anchored';
+  }
   if (
     manifest.execution.backend === 'marketplace'
     && (manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
