@@ -158,7 +158,13 @@ export type ReviewClaimAcquisitionResult =
       readonly confirmed: ReviewActionCandidate;
     }
   | {
-      readonly status: 'already-approved' | 'ineligible' | 'human' | 'lost' | 'ambiguous';
+      readonly status: 'already-approved';
+      readonly detail: string;
+      readonly prNumber: number;
+      readonly head: GitOid;
+    }
+  | {
+      readonly status: 'ineligible' | 'human' | 'lost' | 'ambiguous';
       readonly detail: string;
     };
 
@@ -228,7 +234,7 @@ type ReviewAcquisitionOutcome =
  *     immediately with no further retries.
  */
 async function confirmReviewAcquisition(
-  deps: ReviewExecutorDeps,
+  deps: ReviewClaimAcquisitionDeps,
   input: {
     readonly candidate: ReviewActionCandidate;
     readonly recordOid: GitOid;
@@ -374,6 +380,8 @@ export async function acquireExactHeadReviewClaim(
     return {
       status: 'already-approved',
       detail: 'Pull request already has a matching terminal approval.',
+      prNumber: candidate.number,
+      head: candidate.head,
     };
   }
 
@@ -544,18 +552,10 @@ export async function executeReviewAction(
 ): Promise<ReviewExecutionResult> {
   const acquired = await acquireExactHeadReviewClaim(action, deps);
   if (acquired.status === 'already-approved') {
-    const candidate = await deps.readCandidate(action.prNumber);
-    if (candidate === null) {
-      return {
-        status: 'ineligible',
-        prNumber: action.prNumber,
-        detail: 'Pull request is missing.',
-      };
-    }
     return {
       status: 'already-approved',
-      prNumber: candidate.number,
-      head: candidate.head,
+      prNumber: acquired.prNumber,
+      head: acquired.head,
     };
   }
   if (acquired.status !== 'acquired') {

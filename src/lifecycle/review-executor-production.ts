@@ -603,19 +603,14 @@ export function makeProductionMarketplaceReviewAnchorPort(
 ): MarketplaceReviewAnchorPort {
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
-  const now = options.now ?? (() => new Date());
+  const now = () => new Date();
   const nextId = options.nextAttemptId ?? (() => randomUUID());
   const reviewPort = makeProductionReviewActionPort(options);
   const v2Base = join(options.worktreeBase, 'v2');
   const releasePort = makeProductionReviewSessionPort({
-    repositoryPath: options.repositoryPath,
-    worktreeBase: options.worktreeBase,
-    runnerId: options.runnerId,
     runner,
     environment: ambient,
-    repositorySlug: options.repositorySlug,
-    repositoryUrl: options.repositoryUrl,
-    projectMapping: options.projectMapping,
+    now,
   });
   const claimAcquisition: ReviewClaimAcquisitionDeps = {
     ...reviewPort,

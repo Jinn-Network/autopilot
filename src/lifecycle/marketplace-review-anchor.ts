@@ -5,10 +5,12 @@ import {
   findMarketplaceEvaluatorReviewByAttemptId,
   readAttemptManifest,
   type AttemptManifest,
-  type MarketplaceEvaluatorLegIdentity,
 } from './attempt-workspace.js';
 import { installMarketplaceEvaluatorLeg, transitionMarketplaceEvaluatorLeg } from './marketplace-adoption-state.js';
-import type { MarketplaceReviewAnchorEvidence } from './marketplace-execution-state.js';
+import type {
+  MarketplaceEvaluatorLegIdentity,
+  MarketplaceReviewAnchorEvidence,
+} from './marketplace-execution-state.js';
 import {
   acquireExactHeadReviewClaim,
   type AcquiredExactHeadReviewClaim,
@@ -22,6 +24,7 @@ import type {
   PublicationOutcome,
   ReviewClaimRecord,
 } from './types.js';
+import { gitOid } from './types.js';
 
 export type {
   AcquiredExactHeadReviewClaim,
@@ -63,7 +66,33 @@ export interface MarketplaceReviewAnchorDependencies {
     readonly origin: MarketplaceReviewAnchorOrigin;
     readonly confirmed: ReviewActionCandidate;
   }) => Promise<AttemptManifest>;
+  readonly releasePort?: ReviewSessionPort;
   readonly now?: () => Date;
+}
+
+const ACTIVE_REVIEW_GENERATION_DETAIL = 'The exact PR head already has an active review generation.';
+const CODEOWNER_REJECTION_DETAIL = 'CODEOWNER review claims cannot anchor marketplace evaluators.';
+
+function claimFromManifest(manifest: AttemptManifest): AcquiredExactHeadReviewClaim {
+  if (
+    manifest.prNumber === undefined
+    || manifest.reviewGeneration === undefined
+    || manifest.reviewRefOid === undefined
+    || manifest.reviewApprovalPolicy === undefined
+  ) {
+    throw new Error('Review manifest is incomplete');
+  }
+  return {
+    prNumber: manifest.prNumber,
+    head: gitOid(manifest.expectedHead),
+    reviewRefOid: gitOid(manifest.reviewRefOid),
+    attemptId: manifest.attemptId,
+    generation: manifest.reviewGeneration,
+    reviewer: manifest.selectedLogin,
+    approvalPolicy: manifest.reviewApprovalPolicy,
+    manifestPath: manifest.paths.manifest,
+    paths: manifest.paths,
+  };
 }
 
 function evaluatorIdentity(
@@ -111,6 +140,129 @@ async function installEvaluatorLeg(
   return readAttemptManifest(manifestPath);
 }
 
+async function anchorFromPreparedManifest(
+  manifest: AttemptManifest,
+  origin: MarketplaceReviewAnchorOrigin,
+  claim: AcquiredExactHeadReviewClaim,
+  now: () => Date,
+): Promise<MarketplaceReviewAnchorResult> {
+  if (
+    manifest.execution.backend === 'marketplace'
+    && manifest.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1'
+  ) {
+    if (manifest.execution.state.status === 'released') {
+      return {
+        status: 'rejected',
+        detail: 'Linked evaluator-leg review manifest was already released.',
+      };
+    }
+    return {
+      status: 'anchored',
+      anchor: anchorEvidenceFromEvaluatorManifest(manifest),
+    };
+  }
+  const installed = await installEvaluatorLeg(manifest.paths.manifest, origin, claim, now);
+  return {
+    status: 'anchored',
+    anchor: anchorEvidenceFromEvaluatorManifest(installed),
+  };
+}
+
+async function abandonAcquiredReviewClaim(
+  manifest: AttemptManifest,
+  port: ReviewSessionPort,
+): Promise<void> {
+  await publishStaleReviewClaim(manifest, port);
+}
+
+async function abandonOrphanedActiveClaim(
+  input: {
+    readonly prNumber: number;
+    readonly expectedHead: GitOid;
+    readonly v2Base: string;
+  },
+  port: ReviewSessionPort,
+  readCandidate: ReviewClaimAcquisitionDeps['readCandidate'],
+): Promise<boolean> {
+  const candidate = await readCandidate(input.prNumber);
+  const activeClaim = candidate?.reviewRef?.record;
+  if (
+    candidate === null
+    || candidate.head !== input.expectedHead
+    || activeClaim === undefined
+    || activeClaim.head !== input.expectedHead
+    || activeClaim.state !== 'active'
+    || activeClaim.prNumber !== input.prNumber
+  ) {
+    return false;
+  }
+  const manifest = findMarketplaceEvaluatorReviewByAttemptId(input.v2Base, activeClaim.attempt);
+  if (manifest === null) return false;
+  await abandonAcquiredReviewClaim(manifest, port);
+  return true;
+}
+
+async function recoverPreparedEvaluatorReview(
+  input: {
+    readonly origin: MarketplaceReviewAnchorOrigin;
+    readonly prNumber: number;
+    readonly expectedHead: GitOid;
+    readonly v2Base: string;
+  },
+  deps: MarketplaceReviewAnchorDependencies,
+  now: () => Date,
+): Promise<MarketplaceReviewAnchorResult | null> {
+  const candidate = await deps.claimAcquisition.readCandidate(input.prNumber);
+  const activeClaim = candidate?.reviewRef?.record;
+  if (
+    candidate === null
+    || candidate.head !== input.expectedHead
+    || activeClaim === undefined
+    || activeClaim.head !== input.expectedHead
+    || activeClaim.state !== 'active'
+    || activeClaim.prNumber !== input.prNumber
+  ) {
+    return null;
+  }
+  const manifest = findMarketplaceEvaluatorReviewByAttemptId(input.v2Base, activeClaim.attempt);
+  if (manifest === null) return null;
+  if (manifest.execution.backend !== 'marketplace') return null;
+  const state = manifest.execution.state;
+  if (
+    manifest.prNumber !== input.prNumber
+    || manifest.expectedHead !== input.expectedHead
+  ) {
+    return null;
+  }
+  if (state.schemaVersion === 'marketplace-evaluator-leg-v1') {
+    if (
+      state.originV2AttemptId !== input.origin.originV2AttemptId
+      || state.originRequestDigest !== input.origin.originRequestDigest
+      || state.originManifestPath !== input.origin.originManifestPath
+    ) {
+      return null;
+    }
+    return anchorFromPreparedManifest(manifest, input.origin, claimFromManifest(manifest), now);
+  }
+  if (
+    state.schemaVersion !== 'marketplace-execution-v2'
+    || state.status !== 'prepared'
+    || state.requestDigest !== input.origin.originRequestDigest
+  ) {
+    return null;
+  }
+  return anchorFromPreparedManifest(
+    manifest,
+    input.origin,
+    claimFromManifest(manifest),
+    now,
+  );
+}
+
+function isCodeownerCandidate(candidate: ReviewActionCandidate | null): boolean {
+  return candidate?.approvalPolicy === 'human-codeowner';
+}
+
 export async function anchorMarketplaceEvaluatorReview(
   input: {
     readonly origin: MarketplaceReviewAnchorOrigin;
@@ -142,18 +294,45 @@ export async function anchorMarketplaceEvaluatorReview(
     };
   }
 
+  const preClaimCandidate = await deps.claimAcquisition.readCandidate(input.prNumber);
+  if (isCodeownerCandidate(preClaimCandidate)) {
+    return {
+      status: 'rejected',
+      detail: CODEOWNER_REJECTION_DETAIL,
+    };
+  }
+
   const acquired = await acquireExactHeadReviewClaim(
     { prNumber: input.prNumber, expectedHead: input.expectedHead },
     deps.claimAcquisition,
   );
   if (acquired.status !== 'acquired') {
+    if (
+      acquired.status === 'ineligible'
+      && acquired.detail === ACTIVE_REVIEW_GENERATION_DETAIL
+    ) {
+      const recovered = await recoverPreparedEvaluatorReview(input, deps, now);
+      if (recovered !== null) return recovered;
+    }
+    if (acquired.status === 'human' && deps.releasePort !== undefined) {
+      await abandonOrphanedActiveClaim(
+        input,
+        deps.releasePort,
+        deps.claimAcquisition.readCandidate,
+      );
+    }
     return claimResultToAnchorResult(acquired);
   }
   const { claim, confirmed } = acquired;
   if (confirmed.approvalPolicy !== 'approve-eligible') {
+    if (deps.releasePort !== undefined) {
+      const manifest = findMarketplaceEvaluatorReviewByAttemptId(input.v2Base, claim.attemptId)
+        ?? readAttemptManifest(claim.manifestPath);
+      await abandonAcquiredReviewClaim(manifest, deps.releasePort);
+    }
     return {
       status: 'rejected',
-      detail: 'CODEOWNER review claims cannot anchor marketplace evaluators.',
+      detail: CODEOWNER_REJECTION_DETAIL,
     };
   }
   let manifest = findMarketplaceEvaluatorReviewByAttemptId(input.v2Base, claim.attemptId);
@@ -164,26 +343,7 @@ export async function anchorMarketplaceEvaluatorReview(
       confirmed,
     });
   }
-  if (
-    manifest.execution.backend === 'marketplace'
-    && manifest.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1'
-  ) {
-    if (manifest.execution.state.status === 'released') {
-      return {
-        status: 'rejected',
-        detail: 'Linked evaluator-leg review manifest was already released.',
-      };
-    }
-    return {
-      status: 'anchored',
-      anchor: anchorEvidenceFromEvaluatorManifest(manifest),
-    };
-  }
-  manifest = await installEvaluatorLeg(manifest.paths.manifest, input.origin, claim, now);
-  return {
-    status: 'anchored',
-    anchor: anchorEvidenceFromEvaluatorManifest(manifest),
-  };
+  return anchorFromPreparedManifest(manifest, input.origin, claim, now);
 }
 
 async function publishStaleReviewClaim(
@@ -199,7 +359,7 @@ async function publishStaleReviewClaim(
     generation: manifest.reviewGeneration!,
     attempt: manifest.attemptId,
     reviewer: manifest.selectedLogin,
-    head: manifest.expectedHead,
+    head: gitOid(manifest.expectedHead),
     state: 'stale',
     recordedAt: port.now().toISOString(),
   };
