@@ -162,7 +162,7 @@ export function upgradeMarketplaceExecutionV2(
   if (Date.parse(at) < Date.parse(manifest.timestamps.updatedAt)) {
     throw new Error('Marketplace upgrade timestamp predates manifest updated timestamp');
   }
-  return replaceMarketplaceExecutionState(manifestPath, upgraded, at);
+  return replaceMarketplaceExecutionState(manifestPath, state, upgraded, at);
 }
 
 export function transitionMarketplaceAdoption(
@@ -173,6 +173,10 @@ export function transitionMarketplaceAdoption(
 ): AttemptManifest {
   const expected = digest(expectedRequestDigest);
   const manifest = readAttemptManifest(manifestPath);
+  if (manifest.execution.backend !== 'marketplace') {
+    throw new Error('Marketplace request digest changed before adoption transition');
+  }
+  const expectedState = manifest.execution.state;
   const state = adoptionState(manifest, expected);
   const at = timestamp(now);
   if (Date.parse(at) < Date.parse(manifest.timestamps.updatedAt)) {
@@ -206,26 +210,26 @@ export function transitionMarketplaceAdoption(
   switch (transition.status) {
     case 'solution-observed':
       if (state.status !== 'submitted') return same('solution-observed');
-      return replaceMarketplaceExecutionState(manifestPath, { ...state, status: 'solution-observed', delivery: transition.delivery }, at);
+      return replaceMarketplaceExecutionState(manifestPath, expectedState, { ...state, status: 'solution-observed', delivery: transition.delivery }, at);
     case 'solution-verified':
       if (state.status !== 'solution-observed') return same('solution-verified');
-      return replaceMarketplaceExecutionState(manifestPath, { ...state, status: 'solution-verified', artifact: transition.artifact, verification: transition.verification }, at);
+      return replaceMarketplaceExecutionState(manifestPath, expectedState, { ...state, status: 'solution-verified', artifact: transition.artifact, verification: transition.verification }, at);
     case 'host-committed':
       if (state.status !== 'solution-verified') return same('host-committed');
-      return replaceMarketplaceExecutionState(manifestPath, { ...state, status: 'host-committed', hostCommit: transition.hostCommit }, at);
+      return replaceMarketplaceExecutionState(manifestPath, expectedState, { ...state, status: 'host-committed', hostCommit: transition.hostCommit }, at);
     case 'lifecycle-completed':
       if (state.status !== 'host-committed') return same('lifecycle-completed');
-      return replaceMarketplaceExecutionState(manifestPath, { ...state, status: 'lifecycle-completed', completion: transition.completion }, at);
+      return replaceMarketplaceExecutionState(manifestPath, expectedState, { ...state, status: 'lifecycle-completed', completion: transition.completion }, at);
     case 'review-anchored':
       if (state.status !== 'lifecycle-completed') return same('review-anchored');
-      return replaceMarketplaceExecutionState(manifestPath, { ...state, status: 'review-anchored', reviewAnchor: transition.reviewAnchor }, at);
+      return replaceMarketplaceExecutionState(manifestPath, expectedState, { ...state, status: 'review-anchored', reviewAnchor: transition.reviewAnchor }, at);
     case 'receipt-published':
       if (state.status === 'receipt-published') return same('receipt-published');
       if (!('submission' in state)) return same('receipt-published');
       {
         const progress = durableProgress(state);
         if (progress === undefined) return same('receipt-published');
-        return replaceMarketplaceExecutionState(manifestPath, {
+        return replaceMarketplaceExecutionState(manifestPath, expectedState, {
           schemaVersion: state.schemaVersion,
           requestPath: state.requestPath,
           requestDigest: state.requestDigest,
@@ -256,12 +260,33 @@ export function installMarketplaceEvaluatorLeg(
     }
     return manifest;
   }
+  if (
+    manifest.phase !== 'review'
+    || manifest.reviewApprovalPolicy !== 'approve-eligible'
+    || (
+      manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      && manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    )
+    || manifest.execution.state.status !== 'prepared'
+  ) {
+    throw new Error('Evaluator leg requires an eligible prepared review manifest');
+  }
+  if (
+    manifest.prNumber !== identity.prNumber
+    || manifest.expectedHead !== identity.expectedHead
+    || manifest.reviewGeneration !== identity.generation
+    || manifest.reviewRefOid !== identity.reviewRefOid
+    || manifest.selectedLogin !== identity.reviewer
+  ) {
+    throw new Error('Marketplace evaluator contradicts review manifest authority');
+  }
   const anchoredAt = timestamp(now);
   if (Date.parse(anchoredAt) < Date.parse(manifest.timestamps.updatedAt)) {
     throw new Error('Marketplace evaluator install timestamp predates manifest updated timestamp');
   }
   return replaceMarketplaceExecutionState(
     manifestPath,
+    manifest.execution.state,
     {
       ...identity,
       schemaVersion: MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION,
@@ -294,5 +319,5 @@ export function transitionMarketplaceEvaluatorLeg(
   }
   const releasedAt = timestamp(now);
   if (Date.parse(releasedAt) < Date.parse(state.anchoredAt)) throw new Error('Marketplace evaluator release timestamp predates anchor');
-  return replaceMarketplaceExecutionState(manifestPath, { ...state, status: 'released', releasedAt, releaseReason: transition.releaseReason }, releasedAt);
+  return replaceMarketplaceExecutionState(manifestPath, state, { ...state, status: 'released', releasedAt, releaseReason: transition.releaseReason }, releasedAt);
 }

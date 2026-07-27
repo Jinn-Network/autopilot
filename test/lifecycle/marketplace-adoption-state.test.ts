@@ -1,4 +1,6 @@
+import { spawn } from 'node:child_process';
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -53,9 +55,51 @@ const SUBMISSION = {
 } as const;
 const roots: string[] = [];
 
+interface AdoptionWorkerResult {
+  readonly code: number | null;
+  readonly result: {
+    readonly ok: boolean;
+    readonly error?: string;
+    readonly status?: string;
+  };
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+function runAdoptionWorker(input: Record<string, unknown>): Promise<AdoptionWorkerResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'),
+      join(process.cwd(), 'test/lifecycle/marketplace-adoption-worker.ts'),
+      JSON.stringify(input),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      try {
+        resolve({
+          code,
+          result: JSON.parse(stdout) as AdoptionWorkerResult['result'],
+        });
+      } catch {
+        reject(new Error(`Marketplace adoption worker did not return JSON: ${stderr}`));
+      }
+    });
+  });
+}
+
+async function waitForFiles(...paths: readonly string[]): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (!paths.every((path) => existsSync(path))) {
+    if (Date.now() >= deadline) throw new Error('timed out waiting for adoption workers');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 function fixture(
   status: 'prepared' | 'submitted' | 'cancelled',
@@ -70,7 +114,8 @@ function fixture(
   mkdirSync(join(root, '.git'), { recursive: true });
   const attemptId = input.attemptId ?? ATTEMPT_ID;
   const phase = input.phase ?? 'implement';
-  const attemptDir = join(root, `${phase}-${attemptId}`);
+  const subject = phase === 'implement' ? 'issue-42' : 'pr-84';
+  const attemptDir = join(root, 'v2', 'runner-a', phase, `${subject}-${attemptId}`);
   mkdirSync(join(attemptDir, 'worktree'), { recursive: true });
   mkdirSync(join(attemptDir, 'gh-config'));
   const prepared = {
@@ -100,7 +145,7 @@ function fixture(
     host: 'test-host',
     phase,
     execution: { backend: 'marketplace', state },
-    subject: phase === 'implement' ? 'issue-42' : 'pr-84',
+    subject,
     issueNumber: 42,
     prNumber: 84,
     branch: 'autopilot/42',
@@ -183,8 +228,14 @@ function evaluatorIdentity(
   attemptDir: string,
   overrides: Partial<MarketplaceEvaluatorLegIdentity> = {},
 ): MarketplaceEvaluatorLegIdentity {
+  const runnerDir = join(attemptDir, '..', '..');
   return {
-    originManifestPath: join(attemptDir, '..', 'origin-attempt', 'manifest.json'),
+    originManifestPath: join(
+      runnerDir,
+      'implement',
+      `issue-42-${ATTEMPT_ID}`,
+      'manifest.json',
+    ),
     originV2AttemptId: ATTEMPT_ID,
     originRequestDigest: DIGEST,
     taskId: SUBMISSION.taskId,
@@ -254,9 +305,15 @@ const COMPLETION = {
 } as const;
 
 function reviewAnchor(attemptDir: string) {
+  const runnerDir = join(attemptDir, '..', '..');
   return {
     attemptId: REVIEW_ATTEMPT_ID,
-    manifestPath: join(attemptDir, '..', 'review-attempt', 'manifest.json'),
+    manifestPath: join(
+      runnerDir,
+      'review',
+      `pr-84-${REVIEW_ATTEMPT_ID}`,
+      'manifest.json',
+    ),
     head: OID,
     generation: GENERATION,
     refOid: OID,
@@ -346,6 +403,102 @@ describe('marketplace adoption transition API', () => {
       () => new Date('2026-07-27T12:03:00.000Z'),
     )).toThrow(/request digest changed/i);
     expect(readFileSync(path)).toEqual(before);
+  });
+
+  // This catches two processes validating the same submitted snapshot and last-writer-wins.
+  it('allows only one of two concurrent Solution delivery identities to become durable', async () => {
+    const { path, attemptDir } = fixture('submitted');
+    const readyA = join(attemptDir, 'worker-a.ready');
+    const readyB = join(attemptDir, 'worker-b.ready');
+    const release = join(attemptDir, 'workers.release');
+    const firstDelivery = delivery(attemptDir);
+    const secondDelivery = delivery(attemptDir, {
+      deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4differentenvelopecid',
+      deliveryEnvelopeDigest: `sha256:${'0'.repeat(64)}`,
+      deliveryTransaction: `0x${'4'.repeat(64)}`,
+      deliveryBlock: 503,
+      correlation: {
+        ...firstDelivery.correlation,
+        deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4differentenvelopecid',
+      },
+    });
+    const common = {
+      operation: 'observe',
+      manifestPath: path,
+      requestDigest: DIGEST,
+      timestamp: '2026-07-27T12:03:00.000Z',
+      releasePath: release,
+    } as const;
+
+    const workerA = runAdoptionWorker({
+      ...common,
+      delivery: firstDelivery,
+      readyPath: readyA,
+    });
+    const workerB = runAdoptionWorker({
+      ...common,
+      delivery: secondDelivery,
+      readyPath: readyB,
+    });
+    await waitForFiles(readyA, readyB);
+    writeFileSync(release, 'release\n', { mode: 0o600 });
+    const results = await Promise.all([workerA, workerB]);
+
+    expect(results.every(({ code }) => code === 0)).toBe(true);
+    expect(results.filter(({ result }) => result.ok)).toHaveLength(1);
+    expect(results.find(({ result }) => !result.ok)?.result.error)
+      .toMatch(/marketplace execution state changed|transition already in progress/i);
+    const current = readAttemptManifest(path);
+    expect(current.execution).toMatchObject({
+      backend: 'marketplace',
+      state: { schemaVersion: 'marketplace-execution-v3', status: 'solution-observed' },
+    });
+    if (
+      current.execution.backend !== 'marketplace'
+      || current.execution.state.schemaVersion !== 'marketplace-execution-v3'
+      || current.execution.state.status !== 'solution-observed'
+    ) {
+      throw new Error('expected one durable observed Solution');
+    }
+    expect([
+      firstDelivery.deliveryEnvelopeCid,
+      secondDelivery.deliveryEnvelopeCid,
+    ]).toContain(current.execution.state.delivery.deliveryEnvelopeCid);
+  });
+
+  // This catches a paused v2 migration overwriting later observed v3 evidence.
+  it('rejects a stale v2 upgrade after adoption advanced the same manifest', async () => {
+    const { path, attemptDir } = fixture('submitted');
+    const ready = join(attemptDir, 'upgrade.ready');
+    const release = join(attemptDir, 'upgrade.release');
+    const upgrade = runAdoptionWorker({
+      operation: 'upgrade',
+      manifestPath: path,
+      requestDigest: DIGEST,
+      timestamp: '2026-07-27T12:04:00.000Z',
+      readyPath: ready,
+      releasePath: release,
+    });
+    await waitForFiles(ready);
+
+    transitionMarketplaceAdoption(
+      path,
+      DIGEST,
+      { status: 'solution-observed', delivery: delivery(attemptDir) },
+      () => new Date('2026-07-27T12:03:00.000Z'),
+    );
+    const observedBytes = readFileSync(path);
+    writeFileSync(release, 'release\n', { mode: 0o600 });
+    const stale = await upgrade;
+
+    expect(stale.code).toBe(0);
+    expect(stale.result).toMatchObject({ ok: false });
+    expect(stale.result.error).toMatch(/marketplace execution state changed/i);
+    expect(readFileSync(path)).toEqual(observedBytes);
+    expect(readAttemptManifest(path).execution).toMatchObject({
+      backend: 'marketplace',
+      state: { schemaVersion: 'marketplace-execution-v3', status: 'solution-observed' },
+    });
   });
 
   // This catches adoption replay that rewrites timestamps or accepts a second delivery identity.

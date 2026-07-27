@@ -27,7 +27,7 @@ import {
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
-import { gitOid, gitRefName, isoTimestamp } from './types.js';
+import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
   persistMarketplaceTaskRequest,
   verifyMarketplaceTaskRequest,
@@ -616,6 +616,76 @@ function strictMarketplaceStateTimestamp(
   return undefined;
 }
 
+function requireMarketplaceManifestAuthority(
+  execution: AttemptExecution,
+  authority: {
+    readonly attemptId: string;
+    readonly phase: AttemptPhase;
+    readonly prNumber?: number;
+    readonly branch: string;
+    readonly expectedHead: GitOid;
+    readonly claimOid: GitOid;
+    readonly reviewGeneration?: string;
+    readonly reviewRefOid?: GitOid;
+    readonly reviewApprovalPolicy?: ReviewApprovalPolicy;
+    readonly selectedLogin: string;
+  },
+): void {
+  if (execution.backend !== 'marketplace') return;
+  const state = execution.state;
+  if (state.schemaVersion === 'marketplace-evaluator-leg-v1') {
+    if (
+      authority.phase !== 'review'
+      || authority.reviewApprovalPolicy !== 'approve-eligible'
+      || state.prNumber !== authority.prNumber
+      || state.expectedHead !== authority.expectedHead
+      || state.generation !== authority.reviewGeneration
+      || state.reviewRefOid !== authority.reviewRefOid
+      || state.reviewer !== authority.selectedLogin
+    ) {
+      throw new Error('Marketplace evaluator contradicts review manifest authority');
+    }
+    return;
+  }
+  if (state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) return;
+  if ('submission' in state && state.submission.id !== `autopilot:${authority.attemptId}`) {
+    throw new Error('Marketplace execution contradicts manifest authority');
+  }
+  const progress = state.status === 'receipt-published'
+    ? state.progress
+    : 'delivery' in state
+      ? state
+      : undefined;
+  if (progress === undefined) return;
+  if (
+    progress.delivery.correlation.v2AttemptId !== authority.attemptId
+    || progress.delivery.correlation.prNumber !== authority.prNumber
+    || progress.delivery.correlation.claimOid !== authority.claimOid
+    || progress.delivery.correlation.expectedHead !== authority.expectedHead
+  ) {
+    throw new Error('Marketplace execution contradicts manifest authority');
+  }
+  const completion = progress.status === 'lifecycle-completed'
+    || progress.status === 'review-anchored'
+    ? progress.completion
+    : undefined;
+  if (
+    completion !== undefined
+    && (
+      completion.claimOid !== authority.claimOid
+      || (
+        completion.operation === 'implementation-complete'
+          ? completion.prNumber !== authority.prNumber
+            || completion.branch !== authority.branch
+          : completion.parentPrNumber !== authority.prNumber
+            || completion.parentBranch !== authority.branch
+      )
+    )
+  ) {
+    throw new Error('Marketplace execution contradicts manifest authority');
+  }
+}
+
 export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const manifest = record(value, 'attempt manifest');
   exactKeys(manifest, [
@@ -667,6 +737,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const expectedSubject = phase === 'implement' ? `issue-${issueNumber}` : `pr-${prNumber}`;
   if (subject !== expectedSubject) throw new Error('Attempt subject does not match phase identity');
   const expectedHead = gitOid(stringField(manifest.expectedHead, 'expected head'));
+  const branch = gitRefName(stringField(manifest.branch, 'branch'));
+  const targetBase = gitRefName(stringField(manifest.targetBase, 'target base'));
   const targetBaseOid = manifest.targetBaseOid === undefined
     ? undefined
     : gitOid(stringField(manifest.targetBaseOid, 'target base OID'));
@@ -681,6 +753,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     throw new Error('Target base OID is not valid for attempt manifests');
   }
   const claimOid = gitOid(stringField(manifest.claimOid, 'claim OID'));
+  const selectedLogin = stringField(manifest.selectedLogin, 'selected login');
   const reviewGeneration = manifest.reviewGeneration === undefined
     ? undefined
     : uuid(stringField(manifest.reviewGeneration, 'review generation'), 'review generation');
@@ -762,6 +835,22 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   ) {
     throw new Error('Marketplace execution timestamp postdates manifest updated timestamp');
   }
+  requireMarketplaceManifestAuthority(execution, {
+    attemptId,
+    phase,
+    ...(prNumber === undefined ? {} : { prNumber }),
+    branch,
+    expectedHead,
+    claimOid,
+    ...(reviewGeneration === undefined
+      ? {}
+      : {
+          reviewGeneration,
+          reviewRefOid: reviewRefOid!,
+          reviewApprovalPolicy: reviewApprovalPolicy!,
+        }),
+    selectedLogin,
+  });
   return {
     version: 2,
     attemptId,
@@ -772,8 +861,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     subject,
     issueNumber,
     ...(prNumber === undefined ? {} : { prNumber }),
-    branch: gitRefName(stringField(manifest.branch, 'branch')),
-    targetBase: gitRefName(stringField(manifest.targetBase, 'target base')),
+    branch,
+    targetBase,
     ...(targetBaseOid === undefined ? {} : { targetBaseOid }),
     expectedHead,
     claimOid,
@@ -784,7 +873,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
           reviewRefOid: reviewRefOid!,
           reviewApprovalPolicy: reviewApprovalPolicy!,
         }),
-    selectedLogin: stringField(manifest.selectedLogin, 'selected login'),
+    selectedLogin,
     repository: decodeRepositoryIdentity(manifest.repository),
     processState: decodedProcessState,
     pid,
@@ -829,24 +918,58 @@ function writeManifestAtomic(path: string, manifest: AttemptManifest): void {
 /** Dedicated internal boundary for strict marketplace state transitions. */
 export function replaceMarketplaceExecutionState(
   path: string,
+  expectedState: MarketplaceExecutionState,
   state: MarketplaceExecutionState,
   updatedAt: string,
 ): AttemptManifest {
-  const current = readAttemptManifest(path);
-  if (current.execution.backend !== 'marketplace') {
-    throw new Error('Only marketplace attempts may replace marketplace execution state');
+  const lockPath = `${path}.marketplace-state-transition.lock`;
+  let descriptor: number | undefined;
+  let acquired = false;
+  try {
+    try {
+      descriptor = openSync(lockPath, 'wx', 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('Marketplace state transition already in progress');
+      }
+      throw error;
+    }
+    acquired = true;
+    writeFileSync(
+      descriptor,
+      `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+      'utf8',
+    );
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    fsyncDirectory(dirname(path));
+
+    const current = readAttemptManifest(path);
+    if (current.execution.backend !== 'marketplace') {
+      throw new Error('Only marketplace attempts may replace marketplace execution state');
+    }
+    if (!isDeepStrictEqual(current.execution.state, expectedState)) {
+      throw new Error('Marketplace execution state changed before replacement');
+    }
+    const next = decodeAttemptManifest({
+      ...current,
+      execution: { backend: 'marketplace', state },
+      timestamps: {
+        ...current.timestamps,
+        updatedAt: Date.parse(current.timestamps.updatedAt) >= Date.parse(updatedAt)
+          ? current.timestamps.updatedAt : updatedAt,
+      },
+    });
+    if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
+    return next;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (acquired && existsSync(lockPath)) {
+      rmSync(lockPath);
+      fsyncDirectory(dirname(path));
+    }
   }
-  const next = decodeAttemptManifest({
-    ...current,
-    execution: { backend: 'marketplace', state },
-    timestamps: {
-      ...current.timestamps,
-      updatedAt: Date.parse(current.timestamps.updatedAt) >= Date.parse(updatedAt)
-        ? current.timestamps.updatedAt : updatedAt,
-    },
-  });
-  if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
-  return next;
 }
 
 function fsyncDirectory(path: string): void {

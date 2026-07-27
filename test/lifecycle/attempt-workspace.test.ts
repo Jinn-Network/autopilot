@@ -49,6 +49,10 @@ import {
   persistMarketplaceTaskRequest,
   verifyMarketplaceTaskRequest,
 } from '../../src/lifecycle/marketplace-task.js';
+import {
+  installMarketplaceEvaluatorLeg,
+  transitionMarketplaceAdoption,
+} from '../../src/lifecycle/marketplace-adoption-state.js';
 
 // This file is deliberately subprocess-heavy: almost every test builds one or more real
 // `git` repository fixtures and drives `createAttemptWorkspace` against them, so a single
@@ -923,6 +927,337 @@ describe('attempt workspace and manifest', () => {
     },
   );
 
+  // This catches a self-consistent v3 evidence chain copied into another outer attempt.
+  it('binds submitted, delivery, and completion evidence to outer manifest authority', async () => {
+    const fixture = repositoryFixture();
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const runnerId = 'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      runnerId,
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const submission = {
+      ...SUBMISSION_RESULT,
+      generatedAt: NOW,
+      id: `autopilot:${UUID_A}`,
+      taskId: '501',
+    };
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v3',
+          status: 'submitted',
+          requestPath: join(attemptDir, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(attemptDir, 'solvernet-selection.json'),
+          preparedAt: NOW,
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+          submission,
+          submittedAt: NOW,
+        },
+      },
+    }), defaultRunner);
+    const delivery = {
+      observationPath: join(attemptDir, 'delivery.json'),
+      observationDigest: `sha256:${'b'.repeat(64)}`,
+      taskId: '501',
+      taskCid: submission.taskCid,
+      taskCreationTransaction: submission.creationTx,
+      taskCreationBlock: submission.creationBlock,
+      solverNetManifestCid: submission.solverNetManifestCid,
+      attemptIndex: 0,
+      requestId: `0x${'c'.repeat(64)}`,
+      deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid',
+      deliveryEnvelopeDigest: `sha256:${'d'.repeat(64)}`,
+      deliveryTransaction: `0x${'e'.repeat(64)}`,
+      deliveryBlock: submission.creationBlock + 1,
+      solverSafe: `0x${'1'.repeat(40)}`,
+      solverAgentEoa: `0x${'2'.repeat(40)}`,
+      signer: `0x${'2'.repeat(40)}`,
+      publisherAgentId: '501',
+      correlation: {
+        taskId: '501',
+        attemptIndex: 0,
+        requestId: `0x${'c'.repeat(64)}`,
+        deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid',
+        v2AttemptId: UUID_A,
+        claimOid: fixture.oid,
+        prNumber: 84,
+        expectedHead: fixture.oid,
+      },
+      observedAt: NOW,
+    };
+    const submittedBytes = readFileSync(manifest.paths.manifest);
+    expect(() => transitionMarketplaceAdoption(
+      manifest.paths.manifest,
+      requestDigest,
+      {
+        status: 'solution-observed',
+        delivery: {
+          ...delivery,
+          correlation: { ...delivery.correlation, prNumber: 85 },
+        },
+      },
+      () => new Date(NOW),
+    )).toThrow(/marketplace execution.*manifest authority/i);
+    expect(readFileSync(manifest.paths.manifest)).toEqual(submittedBytes);
+    transitionMarketplaceAdoption(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'solution-observed', delivery },
+      () => new Date(NOW),
+    );
+    const observed = readAttemptManifest(manifest.paths.manifest);
+
+    for (const [name, mutate] of [
+      ['attempt', (raw) => {
+        raw.execution.state.submission.id = `autopilot:${UUID_B}`;
+        raw.execution.state.delivery.correlation.v2AttemptId = UUID_B;
+      }],
+      ['PR', (raw) => { raw.execution.state.delivery.correlation.prNumber = 85; }],
+      ['claim', (raw) => { raw.execution.state.delivery.correlation.claimOid = 'b'.repeat(40); }],
+      ['expected head', (raw) => {
+        raw.execution.state.delivery.correlation.expectedHead = 'c'.repeat(40);
+      }],
+    ]) {
+      const raw = JSON.parse(JSON.stringify(observed));
+      mutate(raw);
+      expect(() => decodeAttemptManifest(raw), `${name} authority`).toThrow(
+        /marketplace execution.*manifest authority/i,
+      );
+    }
+
+    const artifact = {
+      digest: `sha256:${'3'.repeat(64)}`,
+      byteLength: 12,
+      touchedPaths: ['packages/a.ts'],
+      expectedTree: fixture.oid,
+    };
+    transitionMarketplaceAdoption(
+      manifest.paths.manifest,
+      requestDigest,
+      {
+        status: 'solution-verified',
+        artifact,
+        verification: {
+          profile: 'jinn-mono.v1',
+          artifactDigest: artifact.digest,
+          expectedTree: fixture.oid,
+          planDigest: `sha256:${'4'.repeat(64)}`,
+          commands: [{
+            label: 'typecheck',
+            command: 'yarn',
+            args: ['typecheck'],
+            cwdRelative: '.',
+            status: 'passed',
+            exitCode: 0,
+            stdoutDigest: `sha256:${'5'.repeat(64)}`,
+            stderrDigest: `sha256:${'6'.repeat(64)}`,
+            startedAt: NOW,
+            completedAt: NOW,
+          }],
+          verifiedAt: NOW,
+        },
+      },
+      () => new Date(NOW),
+    );
+    transitionMarketplaceAdoption(
+      manifest.paths.manifest,
+      requestDigest,
+      {
+        status: 'host-committed',
+        hostCommit: {
+          head: fixture.oid,
+          tree: fixture.oid,
+          parents: [fixture.oid],
+          artifactDigest: artifact.digest,
+          correlationDigest: `sha256:${'7'.repeat(64)}`,
+          trailers: {
+            taskId: '501',
+            requestId: delivery.requestId,
+            deliveryEnvelopeCid: delivery.deliveryEnvelopeCid,
+            v2AttemptId: UUID_A,
+            artifactDigest: artifact.digest,
+          },
+          createdAt: NOW,
+        },
+      },
+      () => new Date(NOW),
+    );
+    transitionMarketplaceAdoption(
+      manifest.paths.manifest,
+      requestDigest,
+      {
+        status: 'lifecycle-completed',
+        completion: {
+          operation: 'implementation-complete',
+          prNumber: 84,
+          branch: 'autopilot/42',
+          claimOid: fixture.oid,
+          checkpointOid: fixture.oid,
+          resultingHead: fixture.oid,
+          lifecycleStatus: 'In Review',
+          confirmedAt: NOW,
+        },
+      },
+      () => new Date(NOW),
+    );
+    const wrongBranch = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8'));
+    wrongBranch.execution.state.completion.branch = 'autopilot/other';
+    expect(() => decodeAttemptManifest(wrongBranch)).toThrow(
+      /marketplace execution.*manifest authority/i,
+    );
+  });
+
+  // This catches evaluator installation erasing a Task or accepting copied review authority.
+  it('installs an evaluator only over its exact eligible prepared review manifest', async () => {
+    const createReview = async (input: {
+      readonly phase?: 'implement' | 'review';
+      readonly status?: 'prepared' | 'submitted';
+      readonly approval?: 'approve-eligible' | 'human-codeowner';
+    } = {}) => {
+      const fixture = repositoryFixture();
+      const phase = input.phase ?? 'review';
+      const status = input.status ?? 'prepared';
+      const attemptId = UUID_B;
+      const subject = phase === 'review' ? 'pr-84' : 'issue-42';
+      const attemptDir = join(
+        fixture.base,
+        'v2',
+        'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        phase,
+        `${subject}-${attemptId}`,
+      );
+      const prepared = {
+        schemaVersion: 'marketplace-execution-v2',
+        requestPath: join(attemptDir, 'marketplace-request.json'),
+        requestDigest: `sha256:${'a'.repeat(64)}`,
+        solverNetSelectionPath: join(attemptDir, 'solvernet-selection.json'),
+        preparedAt: NOW,
+        agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+        adoptionDeadline: '2026-07-20T01:30:00.000Z',
+      };
+      const manifest = await createAttemptWorkspace(options(fixture, {
+        attemptId,
+        phase,
+        subject,
+        prNumber: 84,
+        branch: 'autopilot/42',
+        ...(phase === 'review'
+          ? {
+              reviewGeneration: UUID_C,
+              reviewRefOid: fixture.oid,
+              reviewApprovalPolicy: input.approval ?? 'approve-eligible',
+              selectedLogin: 'review-bot',
+            }
+          : { targetBaseOid: fixture.oid }),
+        execution: {
+          backend: 'marketplace',
+          state: status === 'prepared'
+            ? { ...prepared, status }
+            : {
+                ...prepared,
+                status,
+                submission: {
+                  ...SUBMISSION_RESULT,
+                  generatedAt: NOW,
+                  id: `autopilot:${attemptId}`,
+                },
+                submittedAt: NOW,
+              },
+        },
+      }), defaultRunner);
+      return {
+        manifest,
+        identity: {
+          originManifestPath: join(
+            fixture.base,
+            'v2',
+            manifest.runnerId,
+            'implement',
+            `issue-42-${UUID_A}`,
+            'manifest.json',
+          ),
+          originV2AttemptId: UUID_A,
+          originRequestDigest: `sha256:${'b'.repeat(64)}`,
+          taskId: '501',
+          taskCid: 'bafybeigdyrzt5m6u2r3o4exampletaskcid',
+          taskCreationBlock: 501,
+          prNumber: 84,
+          expectedHead: fixture.oid,
+          generation: UUID_C,
+          reviewRefOid: fixture.oid,
+          reviewer: 'review-bot',
+        },
+      };
+    };
+
+    const exact = await createReview();
+    const exactBytes = readFileSync(exact.manifest.paths.manifest);
+    for (const [name, identity] of [
+      ['PR', { ...exact.identity, prNumber: 85 }],
+      ['head', { ...exact.identity, expectedHead: 'b'.repeat(40) }],
+      ['generation', { ...exact.identity, generation: UUID_A }],
+      ['ref', { ...exact.identity, reviewRefOid: 'c'.repeat(40) }],
+      ['reviewer', { ...exact.identity, reviewer: 'other-reviewer' }],
+    ]) {
+      let error: unknown;
+      try {
+        installMarketplaceEvaluatorLeg(
+          exact.manifest.paths.manifest,
+          identity,
+          () => new Date(NOW),
+        );
+      } catch (caught) {
+        error = caught;
+      }
+      expect.soft(String(error), `${name} authority`).toMatch(
+        /evaluator.*review manifest authority/i,
+      );
+      writeFileSync(exact.manifest.paths.manifest, exactBytes);
+    }
+
+    for (const [name, input] of [
+      ['submitted predecessor', { status: 'submitted' }],
+      ['human-owned review', { approval: 'human-codeowner' }],
+      ['implementation predecessor', { phase: 'implement' }],
+    ]) {
+      const candidate = await createReview(input);
+      const before = readFileSync(candidate.manifest.paths.manifest);
+      expect(() => installMarketplaceEvaluatorLeg(
+        candidate.manifest.paths.manifest,
+        candidate.identity,
+        () => new Date(NOW),
+      ), name).toThrow(/eligible prepared review manifest/i);
+      expect(readFileSync(candidate.manifest.paths.manifest)).toEqual(before);
+    }
+
+    const invalidLink = {
+      ...exact.identity,
+      originManifestPath: join(
+        dirname(dirname(dirname(exact.identity.originManifestPath))),
+        'other-runner',
+        'implement',
+        `issue-42-${UUID_A}`,
+        'manifest.json',
+      ),
+    };
+    expect(() => installMarketplaceEvaluatorLeg(
+      exact.manifest.paths.manifest,
+      invalidLink,
+      () => new Date(NOW),
+    )).toThrow(/origin manifest path/i);
+    expect(readFileSync(exact.manifest.paths.manifest)).toEqual(exactBytes);
+  });
+
   it.each(['digest', 'submission-identity'] as const)(
     'retains the initialization journal and terminal bytes when the %s contradicts it',
     async (contradiction) => {
@@ -989,7 +1324,9 @@ describe('attempt workspace and manifest', () => {
         join(fixture.base, 'v2'),
         runner,
         resolveCredential,
-      )).rejects.toThrow(/terminal.*journal|conflicts.*journal/i);
+      )).rejects.toThrow(
+        /terminal.*journal|conflicts.*journal|marketplace execution.*manifest authority/i,
+      );
 
       expect(resolveCredential).not.toHaveBeenCalled();
       expect(runner).not.toHaveBeenCalled();
@@ -1198,7 +1535,8 @@ describe('attempt workspace and manifest', () => {
 
     expect(outcomes.every((outcome) =>
       outcome.status === 'rejected'
-      && /identity.*journal/i.test(String(outcome.reason)))).toBe(true);
+      && /identity.*journal|marketplace execution.*manifest authority/i
+        .test(String(outcome.reason)))).toBe(true);
     expect(readFileSync(manifestPath)).toEqual(contradictoryBytes);
     expect(existsSync(journalPath)).toBe(true);
   });

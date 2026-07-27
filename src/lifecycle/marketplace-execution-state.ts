@@ -6,7 +6,15 @@ import {
   type AutopilotAdoptionReceipt,
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
-import { basename, isAbsolute, normalize, relative, resolve } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  normalize,
+  relative,
+  resolve,
+} from 'node:path';
 import { gitOid, type GitOid } from './types.js';
 
 export const MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION =
@@ -337,6 +345,25 @@ function absoluteManifestPath(value: unknown, name: string): string {
   return path;
 }
 
+function siblingManifestPath(
+  value: unknown,
+  attemptDir: string,
+  phase: 'implement' | 'review',
+  attemptId: string,
+  name: string,
+): string {
+  const path = absoluteManifestPath(value, name);
+  const linkedAttemptDir = dirname(path);
+  const runnerDir = resolve(attemptDir, '..', '..');
+  if (
+    dirname(linkedAttemptDir) !== join(runnerDir, phase)
+    || !basename(linkedAttemptDir).endsWith(`-${attemptId}`)
+  ) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return path;
+}
+
 function base(value: Record<string, unknown>, attemptDir: string): MarketplaceExecutionV3Base {
   const preparedAt = timestamp(value.preparedAt, 'marketplace preparation timestamp');
   const agentSoftDeadline = timestamp(value.agentSoftDeadline, 'marketplace agent soft deadline');
@@ -564,10 +591,11 @@ function completion(value: unknown): MarketplaceCompletionEvidence {
   throw new Error('Invalid marketplace completion operation');
 }
 
-function reviewAnchor(value: unknown): MarketplaceReviewAnchorEvidence {
+function reviewAnchor(value: unknown, attemptDir: string): MarketplaceReviewAnchorEvidence {
   const evidence = record(value, 'marketplace review anchor evidence');
   exactKeys(evidence, ['attemptId', 'manifestPath', 'head', 'generation', 'refOid', 'reviewer', 'anchoredAt'], 'marketplace review anchor evidence');
-  return { attemptId: uuid(evidence.attemptId, 'marketplace review anchor attempt ID'), manifestPath: absoluteManifestPath(evidence.manifestPath, 'marketplace review anchor manifest path'), head: oid(evidence.head, 'marketplace review anchor head'), generation: uuid(evidence.generation, 'marketplace review anchor generation'), refOid: oid(evidence.refOid, 'marketplace review anchor ref OID'), reviewer: text(evidence.reviewer, 'marketplace review anchor reviewer'), anchoredAt: timestamp(evidence.anchoredAt, 'marketplace review anchor timestamp') };
+  const attemptId = uuid(evidence.attemptId, 'marketplace review anchor attempt ID');
+  return { attemptId, manifestPath: siblingManifestPath(evidence.manifestPath, attemptDir, 'review', attemptId, 'marketplace review anchor manifest path'), head: oid(evidence.head, 'marketplace review anchor head'), generation: uuid(evidence.generation, 'marketplace review anchor generation'), refOid: oid(evidence.refOid, 'marketplace review anchor ref OID'), reviewer: text(evidence.reviewer, 'marketplace review anchor reviewer'), anchoredAt: timestamp(evidence.anchoredAt, 'marketplace review anchor timestamp') };
 }
 
 function receiptEvidence(
@@ -638,9 +666,11 @@ function receiptEvidence(
     evidence.recordedAt,
     'marketplace receipt evidence timestamp',
   );
+  const progressTimestamp = latestProgressTimestamp(progress);
   if (
-    Date.parse(recordedAt) < Date.parse(receipt.recordedAt)
-    || Date.parse(recordedAt) < Date.parse(latestProgressTimestamp(progress))
+    Date.parse(receipt.recordedAt) < Date.parse(progressTimestamp)
+    || Date.parse(recordedAt) < Date.parse(receipt.recordedAt)
+    || Date.parse(recordedAt) < Date.parse(progressTimestamp)
   ) {
     throw new Error('Marketplace receipt evidence timestamp predates durable adoption');
   }
@@ -726,7 +756,7 @@ function submittedFields(state: MarketplaceSubmittedV3): MarketplaceSubmittedV3 
 
 export function decodeMarketplaceEvaluatorLegExecutionState(
   value: unknown,
-  _attemptDir: string,
+  attemptDir: string,
 ): MarketplaceEvaluatorLegExecutionState {
   const state = record(value, 'marketplace evaluator leg state');
   if (state.schemaVersion !== MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION
@@ -741,12 +771,19 @@ export function decodeMarketplaceEvaluatorLegExecutionState(
       'originRequestDigest', 'taskId', 'taskCid', 'taskCreationBlock', 'prNumber',
       'expectedHead', 'generation', 'reviewRefOid', 'reviewer', 'anchoredAt',
       'releasedAt', 'releaseReason'], 'marketplace evaluator leg state');
+  const originV2AttemptId = uuid(
+    state.originV2AttemptId,
+    'marketplace evaluator origin attempt ID',
+  );
   const identity: MarketplaceEvaluatorLegIdentity = {
-    originManifestPath: absoluteManifestPath(state.originManifestPath, 'marketplace evaluator origin manifest path'),
-    originV2AttemptId: uuid(
-      state.originV2AttemptId,
-      'marketplace evaluator origin attempt ID',
+    originManifestPath: siblingManifestPath(
+      state.originManifestPath,
+      attemptDir,
+      'implement',
+      originV2AttemptId,
+      'marketplace evaluator origin manifest path',
     ),
+    originV2AttemptId,
     originRequestDigest: digest(state.originRequestDigest, 'marketplace evaluator origin request digest'),
     taskId: taskId(state.taskId, 'marketplace evaluator task ID'),
     taskCid: text(state.taskCid, 'marketplace evaluator task CID'),
@@ -932,7 +969,7 @@ export function decodeMarketplaceExecutionV3State(
     }
     const completed = { ...committed, status: 'lifecycle-completed' as const, completion: decodedCompletion };
     if (status === 'lifecycle-completed') return completed;
-    const decodedReviewAnchor = reviewAnchor(state.reviewAnchor);
+    const decodedReviewAnchor = reviewAnchor(state.reviewAnchor, attemptDir);
     if (decodedReviewAnchor.head !== decodedCompletion.resultingHead
       || Date.parse(decodedReviewAnchor.anchoredAt) < Date.parse(decodedCompletion.confirmedAt)) {
       throw new Error('Marketplace review anchor contradicts completion');

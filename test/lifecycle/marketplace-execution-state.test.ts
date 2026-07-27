@@ -4,8 +4,12 @@ import {
   decodeMarketplaceExecutionV3State,
 } from '../../src/lifecycle/marketplace-execution-state.js';
 
-const ATTEMPT_DIR = '/tmp/autopilot/attempt';
 const ATTEMPT_ID = '11111111-1111-4111-8111-111111111111';
+const REVIEW_ATTEMPT_ID = '22222222-2222-4222-8222-222222222222';
+const RUNNER_DIR = '/tmp/autopilot/v2/runner-a';
+const ATTEMPT_DIR = `${RUNNER_DIR}/implement/issue-42-${ATTEMPT_ID}`;
+const EVALUATOR_ATTEMPT_DIR =
+  `${RUNNER_DIR}/review/pr-42-${REVIEW_ATTEMPT_ID}`;
 const OID = 'a'.repeat(40);
 const DIGEST = `sha256:${'b'.repeat(64)}`;
 const DELIVERY_REQUEST_ID = `0x${'9'.repeat(64)}`;
@@ -116,8 +120,9 @@ const completion = {
 } as const;
 
 const reviewAnchor = {
-  attemptId: ATTEMPT_ID, manifestPath: '/tmp/autopilot/review-attempt/manifest.json',
-  head: OID, generation: '22222222-2222-4222-8222-222222222222', refOid: OID,
+  attemptId: REVIEW_ATTEMPT_ID,
+  manifestPath: `${RUNNER_DIR}/review/pr-42-${REVIEW_ATTEMPT_ID}/manifest.json`,
+  head: OID, generation: REVIEW_ATTEMPT_ID, refOid: OID,
   reviewer: 'review-bot', anchoredAt: '2026-07-27T12:07:00.000Z',
 } as const;
 
@@ -228,6 +233,51 @@ describe('decodeMarketplaceExecutionV3State', () => {
     }, ATTEMPT_DIR)).toThrow();
   });
 
+  // This catches a later wrapper timestamp hiding a receipt authored before its evidence.
+  it.each([
+    ['accepted', anchoredProgress, {
+      ...acceptedReceipt,
+      recordedAt: '2026-07-27T12:06:00.000Z',
+    }],
+    ['rejected', {
+      status: 'solution-observed',
+      delivery: observed().delivery,
+    }, {
+      schemaVersion: 'jinn-autopilot-marketplace-adoption.v1',
+      disposition: 'rejected',
+      role: 'solution',
+      reason: 'invalid-artifact',
+      detail: 'Patch policy rejected the artifact.',
+      taskId: '501',
+      attemptIndex: 0,
+      requestId: DELIVERY_REQUEST_ID,
+      deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid',
+      v2AttemptId: ATTEMPT_ID,
+      prNumber: 42,
+      claimOid: OID,
+      expectedHead: OID,
+      recordedAt: '2026-07-27T12:01:00.000Z',
+    }],
+  ] as const)('rejects a %s receipt authored before its durable progress', (
+    _disposition,
+    progress,
+    receipt,
+  ) => {
+    expect(() => decodeMarketplaceExecutionV3State({
+      ...prepared,
+      status: 'receipt-published',
+      submission,
+      submittedAt: '2026-07-27T12:01:00.000Z',
+      progress,
+      receipt: {
+        receipt,
+        commentId: 501,
+        author: 'jinn-autopilot',
+        recordedAt: '2026-07-27T12:08:00.000Z',
+      },
+    }, ATTEMPT_DIR)).toThrow(/receipt.*predates durable adoption/i);
+  });
+
   it('accepts a correlated rejected receipt without requiring review evidence', () => {
     const rejectedReceipt = {
       schemaVersion: 'jinn-autopilot-marketplace-adoption.v1',
@@ -318,7 +368,17 @@ describe('decodeMarketplaceExecutionV3State', () => {
     }],
     ['non-manifest review path', {
       ...anchored,
-      reviewAnchor: { ...reviewAnchor, manifestPath: '/tmp/autopilot/review-attempt/state.json' },
+      reviewAnchor: {
+        ...reviewAnchor,
+        manifestPath: `${RUNNER_DIR}/review/pr-42-${REVIEW_ATTEMPT_ID}/state.json`,
+      },
+    }],
+    ['review manifest outside the current runner tree', {
+      ...anchored,
+      reviewAnchor: {
+        ...reviewAnchor,
+        manifestPath: `/tmp/other/v2/runner-a/review/pr-42-${REVIEW_ATTEMPT_ID}/manifest.json`,
+      },
     }],
     ['host tree that contradicts the verified artifact', {
       ...committed,
@@ -337,39 +397,47 @@ describe('decodeMarketplaceExecutionV3State', () => {
   it('decodes only anchored and released evaluator legs with exact identity', () => {
     const anchored = {
       schemaVersion: 'marketplace-evaluator-leg-v1', status: 'anchored',
-      originManifestPath: '/tmp/autopilot/origin-attempt/manifest.json',
+      originManifestPath: `${RUNNER_DIR}/implement/issue-42-${ATTEMPT_ID}/manifest.json`,
       originV2AttemptId: ATTEMPT_ID,
       originRequestDigest: DIGEST, taskId: '501', taskCid: submission.taskCid,
       taskCreationBlock: 501, prNumber: 42, expectedHead: OID,
       generation: '22222222-2222-4222-8222-222222222222', reviewRefOid: OID,
       reviewer: 'review-bot', anchoredAt: '2026-07-27T12:07:00.000Z',
     } as const;
-    expect(decodeMarketplaceEvaluatorLegExecutionState(anchored, ATTEMPT_DIR)).toEqual(anchored);
+    expect(decodeMarketplaceEvaluatorLegExecutionState(anchored, EVALUATOR_ATTEMPT_DIR)).toEqual(anchored);
     expect(decodeMarketplaceEvaluatorLegExecutionState({
       ...anchored, status: 'released', releasedAt: '2026-07-27T12:08:00.000Z',
       releaseReason: 'receipt-published',
-    }, ATTEMPT_DIR)).toMatchObject({ status: 'released' });
-    expect(() => decodeMarketplaceEvaluatorLegExecutionState({ ...anchored, status: 'submitted' }, ATTEMPT_DIR)).toThrow();
-    expect(() => decodeMarketplaceEvaluatorLegExecutionState({ ...anchored, extra: true }, ATTEMPT_DIR)).toThrow();
+    }, EVALUATOR_ATTEMPT_DIR)).toMatchObject({ status: 'released' });
+    expect(() => decodeMarketplaceEvaluatorLegExecutionState({ ...anchored, status: 'submitted' }, EVALUATOR_ATTEMPT_DIR)).toThrow();
+    expect(() => decodeMarketplaceEvaluatorLegExecutionState({ ...anchored, extra: true }, EVALUATOR_ATTEMPT_DIR)).toThrow();
     expect(() => decodeMarketplaceEvaluatorLegExecutionState({
       ...anchored,
       originV2AttemptId: 'not-a-uuid',
-    }, ATTEMPT_DIR)).toThrow();
+    }, EVALUATOR_ATTEMPT_DIR)).toThrow();
     expect(() => decodeMarketplaceEvaluatorLegExecutionState({
       ...anchored,
       generation: 'not-a-uuid',
-    }, ATTEMPT_DIR)).toThrow();
+    }, EVALUATOR_ATTEMPT_DIR)).toThrow();
     expect(() => decodeMarketplaceEvaluatorLegExecutionState({
       ...anchored,
       prNumber: 0,
-    }, ATTEMPT_DIR)).toThrow();
+    }, EVALUATOR_ATTEMPT_DIR)).toThrow();
     expect(() => decodeMarketplaceEvaluatorLegExecutionState({
       ...anchored,
       originManifestPath: '../manifest.json',
-    }, ATTEMPT_DIR)).toThrow();
+    }, EVALUATOR_ATTEMPT_DIR)).toThrow();
     expect(() => decodeMarketplaceEvaluatorLegExecutionState({
       ...anchored,
-      originManifestPath: '/tmp/autopilot/origin-attempt/state.json',
-    }, ATTEMPT_DIR)).toThrow();
+      originManifestPath: `${RUNNER_DIR}/implement/issue-42-${ATTEMPT_ID}/state.json`,
+    }, EVALUATOR_ATTEMPT_DIR)).toThrow();
+    expect(() => decodeMarketplaceEvaluatorLegExecutionState({
+      ...anchored,
+      originManifestPath: `/tmp/other/v2/runner-a/implement/issue-42-${ATTEMPT_ID}/manifest.json`,
+    }, EVALUATOR_ATTEMPT_DIR)).toThrow();
+    expect(() => decodeMarketplaceEvaluatorLegExecutionState({
+      ...anchored,
+      originManifestPath: `${RUNNER_DIR}/implement/issue-42-${REVIEW_ATTEMPT_ID}/manifest.json`,
+    }, EVALUATOR_ATTEMPT_DIR)).toThrow();
   });
 });
