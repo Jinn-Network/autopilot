@@ -51,7 +51,11 @@ import type {
   CompareStatus,
 } from './types.js';
 import { gitRefName } from './types.js';
-import { EMPTY_GITHUB_USAGE, type GitHubUsage } from './github-usage.js';
+import {
+  EMPTY_GITHUB_USAGE,
+  EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX,
+  type GitHubUsage,
+} from './github-usage.js';
 import { exactUtcTimestampMs } from './exact-utc-time.js';
 
 export type LifecycleCliCommand =
@@ -1660,12 +1664,31 @@ function githubUsageSummary(usage: GitHubUsage): string {
 // Accounting incompleteness is observability, not failure: GitHub's
 // used/remaining counters are eventually consistent under concurrency, so a
 // cycle whose commands all succeeded can still report incomplete accounting.
-// Surface it as a warning line, never let it gate or crash the cycle.
+// Surface it as a line, never let it gate or crash the cycle.
+//
+// Two severities, because the flag covers two situations. A cycle that failed
+// to evidence something it should have evidenced is an anomaly and keeps the
+// WARNING. A cycle whose only gap is an approximation GitHub's API makes
+// unavoidable is not — it fired on EVERY cycle, which trains the operator to
+// ignore the line that also carries the real anomalies, and its "reported
+// quota numbers are best-effort" text overstated the damage: under counter
+// skew `graphqlRemaining`/`graphqlResetAt` are exact and only the cost
+// attribution is soft. The approximate form states which number is soft and
+// why. The `accountingComplete` flag itself is unchanged in both cases.
 function accountingWarningLines(usage: GitHubUsage | undefined): readonly string[] {
   if (usage === undefined || usage.accountingComplete !== false) return [];
+  // A legacy cache entry can carry the flag without a reason; an unattributable
+  // gap is not an expected approximation, so it keeps the warning.
+  const reason = usage.incompleteReason ?? 'eventually-consistent rate-limit counter skew';
+  if (reason.startsWith(EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX)) {
+    return [
+      'GitHub usage accounting is approximate: '
+        + `${reason.slice(EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX.length)}.`,
+    ];
+  }
   return [
     'WARNING: GitHub usage accounting is incomplete '
-      + `(${usage.incompleteReason ?? 'eventually-consistent rate-limit counter skew'}); `
+      + `(${reason}); `
       + 'reported quota numbers are best-effort.',
   ];
 }

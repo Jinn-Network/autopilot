@@ -1276,6 +1276,51 @@ describe('implementation action executor', () => {
     },
   );
 
+  // The child-claim parent gate collapsed "no open parent" and "parent was
+  // retargeted" into one message that named neither the parent nor the base it
+  // actually carries. They send an operator to opposite places, so each must
+  // report itself. Diagnosability only: both are still refusals.
+  it('names the parent PR when no open parent pull request answers a child claim', async () => {
+    const { deps, claims, events } = harness({
+      readIssue: async () => issue({
+        number: 2069,
+        child: { parentPr: 2065, kind: 'review-finding' },
+      }),
+      readParentPullRequest: async () => null,
+    });
+
+    await expect(executeImplementationAction(freshAction(2069), deps)).resolves.toEqual({
+      status: 'ineligible',
+      issueNumber: 2069,
+      detail: 'Parent pull request #2065 is not open.',
+    });
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it('names the actual and expected base when a child claim parent was retargeted', async () => {
+    const { deps, claims, events } = harness({
+      readIssue: async () => issue({
+        number: 2069,
+        targetBase: gitRefName('next'),
+        child: { parentPr: 2065, kind: 'reconcile' },
+      }),
+      readParentPullRequest: async () => pr({
+        number: 2065,
+        headRefName: gitRefName('autopilot/2044'),
+        baseRefName: gitRefName('main'),
+      }),
+    });
+
+    await expect(executeImplementationAction(freshAction(2069), deps)).resolves.toEqual({
+      status: 'ineligible',
+      issueNumber: 2069,
+      detail: 'Parent pull request #2065 is retargeted: base is main, expected next.',
+    });
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
   it('builds an immutable ordinary marketplace request from claim authority without constructing local spawn data', async () => {
     let createdAttempt: unknown;
     let startedRequest: unknown;

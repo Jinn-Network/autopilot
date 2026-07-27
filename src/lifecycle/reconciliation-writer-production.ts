@@ -1009,12 +1009,29 @@ function makeProductionReconciliationWriterWithScope(
         candidate.number === input.issueNumber);
       if (issue === undefined) throw new Error('Issue is absent from the lifecycle snapshot');
       const nativeIssue = await options.readIssueByNumber(input.issueNumber);
-      if (
-        nativeIssue === null
-        || nativeIssue.number !== input.issueNumber
-        || !nativeIssue.open
-      ) {
-        throw new Error('Draft PR reconciliation native issue is missing or closed');
+      // Three separately identifiable causes, collapsed into one "missing or
+      // closed" message — the same shape as the stale-recovery refusal fixed in
+      // #54, where an issue that was neither missing nor closed (its authority
+      // projection was withheld) was reported as both, and the item sat
+      // stranded for days behind a message that named the wrong cause. Split by
+      // cause; the disjunct order is preserved exactly, so nothing this gate
+      // admits or refuses changes.
+      if (nativeIssue === null) {
+        throw new Error(
+          `Draft PR reconciliation native issue #${input.issueNumber} `
+            + 'has no authority projection',
+        );
+      }
+      if (nativeIssue.number !== input.issueNumber) {
+        throw new Error(
+          `Draft PR reconciliation native issue #${input.issueNumber} `
+            + `resolved to issue #${nativeIssue.number}`,
+        );
+      }
+      if (!nativeIssue.open) {
+        throw new Error(
+          `Draft PR reconciliation native issue #${input.issueNumber} is closed`,
+        );
       }
       const projectItem = await readProjectItem(input.issueNumber);
       if (projectItem === null) {

@@ -902,11 +902,26 @@ async function executeChildImplementationAction(
     };
   }
   const parent = await deps.readParentPullRequest(issue.child.parentPr);
-  if (parent === null || parent.baseRefName !== issue.targetBase) {
+  // Two separately identifiable causes, collapsed into one "missing or
+  // retargeted" message. They send an operator to opposite places — an absent
+  // parent means look for a closed/merged PR, a retargeted one means look at
+  // the base branch — and the collapsed form named neither the parent nor the
+  // base it actually carries. Same split as the stale-recovery refusals above.
+  if (parent === null) {
     return {
       status: 'ineligible',
       issueNumber,
-      detail: 'Parent pull request is missing or retargeted.',
+      // The production port resolves OPEN pull requests only, so a null here is
+      // "no open parent PR #N", not necessarily "no such PR".
+      detail: `Parent pull request #${issue.child.parentPr} is not open.`,
+    };
+  }
+  if (parent.baseRefName !== issue.targetBase) {
+    return {
+      status: 'ineligible',
+      issueNumber,
+      detail: `Parent pull request #${issue.child.parentPr} is retargeted: base is `
+        + `${parent.baseRefName}, expected ${issue.targetBase}.`,
     };
   }
 

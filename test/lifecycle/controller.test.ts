@@ -21,6 +21,7 @@ import {
 } from '../../src/lifecycle/types.js';
 import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
 import {
+  EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX,
   GitHubUsageIncompleteError,
   GitHubUsageMeter,
   makeGitHubUsageCommandRunner,
@@ -315,12 +316,18 @@ describe('lifecycle controller', () => {
     expect(json).not.toContain('"graphqlCost": 0');
   });
 
-  it('surfaces incomplete cycle usage accounting as a warning without crashing the loop', async () => {
+  it('reports eventually-consistent counter skew as an approximation, not a per-cycle warning', async () => {
     // Regression (PR #2001): GitHub used/remaining counters are eventually
     // consistent, so under concurrent reads a cycle's usage accounting can be
     // incomplete even though every command succeeded. read() must not throw and
     // the cycle must still produce a report — otherwise the closing opaque probe
     // skew propagates out of runLifecycleCycle and kills the continuous loop.
+    //
+    // And it must not be reported as an ANOMALY. This fired on every single
+    // live cycle, which is exactly how an operator learns to skip the line that
+    // also carries the real gaps — and its "reported quota numbers are
+    // best-effort" text was wrong for this cause: graphqlRemaining/resetAt come
+    // straight off the probe responses and stay exact. Only the cost is soft.
     const meter = new GitHubUsageMeter();
     let probe = 0;
     const raw: CommandRunner = async (_command, args) => {
@@ -346,9 +353,33 @@ describe('lifecycle controller', () => {
     expect(report.status).toBe('ok');
     expect(report.githubUsage.accountingComplete).toBe(false);
     const human = renderLifecycleHuman(report);
-    expect(human).toMatch(/usage accounting.*incomplete/i);
+    expect(human).toContain('GitHub usage accounting is approximate:');
+    expect(human).toContain('graphqlCost is a lower bound');
+    expect(human).not.toMatch(/WARNING: GitHub usage accounting/);
+    // The prefix is an internal severity switch, not operator prose.
+    expect(human).not.toContain(EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX);
+    // The flag is unchanged, so every existing consumer keeps its semantics.
     const json = JSON.parse(renderLifecycleJson(report));
     expect(json.githubUsage.accountingComplete).toBe(false);
+  });
+
+  it('still warns when a cycle genuinely failed to evidence its usage', async () => {
+    // The counterpart to the test above: a real gap keeps the WARNING, so
+    // downgrading the expected approximation does not silence the line the
+    // operator relies on to know whether quota numbers can be trusted.
+    const meter = new GitHubUsageMeter();
+    meter.markIncomplete('the closing opaque-command quota probe failed');
+
+    const report = await runLifecycleCycle('observe', {
+      ...deps(implementation(), []),
+      readGitHubUsage: () => meter.read(),
+    });
+
+    expect(report.status).toBe('ok');
+    const human = renderLifecycleHuman(report);
+    expect(human).toContain('WARNING: GitHub usage accounting is incomplete');
+    expect(human).toContain('closing opaque-command quota probe failed');
+    expect(human).toContain('reported quota numbers are best-effort');
   });
 
   it('cannot claim work from a fallback that forges a fresh full-reconciliation marker', async () => {

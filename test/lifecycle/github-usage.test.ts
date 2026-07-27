@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX,
   FULL_SCAN_RESERVE,
   GitHubUsageMeter,
+  OPAQUE_SPAN_SKEW_APPROXIMATION,
   TARGETED_PR_RESERVE,
   assertRateLimitReserve,
   makeGitHubUsageCommandRunner,
+  slurpedRestPageCount,
 } from '../../src/lifecycle/github-usage.js';
 import type { CommandRunner } from '../../src/dispatcher/issue-source.js';
 
@@ -229,11 +232,74 @@ describe('GitHubUsageMeter', () => {
 
     const usage = meter.read();
     expect(usage.accountingComplete).toBe(false);
-    expect(usage.incompleteReason).toMatch(/skew|inconsistent/i);
+    // Skew is an EXPECTED approximation, not an anomaly: it is a property of
+    // GitHub's counters, it fires on essentially every cycle, and it leaves the
+    // quota numbers themselves exact. Reported as such, so it stops being
+    // indistinguishable from a cycle that genuinely failed to evidence
+    // something. The flag itself is unchanged — graphqlCost IS a lower bound.
+    expect(usage.incompleteReason)
+      .toMatch(new RegExp(`^${EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX}`));
+    expect(usage.incompleteReason).toContain('graphqlCost is a lower bound');
+    expect(usage.incompleteReason).toContain('remain exact');
     // Best-effort quota evidence from both probes still advances.
     expect(usage.graphqlRequests).toBe(2);
     expect(usage.graphqlRemaining).toBe(990);
     expect(usage.graphqlResetAt).toBe('2026-07-22T13:00:00.000Z');
+  });
+
+  it('collapses repeated counter skew into one approximation rather than one per command', async () => {
+    // The same approximation fires on every opaque command in a cycle. It must
+    // read as one statement about the cycle, not N copies of the same sentence.
+    let probe = 0;
+    const raw: CommandRunner = async (_command, args) => {
+      if (args[0] !== 'api' || args[1] !== 'graphql') return 'viewed';
+      probe += 1;
+      return JSON.stringify({
+        data: {
+          rateLimit: {
+            cost: 1,
+            remaining: 1_000 - probe * 10,
+            resetAt: '2026-07-22T13:00:00.000Z',
+            used: probe * 12,
+            limit: 5_000,
+          },
+        },
+      });
+    };
+    const meter = new GitHubUsageMeter();
+    const run = makeGitHubUsageCommandRunner(raw, meter);
+
+    await expect(run('gh', ['pr', 'view', '42'])).resolves.toBe('viewed');
+    await expect(run('gh', ['pr', 'view', '43'])).resolves.toBe('viewed');
+
+    const reason = meter.read().incompleteReason!;
+    expect(reason.split('graphqlCost is a lower bound')).toHaveLength(2);
+  });
+
+  it('never lets an expected approximation demote a genuine accounting anomaly', async () => {
+    // A cycle that both skewed AND failed to evidence something is an anomaly.
+    // The prefix is the report's severity switch, so an approximation recorded
+    // alongside a real gap must not be allowed to flip it.
+    const meter = new GitHubUsageMeter();
+    meter.markApproximate(OPAQUE_SPAN_SKEW_APPROXIMATION);
+    meter.markIncomplete('the closing opaque-command quota probe failed');
+
+    const usage = meter.read();
+    expect(usage.accountingComplete).toBe(false);
+    expect(usage.incompleteReason)
+      .not.toMatch(new RegExp(`^${EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX}`));
+    // Both are still reported; neither masks the other.
+    expect(usage.incompleteReason).toContain('closing opaque-command quota probe failed');
+    expect(usage.incompleteReason).toContain('graphqlCost is a lower bound');
+  });
+
+  it('clears recorded approximations on reset', async () => {
+    const meter = new GitHubUsageMeter();
+    meter.markApproximate(OPAQUE_SPAN_SKEW_APPROXIMATION);
+    expect(meter.read().accountingComplete).toBe(false);
+    meter.reset();
+    expect(meter.read()).toMatchObject({ accountingComplete: true });
+    expect(meter.read().incompleteReason).toBeUndefined();
   });
 
   it('keeps a successful opaque command whose closing quota probe fails to transport', async () => {
@@ -490,6 +556,81 @@ describe('GitHubUsageMeter', () => {
     expect(usage.restRequests).toBe(1);
     expect(usage.accountingComplete).toBe(false);
     expect(usage.incompleteReason).toMatch(/page count/i);
+  });
+
+  // The page count is only hidden for the `--paginate` forms that merge or
+  // filter the pages away. `--slurp` returns one array element PER HTTP page,
+  // so the count is carried in the response and just needed reading — which is
+  // what made every cycle that reads a PR's comments or changed files report
+  // incomplete accounting. `--slurp` is mutually exclusive with `--jq` and
+  // `--template` in gh, so a slurped payload is always the raw page array.
+  it('counts `--paginate --slurp` pages exactly and keeps accounting complete', async () => {
+    let seen: readonly string[] | undefined;
+    const meter = new GitHubUsageMeter();
+    const run = makeGitHubUsageCommandRunner(async (_command, args) => {
+      seen = args;
+      return JSON.stringify([[{ id: 1 }], [{ id: 2 }], []]);
+    }, meter);
+
+    const raw = await run('gh', [
+      'api',
+      'repos/Jinn-Network/mono/issues/42/comments',
+      '--paginate',
+      '--slurp',
+    ]);
+
+    expect(JSON.parse(raw)).toHaveLength(3);
+    // Same argv, run exactly once: this is accounting only, never a request
+    // behaviour change.
+    expect(seen).toEqual([
+      'api',
+      'repos/Jinn-Network/mono/issues/42/comments',
+      '--paginate',
+      '--slurp',
+    ]);
+    const usage = meter.read();
+    expect(usage.restRequests).toBe(3);
+    expect(usage.accountingComplete).toBe(true);
+    expect(usage.incompleteReason).toBeUndefined();
+  });
+
+  it('falls back to the one-request floor when a slurped page array is unreadable', async () => {
+    const meter = new GitHubUsageMeter();
+    const run = makeGitHubUsageCommandRunner(
+      async () => '{"message":"Not Found"}',
+      meter,
+    );
+
+    await expect(run('gh', ['api', 'repos/o/r/x', '--paginate', '--slurp']))
+      .resolves.toBe('{"message":"Not Found"}');
+
+    const usage = meter.read();
+    expect(usage.restRequests).toBe(1);
+    expect(usage.accountingComplete).toBe(false);
+    expect(usage.incompleteReason).toMatch(/not a page array/i);
+  });
+
+  it('keeps a failed paginated command failing and records the request floor', async () => {
+    const meter = new GitHubUsageMeter();
+    const run = makeGitHubUsageCommandRunner(async () => {
+      throw new Error('gh exploded');
+    }, meter);
+
+    await expect(run('gh', ['api', 'repos/o/r/x', '--paginate', '--slurp']))
+      .rejects.toThrow('gh exploded');
+
+    const usage = meter.read();
+    expect(usage.restRequests).toBe(1);
+    expect(usage.accountingComplete).toBe(false);
+    expect(usage.incompleteReason).toMatch(/before its page count/i);
+  });
+
+  it.each([
+    ['a non-array payload', '{"a":1}'],
+    ['an empty page array', '[]'],
+    ['unparseable JSON', 'not json'],
+  ] as const)('reads no page count from %s', (_label, raw) => {
+    expect(slurpedRestPageCount(raw)).toBeNull();
   });
 
   it('records the HTTP status exposed by an included REST response', async () => {
