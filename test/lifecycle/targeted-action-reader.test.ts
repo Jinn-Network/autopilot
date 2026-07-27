@@ -1365,6 +1365,7 @@ describe('targeted action reader unrelated open PR churn', () => {
     readonly index: readonly ReturnType<typeof indexEntry>[];
     readonly reads: ReadonlyMap<number, RawPullRequest | null>;
     readonly dependencies?: readonly number[];
+    readonly blockedOn?: 'Nothing' | 'Another issue';
   }) => makeTargetedActionReader({
     authorAllowlist: new Set(['oaksprout']),
     rateLimitFloor: 500,
@@ -1374,7 +1375,7 @@ describe('targeted action reader unrelated open PR churn', () => {
     readProjectItem: async () => ({
       id: 'item-42',
       status: 'In Review',
-      blockedOn: 'Nothing',
+      blockedOn: input.blockedOn ?? 'Nothing',
     }),
     readIssue: async (number) => ({
       number,
@@ -1693,6 +1694,149 @@ describe('targeted action reader unrelated open PR churn', () => {
     expect(snapshotOf(read)).toBeNull();
     expect(targetedAuthorityRefusalDetail(read)).toMatch(
       /PR #555 shares the target head branch autopilot\/42 and its headOid moved/,
+    );
+  });
+
+  // The mapping resolver counts every lifecycle marker in a body, so a second
+  // marker naming the target issue makes the racing PR a mapping contender.
+  it('refuses authority when a later body marker maps a racing PR onto the target issue', async () => {
+    const subject = target();
+    const contender = rawPullRequest({
+      number: 102,
+      title: 'Competing implementation',
+      body: '<!-- jinn-autopilot:v2 issue=77 branch=autopilot/77 -->\n'
+        + '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      headRefName: 'feature/dup-42',
+      headOid: RACING_LIVE_HEAD,
+      labels: [],
+      closingIssueNumbers: [],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(contender, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map([[subject.number, subject], [contender.number, contender]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #102 closes the target issue #42 and its headOid moved/,
+    );
+  });
+
+  // The mapping resolver infers `autopilot/<N>` as evidence for issue N with no
+  // closing reference and no marker at all.
+  it('refuses authority when a racing PR stable branch names the target issue', async () => {
+    const subject = rawPullRequest({ headRefName: 'feature/target-42' });
+    const contender = rawPullRequest({
+      number: 102,
+      title: 'Stable branch squatter',
+      body: 'No lifecycle marker here.',
+      headRefName: 'autopilot/42',
+      headOid: RACING_LIVE_HEAD,
+      labels: [],
+      closingIssueNumbers: [],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(contender, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map([[subject.number, subject], [contender.number, contender]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #102 closes the target issue #42 and its headOid moved/,
+    );
+  });
+
+  // The target's mapping depends on the whole base chain being unambiguously
+  // mapped, so a contender for a grandparent's issue decides the target's
+  // mapping even though it closes none of the target's direct blockers.
+  it('refuses authority when a racing PR contends for a base chain grandparent issue', async () => {
+    const subject = rawPullRequest({ baseRefName: 'autopilot/7' });
+    const parent = rawPullRequest({
+      number: 201,
+      title: 'Parent of the stack',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+      headRefName: 'autopilot/7',
+      baseRefName: 'autopilot/9',
+      headOid: 'f'.repeat(40),
+      closingIssueNumbers: [7],
+    });
+    const grandparent = rawPullRequest({
+      number: 301,
+      title: 'Grandparent of the stack',
+      body: '<!-- jinn-autopilot:v2 issue=9 branch=autopilot/9 -->',
+      headRefName: 'autopilot/9',
+      headOid: '0'.repeat(40),
+      closingIssueNumbers: [9],
+    });
+    const contender = rawPullRequest({
+      number: 401,
+      title: 'Competing grandparent implementation',
+      body: 'Closes #9',
+      headRefName: 'feature/dup-9',
+      headOid: RACING_LIVE_HEAD,
+      labels: [],
+      closingIssueNumbers: [9],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const base = cycleSnapshot();
+    const cycle: GitHubLifecycleSnapshot = {
+      ...base,
+      project: {
+        ...base.project,
+        items: [
+          base.project.items[0]!,
+          { ...base.project.items[0]!, id: 'item-7', number: 7 },
+          { ...base.project.items[0]!, id: 'item-9', number: 9 },
+        ],
+      },
+      issues: [
+        { ...base.issues[0]!, blockedOn: 'Another issue', blockedByIssues: [7] },
+        {
+          ...base.issues[0]!,
+          number: 7,
+          title: 'Parent issue',
+          projectItemId: 'item-7',
+          blockedOn: 'Another issue',
+          blockedByIssues: [9],
+        },
+        {
+          ...base.issues[0]!,
+          number: 9,
+          title: 'Grandparent issue',
+          projectItemId: 'item-9',
+        },
+      ],
+      pullRequests: [subject, parent, grandparent]
+        .map((pr) => decodePullRequestSnapshot(pr)),
+    };
+    const reader = vetoReader({
+      index: [
+        indexEntry(subject),
+        indexEntry(parent),
+        indexEntry(grandparent),
+        indexEntry(contender, { headOid: RACING_INDEX_HEAD }),
+      ],
+      reads: new Map([
+        [subject.number, subject],
+        [parent.number, parent],
+        [grandparent.number, grandparent],
+        [contender.number, contender],
+      ]),
+      dependencies: [7],
+      blockedOn: 'Another issue',
+    });
+
+    const read = await reader.readPullRequest(cycle, subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #401 maps to target base chain issue #9 and its headOid moved/,
     );
   });
 });

@@ -19,6 +19,7 @@ import {
   type RawPullRequest,
 } from './snapshot.js';
 import type { PullRequestIndexEntry } from './github-rest-discovery.js';
+import { evidencedIssueNumbers } from './pr-mapping.js';
 
 export interface TargetedNativeIssue {
   readonly number: number;
@@ -443,19 +444,39 @@ export function makeTargetedActionReader(
         .filter((pr) => pr.state === 'OPEN')
         .map((pr) => [pr.number, pr]));
       // Ref names the target is stacked on, walked through the index so a
-      // multi-level stack keeps every parent authority-bearing.
-      const baseChainRefNames = ((): ReadonlySet<string> => {
+      // multi-level stack keeps every parent authority-bearing, plus every
+      // issue those parents are evidence for. The target's mapping is resolved
+      // only while each ancestor's own mapping resolves, and an ancestor's
+      // mapping turns ambiguous as soon as a second open PR contends for that
+      // ancestor's issue. So authority reaches the whole transitive chain, not
+      // just the target issue's direct blockers.
+      const baseChain = ((): {
+        readonly refNames: ReadonlySet<string>;
+        readonly issueNumbers: ReadonlySet<number>;
+      } => {
         const byHeadRefName = new Map<string, PullRequestIndexEntry>();
         for (const entry of indexed.values()) {
           if (entry.number !== prNumber) byHeadRefName.set(entry.headRefName, entry);
         }
-        const chain = new Set<string>();
+        const refNames = new Set<string>();
+        const issues = new Set<number>();
         let base: string | undefined = raw.baseRefName;
-        while (base !== undefined && !chain.has(base)) {
-          chain.add(base);
-          base = byHeadRefName.get(base)?.baseRefName;
+        while (base !== undefined && !refNames.has(base)) {
+          refNames.add(base);
+          const parent: PullRequestIndexEntry | undefined = byHeadRefName.get(base);
+          if (parent === undefined) break;
+          const cached = cycleSnapshot.pullRequests
+            .find((pr) => pr.number === parent.number);
+          for (const number of evidencedIssueNumbers({
+            closingIssueNumbers: cached?.closingIssueNumbers,
+            headRefName: parent.headRefName,
+            body: cached?.body,
+          })) {
+            issues.add(number);
+          }
+          base = parent.baseRefName;
         }
-        return chain;
+        return { refNames, issueNumbers: issues };
       })();
       /**
        * Names the role that makes another open PR part of the subject's
@@ -469,7 +490,7 @@ export function makeTargetedActionReader(
         if (entry.headRefName === raw.headRefName) {
           return `shares the target head branch ${raw.headRefName}`;
         }
-        if (baseChainRefNames.has(entry.headRefName)) {
+        if (baseChain.refNames.has(entry.headRefName)) {
           return `heads the target base chain branch ${entry.headRefName}`;
         }
         const priorRecord = cycleSnapshot.pullRequests
@@ -482,17 +503,26 @@ export function makeTargetedActionReader(
           if (live.headRefName === raw.headRefName) {
             return `shares the target head branch ${raw.headRefName}`;
           }
-          if (baseChainRefNames.has(live.headRefName)) {
+          if (baseChain.refNames.has(live.headRefName)) {
             return `heads the target base chain branch ${live.headRefName}`;
           }
         }
+        // The same predicate the mapping resolver uses to decide contention,
+        // read over every row shape we hold: the fresher index row's branch,
+        // the cached row, and the live row.
         const mapped = new Set<number>([
-          ...(priorRecord?.closingIssueNumbers ?? []),
-          ...(live === null ? [] : issueNumbers(live)),
+          ...evidencedIssueNumbers({
+            closingIssueNumbers: priorRecord?.closingIssueNumbers,
+            headRefName: entry.headRefName,
+            body: priorRecord?.body,
+          }),
+          ...(live === null ? [] : evidencedIssueNumbers(live)),
         ]);
         if (mapped.has(issueNumber)) return `closes the target issue #${issueNumber}`;
         const blocked = [...mapped].find((number) => dependencySet.has(number));
         if (blocked !== undefined) return `closes target blocker issue #${blocked}`;
+        const stacked = [...mapped].find((number) => baseChain.issueNumbers.has(number));
+        if (stacked !== undefined) return `maps to target base chain issue #${stacked}`;
         return null;
       };
       const refreshed: GitHubLifecycleSnapshot['pullRequests'][number][] = [];
