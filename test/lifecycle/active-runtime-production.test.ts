@@ -193,6 +193,12 @@ describe('production active runtime preflight', () => {
         submit: vi.fn(),
         recover: vi.fn(),
       },
+      marketplaceObservationHelp: vi.fn(async () => ({
+        exitCode: 0,
+        stdout: 'tasks observe-autopilot-delivery',
+        stderr: '',
+      })),
+      marketplaceVerificationPreflight: vi.fn(async () => ({ ok: true })),
       now: () => NOW,
       nextId: () => ids.shift()!,
     });

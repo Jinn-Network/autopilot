@@ -331,7 +331,7 @@ function reviewAnchorEvidence(
   };
 }
 
-class Harness implements
+export class Harness implements
   MarketplaceMutationAuthorityPort,
   MarketplaceMutationGitPort,
   MarketplaceMutationVerificationPort,

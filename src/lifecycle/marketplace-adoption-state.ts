@@ -19,7 +19,29 @@ import {
   type MarketplaceSolutionDeliveryEvidence,
   type MarketplaceVerificationEvidence,
   type MarketplaceExecutionV3State,
+  type MarketplaceExecutionV3Status,
 } from './marketplace-execution-state.js';
+
+export type MarketplaceRecoveryStatus =
+  | MarketplaceExecutionV3Status
+  | 'prepared'
+  | 'cancelled';
+
+export function marketplaceStatus(manifest: AttemptManifest): MarketplaceRecoveryStatus {
+  if (manifest.execution.backend !== 'marketplace') {
+    throw new Error('Only marketplace attempts expose marketplace status');
+  }
+  const state = manifest.execution.state;
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) {
+    return state.status;
+  }
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION) {
+    if (state.status === 'prepared' || state.status === 'cancelled' || state.status === 'submitted') {
+      return state.status;
+    }
+  }
+  throw new Error('Unsupported marketplace execution state for recovery');
+}
 
 export type MarketplaceAdoptionTransition =
   | { readonly status: 'solution-observed'; readonly delivery: MarketplaceSolutionDeliveryEvidence }

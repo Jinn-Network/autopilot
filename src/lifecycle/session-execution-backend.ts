@@ -20,6 +20,8 @@ import {
 } from '../dispatcher/issue-source.js';
 import {
   claimMarketplaceDispatchDecision,
+  findMarketplaceEvaluatorLegReviews,
+  markAttemptExited,
   MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
   proveMarketplaceAttemptWorktree,
   readAttemptManifest,
@@ -27,7 +29,13 @@ import {
   transitionMarketplaceExecution,
   type AttemptManifest,
 } from './attempt-workspace.js';
+import {
+  marketplaceStatus,
+  upgradeMarketplaceExecutionV2,
+} from './marketplace-adoption-state.js';
 import { MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION } from './marketplace-execution-state.js';
+import type { MarketplaceReviewAnchorEvidence } from './marketplace-execution-state.js';
+import type { MarketplaceMutationAdoptionCoordinator } from './marketplace-mutation-adoption.js';
 import {
   MARKETPLACE_LANGUAGE,
   MARKETPLACE_REPOSITORY,
@@ -35,6 +43,7 @@ import {
   MarketplaceTaskCliAdapter,
   verifyMarketplaceTaskRequest,
 } from './marketplace-task.js';
+import { gitOid } from './types.js';
 
 /**
  * The non-secret session identity shared by local and marketplace backends.
@@ -616,4 +625,162 @@ export async function recoverPreparedMarketplaceAttempts(
     }
   }
   return recovered;
+}
+
+export interface RecoverSubmittedMarketplaceAttemptsOptions {
+  readonly v2Base: string;
+  readonly recoverPrepared: () => Promise<readonly SessionExecutionResult[]>;
+  readonly makeAdopter: (
+    manifestPath: string,
+  ) => MarketplaceMutationAdoptionCoordinator;
+  readonly releaseReviewAnchor?: (
+    anchor: MarketplaceReviewAnchorEvidence,
+  ) => Promise<void>;
+  readonly isPidAlive: (pid: number) => boolean;
+  readonly now?: () => Date;
+}
+
+function validateMarketplaceRecoveryManifest(
+  manifestPath: string,
+  attemptDir: string,
+  runnerDir: string,
+  phaseDir: string,
+): AttemptManifest {
+  const manifest = readAttemptManifest(manifestPath);
+  if (
+    manifest.paths.manifest !== manifestPath
+    || manifest.paths.attemptDir !== attemptDir
+    || manifest.runnerId !== basename(runnerDir)
+    || manifest.phase !== basename(phaseDir)
+    || basename(attemptDir) !== `${manifest.subject}-${manifest.attemptId}`
+  ) {
+    throw new Error(
+      'Marketplace recovery manifest does not match its v2 attempt path',
+    );
+  }
+  if (manifest.execution.backend !== 'marketplace') {
+    throw new Error('Marketplace adoption recovery requires a marketplace attempt');
+  }
+  return manifest;
+}
+
+export async function reconcileReceiptTerminalState(
+  manifest: AttemptManifest,
+  options: Pick<
+    RecoverSubmittedMarketplaceAttemptsOptions,
+    'v2Base' | 'releaseReviewAnchor' | 'isPidAlive' | 'now'
+  >,
+): Promise<void> {
+  if (manifest.execution.backend !== 'marketplace') {
+    throw new Error('Marketplace receipt reconciliation requires a marketplace attempt');
+  }
+  const state = manifest.execution.state;
+  if (
+    state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    || state.status !== 'receipt-published'
+  ) {
+    throw new Error('Marketplace receipt reconciliation requires receipt-published state');
+  }
+  const receipt = state.receipt.receipt;
+  if (receipt.disposition === 'accepted') {
+    return;
+  }
+  const now = options.now ?? (() => new Date());
+  const progress = state.progress;
+  if (
+    progress.status === 'review-anchored'
+    && options.releaseReviewAnchor !== undefined
+  ) {
+    await options.releaseReviewAnchor(progress.reviewAnchor);
+  }
+  if (
+    manifest.processState === 'running'
+  ) {
+    markAttemptExited(
+      manifest.paths.manifest,
+      now,
+      receipt.resultingHead === undefined ? undefined : gitOid(receipt.resultingHead),
+    );
+  }
+  if (
+    manifest.issueNumber === undefined
+    || manifest.prNumber === undefined
+  ) {
+    return;
+  }
+  for (const linked of findMarketplaceEvaluatorLegReviews(options.v2Base, {
+    originManifestPath: manifest.paths.manifest,
+    originV2AttemptId: manifest.attemptId,
+    originRequestDigest: state.requestDigest,
+    prNumber: manifest.prNumber,
+    expectedHead: gitOid(manifest.expectedHead),
+  })) {
+    if (linked.processState === 'running') {
+      markAttemptExited(linked.paths.manifest, now);
+    }
+  }
+}
+
+export async function recoverSubmittedMarketplaceAttempts(
+  options: RecoverSubmittedMarketplaceAttemptsOptions,
+): Promise<{ readonly ok: boolean; readonly detail?: string }> {
+  if (!isAbsolute(options.v2Base)) {
+    return { ok: false, detail: 'Marketplace recovery base must be absolute' };
+  }
+  try {
+    await options.recoverPrepared();
+    const now = options.now ?? (() => new Date());
+    for (const runnerDir of sortedDirectories(options.v2Base)) {
+      for (const phaseDir of sortedDirectories(runnerDir)) {
+        for (const attemptDir of sortedDirectories(phaseDir)) {
+          const manifestPath = join(attemptDir, 'manifest.json');
+          if (!existsSync(manifestPath)) continue;
+          let manifest = validateMarketplaceRecoveryManifest(
+            manifestPath,
+            attemptDir,
+            runnerDir,
+            phaseDir,
+          );
+          if (manifest.execution.backend !== 'marketplace') {
+            continue;
+          }
+          const marketplaceState = manifest.execution.state;
+          if (
+            marketplaceState.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+            && marketplaceState.status === 'submitted'
+          ) {
+            manifest = upgradeMarketplaceExecutionV2(
+              manifestPath,
+              marketplaceState.requestDigest,
+              now,
+            );
+          }
+          switch (marketplaceStatus(manifest)) {
+            case 'prepared':
+              throw new Error('prepared recovery must finish before adoption recovery');
+            case 'submitted':
+            case 'solution-observed':
+            case 'solution-verified':
+            case 'host-committed':
+            case 'lifecycle-completed':
+            case 'review-anchored':
+              await options.makeAdopter(manifest.paths.manifest)
+                .adopt(manifest.paths.manifest);
+              break;
+            case 'receipt-published':
+              await reconcileReceiptTerminalState(manifest, options);
+              break;
+            case 'cancelled':
+              break;
+          }
+        }
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
 }

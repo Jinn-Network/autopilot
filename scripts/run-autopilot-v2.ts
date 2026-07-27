@@ -25,6 +25,7 @@ import {
 import {
   MarketplaceSessionExecutionBackend,
   recoverPreparedMarketplaceAttempts,
+  recoverSubmittedMarketplaceAttempts,
 } from '../src/lifecycle/session-execution-backend.js';
 import {
   MARKETPLACE_LANGUAGE,
@@ -33,7 +34,15 @@ import {
 } from '../src/lifecycle/marketplace-task.js';
 import {
   assertMarketplaceRuntimeProfile,
+  makeProductionMarketplaceAdoptionRecoveryCoordinator,
 } from '../src/lifecycle/active-runtime-production.js';
+import { readAttemptManifest } from '../src/lifecycle/attempt-workspace.js';
+import { releaseMarketplaceReviewAnchor } from '../src/lifecycle/marketplace-review-anchor.js';
+import { makeProductionReviewSessionPort } from '../src/lifecycle/review-session-production.js';
+import type { GitHubLifecycleSnapshot } from '../src/lifecycle/snapshot.js';
+import type { PolledIssue } from '../src/dispatcher/types.js';
+import type { SnapshotItem } from '../src/dispatcher/project-snapshot.js';
+import { EMPTY_GITHUB_USAGE } from '../src/lifecycle/github-usage.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
 import {
   paintBoardOptionsFromConfig,
@@ -634,7 +643,7 @@ export async function runAutopilotV2(
         adapter: marketplaceTaskAdapter,
         now: () => new Date(),
       });
-  const recoverMarketplaceAttempts =
+  const recoverPreparedMarketplaceSubmissions =
     marketplaceExecutionBackend === undefined
       ? undefined
       : makeMarketplaceRecoveryCallback({
@@ -653,6 +662,109 @@ export async function runAutopilotV2(
             );
           },
         });
+  const makeRecoveryReadSnapshot = (
+    manifestPath: string,
+  ): (() => Promise<GitHubLifecycleSnapshot>) => {
+    return async (): Promise<GitHubLifecycleSnapshot> => {
+      const manifest = readAttemptManifest(manifestPath);
+      const capturedAt = new Date().toISOString();
+      const [issueEntry, projectItem] = await Promise.all([
+        restDiscovery.readIssueForAction(manifest.issueNumber),
+        reader.readProjectItemForReconciliation(manifest.issueNumber),
+      ]);
+      const issues: PolledIssue[] = issueEntry === null ? [] : [{
+        number: issueEntry.number,
+        title: issueEntry.title,
+        labels: [...issueEntry.labels],
+        shape: projectItem?.issueType ?? null,
+        blockedOn: projectItem?.blockedOn ?? null,
+        blockedByIssues: [],
+        effort: projectItem?.effort ?? null,
+        priority: projectItem?.priority ?? null,
+        status: projectItem?.status ?? null,
+        onBoard: projectItem !== null,
+        author: issueEntry.author,
+        projectItemId: projectItem?.id ?? null,
+        inCurrentSprint: false,
+      }];
+      const items: SnapshotItem[] = projectItem === null || manifest.issueNumber === undefined
+        ? []
+        : [{
+          id: projectItem.id,
+          number: manifest.issueNumber,
+          contentType: 'Issue',
+          status: projectItem.status,
+          priority: projectItem.priority,
+          effort: projectItem.effort,
+          blockedOn: projectItem.blockedOn,
+          issueType: projectItem.issueType,
+          blockedByIssues: [],
+          sprintIterationId: null,
+        }];
+      return {
+        capturedAt,
+        snapshotComplete: true,
+        issues,
+        project: {
+          items,
+          rateLimit: {
+            remaining: 5_000,
+            used: 0,
+            resetAt: capturedAt,
+          },
+          currentSprintIterationId: null,
+        },
+        pullRequests: [],
+        branches: [],
+        diagnostics: [],
+        lifecycle: { items: [] },
+        githubUsage: EMPTY_GITHUB_USAGE,
+      };
+    };
+  };
+  const recoverSubmittedMarketplaceAdoptions =
+    marketplaceExecutionBackend === undefined
+      ? undefined
+      : async (): Promise<void> => {
+          assertMarketplaceRuntimeProfile({
+            repository: loaded.config.repository.slug,
+            language: MARKETPLACE_LANGUAGE,
+            verificationProfile: MARKETPLACE_VERIFICATION_PROFILE,
+          });
+          const reviewReleasePort = makeProductionReviewSessionPort({
+            runner,
+            environment: runtimeEnvironment,
+          });
+          const result = await recoverSubmittedMarketplaceAttempts({
+            v2Base: v2AttemptsBase,
+            recoverPrepared: async () => [],
+            makeAdopter: (manifestPath) =>
+              makeProductionMarketplaceAdoptionRecoveryCoordinator({
+                manifestPath,
+                repositoryPath,
+                worktreeBase,
+                runnerId,
+                credentials: credentials!,
+                staleAfterMs,
+                runner,
+                environment: runtimeEnvironment,
+                readRecoverySnapshot: makeRecoveryReadSnapshot(manifestPath),
+              }),
+            releaseReviewAnchor: async (anchor) => {
+              await releaseMarketplaceReviewAnchor(
+                anchor,
+                reviewReleasePort,
+                () => new Date(),
+              );
+            },
+            isPidAlive: childIsAlive,
+          });
+          if (!result.ok) {
+            throw new Error(
+              result.detail ?? 'submitted marketplace adoption recovery failed',
+            );
+          }
+        };
   const cleanupEnabled = options.mode === 'active'
     && activeCleanupEnabled(
       env.JINN_AUTOPILOT_CLEANUP_ENABLED,
@@ -774,9 +886,12 @@ export async function runAutopilotV2(
         readGitHubUsage: () => reader.githubUsage(),
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
         ...(active === undefined ? {} : { active }),
-        ...(recoverMarketplaceAttempts === undefined
+        ...(recoverPreparedMarketplaceSubmissions === undefined
           ? {}
-          : { recoverMarketplaceAttempts }),
+          : { recoverPreparedMarketplaceSubmissions }),
+        ...(recoverSubmittedMarketplaceAdoptions === undefined
+          ? {}
+          : { recoverSubmittedMarketplaceAdoptions }),
         now: () => new Date(),
         staleAfterMs,
         runnerId,

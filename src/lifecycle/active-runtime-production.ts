@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import type { DispatcherConfig } from '../dispatcher/types.js';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
+import { AutopilotDeliveryExpectationSchema } from '@jinn-network/sdk/autopilot';
 import {
   spawnCoordinatorSession,
   type SpawnFn,
@@ -114,6 +115,16 @@ import {
   type ProductionMarketplaceMutationAdoptionOptions,
 } from './marketplace-mutation-adoption-production.js';
 import type { MarketplaceMutationAdoptionCoordinator } from './marketplace-mutation-adoption.js';
+import {
+  marketplaceMachineEnvironment,
+  resolveInstalledJinnBinary,
+  runMarketplaceMachineSubprocess,
+  type MarketplaceMachineSubprocess,
+} from './marketplace-cli.js';
+import {
+  createMarketplaceVerificationDockerSandbox,
+  createProductionMarketplaceVerificationPort,
+} from './marketplace-mutation-verification-production.js';
 
 type ProductionMarketplaceTaskAdapter = Pick<
   MarketplaceTaskCliAdapter,
@@ -233,6 +244,11 @@ export interface ProductionActiveRuntimeOptions {
   readonly makeMarketplaceMutationAdoptionCoordinator?: (
     options: ProductionMarketplaceMutationAdoptionOptions,
   ) => MarketplaceMutationAdoptionCoordinator;
+  readonly marketplaceObservationHelp?: MarketplaceMachineSubprocess;
+  readonly marketplaceVerificationPreflight?: () => Promise<{
+    readonly ok: boolean;
+    readonly detail?: string;
+  }>;
 }
 
 export type ProductionActiveRuntime = ReturnType<typeof makeActiveRuntime> & {
@@ -301,6 +317,8 @@ export function makeProductionCapabilityPreflight(
   | 'marketplaceTaskAdapter'
   | 'marketplaceLanguage'
   | 'marketplaceVerificationProfile'
+  | 'marketplaceObservationHelp'
+  | 'marketplaceVerificationPreflight'
   >,
 ): () => Promise<{ readonly ok: boolean; readonly detail?: string }> {
   const executionBackend = options.executionBackend ?? 'local';
@@ -358,6 +376,46 @@ export function makeProductionCapabilityPreflight(
         const adapter = options.marketplaceTaskAdapter
           ?? new MarketplaceTaskCliAdapter({ environment: ambient });
         await adapter.dryRun(persisted.requestPath);
+        AutopilotDeliveryExpectationSchema.parse({
+          schemaVersion: 'jinn-autopilot-delivery-observation-request.v1',
+          role: 'solution',
+          taskId: '501',
+          taskCid: 'bafy-task',
+          creationBlockNumber: 1,
+          session: built.request.spec.session,
+        });
+        const jinnBinary = resolveInstalledJinnBinary();
+        const observationHelp = options.marketplaceObservationHelp
+          ?? runMarketplaceMachineSubprocess;
+        const helpResult = await observationHelp(
+          jinnBinary,
+          ['tasks', '--help'],
+          { environment: marketplaceMachineEnvironment(ambient) },
+        );
+        if (
+          helpResult.exitCode !== 0
+          || !helpResult.stdout.includes('observe-autopilot-delivery')
+        ) {
+          throw new Error(
+            'Installed jinn client does not expose tasks observe-autopilot-delivery',
+          );
+        }
+        const verificationPreflight = options.marketplaceVerificationPreflight
+          ?? (async () => {
+            const sandbox = createMarketplaceVerificationDockerSandbox();
+            return createProductionMarketplaceVerificationPort({
+              dockerRunner: sandbox.dockerRunner,
+              dockerInspector: sandbox.dockerInspector,
+              ambientEnvironment: ambient,
+              now,
+            }).preflight();
+          });
+        const verificationReady = await verificationPreflight();
+        if (!verificationReady.ok) {
+          throw new Error(
+            verificationReady.detail ?? 'marketplace verification preflight failed',
+          );
+        }
         return { ok: true };
       } catch (error) {
         return {
@@ -1160,4 +1218,41 @@ export function makeProductionActiveRuntime(
       sleep,
     }),
   };
+}
+
+export function makeProductionMarketplaceAdoptionRecoveryCoordinator(
+  options: Pick<
+    ProductionActiveRuntimeOptions,
+    | 'repositoryPath'
+    | 'worktreeBase'
+    | 'runnerId'
+    | 'credentials'
+    | 'staleAfterMs'
+    | 'runner'
+    | 'environment'
+    | 'now'
+    | 'nextId'
+    | 'sleep'
+    | 'makeMarketplaceMutationAdoptionCoordinator'
+  > & {
+    readonly manifestPath: string;
+    readonly readRecoverySnapshot: () => Promise<GitHubLifecycleSnapshot>;
+  },
+): MarketplaceMutationAdoptionCoordinator {
+  const adoptionFactory = options.makeMarketplaceMutationAdoptionCoordinator
+    ?? makeProductionMarketplaceMutationAdoptionCoordinator;
+  return adoptionFactory({
+    originManifestPath: options.manifestPath,
+    repositoryPath: options.repositoryPath,
+    worktreeBase: options.worktreeBase,
+    runnerId: options.runnerId,
+    credentials: options.credentials,
+    readSnapshot: options.readRecoverySnapshot,
+    staleAfterMs: options.staleAfterMs,
+    runner: options.runner ?? defaultRunner,
+    environment: options.environment ?? process.env,
+    now: options.now,
+    nextId: options.nextId,
+    sleep: options.sleep,
+  });
 }

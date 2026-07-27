@@ -5,6 +5,9 @@ maintainers. It watches a repository’s GitHub Project, claims ready issues,
 launches isolated Hermes workers, reviews exact PR heads, recovers durable work
 after interruption, and leaves merge control with the maintainer by default.
 
+Marketplace mode supports Solution adoption for submitted mutation Tasks.
+Verdict adoption is the next slice.
+
 ## Install
 
 Requirements: macOS or Linux, Node 22, Git, GitHub CLI, authenticated Hermes,
