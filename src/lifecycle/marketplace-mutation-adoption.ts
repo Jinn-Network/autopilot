@@ -251,6 +251,54 @@ function baseParsedObservation(
   };
 }
 
+function deliveryDerivedParsedObservation(
+  delivery: MarketplaceSolutionDeliveryEvidence,
+): Omit<ParsedObservation, 'patch' | 'artifact'> {
+  return {
+    observation: {
+      status: 'verified',
+      role: 'solution',
+      task: {
+        taskId: delivery.taskId,
+        taskCid: delivery.taskCid,
+        createdAtBlock: delivery.taskCreationBlock,
+        createdAtTx: delivery.taskCreationTransaction,
+      },
+      attempt: {
+        attemptIndex: delivery.attemptIndex,
+        requestId: delivery.requestId,
+        operator: delivery.solverSafe,
+        createdAtBlock: delivery.deliveryBlock,
+      },
+      delivery: {
+        envelopeCid: delivery.deliveryEnvelopeCid,
+        envelopeDigest: delivery.deliveryEnvelopeDigest.replace(/^sha256:/, '0x'),
+        publisherAgentId: delivery.publisherAgentId,
+        transactionHash: delivery.deliveryTransaction,
+        blockNumber: delivery.deliveryBlock,
+      },
+      envelope: {
+        cid: delivery.deliveryEnvelopeCid,
+        digest: delivery.deliveryEnvelopeDigest.replace(/^sha256:/, '0x'),
+        executionSchema: 'jinn.execution.v1',
+        solverType: 'jinn-repo.v1',
+        role: 'solution',
+        participant: {
+          safeAddress: delivery.solverSafe,
+          agentEoa: delivery.solverAgentEoa,
+        },
+        signer: delivery.signer,
+      },
+      session: {} as AutopilotSessionCapsule,
+      result: {} as AutopilotMutationResult,
+      correlation: delivery.correlation,
+    } as VerifiedSolutionObservation,
+    session: {} as AutopilotSessionCapsule,
+    result: {} as AutopilotMutationResult,
+    correlation: delivery.correlation,
+  };
+}
+
 function pureValidateObservation(
   observation: VerifiedSolutionObservation,
   delivery: MarketplaceSolutionDeliveryEvidence,
@@ -906,54 +954,7 @@ async function adoptManifest(
 
   const observationPath = progress.delivery.observationPath;
   if (observationFileDigest(observationPath) !== progress.delivery.observationDigest) {
-    let mismatchParsed: Omit<ParsedObservation, 'patch' | 'artifact'>;
-    try {
-      mismatchParsed = baseParsedObservation(readObservationFile(observationPath));
-    } catch {
-      mismatchParsed = {
-        observation: {
-          status: 'verified',
-          role: 'solution',
-          task: {
-            taskId: progress.delivery.taskId,
-            taskCid: progress.delivery.taskCid,
-            createdAtBlock: progress.delivery.taskCreationBlock,
-            createdAtTx: progress.delivery.taskCreationTransaction,
-          },
-          attempt: {
-            attemptIndex: progress.delivery.attemptIndex,
-            requestId: progress.delivery.requestId,
-            operator: progress.delivery.solverSafe,
-            createdAtBlock: progress.delivery.deliveryBlock,
-          },
-          delivery: {
-            envelopeCid: progress.delivery.deliveryEnvelopeCid,
-            envelopeDigest: progress.delivery.deliveryEnvelopeDigest.replace(/^sha256:/, '0x'),
-            publisherAgentId: progress.delivery.publisherAgentId,
-            transactionHash: progress.delivery.deliveryTransaction,
-            blockNumber: progress.delivery.deliveryBlock,
-          },
-          envelope: {
-            cid: progress.delivery.deliveryEnvelopeCid,
-            digest: progress.delivery.deliveryEnvelopeDigest.replace(/^sha256:/, '0x'),
-            executionSchema: 'jinn.execution.v1',
-            solverType: 'jinn-repo.v1',
-            role: 'solution',
-            participant: {
-              safeAddress: progress.delivery.solverSafe,
-              agentEoa: progress.delivery.solverAgentEoa,
-            },
-            signer: progress.delivery.signer,
-          },
-          session: {} as AutopilotSessionCapsule,
-          result: {} as AutopilotMutationResult,
-          correlation: progress.delivery.correlation,
-        } as VerifiedSolutionObservation,
-        session: {} as AutopilotSessionCapsule,
-        result: {} as AutopilotMutationResult,
-        correlation: progress.delivery.correlation,
-      };
-    }
+    const mismatchParsed = deliveryDerivedParsedObservation(progress.delivery);
     const mismatchAuthority = await readAuthority(manifestPath, [], deps);
     return stableReject(mismatchParsed, {
       reason: 'correlation-mismatch',

@@ -759,6 +759,39 @@ describe('marketplace mutation adoption validation', () => {
     expect(harness.comments).toHaveLength(1);
   });
 
+  it('rejects digest-mismatched parseable observation using delivery correlation', async () => {
+    const harness = new Harness();
+    const tamperedRequestId = `0x${'f'.repeat(64)}`;
+    const tamperedCorrelation = { ...correlation(), requestId: tamperedRequestId };
+    const obs = observation('implement', {
+      ...mutationResult(),
+      correlation: tamperedCorrelation,
+    });
+    writeFileSync(
+      harness.delivery.observationPath,
+      `${JSON.stringify({
+        ...obs,
+        attempt: { ...obs.attempt, requestId: tamperedRequestId },
+        correlation: tamperedCorrelation,
+      }, null, 2)}\n`,
+    );
+    const result = await adopt(harness);
+    expect(result).toMatchObject({
+      status: 'rejected',
+      reason: 'correlation-mismatch',
+      receipt: expect.objectContaining({
+        requestId: REQUEST_ID,
+        disposition: 'rejected',
+      }),
+    });
+    expect(harness.applyMutations).toBe(0);
+    expect(harness.comments).toHaveLength(1);
+    expect(readAttemptManifest(harness.manifestPath).execution).toMatchObject({
+      backend: 'marketplace',
+      state: { status: 'receipt-published' },
+    });
+  });
+
   it('rejects correlation mismatch before patch effects', async () => {
     const harness = new Harness();
     const obs = observation('implement', {
