@@ -80,7 +80,7 @@ function isAuthorizedAuthor(
 }
 
 function baseReceiptCorrelation(receipt: AutopilotAdoptionReceipt): AutopilotCorrelation {
-  return {
+  return baseCorrelation({
     taskId: receipt.taskId,
     attemptIndex: receipt.attemptIndex,
     requestId: receipt.requestId,
@@ -89,6 +89,19 @@ function baseReceiptCorrelation(receipt: AutopilotAdoptionReceipt): AutopilotCor
     claimOid: receipt.claimOid,
     prNumber: receipt.prNumber,
     expectedHead: receipt.expectedHead,
+  });
+}
+
+function baseCorrelation(correlation: AutopilotCorrelation): AutopilotCorrelation {
+  return {
+    taskId: correlation.taskId,
+    attemptIndex: correlation.attemptIndex,
+    requestId: correlation.requestId,
+    deliveryEnvelopeCid: correlation.deliveryEnvelopeCid,
+    v2AttemptId: correlation.v2AttemptId,
+    claimOid: correlation.claimOid,
+    prNumber: correlation.prNumber,
+    expectedHead: correlation.expectedHead,
   };
 }
 
@@ -97,7 +110,10 @@ function receiptCorrelates(
   expected: AdoptionReceiptExactFacts,
 ): boolean {
   return receipt.role === expected.role
-    && autopilotCorrelationMatches(expected.correlation, baseReceiptCorrelation(receipt));
+    && autopilotCorrelationMatches(
+      baseCorrelation(expected.correlation),
+      baseReceiptCorrelation(receipt),
+    );
 }
 
 function receiptsContradict(
@@ -173,6 +189,18 @@ function assertAcceptedPublicationIdentity(
   }
 }
 
+function assertRejectedPublicationIdentity(
+  expected: Extract<AdoptionReceiptExactFacts, { disposition: 'rejected' }>,
+  receipt: AutopilotAdoptionReceipt,
+): void {
+  if (receipt.disposition !== 'rejected') {
+    throw new Error('Marketplace adoption receipt disposition does not match rejected publication facts');
+  }
+  if (receipt.reason !== expected.reason) {
+    throw new Error('Rejected marketplace adoption receipt reason does not match publication facts');
+  }
+}
+
 async function resolvePublicationFacts(
   expected: AdoptionReceiptExactFacts,
   ports: AdoptionReceiptPorts,
@@ -225,22 +253,30 @@ export async function publishAdoptionReceipt(
   const canonicalReceipt = AutopilotAdoptionReceiptSchema.parse(receipt);
   if (publicationFacts.disposition === 'accepted') {
     assertAcceptedPublicationIdentity(publicationFacts, canonicalReceipt);
+  } else {
+    assertRejectedPublicationIdentity(publicationFacts, canonicalReceipt);
+  }
+  if (!(await ports.verifyReceiptFacts({ expected: publicationFacts, receipt: canonicalReceipt }))) {
+    throw new Error('Marketplace adoption receipt does not satisfy publication facts verification');
   }
 
   const existing = await readAdoptionReceiptState(publicationFacts, ports);
   if (existing.status === 'contradiction') {
     throw new Error(existing.detail);
   }
-  if (existing.status === 'exact' && receiptsMatch(existing.receipt, canonicalReceipt)) {
-    return {
-      status: 'already-published',
-      commentId: existing.comment.id,
-      author: existing.comment.authorLogin,
-    };
+  if (existing.status === 'exact') {
+    if (receiptsMatch(existing.receipt, canonicalReceipt)) {
+      return {
+        status: 'already-published',
+        commentId: existing.comment.id,
+        author: existing.comment.authorLogin,
+      };
+    }
+    throw new Error('An exact marketplace adoption receipt already exists with a different identity');
   }
 
   const publicationHead = publicationFacts.publicationHead;
-  const created = await ports.createPrComment({
+  await ports.createPrComment({
     prNumber: publicationFacts.prNumber,
     expectedHead: publicationHead,
     body: formatAutopilotAdoptionReceiptComment(canonicalReceipt),
@@ -258,7 +294,7 @@ export async function publishAdoptionReceipt(
 
   return {
     status: 'published',
-    commentId: created.commentId,
-    author: created.author,
+    commentId: readback.comment.id,
+    author: readback.comment.authorLogin,
   };
 }

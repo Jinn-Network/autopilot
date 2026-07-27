@@ -126,12 +126,12 @@ function comment(
   };
 }
 
-function verifyReceiptFacts(
+async function verifyReceiptFacts(
   input: {
     readonly expected: AdoptionReceiptExactFacts;
     readonly receipt: ReturnType<typeof acceptedReceipt>;
   },
-): boolean {
+): Promise<boolean> {
   const { expected, receipt } = input;
   if (receipt.role !== expected.role) return false;
   if (receipt.prNumber !== expected.prNumber) return false;
@@ -386,6 +386,27 @@ describe('readAdoptionReceiptState', () => {
       receipt,
     });
   });
+
+  it('correlates receipts when expected correlation includes optional review fields', async () => {
+    const receipt = acceptedReceipt();
+    const ports = createPorts({
+      comments: [[comment(1, 'jinn-autopilot', formatAutopilotAdoptionReceiptComment(receipt))]],
+    });
+
+    await expect(readAdoptionReceiptState(
+      acceptedFacts({
+        correlation: {
+          ...CORRELATION,
+          reviewGeneration: GENERATION,
+          reviewRefOid: REVIEW_REF_OID,
+        },
+      }),
+      ports,
+    )).resolves.toMatchObject({
+      status: 'exact',
+      receipt,
+    });
+  });
 });
 
 describe('publishAdoptionReceipt', () => {
@@ -464,8 +485,9 @@ describe('publishAdoptionReceipt', () => {
 
   it('publishes bounded rejection detail through the SDK codec', async () => {
     const ports = createPorts() as MutablePorts;
+    const expectedDetail = 'x'.repeat(7_000);
     const receipt = rejectedReceipt({
-      detail: 'x'.repeat(7_000),
+      detail: expectedDetail,
     });
 
     await publishAdoptionReceipt(rejectedFacts(), receipt, ports);
@@ -474,8 +496,11 @@ describe('publishAdoptionReceipt', () => {
     const parsed = AutopilotAdoptionReceiptSchema.parse(
       JSON.parse(published.split('\n')[3] ?? '{}'),
     );
+    if (parsed.disposition !== 'rejected') {
+      throw new Error('Expected rejected adoption receipt');
+    }
     expect(Buffer.byteLength(parsed.detail ?? '', 'utf8')).toBeLessThanOrEqual(8_192);
-    expect(parsed.detail).toBe(receipt.detail);
+    expect(parsed.detail).toBe(expectedDetail);
   });
 
   it('publishes stale-head rejections against the newly observed publication head', async () => {
@@ -515,5 +540,71 @@ describe('publishAdoptionReceipt', () => {
 
     await publishAdoptionReceipt(acceptedFacts(), receipt, ports);
     expect(transition).not.toHaveBeenCalled();
+  });
+
+  it('returns readback comment identity instead of create response identity', async () => {
+    const receipt = acceptedReceipt();
+    const ports = createPorts({
+      onCreate: async (request) => {
+        const created = comment(99, 'jinn-autopilot', request.body);
+        ports.liveComments.push(created);
+        return { commentId: 999, author: 'create-bot' };
+      },
+    }) as MutablePorts;
+
+    const result = await publishAdoptionReceipt(acceptedFacts(), receipt, ports);
+
+    expect(result).toEqual({
+      status: 'published',
+      commentId: 99,
+      author: 'jinn-autopilot',
+    });
+  });
+
+  it('does not create when an exact receipt exists with a different recordedAt', async () => {
+    const existing = acceptedReceipt({ recordedAt: '2026-07-27T12:00:00.000Z' });
+    const outbound = acceptedReceipt({ recordedAt: '2026-07-27T12:09:00.000Z' });
+    const ports = createPorts({
+      comments: [[comment(1, 'jinn-autopilot', formatAutopilotAdoptionReceiptComment(existing))]],
+    }) as MutablePorts;
+
+    await expect(publishAdoptionReceipt(acceptedFacts(), outbound, ports)).rejects.toThrow(
+      /different identity|already exists/i,
+    );
+    expect(ports.createCalls).toHaveLength(0);
+  });
+
+  it('does not write rejected receipts with the wrong disposition', async () => {
+    const ports = createPorts() as MutablePorts;
+
+    await expect(publishAdoptionReceipt(
+      rejectedFacts(),
+      acceptedReceipt(),
+      ports,
+    )).rejects.toThrow(/disposition|publication facts/i);
+    expect(ports.createCalls).toHaveLength(0);
+  });
+
+  it('does not write rejected receipts with the wrong reason', async () => {
+    const ports = createPorts() as MutablePorts;
+
+    await expect(publishAdoptionReceipt(
+      rejectedFacts({ reason: 'invalid-artifact' }),
+      rejectedReceipt({ reason: 'stale-head' }),
+      ports,
+    )).rejects.toThrow(/reason|publication facts/i);
+    expect(ports.createCalls).toHaveLength(0);
+  });
+
+  it('does not write when verifyReceiptFacts rejects wrong review generation', async () => {
+    const ports = createPorts() as MutablePorts;
+    ports.verifyReceiptFacts = vi.fn(async () => false);
+
+    await expect(publishAdoptionReceipt(
+      acceptedFacts(),
+      acceptedReceipt({ reviewGeneration: '44444444-4444-4444-8444-444444444444' }),
+      ports,
+    )).rejects.toThrow(/verification|publication facts/i);
+    expect(ports.createCalls).toHaveLength(0);
   });
 });
