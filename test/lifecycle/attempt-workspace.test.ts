@@ -2150,18 +2150,27 @@ describe('attempt workspace and manifest', () => {
       Partial<CreateAttemptOptions>,
       (manifest: AttemptManifest) => unknown,
     ]> = [
-      ['updateAttemptManifest', {}, (manifest) => updateAttemptManifest(
+      ['updateAttemptManifest', {
+        attemptId: '44444444-4444-4444-8444-444444444444',
+      }, (manifest) => updateAttemptManifest(
         manifest.paths.manifest,
         (current) => current,
       )],
-      ['markAttemptRunning', {}, (manifest) => markAttemptRunning(manifest.paths.manifest, 4242)],
-      ['markAttemptExited', {}, (manifest) => markAttemptExited(manifest.paths.manifest)],
-      ['advanceAttemptExpectedHead', {}, (manifest) => advanceAttemptExpectedHead(
+      ['markAttemptRunning', {
+        attemptId: '55555555-5555-4555-8555-555555555555',
+      }, (manifest) => markAttemptRunning(manifest.paths.manifest, 4242)],
+      ['markAttemptExited', {
+        attemptId: '66666666-6666-4666-8666-666666666666',
+      }, (manifest) => markAttemptExited(manifest.paths.manifest)],
+      ['advanceAttemptExpectedHead', {
+        attemptId: '77777777-7777-4777-8777-777777777777',
+      }, (manifest) => advanceAttemptExpectedHead(
         manifest.paths.manifest,
         manifest.expectedHead,
         'a'.repeat(40),
       )],
       ['advanceAttemptReviewPair', {
+        attemptId: '88888888-8888-4888-8888-888888888888',
         phase: 'review',
         subject: 'pr-7',
         prNumber: 7,
@@ -2177,13 +2186,24 @@ describe('attempt workspace and manifest', () => {
       )],
     ];
 
-    for (const [name, overrides, writer] of writers) {
-      const fixture = repositoryFixture();
-      const manifest = await createAttemptWorkspace(options(fixture, {
+    // One repository fixture serves every writer: each case carries its own
+    // attemptId, so `createAttemptWorkspace` places it under a distinct
+    // `<base>/v2/<runnerId>/<phase>/<subject>-<attemptId>` directory
+    // (src/lifecycle/attempt-workspace.ts:2493-2503) and therefore its own
+    // manifest.json. The reservation the loop asserts is decided solely by the
+    // manifest bytes at that path (src/lifecycle/attempt-workspace.ts:797-804),
+    // so no case can observe or be rescued by another's state. The distinct-path
+    // assertion below fails loudly if a future edit reuses an attemptId.
+    const loopFixture = repositoryFixture();
+    const loopManifests = new Set<string>();
+    for (const [index, [name, overrides, writer]] of writers.entries()) {
+      const manifest = await createAttemptWorkspace(options(loopFixture, {
         ...overrides,
-        ...(name === 'advanceAttemptReviewPair' ? { reviewRefOid: fixture.oid } : {}),
-        execution: marketplaceExecution(fixture),
+        ...(name === 'advanceAttemptReviewPair' ? { reviewRefOid: loopFixture.oid } : {}),
+        execution: marketplaceExecution(loopFixture),
       }), defaultRunner);
+      expect(loopManifests.add(manifest.paths.manifest).size, `${name} must own a manifest`)
+        .toBe(index + 1);
       const original = readFileSync(manifest.paths.manifest, 'utf8');
       let error: unknown;
       try {
