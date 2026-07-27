@@ -1816,6 +1816,58 @@ describe('production reconciliation writer', () => {
     expect(mutations).toBe(0);
   });
 
+  // Same collapse shape as the stale-recovery refusal fixed in #54: one
+  // "missing or closed" message over three separately identifiable causes, so
+  // an issue that is neither missing nor closed reports as both. Each cause now
+  // reports itself. The gate still refuses in all three cases.
+  it.each([
+    [
+      'withholds the native issue projection entirely',
+      null,
+      'Draft PR reconciliation native issue #50 has no authority projection',
+    ],
+    [
+      'answers with a different issue number',
+      { number: 51, title: 'Other', open: true, author: 'a', labels: [] },
+      'Draft PR reconciliation native issue #50 resolved to issue #51',
+    ],
+    [
+      'answers with a closed issue',
+      { number: 50, title: 'Exact', open: false, author: 'a', labels: [] },
+      'Draft PR reconciliation native issue #50 is closed',
+    ],
+  ] as const)(
+    'names the cause when the native issue authority %s',
+    async (_label, nativeIssue, expected) => {
+      const cycle = worldSnapshotFixture();
+      let mutations = 0;
+      const writer = makeProductionReconciliationWriter({
+        repositoryPath: '/repo',
+        ...targetedWriterOptions(() => cycle, cycle),
+        readIssueByNumber: async () => nativeIssue,
+        readIssueActionContext: async () => ({
+          projectItem: {
+            id: 'PVTI_issue_50', status: 'In Progress', blockedOn: 'Nothing',
+          },
+          openPullRequests: [],
+        }),
+        credential: selectedCredential(),
+        runner: async () => {
+          mutations += 1;
+          return '';
+        },
+      });
+
+      await expect(writer.ensureDraftPullRequest({
+        issueNumber: 50,
+        expectedHead: DRAFT_BRANCH_HEAD,
+        headRefName: 'autopilot/50',
+        baseRefName: 'next',
+      })).rejects.toThrow(expected);
+      expect(mutations).toBe(0);
+    },
+  );
+
   it('recovers an exact orphan claim while its Project status is still Todo', async () => {
     const base = worldSnapshotFixture();
     const cycle: GitHubLifecycleSnapshot = {

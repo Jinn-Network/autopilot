@@ -42,7 +42,12 @@ export interface GitHubUsage {
    * command or crash the loop.
    */
   readonly accountingComplete: boolean;
-  /** Human-readable reason accounting was incomplete; set only when incomplete. */
+  /**
+   * Human-readable reason accounting was incomplete; set only when incomplete.
+   * Prefixed with {@link EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX} when every
+   * recorded cause is an expected approximation rather than an anomaly — see
+   * that constant for why the distinction is reported rather than flattened.
+   */
   readonly incompleteReason?: string;
   /**
    * Transport faults retried on allowlisted reads this cycle; present only when
@@ -62,6 +67,43 @@ export const EMPTY_GITHUB_USAGE: GitHubUsage = Object.freeze({
   cacheHits: 0,
   accountingComplete: true,
 });
+
+/**
+ * Marks a cycle whose only accounting gaps are EXPECTED approximations — the
+ * cycle measured everything it can measure, and the residue is a property of
+ * GitHub's API, not of this run.
+ *
+ * Why the distinction exists. `accountingComplete: false` is one flag over two
+ * very different situations: (1) something that should have been evidenced was
+ * not — a failed probe, an unevidenced retry, a hidden page count; and (2) a
+ * quantity GitHub itself cannot report exactly. Reporting (2) with the same
+ * `WARNING: … reported quota numbers are best-effort` line fires on every
+ * single cycle, which trains the operator to ignore the line that also carries
+ * (1) — and it misstates the condition: under counter skew `graphqlRemaining`
+ * and `graphqlResetAt` are read straight off the probe responses and are
+ * exact. Only the cost attribution is soft.
+ *
+ * The flag itself is deliberately NOT changed: `graphqlCost` really is a lower
+ * bound in this case, so `accountingComplete: false` remains the accurate
+ * value, the persisted cache shape is untouched, and every existing consumer
+ * keeps its current semantics. Only the severity of the report changes.
+ */
+export const EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX = 'expected approximation: ';
+
+/**
+ * The one approximation GitHub's API makes unavoidable. `rateLimit.used` and
+ * `rateLimit.remaining` are eventually consistent, so the before/after probes
+ * bracketing an opaque `gh` command legitimately disagree even when the
+ * command and both probes all succeeded (see `recordOpaqueGraphQlSpan`). The
+ * span cannot be closed from within the probe design, so the hidden cost goes
+ * unattributed and `graphqlCost` becomes a lower bound.
+ */
+export const OPAQUE_SPAN_SKEW_APPROXIMATION =
+  'GitHub\'s rateLimit used/remaining counters are eventually consistent, so the '
+  + 'before/after probes bracketing at least one opaque `gh` command disagreed and '
+  + 'its hidden cost could not be attributed; graphqlCost is a lower bound, while '
+  + 'graphqlRemaining and graphqlResetAt are read directly from the probe responses '
+  + 'and remain exact';
 
 export class GitHubUsageDecodeError extends Error {
   constructor(detail: string) {
@@ -176,6 +218,12 @@ export class GitHubUsageMeter {
   private transientRetries = 0;
   private transientRetryReason: string | null = null;
   private incompleteReason: string | null = null;
+  /**
+   * Expected approximations, deduplicated. Unlike `incompleteReason` this is
+   * not first-wins: the same approximation fires on many commands per cycle
+   * and must collapse to one statement, not N.
+   */
+  private readonly approximations = new Set<string>();
   private opaqueQueue: Promise<void> = Promise.resolve();
 
   private recordQuotaEvidence(
@@ -260,10 +308,12 @@ export class GitHubUsageMeter {
         || usedDelta < end.cost
         || remainingDelta !== usedDelta
       ) {
-        this.markIncomplete(
-          'opaque-command quota evidence was inconsistent '
-            + '(eventually-consistent rate-limit counter skew)',
-        );
+        // Expected, not anomalous: this is the documented eventual consistency
+        // of GitHub's own counters, reachable on a cycle where the command and
+        // both probes succeeded. Recorded as an approximation so it stops
+        // being reported as a per-cycle anomaly, and so the report can say
+        // which number is soft (cost) and which is not (remaining/resetAt).
+        this.markApproximate(OPAQUE_SPAN_SKEW_APPROXIMATION);
       } else {
         hiddenCost = usedDelta - end.cost;
       }
@@ -300,6 +350,16 @@ export class GitHubUsageMeter {
     this.incompleteReason ??= detail;
   }
 
+  /**
+   * Records an approximation GitHub's API makes unavoidable, as opposed to
+   * something this cycle failed to evidence. Keeps `accountingComplete` false
+   * — the number really is soft — but lets the report state it without the
+   * anomaly framing. See {@link EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX}.
+   */
+  markApproximate(detail: string): void {
+    this.approximations.add(detail);
+  }
+
   recordCacheHit(): void {
     this.cacheHits += 1;
   }
@@ -333,6 +393,7 @@ export class GitHubUsageMeter {
     this.transientRetries = 0;
     this.transientRetryReason = null;
     this.incompleteReason = null;
+    this.approximations.clear();
   }
 
   read(): GitHubUsage {
@@ -346,8 +407,15 @@ export class GitHubUsageMeter {
     }
     // Both incompleteness reasons are reported: a retry must never mask a
     // genuine quota-evidence skew recorded later in the same cycle.
-    const reasons = [this.incompleteReason, this.transientRetryReason]
+    const anomalies = [this.incompleteReason, this.transientRetryReason]
       .filter((reason): reason is string => reason !== null);
+    const approximations = [...this.approximations];
+    const reasons = [...anomalies, ...approximations];
+    // Anomalies always lead, so the prefix appears only when there are none —
+    // an anomaly is never demoted by an approximation recorded alongside it.
+    const composed = anomalies.length === 0 && approximations.length > 0
+      ? EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX + approximations.join('; ')
+      : reasons.join('; ');
     return Object.freeze({
       graphqlRequests: this.graphqlRequests,
       graphqlCost: this.graphqlCost,
@@ -357,7 +425,7 @@ export class GitHubUsageMeter {
       restNotModified: this.restNotModified,
       cacheHits: this.cacheHits,
       accountingComplete: reasons.length === 0,
-      ...(reasons.length === 0 ? {} : { incompleteReason: reasons.join('; ') }),
+      ...(reasons.length === 0 ? {} : { incompleteReason: composed }),
       ...(this.transientRetries === 0 ? {} : { transientRetries: this.transientRetries }),
     });
   }
@@ -378,6 +446,28 @@ function ephemeralCredentialKey(options?: { env?: Record<string, string> }): str
 function includedRestStatus(raw: string): number | undefined {
   const match = /^(?:HTTP\/1\.[01]|HTTP\/2(?:\.0)?) ([1-5][0-9]{2})(?:[ \r\n])/.exec(raw);
   return match?.[1] === undefined ? undefined : Number(match[1]);
+}
+
+/**
+ * Exact HTTP page count of a `gh api --paginate --slurp` response, or null when
+ * the payload is not a usable page array.
+ *
+ * `--slurp` emits one JSON array element per HTTP page, so the element count IS
+ * the request count — the page count is not actually hidden for this command
+ * form, it was simply never read. `--slurp` is mutually exclusive with `--jq`
+ * and `--template` in `gh`, so a slurped response is always the raw page array.
+ * An empty array is treated as unusable: `gh` always issues at least one
+ * request, so zero pages is evidence of a payload this decoder does not model,
+ * not of a request that never happened.
+ */
+export function slurpedRestPageCount(raw: string): number | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+  return Array.isArray(parsed) && parsed.length > 0 ? parsed.length : null;
 }
 
 /** stdout retained by Node's exec-file rejection, when one is available. */
@@ -469,17 +559,48 @@ export function makeGitHubUsageCommandRunner(
     // deliberately; changing metering shape is out of scope for this fix.
     if (args[0] === 'api' && args[1] !== 'graphql') {
       if (args.includes('--paginate')) {
-        // --paginate collapses N HTTP pages into a single gh invocation, so the
-        // exact per-page request count is unobservable. Per #2013, incomplete
-        // usage accounting is best-effort and must never fail a command or crash
-        // the loop — the review and reconciliation paths legitimately page a
-        // PR's comments and reviews via `--paginate --slurp`. Record the floor of
-        // one request, mark the undercount as incomplete so it is surfaced, and
-        // run the command. Large-N pagination should still prefer explicit
-        // per-page requests for exact metering (see dispatcher/issue-source.ts).
-        meter.markIncomplete('an explicit REST command hid its response page count');
-        meter.recordRestRequest();
-        return run(command, args, options);
+        // --paginate collapses N HTTP pages into a single gh invocation. That
+        // was treated as making the per-page count unobservable for every
+        // paginated command, which marked accounting incomplete on every cycle
+        // that read a PR's comments or changed files. It is only true for the
+        // forms that merge or filter the pages away: `--slurp` returns one
+        // array element PER PAGE, so those responses carry their own exact
+        // count and just needed reading. Per #2013 this stays best-effort and
+        // must never fail a command or crash the loop.
+        //
+        // No request behaviour changes: the same argv runs exactly once on
+        // both paths, and REST counts gate nothing (only `graphqlRemaining`
+        // feeds the reserve check, in the opaque branch below).
+        if (!args.includes('--slurp')) {
+          meter.markIncomplete(
+            'a `gh api --paginate` command without `--slurp` merged its response '
+              + 'pages, so its page count is unobservable',
+          );
+          meter.recordRestRequest();
+          return run(command, args, options);
+        }
+        let raw: string;
+        try {
+          raw = await run(command, args, options);
+        } catch (error) {
+          // At least one page was attempted; how many is unknowable now.
+          meter.markIncomplete(
+            'a paginated REST command failed before its page count could be read',
+          );
+          meter.recordRestRequest();
+          throw error;
+        }
+        const pages = slurpedRestPageCount(raw);
+        if (pages === null) {
+          meter.markIncomplete(
+            'a `gh api --paginate --slurp` response was not a page array, so its '
+              + 'page count is unreadable',
+          );
+          meter.recordRestRequest();
+          return raw;
+        }
+        for (let page = 0; page < pages; page += 1) meter.recordRestRequest();
+        return raw;
       }
       if (!args.includes('--include')) {
         meter.recordRestRequest();
