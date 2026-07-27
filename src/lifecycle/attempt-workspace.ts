@@ -1759,8 +1759,7 @@ export function markAttemptExited(
   if (
     current.execution.backend === 'marketplace'
     && (
-      current.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
-      || current.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+      current.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
       || current.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1'
     )
   ) {
