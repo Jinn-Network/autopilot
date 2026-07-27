@@ -152,18 +152,24 @@ describe('marketplace Solution delivery observation', () => {
 
   it('pins a retry to the prior delivery and reuses byte-identical evidence', async () => {
     const { attemptDir, manifestPath } = fixture();
-    const output = JSON.stringify(verifiedWrapper());
-    const run = vi.fn(async () => ({ exitCode: 0, stdout: output, stderr: '' }));
+    const firstWrapper = verifiedWrapper();
+    const retryWrapper = verifiedWrapper();
+    retryWrapper.generatedAt = '2026-07-27T12:02:00.000Z';
+    const outputs = [JSON.stringify(firstWrapper), JSON.stringify(retryWrapper)];
+    const run = vi.fn(async () => ({ exitCode: 0, stdout: outputs.shift()!, stderr: '' }));
     const options = { jinnBinary: '/installed/bin/jinn', run, now: vi.fn()
       .mockReturnValueOnce(new Date('2026-07-27T12:01:00.000Z'))
       .mockReturnValueOnce(new Date('2026-07-27T12:01:00.000Z'))
       .mockReturnValueOnce(new Date('2026-07-27T12:02:00.000Z')) };
 
     const first = await observeMarketplaceSolutionDelivery(manifestPath, options);
+    const persistedBytes = readFileSync(join(attemptDir, 'marketplace-solution-observation.json'));
     const second = await observeMarketplaceSolutionDelivery(manifestPath, options);
 
     expect(first).toMatchObject({ status: 'verified' });
     expect(second).toEqual(first);
+    expect(JSON.parse(persistedBytes.toString('utf8'))).toEqual(firstWrapper.observation);
+    expect(readFileSync(join(attemptDir, 'marketplace-solution-observation.json'))).toEqual(persistedBytes);
     const expectation = JSON.parse(readFileSync(join(attemptDir, 'marketplace-solution-expectation.json'), 'utf8')) as Record<string, unknown>;
     expect(expectation).toMatchObject({ attemptIndex: 0, requestId: `0x${'1'.repeat(64)}`, deliveryEnvelopeCid: 'bafy-envelope-solution', deliveryTransactionHash: `0x${'d'.repeat(64)}`, deliveryBlockNumber: 102, solutionOperator: `0x${'1'.repeat(40)}` });
   });

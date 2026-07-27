@@ -26,9 +26,6 @@ import {
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
 import {
-  JinnRepoMergedPrTaskSchema,
-} from '@jinn-network/sdk/solvernets/jinn-repo';
-import {
   MarketplaceMachineCliFailure,
   MarketplaceMachineCliProtocolError,
   marketplaceMachineEnvironment,
@@ -75,10 +72,8 @@ export class MarketplaceTaskCliFailure extends MarketplaceMachineCliFailure {
  * its legacy literal fields instead of embedding a standalone repository
  * fallback in the distributable Autopilot binary.
  */
-export const MARKETPLACE_REPOSITORY =
-  JinnRepoMergedPrTaskSchema.shape.repo.value;
-export const MARKETPLACE_LANGUAGE =
-  JinnRepoMergedPrTaskSchema.shape.language.value;
+export const MARKETPLACE_REPOSITORY = 'Jinn-Network/mono';
+export const MARKETPLACE_LANGUAGE = 'typescript';
 export const MARKETPLACE_VERIFICATION_PROFILE = 'jinn-mono.v1';
 
 export type MarketplaceMutationWorkflow =

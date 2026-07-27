@@ -332,7 +332,7 @@ export async function observeMarketplaceSolutionDelivery(
   }
   const observation = observed as VerifiedSolutionObservation;
   const observationPath = join(manifest.paths.attemptDir, OBSERVATION_FILE);
-  const observationBytes = canonicalBytes(commandResult);
+  const observationBytes = canonicalBytes(observation);
   const observationDigest = digest(observationBytes);
   const observedAt = state.delivery?.observedAt ?? now().toISOString();
   const evidence = verifiedEvidence(
