@@ -28,7 +28,6 @@ import {
 } from '../../src/lifecycle/marketplace-task.js';
 import type { VerifiedSolutionObservation } from '../../src/lifecycle/marketplace-delivery.js';
 import type {
-  MarketplaceArtifactEvidence,
   MarketplaceHostCommitEvidence,
   MarketplaceReviewAnchorEvidence,
   MarketplaceSolutionDeliveryEvidence,
@@ -709,7 +708,11 @@ function writeObservationFile(
     ...harness.delivery,
     observationDigest,
   };
-  const state = harness.currentManifest.execution.state;
+  const execution = harness.currentManifest.execution;
+  if (execution.backend !== 'marketplace') {
+    throw new Error('expected marketplace execution');
+  }
+  const state = execution.state;
   if (state.schemaVersion !== 'marketplace-execution-v3' || !('delivery' in state)) {
     throw new Error('expected marketplace solution-observed state');
   }
@@ -848,11 +851,19 @@ describe('marketplace mutation adoption success', () => {
     harness.phaseCompleteHead = COMPLETION;
     const result = await adopt(harness);
     expect(result).toMatchObject({ status: 'accepted', resultingHead: COMPLETION });
-    const state = readAttemptManifest(harness.manifestPath).execution.state;
+    const execution = readAttemptManifest(harness.manifestPath).execution;
+    if (execution.backend !== 'marketplace') {
+      throw new Error('expected marketplace execution');
+    }
+    const state = execution.state;
     if (state.schemaVersion !== 'marketplace-execution-v3' || state.status !== 'receipt-published') {
       throw new Error('expected receipt-published marketplace state');
     }
-    expect(state.progress.completion).toEqual({
+    const progress = state.progress;
+    if (progress.status !== 'lifecycle-completed' && progress.status !== 'review-anchored') {
+      throw new Error('expected completion progress');
+    }
+    expect(progress.completion).toEqual({
       operation: 'implementation-complete',
       prNumber: 2101,
       branch: 'codex/issue-2001',
@@ -868,11 +879,19 @@ describe('marketplace mutation adoption success', () => {
     const harness = new Harness('fix-child');
     const result = await adopt(harness);
     expect(result).toMatchObject({ status: 'accepted', resultingHead: HOST_COMMIT });
-    const state = readAttemptManifest(harness.manifestPath).execution.state;
+    const execution = readAttemptManifest(harness.manifestPath).execution;
+    if (execution.backend !== 'marketplace') {
+      throw new Error('expected marketplace execution');
+    }
+    const state = execution.state;
     if (state.schemaVersion !== 'marketplace-execution-v3' || state.status !== 'receipt-published') {
       throw new Error('expected receipt-published marketplace state');
     }
-    expect(state.progress.completion).toEqual({
+    const progress = state.progress;
+    if (progress.status !== 'lifecycle-completed' && progress.status !== 'review-anchored') {
+      throw new Error('expected completion progress');
+    }
+    expect(progress.completion).toEqual({
       operation: 'child-complete',
       childIssueNumber: 2069,
       parentPrNumber: 2101,

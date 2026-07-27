@@ -53,7 +53,7 @@ import type {
   MarketplaceReviewAnchorPort,
 } from './marketplace-review-anchor.js';
 import type { ImplementationSessionProtocol } from './implementation-session.js';
-import type { BranchClaim, GitOid } from './types.js';
+import { gitOid, type BranchClaim, type GitOid } from './types.js';
 
 export type MarketplaceMutationAdoptionResult =
   | {
@@ -275,7 +275,7 @@ function pureValidateObservation(
       },
     };
   }
-  const { session, result, correlation } = parsed;
+  const { result, correlation } = parsed;
   if (
     delivery.taskId !== observation.task.taskId
     || delivery.taskCid !== observation.task.taskCid
@@ -482,14 +482,22 @@ function progressFromManifest(manifest: AttemptManifest): AdoptionProgress | nul
     return { ...state.progress, receipt: state.receipt };
   }
   if (state.status === 'submitted') return null;
-  const { delivery, artifact, verification, hostCommit, completion, reviewAnchor } = state;
+  if (
+    state.status !== 'solution-observed'
+    && state.status !== 'solution-verified'
+    && state.status !== 'host-committed'
+    && state.status !== 'lifecycle-completed'
+    && state.status !== 'review-anchored'
+  ) {
+    return null;
+  }
   return {
-    delivery,
-    ...(artifact === undefined ? {} : { artifact }),
-    ...(verification === undefined ? {} : { verification }),
-    ...(hostCommit === undefined ? {} : { hostCommit }),
-    ...(completion === undefined ? {} : { completion }),
-    ...(reviewAnchor === undefined ? {} : { reviewAnchor }),
+    delivery: state.delivery,
+    ...('artifact' in state ? { artifact: state.artifact } : {}),
+    ...('verification' in state ? { verification: state.verification } : {}),
+    ...('hostCommit' in state ? { hostCommit: state.hostCommit } : {}),
+    ...('completion' in state ? { completion: state.completion } : {}),
+    ...('reviewAnchor' in state ? { reviewAnchor: state.reviewAnchor } : {}),
   };
 }
 
@@ -579,7 +587,7 @@ async function readAuthority(
 }
 
 async function requireHumanAuthority(
-  parsed: ParsedObservation | Omit<ParsedObservation, 'patch' | 'artifact'>,
+  _parsed: ParsedObservation | Omit<ParsedObservation, 'patch' | 'artifact'>,
   authority: MarketplaceMutationAuthority,
   detail: string,
   deps: MarketplaceMutationAdoptionDependencies,
@@ -620,11 +628,15 @@ async function stableReject(
   try {
     const publication = await publishAdoptionReceipt(facts, receipt, deps.receipts);
     await deps.onBoundary?.('receipt-persisted');
+    const publicationExecution = publicationAuthority.manifest.execution;
+    const publicationRequestDigest =
+      publicationExecution.backend === 'marketplace'
+      && publicationExecution.state.schemaVersion === 'marketplace-execution-v3'
+        ? publicationExecution.state.requestDigest
+        : '';
     await deps.transition(
       publicationAuthority.manifest.paths.manifest,
-      publicationAuthority.manifest.execution.backend === 'marketplace'
-        ? publicationAuthority.manifest.execution.state.requestDigest
-        : '',
+      publicationRequestDigest,
       {
         status: 'receipt-published',
         receipt: {
@@ -761,7 +773,7 @@ function buildCompletionEvidence(
       operation: 'implementation-complete',
       prNumber: authority.pullRequest.number,
       branch: authority.pullRequest.headRefName,
-      claimOid: authority.manifest.claimOid,
+      claimOid: gitOid(authority.manifest.claimOid),
       checkpointOid,
       resultingHead,
       lifecycleStatus: 'In Review',
@@ -773,7 +785,7 @@ function buildCompletionEvidence(
     childIssueNumber: authority.child!.number,
     parentPrNumber: authority.child!.parentPrNumber,
     parentBranch: authority.pullRequest.headRefName,
-    claimOid: authority.manifest.claimOid,
+    claimOid: gitOid(authority.manifest.claimOid),
     checkpointOid,
     resultingHead,
     childClosed: true,
@@ -846,13 +858,13 @@ async function adoptManifest(
     const receipt = state.receipt.receipt;
     if (receipt.disposition === 'accepted') {
       const progress = state.progress;
-      if (progress.reviewAnchor === undefined) {
+      if (progress.status !== 'review-anchored') {
         throw new Error('Accepted marketplace receipt is missing review anchor progress');
       }
       return {
         status: 'accepted',
         receipt,
-        resultingHead: receipt.resultingHead!,
+        resultingHead: gitOid(receipt.resultingHead!),
         reviewAnchor: progress.reviewAnchor,
       };
     }
