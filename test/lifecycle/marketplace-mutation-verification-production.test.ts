@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildJinnMonoV1VerificationPlan,
   MarketplaceVerificationError,
@@ -162,13 +162,31 @@ describe('marketplace verification sandbox helpers', () => {
       ALCHEMY_API_KEY: 'secret',
     })).toEqual({
       PATH: '/usr/bin',
-      HOME: '/home/operator',
+      HOME: '/workspace',
       LANG: 'C.UTF-8',
       NO_COLOR: '1',
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
       YARN_ENABLE_SCRIPTS: '0',
       YARN_ENABLE_IMMUTABLE_INSTALLS: '1',
       CI: 'true',
+    });
+  });
+
+  it('forces security defaults over hostile ambient yarn settings', () => {
+    expect(sanitizeMarketplaceVerificationSandboxEnvironment({
+      YARN_ENABLE_SCRIPTS: '1',
+      YARN_ENABLE_IMMUTABLE_INSTALLS: '0',
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '1',
+      NO_COLOR: '0',
+      CI: 'false',
+      HOME: '/root',
+    })).toEqual({
+      YARN_ENABLE_SCRIPTS: '0',
+      YARN_ENABLE_IMMUTABLE_INSTALLS: '1',
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+      NO_COLOR: '1',
+      CI: 'true',
+      HOME: '/workspace',
     });
   });
 
@@ -207,11 +225,18 @@ describe('marketplace verification sandbox helpers', () => {
     });
 
     expect(invocation.image).toBe(JINN_MONO_V1_VERIFICATION_NODE_IMAGE);
+    expect(invocation.perCommandTimeoutSeconds).toBe(
+      MARKETPLACE_VERIFICATION_SANDBOX_LIMITS.perCommandTimeoutSeconds,
+    );
     expect(invocation.argv).toEqual(expect.arrayContaining([
       'run',
       '--rm',
       '--init',
       '--read-only',
+      '--tmpfs',
+      '/tmp:rw,noexec,nosuid',
+      '--tmpfs',
+      '/run:rw,noexec,nosuid',
       '--security-opt',
       'no-new-privileges',
       '--cap-drop',
@@ -239,6 +264,7 @@ describe('marketplace verification sandbox helpers', () => {
       NO_COLOR: '1',
       CI: 'true',
       PATH: '/usr/bin',
+      HOME: '/workspace',
     });
     expect(invocation.network).toBe('bridge');
     expect(invocation.label).toBe('install');
@@ -394,6 +420,52 @@ describe('createProductionMarketplaceVerificationPort', () => {
     });
   });
 
+  it('classifies signal and OOM-class non-install exits as recoverable', async () => {
+    for (const exitCode of [137, 143]) {
+      const port = createProductionMarketplaceVerificationPort({
+        now: clock(),
+        dockerRunner: async (invocation) => (
+          invocation.label === 'install'
+            ? { exitCode: 0, stdout: invocation.label, stderr: '' }
+            : { exitCode, stdout: '', stderr: '' }
+        ),
+        dockerInspector: {
+          inspectDaemon: async () => true,
+          inspectImage: async () => true,
+        },
+        cleanup: confirmedCleanup(),
+        prepareWorkspace: async () => {},
+      });
+
+      await expect(port.verify(verifyInput)).rejects.toMatchObject({
+        reason: 'command-failed',
+        disposition: 'recoverable',
+      });
+    }
+  });
+
+  it('classifies a normal non-install failure as stable-rejection', async () => {
+    const port = createProductionMarketplaceVerificationPort({
+      now: clock(),
+      dockerRunner: async (invocation) => (
+        invocation.label === 'typecheck:packages/autopilot'
+          ? { exitCode: 1, stdout: '', stderr: 'type error' }
+          : { exitCode: 0, stdout: invocation.label, stderr: '' }
+      ),
+      dockerInspector: {
+        inspectDaemon: async () => true,
+        inspectImage: async () => true,
+      },
+      cleanup: confirmedCleanup(),
+      prepareWorkspace: async () => {},
+    });
+
+    await expect(port.verify(verifyInput)).rejects.toMatchObject({
+      reason: 'command-failed',
+      disposition: 'stable-rejection',
+    });
+  });
+
   it('classifies a registry outage during install as recoverable', async () => {
     const port = createProductionMarketplaceVerificationPort({
       now: clock(),
@@ -477,6 +549,26 @@ describe('createProductionMarketplaceVerificationPort', () => {
     expect(invocations.map((entry) => entry.label)).toEqual(['install']);
   });
 
+  it('escalates SIGTERM ambiguity to SIGKILL before failing closed', async () => {
+    const signals: string[] = [];
+    const port = createProductionMarketplaceVerificationPort({
+      now: clock(),
+      dockerRunner: passingRunner(),
+      dockerInspector: {
+        inspectDaemon: async () => true,
+        inspectImage: async () => true,
+      },
+      cleanup: async ({ signal }) => {
+        signals.push(signal);
+        return signal === 'SIGTERM' ? 'ambiguous' : 'confirmed';
+      },
+      prepareWorkspace: async () => {},
+    });
+
+    await expect(port.verify(verifyInput)).resolves.toBeDefined();
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
+  });
+
   it('cleans up with SIGTERM then SIGKILL and fails closed when cleanup is ambiguous', async () => {
     const signals: string[] = [];
     const port = createProductionMarketplaceVerificationPort({
@@ -528,6 +620,47 @@ describe('createProductionMarketplaceVerificationPort', () => {
       reason: 'unsafe-cleanup',
       disposition: 'unsafe',
     });
+  });
+
+  it('enforces per-command timeout on docker invocations', async () => {
+    vi.useFakeTimers({ now: Date.parse('2020-01-01T00:00:00.000Z') });
+    try {
+      const invocations: MarketplaceVerificationDockerInvocation[] = [];
+      const installBlocked = new Promise<void>(() => {});
+      const port = createProductionMarketplaceVerificationPort({
+        now: () => new Date(Date.parse('2020-01-01T00:00:00.000Z')),
+        dockerRunner: async (invocation) => {
+          invocations.push(invocation);
+          if (invocation.label === 'install') {
+            await installBlocked;
+          }
+          return { exitCode: 0, stdout: invocation.label, stderr: '' };
+        },
+        dockerInspector: {
+          inspectDaemon: async () => true,
+          inspectImage: async () => true,
+        },
+        cleanup: confirmedCleanup(),
+        prepareWorkspace: async () => {},
+      });
+
+      const verifyPromise = port.verify({
+        ...verifyInput,
+        deadline: '2020-01-01T00:00:02.000Z',
+      });
+      const expectation = expect(verifyPromise).rejects.toMatchObject({
+        reason: 'deadline-expired',
+        disposition: 'abandoned',
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expectation;
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]?.perCommandTimeoutSeconds).toBe(
+        MARKETPLACE_VERIFICATION_SANDBOX_LIMITS.perCommandTimeoutSeconds,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('records every planned command in order with bounded digests on success', async () => {

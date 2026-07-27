@@ -36,14 +36,9 @@ export const MARKETPLACE_VERIFICATION_SANDBOX_LIMITS = {
 
 const SANDBOX_ENV_ALLOWLIST = new Set([
   'PATH',
-  'HOME',
   'LANG',
   'LC_ALL',
   'TZ',
-  'NO_COLOR',
-  'COREPACK_ENABLE_DOWNLOAD_PROMPT',
-  'YARN_ENABLE_SCRIPTS',
-  'YARN_ENABLE_IMMUTABLE_INSTALLS',
   'CI',
 ]);
 
@@ -63,6 +58,7 @@ export interface MarketplaceVerificationDockerInvocation {
   readonly image: string;
   readonly argv: readonly string[];
   readonly env: Readonly<Record<string, string>>;
+  readonly perCommandTimeoutSeconds: number;
 }
 
 export interface MarketplaceVerificationDockerHandle {
@@ -113,13 +109,7 @@ function isVerificationSecretEnvironmentKey(key: string): boolean {
 export function sanitizeMarketplaceVerificationSandboxEnvironment(
   ambient: NodeJS.ProcessEnv,
 ): Record<string, string> {
-  const environment: Record<string, string> = {
-    YARN_ENABLE_SCRIPTS: '0',
-    YARN_ENABLE_IMMUTABLE_INSTALLS: '1',
-    COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
-    NO_COLOR: '1',
-    CI: 'true',
-  };
+  const environment: Record<string, string> = {};
   for (const [key, value] of Object.entries(ambient)) {
     if (
       value !== undefined
@@ -129,6 +119,12 @@ export function sanitizeMarketplaceVerificationSandboxEnvironment(
       environment[key] = value;
     }
   }
+  environment.YARN_ENABLE_SCRIPTS = '0';
+  environment.YARN_ENABLE_IMMUTABLE_INSTALLS = '1';
+  environment.COREPACK_ENABLE_DOWNLOAD_PROMPT = '0';
+  environment.NO_COLOR = '1';
+  environment.CI = 'true';
+  environment.HOME = '/workspace';
   return environment;
 }
 
@@ -173,6 +169,10 @@ export function buildMarketplaceVerificationDockerInvocation(input: {
     '--rm',
     '--init',
     '--read-only',
+    '--tmpfs',
+    '/tmp:rw,noexec,nosuid',
+    '--tmpfs',
+    '/run:rw,noexec,nosuid',
     '--security-opt',
     'no-new-privileges',
     '--cap-drop',
@@ -201,6 +201,7 @@ export function buildMarketplaceVerificationDockerInvocation(input: {
     image: JINN_MONO_V1_VERIFICATION_NODE_IMAGE,
     argv,
     env: input.environment,
+    perCommandTimeoutSeconds: MARKETPLACE_VERIFICATION_SANDBOX_LIMITS.perCommandTimeoutSeconds,
   };
 }
 
@@ -217,17 +218,56 @@ function classifyInstallFailure(stdout: string, stderr: string): 'stable-rejecti
   return 'recoverable';
 }
 
+function classifyNonInstallFailure(exitCode: number): 'stable-rejection' | 'recoverable' {
+  if (exitCode === 137 || exitCode === 143) {
+    return 'recoverable';
+  }
+  return 'stable-rejection';
+}
+
+async function runDockerWithPerCommandTimeout(input: {
+  readonly runner: MarketplaceVerificationDockerRunner;
+  readonly invocation: MarketplaceVerificationDockerInvocation;
+  readonly remainingMs: number;
+}): Promise<MarketplaceVerificationDockerHandle> {
+  const timeoutMs = Math.min(
+    input.invocation.perCommandTimeoutSeconds * 1000,
+    input.remainingMs,
+  );
+  if (timeoutMs <= 0) {
+    throw new MarketplaceVerificationError(
+      'deadline-expired',
+      'abandoned',
+      `Marketplace adoption deadline passed during verification command ${input.invocation.label}`,
+    );
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      input.runner(input.invocation),
+      new Promise<MarketplaceVerificationDockerHandle>((_, reject) => {
+        timer = setTimeout(() => {
+          const cappedByDeadline = input.remainingMs < input.invocation.perCommandTimeoutSeconds * 1000;
+          reject(new MarketplaceVerificationError(
+            cappedByDeadline ? 'deadline-expired' : 'runner-failed',
+            cappedByDeadline ? 'abandoned' : 'recoverable',
+            cappedByDeadline
+              ? `Marketplace adoption deadline passed during verification command ${input.invocation.label}`
+              : `Marketplace verification command ${input.invocation.label} exceeded `
+                + `${input.invocation.perCommandTimeoutSeconds}s`,
+          ));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function ensureSandboxCleanup(
   cleanup: MarketplaceVerificationSandboxCleanup,
 ): Promise<void> {
-  const term = await cleanup({ signal: 'SIGTERM' });
-  if (term === 'ambiguous') {
-    throw new MarketplaceVerificationError(
-      'unsafe-cleanup',
-      'unsafe',
-      'Marketplace verification sandbox teardown could not be confirmed after SIGTERM',
-    );
-  }
+  await cleanup({ signal: 'SIGTERM' });
   const kill = await cleanup({ signal: 'SIGKILL' });
   if (kill === 'ambiguous') {
     throw new MarketplaceVerificationError(
@@ -302,7 +342,8 @@ export function createProductionMarketplaceVerificationPort(
 
         const commands: MarketplaceVerificationEvidence['commands'][number][] = [];
         for (const command of plan.commands) {
-          if (now().getTime() >= deadlineMs) {
+          const nowMs = now().getTime();
+          if (nowMs >= deadlineMs) {
             throw new MarketplaceVerificationError(
               'deadline-expired',
               'abandoned',
@@ -311,6 +352,7 @@ export function createProductionMarketplaceVerificationPort(
             );
           }
           const startedAt = now().toISOString();
+          const remainingMs = deadlineMs - nowMs;
           let result: MarketplaceVerificationRunResult;
           let rawStdout = '';
           let rawStderr = '';
@@ -322,7 +364,11 @@ export function createProductionMarketplaceVerificationPort(
               network: networkForCommand(command),
               environment,
             });
-            const handle = await options.dockerRunner(invocation);
+            const handle = await runDockerWithPerCommandTimeout({
+              runner: options.dockerRunner,
+              invocation,
+              remainingMs,
+            });
             rawStdout = handle.stdout;
             rawStderr = handle.stderr;
             result = {
@@ -342,7 +388,7 @@ export function createProductionMarketplaceVerificationPort(
           if (result.exitCode !== 0) {
             const disposition = command.label === 'install'
               ? classifyInstallFailure(rawStdout, rawStderr)
-              : 'stable-rejection';
+              : classifyNonInstallFailure(result.exitCode);
             throw new MarketplaceVerificationError(
               'command-failed',
               disposition,
