@@ -498,7 +498,12 @@ async function reviewFollowUpRecoveryRejection(
       ? `Stale recovery issue #${issueNumber} carries an unparseable review follow-up marker.`
       : null;
   }
-  if (readParentPullRequest === undefined) return null;
+  // Fail closed, as the child-claim gate below does for the same missing dep:
+  // the marker parsed, so a parent dependency is asserted, and without the
+  // lookup it cannot be checked.
+  if (readParentPullRequest === undefined) {
+    return `Parent PR lookup is unavailable for review follow-up issue #${issueNumber}.`;
+  }
   // The production port resolves only OPEN pull requests, so non-null is
   // exactly the positive OPEN evidence the projection gate fires on.
   const parent = await readParentPullRequest(marker.parentPr);

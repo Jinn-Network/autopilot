@@ -1,4 +1,5 @@
 // @ts-nocheck — Stage 5 leftover fixtures for deleted merge-prep/review-fix/project APIs.
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { TaskSubmitRequestV1Schema } from '@jinn-network/sdk/autopilot';
 import type { AttemptManifest } from '../../src/lifecycle/attempt-workspace.js';
@@ -706,6 +707,86 @@ describe('implementation action executor', () => {
     // No parent number is readable, so no parent lookup is attempted.
     expect(parentReads).toEqual([]);
     expect(claims).toEqual([]);
+  });
+
+  // Same trigger as the snapshot gate: the R5 refusal is permanent for the
+  // life of the body, so it must not fire on an issue that merely quotes the
+  // canon §5.1 marker template.
+  it('resumes stale recovery of an issue quoting the canon §5.1 marker template', async () => {
+    const canon = readFileSync(
+      new URL('../../assets/canon/single-surface-lifecycle.md', import.meta.url),
+      'utf8',
+    );
+    const template = canon.match(/`(<!-- jinn-autopilot:review-follow-up [^`]*-->)`/)?.[1];
+    expect(template).toBeDefined();
+
+    const state = staleRecoveryState({
+      issue: issue({
+        eligible: false,
+        eligibilityDetail: 'Project status is In Progress',
+        body: `Canon §5.1 requires the body marker:\n\n\`\`\`\n${template}\n\`\`\`\n`,
+      }),
+    });
+    const parentReads: number[] = [];
+    const { deps, events } = harness({
+      readStaleRecovery: async () => state,
+      readParentPullRequest: async (number: number) => {
+        parentReads.push(number);
+        return null;
+      },
+      runRealityCheck: async () => ({
+        classification: 'pr-open',
+        evidence: { prNumber: 84 },
+        suggestedBlockedOn: 'Another issue',
+        suggestedComment: 'Open PR exists.',
+      }),
+    });
+
+    await expect(executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: ADOPTED_HEAD,
+      branch: gitRefName('existing/issue-42'),
+      claimAttempt: ATTEMPT_A,
+    }, deps)).resolves.toMatchObject({ status: 'spawned', issueNumber: 42 });
+    // Not marker-shaped at all, so the gate never engages.
+    expect(parentReads).toEqual([]);
+    expect(events).toEqual(['claim', 'pr', 'project', 'attempt', 'spawn', 'track']);
+  });
+
+  // Fail closed on a missing optional dep, matching the child-claim gate: a
+  // parseable follow-up marker states a dependency that cannot be checked
+  // without the lookup, so the claim is refused rather than waved through.
+  it('refuses stale recovery of a review follow-up when parent PR lookup is unavailable', async () => {
+    const state = staleRecoveryState({
+      issue: issue({
+        eligible: false,
+        eligibilityDetail: 'Project status is In Progress',
+        body: followUpBody(2065),
+      }),
+    });
+    const { deps, claims, events, human } = harness({
+      readStaleRecovery: async () => state,
+      readParentPullRequest: undefined,
+    });
+
+    await expect(executeImplementationAction({
+      kind: 'claim-implementation',
+      intent: 'stale-recovery',
+      issueNumber: 42,
+      prNumber: 84,
+      expectedHead: ADOPTED_HEAD,
+      branch: gitRefName('existing/issue-42'),
+      claimAttempt: ATTEMPT_A,
+    }, deps)).resolves.toEqual(expect.objectContaining({
+      status: 'ineligible',
+      detail: expect.stringContaining('Parent PR lookup is unavailable'),
+    }));
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+    expect(human).toEqual([]);
   });
 
   it('escalates duplicate open implementation PRs without publishing a recovery claim', async () => {

@@ -2,6 +2,7 @@
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -2319,6 +2320,41 @@ describe('buildGitHubLifecycleSnapshot', () => {
       eligible: false,
       eligibilityReason: 'not-selected',
     });
+  });
+
+  // The fail-closed hold is permanent — `eligible: false` with reason
+  // `not-selected`, no self-heal and no timeout — so its trigger must not fire
+  // on documentation. Canon §5.1 prints the marker *template* verbatim, and
+  // issues here are routinely written by agents told to cite canon; matching
+  // the template stranded any such issue forever behind a reason string that
+  // reads like an ordinary triage miss.
+  it('does not fail closed on an issue quoting the canon §5.1 marker template', async () => {
+    const canon = readFileSync(
+      new URL('../../assets/canon/single-surface-lifecycle.md', import.meta.url),
+      'utf8',
+    );
+    const template = canon.match(/`(<!-- jinn-autopilot:review-follow-up [^`]*-->)`/)?.[1];
+    expect(template).toBeDefined();
+
+    for (const body of [
+      `Canon §5.1 requires the body marker ${template}.`,
+      `Canon §5.1 requires the body marker:\n\n\`\`\`\n${template}\n\`\`\`\n`,
+    ]) {
+      const quoting = { ...followUpIssue(101), body };
+      const source = reader({
+        readIssues: async () => [{ ...issue(), status: 'Todo' }, quoting],
+      });
+
+      const snapshot = await buildGitHubLifecycleSnapshot(source, {
+        authorAllowlist: new Set(['trusted']),
+      });
+
+      expect(snapshot.pullRequests.find((pr) => pr.number === 101)?.state).toBe('OPEN');
+      expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+        eligible: true,
+        eligibilityReason: 'eligible',
+      });
+    }
   });
 
   it('does not fail closed on prose that merely names the review-follow-up marker tag', async () => {
