@@ -576,6 +576,9 @@ describe('production implementation action port', () => {
     });
     await expect(port.readStaleRecovery(42, 84)).resolves.toMatchObject({
       issue: null,
+      // The refusal names the blocker and why no base resolved, so the
+      // operator-facing line does not have to guess at "missing or closed".
+      issueRefusal: expect.stringContaining('#50 has no closing pull request'),
       pullRequest: {
         baseRefName: 'next',
       },
@@ -621,9 +624,29 @@ describe('production implementation action port', () => {
         ],
       }),
     });
-    await expect(untrustedPort.readStaleRecovery(42, 84)).resolves.toMatchObject({
-      issue: null,
+    // This is the live #2040 shape: the issue is present and open, and the
+    // only thing missing is a trusted blocker PR. The refusal must name the
+    // blocker issue, the blocking PR and its untrusted author.
+    const untrusted = await untrustedPort.readStaleRecovery(42, 84);
+    expect(untrusted.issue).toBeNull();
+    expect(untrusted.issueRefusal).toContain('issue #42 is open');
+    expect(untrusted.issueRefusal).toContain('blocker issue #50');
+    expect(untrusted.issueRefusal).toContain('PR #83');
+    expect(untrusted.issueRefusal).toContain('outsider');
+    expect(untrusted.issueRefusal).toContain('allowlist');
+    // Distinguishable from the absent-source refusal.
+    const absentPort = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: new CredentialPool([]),
+      authorAllowlist: new Set(['trusted-author']),
+      readSnapshot: async () => ({ ...current, issues: [] }),
     });
+    const absent = await absentPort.readStaleRecovery(42, 84);
+    expect(absent.issue).toBeNull();
+    expect(absent.issueRefusal).toBe('issue #42 is absent from the snapshot issue index');
+    expect(absent.issueRefusal).not.toBe(untrusted.issueRefusal);
 
     const unresolvedPort = makeProductionImplementationActionPort({
       repositoryPath: '/repo',
@@ -653,6 +676,10 @@ describe('production implementation action port', () => {
     });
     await expect(unresolvedPort.readStaleRecovery(42, 84)).resolves.toMatchObject({
       issue: null,
+      issueRefusal: expect.stringContaining('multi-parent stacking is not supported'),
+    });
+    await expect(unresolvedPort.readStaleRecovery(42, 84)).resolves.toMatchObject({
+      issueRefusal: expect.stringContaining('#50 (PR #82) and #60 (PR #83)'),
     });
   });
 
