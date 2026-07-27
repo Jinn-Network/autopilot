@@ -207,6 +207,7 @@ function installAtV2(
   harness.manifestPath = manifestPath;
   harness.attemptDir = linkedDir;
   harness.worktreePath = join(linkedDir, 'worktree');
+  harness.currentManifest = readAttemptManifest(manifestPath);
   return manifestPath;
 }
 
@@ -550,8 +551,6 @@ class RealGitVerticalHarness implements
         this.commitMutations += 1;
         const evidence = await gitPort.commit(identity);
         this.hostHead = evidence.head;
-        this.remoteHead = evidence.head;
-        this.prHead = evidence.head;
         return evidence;
       },
     };
@@ -665,15 +664,7 @@ describe('marketplace solution vertical acceptance (real git)', () => {
     for (let attempt = 0; attempt < 5 && completed.status === 'recoverable'; attempt += 1) {
       completed = await adopt(harness);
     }
-    if (completed.status !== 'accepted') {
-      const unit = new Harness('implement', boundary === 'observation-persisted' ? 'submitted' : 'solution-observed');
-      unit.clock = () => new Date('2026-07-27T12:22:00.000Z');
-      unit.crashBoundary = boundary;
-      await expect(unit.coordinator().adopt(unit.manifestPath)).resolves.toMatchObject({ status: 'recoverable' });
-      await expect(unit.coordinator().adopt(unit.manifestPath)).resolves.toMatchObject({ status: 'accepted' });
-      expect(unit.comments).toHaveLength(1);
-      return;
-    }
+    expect(completed).toMatchObject({ status: 'accepted' });
 
     expect(harness.observeCalls).toBe(observeAfterCrash);
     expect(harness.comments).toHaveLength(Math.max(1, commentsAfterCrash));
@@ -682,7 +673,7 @@ describe('marketplace solution vertical acceptance (real git)', () => {
     expect(marketplaceStatus(manifest)).toBe('receipt-published');
     expect(readAttemptManifest(harness.manifestPath).processState).toBe('running');
     expect(harness.reviewAnchorLinked()).toBe(true);
-    expect(completed.resultingHead).toBe(harness.hostHead);
+    expect(completed.status === 'accepted' ? completed.resultingHead : null).toBe(harness.hostHead);
 
     expect(await harness.recover()).toEqual({ ok: true });
     expect(harness.observeCalls).toBe(observeAfterCrash);
