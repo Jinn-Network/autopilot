@@ -59,9 +59,9 @@ import type { MarketplaceReviewAnchorPort } from '../../src/lifecycle/marketplac
 import type { ImplementationSessionProtocol } from '../../src/lifecycle/implementation-session.js';
 import { gitOid, gitRefName, type BranchClaim, type GitOid } from '../../src/lifecycle/types.js';
 
-const ATTEMPT_ID = '123e4567-e89b-42d3-a456-426614174001';
-const REVIEW_ATTEMPT = '22222222-2222-4222-8222-222222222222';
-const GENERATION = '33333333-3333-4333-8333-333333333333';
+export const ATTEMPT_ID = '123e4567-e89b-42d3-a456-426614174001';
+export const REVIEW_ATTEMPT = '22222222-2222-4222-8222-222222222222';
+export const GENERATION = '33333333-3333-4333-8333-333333333333';
 const CLAIM = gitOid('1'.repeat(40));
 const EXPECTED = gitOid('2'.repeat(40));
 const HOST_COMMIT = gitOid('3'.repeat(40));
@@ -69,11 +69,11 @@ const HOST_TREE = gitOid('4'.repeat(40));
 const COMPLETION = gitOid('5'.repeat(40));
 const REVIEW_REF = gitOid('6'.repeat(40));
 const STALE = gitOid('9'.repeat(40));
-const NOW = '2026-07-27T12:08:00.000Z';
-const REQUEST_ID = `0x${'1'.repeat(64)}`;
-const ENVELOPE_CID = 'bafy-envelope-solution';
-const PATCH_PATH = 'packages/autopilot/src/a.ts';
-const PATCH = [
+export const NOW = '2026-07-27T12:08:00.000Z';
+export const REQUEST_ID = `0x${'1'.repeat(64)}`;
+export const ENVELOPE_CID = 'bafy-envelope-solution';
+export const PATCH_PATH = 'packages/autopilot/src/a.ts';
+export const PATCH = [
   `diff --git a/${PATCH_PATH} b/${PATCH_PATH}`,
   `--- a/${PATCH_PATH}`,
   `+++ b/${PATCH_PATH}`,
@@ -170,6 +170,25 @@ function mutationResult(
   };
 }
 
+export function observationForHeads(
+  claimOid: GitOid,
+  expectedHead: GitOid,
+  workflow: MutationWorkflow = 'implement',
+  result: AutopilotMutationResult = mutationResult(),
+): VerifiedSolutionObservation {
+  const base = observation(workflow, result);
+  const correlation = { ...base.correlation, claimOid, expectedHead };
+  const patchedResult = 'correlation' in base.result
+    ? { ...base.result, correlation }
+    : base.result;
+  return {
+    ...base,
+    correlation,
+    session: { ...base.session, claimOid, expectedHead },
+    result: patchedResult,
+  };
+}
+
 function observation(
   workflow: MutationWorkflow,
   result: AutopilotMutationResult = mutationResult(),
@@ -215,7 +234,7 @@ function observation(
   };
 }
 
-function deliveryEvidence(
+export function deliveryEvidence(
   attemptDir: string,
   obs: VerifiedSolutionObservation,
 ): MarketplaceSolutionDeliveryEvidence {
@@ -242,6 +261,13 @@ function deliveryEvidence(
     correlation: obs.correlation,
     observedAt: '2026-07-26T12:02:00.000Z',
   };
+}
+
+export function branchClaimFor(
+  claimOid: GitOid,
+  workflow: MutationWorkflow = 'implement',
+): BranchClaim {
+  return { ...branchClaim(workflow), expectedHead: claimOid };
 }
 
 function branchClaim(workflow: MutationWorkflow): BranchClaim {
@@ -292,7 +318,7 @@ function verificationEvidence(expectedTree: GitOid): MarketplaceVerificationEvid
   };
 }
 
-function reviewManifestPath(attemptDir: string): string {
+export function reviewManifestPath(attemptDir: string): string {
   const runnerDir = resolve(attemptDir, '..', '..');
   return join(runnerDir, 'review', `pr-2101-${REVIEW_ATTEMPT}`, 'manifest.json');
 }
@@ -316,7 +342,7 @@ function hostCommitEvidence(childIssueNumber?: number): MarketplaceHostCommitEvi
   };
 }
 
-function reviewAnchorEvidence(
+export function reviewAnchorEvidence(
   attemptDir: string,
   head: GitOid = HOST_COMMIT,
 ): MarketplaceReviewAnchorEvidence {
@@ -634,6 +660,10 @@ export class Harness implements
   }
 
   async createPrComment(input: { readonly expectedHead: GitOid; readonly body: string }) {
+    const existing = this.comments.find((comment) => comment.body === input.body);
+    if (existing !== undefined) {
+      return { commentId: existing.id, author: existing.authorLogin };
+    }
     const comment = {
       id: this.nextCommentId,
       authorLogin: this.receiptAuthors[0] ?? 'jinn-autopilot',

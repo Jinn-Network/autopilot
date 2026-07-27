@@ -184,6 +184,10 @@ function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isAdoptionCrashInjection(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('crash after ');
+}
+
 function receiptSafeDetail(detail: string): string {
   const sanitized = detail.replaceAll('\u0000', '\ufffd');
   const source = sanitized.length === 0
@@ -701,6 +705,7 @@ async function stableReject(
     }
     return { status: 'rejected', reason: failure.reason, receipt };
   } catch (error) {
+    if (isAdoptionCrashInjection(error)) throw error;
     if (failure.reason !== 'receipt-contradiction') {
       await requireHumanAuthority(parsed, authority, errorDetail(error), deps, touchedPaths);
     }
@@ -1368,6 +1373,7 @@ async function adoptManifest(
       reviewAnchor,
     };
   } catch (error) {
+    if (isAdoptionCrashInjection(error)) throw error;
     return stableReject(parsed, {
       reason: 'receipt-contradiction',
       detail: errorDetail(error),
