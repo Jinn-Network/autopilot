@@ -410,6 +410,7 @@ function projectionContext(
   now: Date,
   staleAfterMs: number,
 ): ProjectionContext {
+  const liveIssues = new Set(snapshot.issues.map((issue) => issue.number));
   const prBranches = new Set(snapshot.pullRequests.map((pr) => pr.headRefName));
   const ambiguousIssues = new Set(snapshot.diagnostics.flatMap((diagnostic) => (
     diagnostic.issueNumbers
@@ -430,6 +431,7 @@ function projectionContext(
     .filter((branch) => {
       const claim = branch.claim;
       return claim.phase === 'implement'
+        && liveIssues.has(branch.issueNumber)
         && !prBranches.has(branch.headRefName)
         && !ambiguousIssues.has(branch.issueNumber)
         && !terminalIssues.has(branch.issueNumber)
