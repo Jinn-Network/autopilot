@@ -12,6 +12,7 @@ import {
   mappingDiagnosticSignature,
 } from './codecs.js';
 import { parseChildMarker, isMachineChildIssue, type ChildKind } from './child-issues.js';
+import { parseReviewFollowUpMarker } from './review-follow-ups.js';
 import {
   gitOid,
   isoTimestamp,
@@ -839,12 +840,48 @@ function resolveMappings(
   };
 }
 
+/**
+ * A review follow-up (canon §5.1) is an *ordinary* issue the reviewer files
+ * against work that exists only on the parent PR's branch. It carries the
+ * machine-written marker `<!-- jinn-autopilot:review-follow-up pr=<N> ... -->`
+ * and — by design — no child marker, no issue dependency, and no board hold.
+ * Without this gate it is eligible the moment it is filed, gets claimed
+ * against the default branch, and the implementation session escalates to
+ * Human for code that is simply not there yet (jinn-mono#2175 → draft PR
+ * #2217 → `review:needs-human` + `implementation-escalation`, 2026-07-27).
+ * That is an ordering problem, not one of canon §6.3's three Human doors.
+ *
+ * The gate is a query over two authoritative facts only (canon §2: "body
+ * markers | the issue" and "PR existence ... merged state | the PR"): the
+ * structured marker's `pr=` and that PR's state in this snapshot. No prose is
+ * ever read, and no Project field participates.
+ *
+ * Fail-closed boundary — a parent PR *absent* from the snapshot does not gate.
+ * The world snapshot carries only OPEN and MERGED pull requests: the reader
+ * drops closed-unmerged nodes outright, and merged PRs are pruned once their
+ * associated issues reach Done. Absence therefore cannot distinguish
+ * "merged and pruned" (the normal end state of every follow-up's parent) from
+ * "closed unmerged", and gating on it would strand every follow-up forever
+ * with no machine exit. Gating strictly on positive OPEN evidence is the
+ * conservative rule that still terminates; a follow-up orphaned by an
+ * abandoned parent remains a genuine §6.3 door-1 human judgement.
+ */
+function openParentReviewFollowUpPr(
+  issue: PolledIssue,
+  prStateByNumber: ReadonlyMap<number, PullRequestSnapshot['state']>,
+): number | null {
+  const marker = parseReviewFollowUpMarker(issue.body ?? '');
+  if (marker === null) return null;
+  return prStateByNumber.get(marker.parentPr) === 'OPEN' ? marker.parentPr : null;
+}
+
 function eligibilityEvidence(
   issue: PolledIssue,
   eligible: boolean,
   authorDisallowed: boolean,
   stackReady: ReadonlyMap<number, unknown>,
   hasClaimBranch = false,
+  followUpParentPr: number | null = null,
 ): { readonly reason: IssueEligibilityReason; readonly detail: string } {
   if (eligible) return { reason: 'eligible', detail: 'All implementation admission gates pass' };
   if (issue.blockedOn === 'Another issue' && !stackReady.has(issue.number)) {
@@ -854,6 +891,12 @@ function eligibilityEvidence(
       detail: blockers.length === 0
         ? 'Blocked by an unresolved issue dependency'
         : `Blocked by unresolved issue ${blockers}`,
+    };
+  }
+  if (followUpParentPr !== null) {
+    return {
+      reason: 'dependency-blocked',
+      detail: `Review follow-up is blocked by open parent PR #${followUpParentPr}`,
     };
   }
   if (authorDisallowed) {
@@ -957,6 +1000,7 @@ function lifecycleItems(
   const ready = new Set(selected.ready.map((issue) => issue.number));
   const skippedForAuthor = new Set(selected.skippedForAuthor.map((issue) => issue.number));
   const childrenByParent = openChildrenByParent([...byIssue.values()]);
+  const prStateByNumber = new Map(prs.map((pr) => [pr.number, pr.state] as const));
   const out: LifecycleItem[] = [];
   for (const issue of issues) {
     if (issuesWithPr.has(issue.number)) continue;
@@ -966,7 +1010,9 @@ function lifecycleItems(
       projectBlockedOn: issue.blockedOn,
     });
     const selectedReady = ready.has(issue.number);
-    const eligible = selectedReady && !sourceHumanHold;
+    // Review follow-ups wait on their parent PR's branch (canon §5.1).
+    const followUpParentPr = openParentReviewFollowUpPr(issue, prStateByNumber);
+    const eligible = selectedReady && !sourceHumanHold && followUpParentPr === null;
     const holdDetail = issue.blockedOn === 'Human'
       ? 'Project Blocked on is Human'
       : issueLabels.includes('autopilot:human')
@@ -987,6 +1033,7 @@ function lifecycleItems(
         skippedForAuthor.has(issue.number),
         stackReady,
         claimBranchIssues.has(issue.number),
+        followUpParentPr,
       );
     const sourceHumanReason: HumanReason | undefined = sourceHumanHold
       ? {

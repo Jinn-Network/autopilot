@@ -163,7 +163,14 @@ follow-ups in the same session command:
   idempotent on `pr+head+index` and runs before terminal publish. These
   issues never carry `review-finding`/`reconcile` labels or the child
   marker, never appear in `openChildKinds`, and **do not** move the parent
-  into BLOCKED-BY-CHILD.
+  into BLOCKED-BY-CHILD. They are non-blocking *for the parent*; the
+  dependency runs the other way. Because a follow-up describes code that so
+  far exists only on the parent's branch, eligibility gates it while that
+  parent PR is still OPEN in the snapshot — a query over the marker's `pr=`
+  and the PR's state, nothing else. A parent that is MERGED, or absent from
+  the snapshot (which carries only OPEN and MERGED PRs, so closed-unmerged
+  and pruned-merged parents are indistinguishable), does not gate: the
+  follow-up returns to ordinary eligibility rather than stalling forever.
 - **Request changes:** native REQUEST_CHANGES (head-bound) + one
   `review-finding` child per round listing all **blocking** findings
   (reviewer may split genuinely independent findings) + release the claim

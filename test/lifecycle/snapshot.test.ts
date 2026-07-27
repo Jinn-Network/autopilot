@@ -2083,6 +2083,142 @@ describe('buildGitHubLifecycleSnapshot', () => {
     ]);
   });
 
+  // Review follow-ups (canon §5.1) are ordinary issues filed against code that
+  // exists only on the parent PR's branch. jinn-mono#2175 (marker pr=2065,
+  // blocked_by []) was claimed against `next`, produced draft PR #2217, and the
+  // implementation session escalated to Human because the reviewed code was not
+  // on the default branch. The gate is a query over the machine-written marker
+  // plus the parent PR's snapshot state only — never prose.
+  function followUpIssue(parentPr: number): PolledIssue {
+    return {
+      ...issue(),
+      number: 50,
+      title: 'Follow-up from review',
+      status: 'Todo',
+      projectItemId: 'PVTI_50',
+      body: `<!-- jinn-autopilot:review-follow-up pr=${parentPr} head=${HEAD} index=0 -->\n\n`
+        + `Follow-up from PR #${parentPr} review.`,
+    };
+  }
+
+  it('holds a review follow-up while its parent PR is still open', async () => {
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(101)],
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    const followUp = snapshot.lifecycle.items.find((item) => item.issueNumber === 50);
+    expect(snapshot.pullRequests.find((pr) => pr.number === 101)?.state).toBe('OPEN');
+    expect(followUp).toMatchObject({
+      kind: 'issue',
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+    });
+    expect(followUp?.eligibilityDetail).toContain('#101');
+  });
+
+  it('releases a review follow-up once its parent PR is merged', async () => {
+    const mergedParent = {
+      ...page('page-2').nodes[0]!,
+      state: 'MERGED' as const,
+      labels: [],
+      reviews: [],
+      reviewClaim: null,
+      mergedAt: '2026-07-20T11:00:00.000Z',
+      mergeCommitOid: REVIEW_REF,
+    };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(101)],
+      readPullRequests: async () => ({
+        nodes: [mergedParent],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.pullRequests.find((pr) => pr.number === 101)?.state).toBe('MERGED');
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
+  // Fail-closed boundary, stated: absence does NOT block. The reader drops
+  // closed-unmerged PRs outright (github-reader `if (pr.state === 'CLOSED')
+  // continue;`) and prunes merged PRs once their issues reach Done, so absence
+  // is dominated by "merged and pruned". Blocking on absence would strand every
+  // follow-up permanently with no machine exit.
+  it('releases a review follow-up whose parent PR is absent from the snapshot', async () => {
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(909)],
+      readPullRequests: async () => ({
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.pullRequests.some((pr) => pr.number === 909)).toBe(false);
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
+  it('releases a review follow-up whose parent PR was closed without merging', async () => {
+    // A closed-unmerged parent is structurally identical to an absent one: the
+    // world snapshot never carries CLOSED PRs. Asserted separately so the
+    // decision is covered by name and cannot be changed silently.
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(101)],
+      readPullRequests: async () => ({
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
+  it('does not gate an ordinary issue that merely mentions an open PR in prose', async () => {
+    const prose = {
+      ...issue(),
+      number: 50,
+      status: 'Todo' as const,
+      projectItemId: 'PVTI_50',
+      body: 'Follow-up from the review of PR #101. Parent PR: '
+        + 'https://github.com/Jinn-Network/mono/pull/101',
+    };
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, prose],
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
   it('invalidates global action authority when truncated PR closure omits an issue', async () => {
     const partialClosure = {
       ...page('page-2').nodes[0]!,
