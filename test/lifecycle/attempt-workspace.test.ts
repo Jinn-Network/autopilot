@@ -58,13 +58,15 @@ import {
 // have since aged out of GitHub's log retention, so the failures cannot be re-read here.
 //
 // The number below is derived from measurement wherever measurement was still possible:
-//   - Local worst case (measured here), unloaded dev Mac, 3 runs, slowest test in the file
-//     ('retains authentication failure, missing objects, malformed manifests, and escaped
-//     paths'): 1474 / 1388 / 1466 ms.
-//   - Inferred CI slowdown floor: the test named in that timeout report measures here at
-//     1893 / 1891 / 1812 ms. Taking the report at face value — it is the one input below
+//   - Local worst case (measured here, post-fix), unloaded dev Mac, 3 runs, slowest test in
+//     the file ('retains authentication failure, missing objects, malformed manifests, and
+//     escaped paths'): 1474 / 1388 / 1466 ms.
+//   - Inferred CI slowdown floor: the test named in that timeout report measured here
+//     *before this PR's fixture fix* at 1893 / 1891 / 1812 ms — post-fix it measures
+//     1281 / 1259 ms here, which is why the bullet above names a different test as the
+//     file's slowest. Taking the report at face value — it is the one input below
 //     resting on the expired logs rather than on a local measurement — puts that runner at
-//     no better than 5000 / 1893 = 2.6x slower than this baseline.
+//     no better than 5000 / 1893 = 2.6x slower than this pre-fix baseline.
 //   - Extrapolated CI worst case: 1474 ms x 2.6 = ~3.9 s, i.e. only ~1.3x under the
 //     default — the next timeout would be a matter of runner variance, not of any one
 //     test. 15000 ms restores a ~3.8x margin over that extrapolated CI worst case
