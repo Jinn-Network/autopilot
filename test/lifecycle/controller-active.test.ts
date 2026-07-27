@@ -126,6 +126,55 @@ describe('active lifecycle controller', () => {
     expect({ reads, actions }).toEqual({ reads: 0, actions: 0 });
   });
 
+  it('runs active recovery after capability preflight and before snapshot discovery or claims', async () => {
+    const events: string[] = [];
+    const controller = deps({
+      recoverMarketplaceAttempts: async () => {
+        events.push('recover');
+      },
+      readSnapshot: async () => {
+        events.push('snapshot');
+        return snapshot();
+      },
+    });
+    controller.active!.preflight = async () => {
+      events.push('preflight');
+      return { ok: true };
+    };
+    controller.active!.executeAction = async () => {
+      events.push('claim');
+      return { outcome: 'spawned' };
+    };
+
+    await expect(runLifecycleCycle('active', controller))
+      .resolves.toMatchObject({ status: 'ok' });
+    expect(events).toEqual(['preflight', 'recover', 'snapshot', 'claim']);
+  });
+
+  it('runs recover-mode marketplace recovery before snapshot discovery and reconciliation', async () => {
+    const events: string[] = [];
+    const controller = deps({
+      recoverMarketplaceAttempts: async () => {
+        events.push('recover');
+      },
+      readSnapshot: async () => {
+        events.push('snapshot');
+        return snapshot('In Progress');
+      },
+      writerForSnapshot: (cycleSnapshot) => {
+        events.push(`writer:${cycleSnapshot.capturedAt}`);
+        return writer();
+      },
+      writer: undefined,
+    });
+
+    await expect(runLifecycleCycle('recover', controller))
+      .resolves.toMatchObject({ status: 'ok' });
+    expect(events[0]).toBe('recover');
+    expect(events[1]).toBe('snapshot');
+    expect(events[2]).toBe(`writer:${NOW.toISOString()}`);
+  });
+
   it('claims only in explicit active mode', async () => {
     const actions: string[] = [];
     const controller = deps();

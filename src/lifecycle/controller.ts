@@ -84,6 +84,11 @@ export interface LifecycleControllerDeps {
   /** Reset/read the shared meter at cycle boundaries and report completion. */
   readonly resetGitHubUsage?: () => void;
   readonly readGitHubUsage?: () => GitHubUsage;
+  /**
+   * Replays durable prepared marketplace attempts before any new snapshot,
+   * reconciliation, or claim work. Active capability preflight runs first.
+   */
+  readonly recoverMarketplaceAttempts?: () => Promise<void>;
   readonly writer?: ReconciliationWriter;
   readonly writerForSnapshot?: (snapshot: GitHubLifecycleSnapshot) => ReconciliationWriter;
   readonly now: () => Date;
@@ -1232,6 +1237,9 @@ export async function runLifecycleCycle(
         events: [],
       };
     }
+  }
+  if (mode === 'active' || mode === 'recover') {
+    await deps.recoverMarketplaceAttempts?.();
   }
   const rateLimitFloor = Math.max(DEFAULT_FLOOR, deps.rateLimitFloor ?? DEFAULT_FLOOR);
   let scopedCycleId: string | undefined;

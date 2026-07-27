@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { pathToFileURL } from 'node:url';
 import * as lifecycleEntrypoint from '../scripts/run-autopilot-v2.js';
+import { CredentialPool } from '../src/lifecycle/credentials.js';
 
-const { isDirectLifecycleEntrypoint } = lifecycleEntrypoint;
+const {
+  isDirectLifecycleEntrypoint,
+  makeMarketplaceRecoveryCallback,
+  makeMarketplaceRecoveryCredentialResolver,
+} = lifecycleEntrypoint;
 
 describe('lifecycle script entrypoint', () => {
   it('runs only from the lifecycle script and not from the bundled CLI', () => {
@@ -47,7 +52,9 @@ describe('lifecycle script entrypoint', () => {
     })).toBe('local');
   });
 
-  it('short-circuits active marketplace mode before repository and credential setup', async () => {
+  it.each(['observe', 'recover', 'active'] as const)(
+    'allows %s marketplace mode to continue into repository setup',
+    async (mode) => {
     const preflightProductionEntrypoint = Reflect.get(
       lifecycleEntrypoint,
       'preflightProductionEntrypoint',
@@ -60,13 +67,79 @@ describe('lifecycle script entrypoint', () => {
 
     expect(preflightProductionEntrypoint).toBeTypeOf('function');
     await expect(preflightProductionEntrypoint!(
-      'active',
+      mode,
       { JINN_AUTOPILOT_EXECUTION_BACKEND: 'marketplace' },
       setup,
-    )).rejects.toThrow(
-      'Marketplace session submission and adoption are not enabled yet.',
-    );
-    expect(setup).not.toHaveBeenCalled();
+    )).resolves.toBe('/repo');
+    expect(setup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['repository', { repositorySlug: 'Other/repository' }],
+    ['language', { language: 'rust' }],
+    ['verification profile', { verificationProfile: 'other.v1' }],
+  ])(
+    'fails closed on an unsupported recover-mode marketplace %s before attempting replay',
+    async (_label, overrides) => {
+      const replay = vi.fn(async () => {});
+
+      expect(makeMarketplaceRecoveryCallback).toBeTypeOf('function');
+      const callback = makeMarketplaceRecoveryCallback({
+        mode: 'recover',
+        executionBackend: 'marketplace',
+        repositorySlug: 'Jinn-Network/mono',
+        replay,
+        ...overrides,
+      });
+      await expect(callback!()).rejects.toThrow(
+        /supports only Jinn-Network\/mono.*typescript.*jinn-mono\.v1/i,
+      );
+      expect(replay).not.toHaveBeenCalled();
+    },
+  );
+
+  it('runs the recover-mode marketplace profile gate even when replay finds no prepared attempts', async () => {
+    const replay = vi.fn(async () => {});
+
+    const callback = makeMarketplaceRecoveryCallback({
+      mode: 'recover',
+      executionBackend: 'marketplace',
+      repositorySlug: 'Jinn-Network/mono',
+      replay,
+    });
+    await expect(callback!()).resolves.toBeUndefined();
+    expect(replay).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves marketplace initialization credentials by the journal exact login', () => {
+    const credentials = new CredentialPool([
+      {
+        login: 'First-Bot',
+        normalizedLogin: 'first-bot',
+        implementationToken: 'first-secret',
+      },
+      {
+        login: 'Second-Bot',
+        normalizedLogin: 'second-bot',
+        implementationToken: 'second-secret',
+      },
+    ]);
+
+    const resolve = makeMarketplaceRecoveryCredentialResolver(credentials);
+    expect(resolve('second-bot').normalizedLogin).toBe('second-bot');
+    expect(() => resolve('missing-bot')).toThrow(/missing-bot.*unavailable/i);
+  });
+
+  it('leaves observe mode unchanged without marketplace profile validation or replay', () => {
+    const replay = vi.fn(async () => {});
+
+    expect(makeMarketplaceRecoveryCallback({
+      mode: 'observe',
+      executionBackend: 'marketplace',
+      repositorySlug: 'Other/repository',
+      replay,
+    })).toBeUndefined();
+    expect(replay).not.toHaveBeenCalled();
   });
 
   it('allows attempt cleanup only for successful complete local active cycles', () => {

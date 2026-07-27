@@ -1,5 +1,6 @@
 // @ts-nocheck — Stage 5 leftover fixtures for deleted merge-prep/review-fix/project APIs.
 import { describe, expect, it } from 'vitest';
+import { TaskSubmitRequestV1Schema } from '@jinn-network/sdk/autopilot';
 import type { AttemptManifest } from '../../src/lifecycle/attempt-workspace.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
 import {
@@ -34,6 +35,7 @@ function issue(overrides: Partial<ImplementationIssue> = {}): ImplementationIssu
   return {
     number: 42,
     title: 'Implement exact lifecycle ownership',
+    body: 'Authoritative issue body for #42.',
     open: true,
     eligible: true,
     targetBase: gitRefName('next'),
@@ -1033,6 +1035,263 @@ describe('implementation action executor', () => {
           },
         },
       });
+    },
+  );
+
+  it('builds an immutable ordinary marketplace request from claim authority without constructing local spawn data', async () => {
+    let createdAttempt: unknown;
+    let startedRequest: unknown;
+    let targetBaseReads = 0;
+    const credentials = new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }, {
+      login: 'review-bot',
+      normalizedLogin: 'review-bot',
+      reviewToken: 'review-secret',
+    }]);
+    const { deps } = harness({
+      executionBackend: 'marketplace',
+      marketplace: {
+        repository: 'Jinn-Network/mono',
+        language: 'typescript',
+        verificationProfile: 'jinn-mono.v1',
+      },
+      credentials,
+      readTargetBaseHead: async () => {
+        targetBaseReads += 1;
+        return BASE;
+      },
+      createAttempt: async (input) => {
+        createdAttempt = input;
+        return {
+          attemptId: input.attemptId,
+          paths: {
+            worktree: `/tmp/${input.attemptId}/worktree`,
+            manifest: `/tmp/${input.attemptId}/manifest.json`,
+            log: `/tmp/${input.attemptId}/session.log`,
+            ghConfigDir: `/tmp/${input.attemptId}/gh-config`,
+            askpass: `/tmp/${input.attemptId}/askpass`,
+          },
+        };
+      },
+      startSession: async (request) => {
+        startedRequest = request;
+        return {
+          status: 'started',
+          backend: 'marketplace',
+          id: `autopilot:${ATTEMPT_A}`,
+          taskId: 'task-42',
+          taskCid: 'bafy-task-42',
+        };
+      },
+    });
+
+    await expect(executeImplementationAction(freshAction(), deps))
+      .resolves.toMatchObject({ status: 'spawned', attemptId: ATTEMPT_A });
+    expect(targetBaseReads).toBe(1);
+    expect(startedRequest).toMatchObject({
+      kind: 'implementation',
+      workflow: 'implementation',
+      backend: 'marketplace',
+      attemptId: ATTEMPT_A,
+    });
+    expect(startedRequest).not.toHaveProperty('local');
+    expect(JSON.stringify(startedRequest)).not.toContain('selected-secret');
+    expect(createdAttempt).toMatchObject({
+      targetBaseOid: BASE,
+      marketplacePreparation: {
+        workflow: 'implementation',
+        baseSha: BASE,
+      },
+    });
+    const preparation = createdAttempt.marketplacePreparation;
+    const request = TaskSubmitRequestV1Schema.parse(preparation.request);
+    expect(request.spec.session).toMatchObject({
+      schemaVersion: 'jinn-autopilot-session.v1',
+      workflow: 'implement',
+      issueNumber: 42,
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBase: 'next',
+      claimOid: CLAIM_A,
+      expectedHead: CLAIM_A,
+      v2AttemptId: ATTEMPT_A,
+      runnerId: 'runner-a',
+      receiptAuthors: ['implementation-bot', 'review-bot'],
+      taskSnapshot: {
+        title: 'Implement exact lifecycle ownership',
+        body: 'Authoritative issue body for #42.',
+        prBody: 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+        baseSha: BASE,
+        targetBaseOid: BASE,
+      },
+    });
+    expect(request.spec.problem_statement)
+      .toBe('Authoritative issue body for #42.');
+  });
+
+  it('reads exact target-base authority for an adopted marketplace branch while preserving its pre-claim head as baseSha', async () => {
+    const adopted = pr();
+    let targetBaseReads = 0;
+    let preparation: unknown;
+    const { deps } = harness({
+      executionBackend: 'marketplace',
+      marketplace: {
+        repository: 'Jinn-Network/mono',
+        language: 'typescript',
+        verificationProfile: 'jinn-mono.v1',
+      },
+      listOpenPullRequests: async () => [adopted],
+      runRealityCheck: async () => ({
+        classification: 'pr-open',
+        evidence: { prNumber: adopted.number },
+        suggestedBlockedOn: null,
+        suggestedComment: null,
+      }),
+      readTargetBaseHead: async () => {
+        targetBaseReads += 1;
+        return BASE;
+      },
+      createAttempt: async (input) => {
+        preparation = input.marketplacePreparation;
+        return {
+          attemptId: input.attemptId,
+          paths: {
+            worktree: `/tmp/${input.attemptId}/worktree`,
+            manifest: `/tmp/${input.attemptId}/manifest.json`,
+            log: `/tmp/${input.attemptId}/session.log`,
+            ghConfigDir: `/tmp/${input.attemptId}/gh-config`,
+            askpass: `/tmp/${input.attemptId}/askpass`,
+          },
+        };
+      },
+      startSession: async () => ({
+        status: 'started',
+        backend: 'marketplace',
+        id: `autopilot:${ATTEMPT_A}`,
+        taskId: 'task-42',
+        taskCid: 'bafy-task-42',
+      }),
+    });
+
+    await expect(executeImplementationAction(freshAction(), deps))
+      .resolves.toMatchObject({ status: 'spawned', branch: adopted.headRefName });
+    expect(targetBaseReads).toBe(1);
+    expect(preparation).toMatchObject({ baseSha: adopted.head });
+    expect(TaskSubmitRequestV1Schema.parse(preparation.request).spec.session.taskSnapshot)
+      .toMatchObject({
+        baseSha: adopted.head,
+        targetBaseOid: BASE,
+      });
+  });
+
+  it.each([
+    ['review-finding', 'fix-child'],
+    ['reconcile', 'reconcile'],
+    ['ci-failure', 'ci-failure'],
+  ] as const)(
+    'builds the authoritative %s child marketplace request on the parent branch without local spawn data',
+    async (childKind, sdkWorkflow) => {
+      const parent = pr({
+        number: 2065,
+        headRefName: gitRefName('autopilot/2044'),
+        head: ADOPTED_HEAD,
+        baseRefName: gitRefName('next'),
+        draft: false,
+        body: 'Authoritative parent PR body.',
+      });
+      let targetBaseReads = 0;
+      let createdAttempt: unknown;
+      let startedRequest: unknown;
+      const { deps } = harness({
+        executionBackend: 'marketplace',
+        marketplace: {
+          repository: 'Jinn-Network/mono',
+          language: 'typescript',
+          verificationProfile: 'jinn-mono.v1',
+        },
+        readIssue: async () => issue({
+          number: 2069,
+          title: `Address ${childKind} work for PR #2065`,
+          body: `Authoritative ${childKind} child body.`,
+          child: { parentPr: 2065, kind: childKind },
+        }),
+        readParentPullRequest: async () => parent,
+        readTargetBaseHead: async () => {
+          targetBaseReads += 1;
+          return BASE;
+        },
+        createAttempt: async (input) => {
+          createdAttempt = input;
+          return {
+            attemptId: input.attemptId,
+            paths: {
+              worktree: `/tmp/${input.attemptId}/worktree`,
+              manifest: `/tmp/${input.attemptId}/manifest.json`,
+              log: `/tmp/${input.attemptId}/session.log`,
+              ghConfigDir: `/tmp/${input.attemptId}/gh-config`,
+              askpass: `/tmp/${input.attemptId}/askpass`,
+            },
+          };
+        },
+        startSession: async (request) => {
+          startedRequest = request;
+          return {
+            status: 'started',
+            backend: 'marketplace',
+            id: `autopilot:${ATTEMPT_A}`,
+            taskId: 'task-child',
+            taskCid: 'bafy-task-child',
+          };
+        },
+      });
+
+      await expect(executeImplementationAction(freshAction(2069), deps))
+        .resolves.toMatchObject({
+          status: 'spawned',
+          prNumber: 2065,
+          branch: parent.headRefName,
+        });
+      expect(targetBaseReads).toBe(1);
+      expect(startedRequest).toMatchObject({
+        backend: 'marketplace',
+        workflow: childKind,
+        issueNumber: 2069,
+        prNumber: 2065,
+        branch: parent.headRefName,
+      });
+      expect(startedRequest).not.toHaveProperty('local');
+      expect(createdAttempt).toMatchObject({
+        targetBaseOid: BASE,
+        marketplacePreparation: {
+          workflow: childKind,
+          baseSha: parent.head,
+        },
+      });
+      const request = TaskSubmitRequestV1Schema.parse(
+        createdAttempt.marketplacePreparation.request,
+      );
+      expect(request.spec.session).toMatchObject({
+        workflow: sdkWorkflow,
+        issueNumber: 2069,
+        childIssueNumber: 2069,
+        prNumber: 2065,
+        parentPrNumber: 2065,
+        branch: parent.headRefName,
+        claimOid: CLAIM_A,
+        expectedHead: CLAIM_A,
+        taskSnapshot: {
+          title: `Address ${childKind} work for PR #2065`,
+          body: `Authoritative ${childKind} child body.`,
+          prBody: 'Authoritative parent PR body.',
+          baseSha: parent.head,
+          targetBaseOid: BASE,
+        },
+      });
+      expect(JSON.stringify({ startedRequest, request }))
+        .not.toContain('selected-secret');
     },
   );
 

@@ -4,6 +4,7 @@ import {
   makeProductionImplementationActionPort,
 } from '../../src/lifecycle/implementation-executor-production.js';
 import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
+import { buildMarketplaceTaskRequest } from '../../src/lifecycle/marketplace-task.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
@@ -32,6 +33,7 @@ function snapshot(): GitHubLifecycleSnapshot {
     issues: [{
       number: 42,
       title: 'Implement active lifecycle',
+      body: 'Authoritative implementation issue body.',
       shape: 'feat',
       blockedOn: 'Nothing',
       blockedByIssues: [],
@@ -223,6 +225,7 @@ describe('production implementation action port', () => {
     });
 
     await expect(port.readIssue(42)).resolves.toMatchObject({
+      body: 'Authoritative implementation issue body.',
       eligible: false,
       eligibilityDetail: 'Project status is In Progress',
       targetBase: 'next',
@@ -259,6 +262,90 @@ describe('production implementation action port', () => {
         ],
       }),
     );
+  });
+
+  it('forwards exact target-base authority and marketplace preparation into transactional attempt creation', async () => {
+    const credentials = new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }]);
+    const selection = selectCredential(credentials, { phase: 'implement' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    const attemptId = '11111111-1111-4111-8111-111111111111';
+    const built = buildMarketplaceTaskRequest({
+      workflow: 'implementation',
+      repository: 'Jinn-Network/mono',
+      language: 'typescript',
+      verificationProfile: 'jinn-mono.v1',
+      issueNumber: 42,
+      prNumber: 84,
+      targetBase: 'next',
+      branch: 'autopilot/42',
+      claimOid: CLAIM,
+      expectedHead: CLAIM,
+      v2AttemptId: attemptId,
+      runnerId: 'runner-a',
+      taskSnapshot: {
+        title: 'Implement active lifecycle',
+        body: 'Authoritative implementation issue body.',
+        prBody: 'Closes #42',
+        baseSha: PARENT,
+        targetBaseOid: HEAD,
+      },
+      receiptAuthors: ['implementation-bot'],
+      createdAt: Date.parse('2026-07-20T12:00:00.000Z'),
+    });
+    const preparation = {
+      workflow: 'implementation' as const,
+      baseSha: PARENT,
+      request: built.request,
+      agentSoftDeadline: built.agentSoftDeadline,
+      adoptionDeadline: built.adoptionDeadline,
+    };
+    let workspaceOptions: unknown;
+    const port = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials,
+      authorAllowlist: new Set(['trusted-author']),
+      readSnapshot: async () => snapshot(),
+      createWorkspace: async (options) => {
+        workspaceOptions = options;
+        return {
+          attemptId,
+          paths: {
+            attemptDir: '/attempts/v2/runner-a/implement/issue-42',
+            worktree: '/attempts/v2/runner-a/implement/issue-42/worktree',
+            manifest: '/attempts/v2/runner-a/implement/issue-42/manifest.json',
+            log: '/attempts/v2/runner-a/implement/issue-42/session.log',
+            ghConfigDir: '/attempts/v2/runner-a/implement/issue-42/gh-config',
+            askpass: '/attempts/v2/runner-a/implement/issue-42/askpass',
+            tokenFile: '/attempts/v2/runner-a/implement/issue-42/gh-token',
+          },
+        } as never;
+      },
+    });
+
+    await port.createAttempt({
+      attemptId,
+      issueNumber: 42,
+      branch: gitRefName('autopilot/42'),
+      targetBase: gitRefName('next'),
+      targetBaseOid: HEAD,
+      expectedHead: CLAIM,
+      claimOid: CLAIM,
+      prNumber: 84,
+      selectedLogin: 'implementation-bot',
+      credential: selection.credential,
+      marketplacePreparation: preparation,
+    });
+
+    expect(workspaceOptions).toMatchObject({
+      targetBaseOid: HEAD,
+      marketplacePreparation: preparation,
+    });
   });
 
   it('derives stale recovery target authority independently of a PR-only retarget', async () => {
