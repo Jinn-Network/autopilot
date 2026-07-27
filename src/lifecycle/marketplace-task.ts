@@ -1,7 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import {
-  accessSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -12,15 +10,12 @@ import {
   readFileSync,
   rmSync,
   writeFileSync,
-  constants as fsConstants,
 } from 'node:fs';
-import { createRequire } from 'node:module';
 import {
   basename,
   dirname,
   isAbsolute,
   join,
-  resolve,
 } from 'node:path';
 import {
   AutopilotSessionCapsuleSchema,
@@ -33,7 +28,47 @@ import {
 import {
   JinnRepoMergedPrTaskSchema,
 } from '@jinn-network/sdk/solvernets/jinn-repo';
-import { isGitHubSecretEnvironmentKey } from './credentials.js';
+import {
+  MarketplaceMachineCliFailure,
+  MarketplaceMachineCliProtocolError,
+  marketplaceMachineEnvironment,
+  parseMarketplaceMachineJson,
+  runMarketplaceMachineSubprocess,
+  resolveInstalledJinnBinary,
+  parseMarketplaceMachineFailure,
+  type MarketplaceMachineCliFailureCode as MarketplaceTaskCliFailureCode,
+  type MarketplaceMachineCliFailureEnvelope as MarketplaceTaskCliFailureEnvelope,
+  type MarketplaceMachineSubprocess as MarketplaceTaskSubprocess,
+  type MarketplaceMachineSubprocessResult as MarketplaceTaskSubprocessResult,
+} from './marketplace-cli.js';
+
+export {
+  resolveInstalledJinnBinary,
+};
+export type {
+  MarketplaceTaskCliFailureCode,
+  MarketplaceTaskCliFailureEnvelope,
+  MarketplaceTaskSubprocess,
+  MarketplaceTaskSubprocessResult,
+};
+
+export class MarketplaceTaskCliProtocolError extends MarketplaceMachineCliProtocolError {
+  constructor(
+    message: string,
+    result: MarketplaceTaskSubprocessResult,
+    cause?: unknown,
+  ) {
+    super(message, result, cause);
+    this.name = 'MarketplaceTaskCliProtocolError';
+  }
+}
+
+export class MarketplaceTaskCliFailure extends MarketplaceMachineCliFailure {
+  constructor(envelope: MarketplaceTaskCliFailureEnvelope, stderr: string) {
+    super(envelope, stderr);
+    this.name = 'MarketplaceTaskCliFailure';
+  }
+}
 
 /**
  * The fixed marketplace profile is owned by the published SDK contract. Read
@@ -320,18 +355,6 @@ export function verifyMarketplaceTaskRequest(
   return request;
 }
 
-export interface MarketplaceTaskSubprocessResult {
-  readonly exitCode: number;
-  readonly stdout: string;
-  readonly stderr: string;
-}
-
-export type MarketplaceTaskSubprocess = (
-  command: string,
-  args: readonly string[],
-  options: { readonly environment: NodeJS.ProcessEnv },
-) => Promise<MarketplaceTaskSubprocessResult>;
-
 export interface MarketplaceTaskCliAdapterOptions {
   readonly jinnBinary?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -347,127 +370,8 @@ export interface MarketplaceTaskDryRunResult {
   readonly plan: readonly Readonly<Record<string, unknown>>[];
 }
 
-export class MarketplaceTaskCliProtocolError extends Error {
-  readonly exitCode: number;
-  readonly stdout: string;
-  readonly stderr: string;
-
-  constructor(
-    message: string,
-    result: MarketplaceTaskSubprocessResult,
-    cause?: unknown,
-  ) {
-    super(message, cause === undefined ? undefined : { cause });
-    this.name = 'MarketplaceTaskCliProtocolError';
-    this.exitCode = result.exitCode;
-    this.stdout = result.stdout;
-    this.stderr = result.stderr;
-  }
-}
-
-export type MarketplaceTaskCliFailureCode =
-  | 'funding_required'
-  | 'invalid_invocation'
-  | 'bootstrap_incomplete'
-  | 'reconcile_needed'
-  | 'transient_error'
-  | 'fatal';
-
-export interface MarketplaceTaskCliFailureEnvelope {
-  readonly schemaVersion: 1;
-  readonly generatedAt: string;
-  readonly code: MarketplaceTaskCliFailureCode;
-  readonly exitCode: number;
-  readonly message: string;
-  readonly hint?: string;
-  readonly exampleCli?: string;
-  readonly details?: Readonly<Record<string, unknown>>;
-}
-
-export class MarketplaceTaskCliFailure extends Error {
-  readonly code: MarketplaceTaskCliFailureCode;
-  readonly exitCode: number;
-  readonly envelope: MarketplaceTaskCliFailureEnvelope;
-  readonly stderr: string;
-
-  constructor(
-    envelope: MarketplaceTaskCliFailureEnvelope,
-    stderr: string,
-  ) {
-    super(envelope.message);
-    this.name = 'MarketplaceTaskCliFailure';
-    this.code = envelope.code;
-    this.exitCode = envelope.exitCode;
-    this.envelope = envelope;
-    this.stderr = stderr;
-  }
-}
-
-export function resolveInstalledJinnBinary(): string {
-  const require = createRequire(import.meta.url);
-  const packageJsonPath = require.resolve('@jinn-network/client/package.json');
-  const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as {
-    readonly bin?: string | Readonly<Record<string, string>>;
-  };
-  const declared = typeof packageJson.bin === 'string'
-    ? packageJson.bin
-    : packageJson.bin?.jinn;
-  if (declared === undefined || declared.length === 0) {
-    throw new Error('Installed @jinn-network/client does not declare the jinn binary');
-  }
-  const binary = resolve(dirname(packageJsonPath), declared);
-  accessSync(binary, fsConstants.X_OK);
-  return binary;
-}
-
-const runMarketplaceTaskSubprocess: MarketplaceTaskSubprocess = (
-  command,
-  args,
-  options,
-) => new Promise((resolve, reject) => {
-  const child = spawn(command, [...args], {
-    env: options.environment,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk: Buffer) => {
-    stdout += chunk.toString();
-  });
-  child.stderr.on('data', (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-  child.on('error', reject);
-  child.on('close', (exitCode) => {
-    resolve({
-      exitCode: exitCode ?? 50,
-      stdout,
-      stderr,
-    });
-  });
-});
-
-function marketplaceTaskEnvironment(ambient: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(ambient)) {
-    if (
-      value !== undefined
-      && !isGitHubSecretEnvironmentKey(key)
-      && key !== 'GH_CONFIG_DIR'
-    ) {
-      environment[key] = value;
-    }
-  }
-  environment.NO_COLOR = '1';
-  return environment;
-}
-
-function parseJsonOutput(stdout: string): unknown {
-  return JSON.parse(stdout) as unknown;
-}
-
 function parseMarketplaceTaskDryRun(stdout: string): MarketplaceTaskDryRunResult {
-  const value = parseJsonOutput(stdout);
+  const value = parseMarketplaceMachineJson(stdout);
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Invalid jinn tasks submit dry-run result');
   }
@@ -490,74 +394,21 @@ function parseMarketplaceTaskDryRun(stdout: string): MarketplaceTaskDryRunResult
   return value as MarketplaceTaskDryRunResult;
 }
 
-const MARKETPLACE_TASK_FAILURE_EXIT_CODES: Readonly<
-  Record<MarketplaceTaskCliFailureCode, number>
-> = {
-  funding_required: 10,
-  invalid_invocation: 11,
-  bootstrap_incomplete: 20,
-  reconcile_needed: 30,
-  transient_error: 40,
-  fatal: 50,
-};
-
-function parseMarketplaceTaskFailure(
-  result: MarketplaceTaskSubprocessResult,
-): MarketplaceTaskCliFailureEnvelope {
-  let value: unknown;
-  try {
-    value = parseJsonOutput(result.stdout);
-  } catch (error) {
-    throw new MarketplaceTaskCliProtocolError(
-      'jinn tasks submit returned malformed failure output',
-      result,
-      error,
-    );
-  }
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new MarketplaceTaskCliProtocolError(
-      'jinn tasks submit returned malformed failure output',
-      result,
-    );
-  }
-  const record = value as Record<string, unknown>;
-  const code = record.code;
-  const expectedExitCode = typeof code === 'string'
-    && Object.hasOwn(MARKETPLACE_TASK_FAILURE_EXIT_CODES, code)
-    ? MARKETPLACE_TASK_FAILURE_EXIT_CODES[
-        code as MarketplaceTaskCliFailureCode
-      ]
-    : undefined;
-  const details = record.details;
-  if (
-    record.schemaVersion !== 1
-    || typeof record.generatedAt !== 'string'
-    || !Number.isFinite(Date.parse(record.generatedAt))
-    || expectedExitCode === undefined
-    || record.exitCode !== expectedExitCode
-    || result.exitCode !== expectedExitCode
-    || typeof record.message !== 'string'
-    || record.message.length === 0
-    || (record.hint !== undefined && typeof record.hint !== 'string')
-    || (record.exampleCli !== undefined && typeof record.exampleCli !== 'string')
-    || (
-      details !== undefined
-      && (details === null || typeof details !== 'object' || Array.isArray(details))
-    )
-  ) {
-    throw new MarketplaceTaskCliProtocolError(
-      'jinn tasks submit returned malformed failure output',
-      result,
-    );
-  }
-  return value as MarketplaceTaskCliFailureEnvelope;
-}
-
 function throwMarketplaceTaskFailure(
   result: MarketplaceTaskSubprocessResult,
 ): never {
-  const envelope = parseMarketplaceTaskFailure(result);
-  throw new MarketplaceTaskCliFailure(envelope, result.stderr);
+  try {
+    throw new MarketplaceTaskCliFailure(
+      parseMarketplaceMachineFailure(result), result.stderr,
+    );
+  } catch (error) {
+    if (error instanceof MarketplaceMachineCliProtocolError) {
+      throw new MarketplaceTaskCliProtocolError(
+        error.message, result, error.cause,
+      );
+    }
+    throw error;
+  }
 }
 
 export class MarketplaceTaskCliAdapter {
@@ -567,10 +418,10 @@ export class MarketplaceTaskCliAdapter {
 
   constructor(options: MarketplaceTaskCliAdapterOptions) {
     this.jinnBinary = options.jinnBinary ?? resolveInstalledJinnBinary();
-    this.environment = marketplaceTaskEnvironment(
+    this.environment = marketplaceMachineEnvironment(
       options.environment ?? process.env,
     );
-    this.run = options.run ?? runMarketplaceTaskSubprocess;
+    this.run = options.run ?? runMarketplaceMachineSubprocess;
   }
 
   submit(requestPath: string): Promise<TaskSubmitResultV1> {
@@ -618,7 +469,7 @@ export class MarketplaceTaskCliAdapter {
       throwMarketplaceTaskFailure(result);
     }
     try {
-      return TaskSubmitResultV1Schema.parse(parseJsonOutput(result.stdout));
+      return TaskSubmitResultV1Schema.parse(parseMarketplaceMachineJson(result.stdout));
     } catch (error) {
       throw new MarketplaceTaskCliProtocolError(
         'jinn tasks submit returned malformed successful output',
