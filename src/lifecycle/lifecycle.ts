@@ -118,6 +118,43 @@ function correlatedReviewClaim(item: PullRequestLifecycleItem) {
   return reviewClaimMatchesItem(item) ? item.reviewClaim : undefined;
 }
 
+/**
+ * The engine's own signed approval, bound by SHA to the current head.
+ *
+ * Mirrors the engine-side half of `terminalApprovalMatches` in
+ * merge-executor-production (the merge gate additionally re-derives the signed
+ * marker and requires a native APPROVED review carrying it). Deliberately a
+ * strict subset: the view may never call an item merge-ready that the gate
+ * would then reject for `terminal-approval`.
+ */
+export function engineApprovedAtHead(item: PullRequestLifecycleItem): boolean {
+  const claim = correlatedReviewClaim(item);
+  const verdict = item.terminalVerdict;
+  return claim?.state === 'terminal-approved'
+    && claim.head === item.head
+    && verdict !== undefined
+    && verdict.head === item.head
+    && verdict.state === 'APPROVE'
+    && verdict.marker === claim.verdict.marker;
+}
+
+/**
+ * GitHub's native review state says APPROVED at the current head, but the
+ * engine never signed this head.
+ *
+ * The integration ladder's own `update-branch` action merges the base into the
+ * PR branch, which creates a new head commit AND carries the prior review
+ * forward onto it (GitHub re-points the review's `commit_id`). Native
+ * `approved` stays true while the engine's claim ref and signed body marker
+ * remain bound to the pre-merge sha, so the merge gate refuses with
+ * `terminal-approval` forever. The only correct response is a fresh review of
+ * the new head, because merging the base in can change the semantics that were
+ * approved.
+ */
+export function engineApprovalLapsed(item: PullRequestLifecycleItem): boolean {
+  return item.approved && !item.needsReview && !engineApprovedAtHead(item);
+}
+
 function humanOverlay(item: LifecycleItem): boolean {
   return item.humanHold === true
     || item.labels.includes('review:needs-human')
@@ -168,7 +205,12 @@ function underlyingPhase(item: LifecycleItem): Exclude<LifecyclePhase, 'human'> 
 
   if (item.approved && !item.needsReview) {
     if (!isCiGreen(item.checks ?? [])) return 'ci-blocked';
-    if (item.mergeState === 'clean') return 'merge-ready';
+    // A native APPROVED that the engine did not sign at this exact head cannot
+    // pass the merge gate (`terminal-approval`), so calling it merge-ready
+    // strands the PR in a merge-ready -> merge -> ineligible loop with review
+    // enrollment closed. Fall through to awaiting-review so it can be
+    // re-reviewed at the head that actually exists.
+    if (item.mergeState === 'clean' && !engineApprovalLapsed(item)) return 'merge-ready';
     // Behind / conflict: integration ladder owns the next mutation; view stays
     // awaiting-review so review enrollment stays closed while the gate
     // schedules update-branch / file-reconcile-child.
@@ -427,7 +469,10 @@ function nonNegativeSlots(value: number): number {
 }
 
 function reviewEnrollmentEligible(item: PullRequestLifecycleItem): boolean {
-  if (item.approved && !item.needsReview) return false;
+  // A lapsed engine approval (native APPROVED carried onto a head the engine
+  // never signed) is the one approved-looking shape that still needs a review;
+  // suppressing it here is what made the merge-gate refusal unrecoverable.
+  if (item.approved && !item.needsReview) return !item.isDraft && engineApprovalLapsed(item);
   if (!item.isDraft) return item.needsReview && !item.approved;
   return item.reviewClaim?.state === 'stale' && item.reviewClaim.head === item.head;
 }

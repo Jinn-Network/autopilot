@@ -2,6 +2,7 @@ import { DEFAULT_FLOOR } from '../dispatcher/rate-limit-guard.js';
 import {
   deriveLifecycle,
   deriveOrphanImplementationState,
+  engineApprovalLapsed,
 } from './lifecycle.js';
 import {
   planProjection,
@@ -846,6 +847,27 @@ function activeCandidates(
           effort: ladder.effort,
         });
       }
+    } else if (
+      // Re-review after the ladder moved the head under the approval. GitHub's
+      // update-branch merges the base into the PR branch and re-points the
+      // prior APPROVED review onto the new merge commit, so `approved` stays
+      // true while the engine's signed approval is still bound to the old sha.
+      // The merge gate refuses that forever (`terminal-approval`), so the head
+      // must be reviewed again. Ordered AFTER the integration ladder branch on
+      // purpose: while the PR is behind or conflicted the ladder still owns the
+      // next mutation, otherwise a re-review would only be invalidated again by
+      // the update-branch that follows it.
+      entry.phase === 'awaiting-review'
+      && !item.isDraft
+      && engineApprovalLapsed(item)
+    ) {
+      other.push({
+        phase: 'review',
+        issueNumber: item.issueNumber,
+        prNumber: item.prNumber,
+        head: item.head,
+        author: pr.author,
+      });
     } else if (entry.phase === 'ci-blocked') {
       const classification = classifyCiChecks(pr.checks);
       if (classification.state === 'failed') {

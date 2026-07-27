@@ -268,6 +268,30 @@ describe('buildGitHubLifecycleSnapshot', () => {
         approved: true,
         mergeState: 'clean',
         checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+        // Merge-ready needs the engine's own signed approval bound to this
+        // exact head, not just GitHub's native APPROVED state: the merge gate
+        // refuses anything else with `terminal-approval`.
+        reviewClaim: {
+          kind: 'review-claim',
+          protocolVersion: 2,
+          prNumber: 84,
+          generation: '22222222-2222-4222-8222-222222222222',
+          attempt: '33333333-3333-4333-8333-333333333333',
+          reviewer: 'review-bot',
+          head: HEAD,
+          state: 'terminal-approved',
+          recordedAt: '2026-07-20T11:00:00.000Z',
+          verdict: {
+            marker: '44444444-4444-4444-8444-444444444444',
+            state: 'APPROVE',
+          },
+        },
+        terminalVerdict: {
+          head: HEAD,
+          state: 'APPROVE',
+          marker: '44444444-4444-4444-8444-444444444444',
+          recordedAt: '2026-07-20T11:00:00.000Z',
+        },
       }],
     }, new Date('2026-07-20T12:00:00.000Z'), 2 * 60 * 60 * 1_000);
     expect(planCycle(mergeView, {
