@@ -3,6 +3,7 @@ import {
   readExactChangedFiles,
   readExactCompareStatus,
 } from '../../src/lifecycle/github-changed-files.js';
+import { chooseIntegrationLadderAction } from '../../src/lifecycle/integration-ladder.js';
 import { evaluateMergeGate, type MergeCandidate } from '../../src/lifecycle/merge-executor.js';
 import { gitOid, gitRefName, type CompareStatus } from '../../src/lifecycle/types.js';
 
@@ -32,7 +33,7 @@ describe('readExactCompareStatus', () => {
     expect(status).toBe('behind');
     expect(calls).toEqual([
       'repos/Jinn-Network/mono/pulls/101',
-      `repos/Jinn-Network/mono/compare/next...${HEAD}`,
+      `repos/Jinn-Network/mono/compare/heads/next...${HEAD}`,
     ]);
   });
 
@@ -56,7 +57,7 @@ describe('readExactCompareStatus', () => {
     });
 
     expect(calls[1]).not.toContain(BASE);
-    expect(calls[1]).toBe(`repos/Jinn-Network/mono/compare/next...${HEAD}`);
+    expect(calls[1]).toBe(`repos/Jinn-Network/mono/compare/heads/next...${HEAD}`);
   });
 
   it('rejects a compare when the fresh PR reread no longer has the expected head or base', async () => {
@@ -70,6 +71,74 @@ describe('readExactCompareStatus', () => {
       expectedBaseRefName: 'next',
       repositorySlug: 'Jinn-Network/mono',
     })).rejects.toThrow(/exact PR authority/i);
+  });
+
+  /**
+   * `gitRefName` is the only thing keeping URL construction safe. `..` rejection
+   * is what stops a base branch named `x...y` from injecting a second `...`
+   * separator and silently changing which comparison is performed, and the
+   * `heads/` prefix stops a same-named tag from hijacking ref resolution.
+   */
+  it.each([
+    ['embedded range separator', 'a..b'],
+    ['triple-dot injection', `x...${'9'.repeat(40)}`],
+    ['whitespace', 'a b'],
+    ['revision suffix', 'a~1'],
+    ['caret', 'a^2'],
+    ['reflog syntax', 'a@{1}'],
+  ])('refuses to issue a compare for an unsafe base ref (%s)', async (_name, ref) => {
+    const calls: string[] = [];
+    await expect(readExactCompareStatus({
+      run: async (_command, args) => {
+        calls.push(args[1]!);
+        return JSON.stringify({ head: { sha: HEAD }, base: { ref, sha: BASE } });
+      },
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: ref,
+      repositorySlug: 'Jinn-Network/mono',
+    })).rejects.toThrow(/Invalid Git ref name/i);
+
+    // The PR reread happened; the compare never did.
+    expect(calls).toEqual(['repos/Jinn-Network/mono/pulls/101']);
+  });
+
+  it('refuses to return changed files for an unsafe base ref', async () => {
+    await expect(readExactChangedFiles({
+      run: async () => JSON.stringify({
+        changed_files: 1,
+        head: { sha: HEAD },
+        base: { ref: 'a..b', sha: BASE },
+      }),
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'a..b',
+      context: 'Merge',
+      repositorySlug: 'Jinn-Network/mono',
+      readFiles: async () => ['README.md'],
+    })).rejects.toThrow(/Invalid Git ref name/i);
+  });
+
+  it('pins the base branch through heads/ so a same-named tag cannot hijack it', async () => {
+    const calls: string[] = [];
+    await readExactCompareStatus({
+      run: async (_command, args) => {
+        calls.push(args[1]!);
+        if (args[1] === 'repos/Jinn-Network/mono/pulls/101') {
+          return JSON.stringify({
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: BASE },
+          });
+        }
+        return JSON.stringify({ status: 'ahead' });
+      },
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'next',
+      repositorySlug: 'Jinn-Network/mono',
+    });
+
+    expect(calls[1]).toBe(`repos/Jinn-Network/mono/compare/heads/next...${HEAD}`);
   });
 });
 
@@ -110,7 +179,7 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       if (path === `repos/Jinn-Network/mono/compare/${PR_2081_FORK_POINT}...${PR_2081_HEAD}`) {
         return JSON.stringify({ status: 'ahead', ahead_by: 20, behind_by: 0 });
       }
-      if (path === `repos/Jinn-Network/mono/compare/next...${PR_2081_HEAD}`) {
+      if (path === `repos/Jinn-Network/mono/compare/heads/next...${PR_2081_HEAD}`) {
         return JSON.stringify({ status: 'diverged', ahead_by: 20, behind_by: 30 });
       }
       throw new Error(`unexpected gh api path: ${path}`);
@@ -163,6 +232,32 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
     expect(calls).not.toContain(
       `repos/Jinn-Network/mono/compare/${PR_2081_FORK_POINT}...${PR_2081_HEAD}`,
     );
+  });
+
+  it('reaches the ladder and arms update-branch on that status', async () => {
+    const status = await readExactCompareStatus({
+      run: monoRun([]),
+      prNumber: 2081,
+      expectedHead: PR_2081_HEAD,
+      expectedBaseRefName: 'next',
+      repositorySlug: 'Jinn-Network/mono',
+    });
+
+    // The controller only consults the ladder for behind/diverged/unknown, so
+    // the old `ahead` short-circuited the whole recovery path.
+    expect(['behind', 'diverged', 'unknown']).toContain(status);
+    expect(chooseIntegrationLadderAction({
+      approved: true,
+      ciGreen: true,
+      draft: false,
+      humanHold: false,
+      mergeable: 'MERGEABLE',
+      mergeStateStatus: 'CLEAN',
+      compareStatus: status,
+      openReconcileChild: false,
+      openFindingChild: false,
+      childrenEnabled: true,
+    })).toEqual({ kind: 'update-branch' });
   });
 
   it('blocks the merge gate with reason "behind" on that status', async () => {

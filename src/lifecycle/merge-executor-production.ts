@@ -145,11 +145,12 @@ export function makeProductionMergeActionPort(
     // read above, wrong for staleness. It never advances with the base branch,
     // so comparing against it can only ever yield `ahead`/`identical` and made
     // the `behind` merge-gate reason unreachable. Compare against the base
-    // branch name so GitHub resolves it to the current tip. See
-    // `readExactCompareStatus` for the race analysis.
+    // branch so GitHub resolves it to the current tip. The `heads/` prefix
+    // keeps a same-named tag from hijacking the resolution. See
+    // `readExactCompareStatus` for the full race analysis.
     const compare = JSON.parse(await runner('gh', [
       'api',
-      `repos/${repositorySlug}/compare/${compareBaseRefName}...${pr.headOid}`,
+      `repos/${repositorySlug}/compare/heads/${compareBaseRefName}...${pr.headOid}`,
     ])) as { status?: unknown };
     const compareStatus = decodeCompareStatus(compare.status);
     const effectiveReviews = effectiveCurrentHeadReviews(pr);

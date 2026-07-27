@@ -108,12 +108,11 @@ export async function readExactChangedFiles(
 }
 
 /**
- * Bind REST compare status to the exact REST head/base snapshot used by merge.
+ * Bind REST compare status to an exactly pinned head and a deliberately *live*
+ * base branch tip.
  *
- * The head side stays exactly pinned: `expectedHead` must still be the PR head
- * on a fresh reread, and merge itself is head-pinned via `--match-head-commit` /
- * `expected_head_sha`. The base side deliberately uses the branch *name*, not
- * `base.sha`.
+ * The head side is a snapshot: `expectedHead` must still be the PR head on a
+ * fresh reread. The base side is intentionally not a snapshot.
  *
  * `pulls/{n}.base.sha` is the commit the PR forked from. It never advances as
  * the base branch advances, so `compare/{base.sha}...{head}` asks "is head ahead
@@ -121,14 +120,24 @@ export async function readExactChangedFiles(
  * unable to return `behind`/`diverged` no matter how far the base has moved.
  * That made every behind-guard downstream of this value unreachable.
  *
- * `compare/{base.ref}...{head}` lets GitHub resolve the ref to its tip at
- * request time, which is the only formulation that can observe staleness. The
- * base tip may advance between this read and the merge, but that race is
- * one-directional: on a protected, non-rewinding base the tip only moves
- * forward, so a stale read can only *under*-report how far behind the head is —
- * never over-report it into a false green. The residual staleness is bounded by
- * one poll interval and the integration ladder corrects it on the next cycle,
- * versus the unbounded blindness of comparing against the fork point.
+ * `compare/heads/{base.ref}...{head}` lets GitHub resolve the branch to its tip
+ * at request time, which is the only formulation that can observe staleness.
+ * GitHub derives `status` from the real merge-base of the two supplied commits,
+ * so the result is `ahead`/`identical` exactly when the live base tip is an
+ * ancestor of head at read time: a false `ahead` is not constructible.
+ *
+ * Residual race, stated plainly: this compare runs in the merge candidate read
+ * and the merge itself is pinned on the head only — GitHub offers no
+ * expected-base-SHA on merge — so the base tip can advance in the seconds
+ * between the two. That window is inherent to the API. It is a large reduction
+ * from the previous window, which was the PR's entire lifetime.
+ *
+ * The `heads/` prefix is load-bearing. A bare `{name}` is resolved by git's
+ * disambiguation order, in which `refs/tags/<name>` precedes `refs/heads/<name>`,
+ * so a tag sharing the base branch's name would silently redirect the
+ * comparison. `gitRefName` is likewise load-bearing: it rejects `..`, which is
+ * what stops a base branch named `x...y` from injecting a second `...`
+ * separator and changing which comparison is performed.
  */
 export async function readExactCompareStatus(
   options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
@@ -143,14 +152,19 @@ export async function readExactCompareStatus(
   if (
     metadata.head?.sha !== options.expectedHead
     || metadata.base?.ref !== options.expectedBaseRefName
+    // Runtime no-op given the comparison above (`expectedBaseRefName` is typed
+    // `string`); its job is to narrow `unknown` so `gitRefName` compiles.
     || typeof metadata.base.ref !== 'string'
     || typeof metadata.base.sha !== 'string'
   ) {
     throw new Error('Compare metadata lost exact PR authority');
   }
+  // Validated before the request is built, so an unsafe ref never reaches the
+  // network at all.
+  const compareBase = gitRefName(metadata.base.ref);
   const compare = JSON.parse(await options.run('gh', [
     'api',
-    `repos/${repositorySlug}/compare/${gitRefName(metadata.base.ref)}...${options.expectedHead}`,
+    `repos/${repositorySlug}/compare/heads/${compareBase}...${options.expectedHead}`,
   ])) as { status?: unknown };
   return decodeCompareStatus(compare.status);
 }

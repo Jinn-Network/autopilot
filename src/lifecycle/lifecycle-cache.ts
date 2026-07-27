@@ -51,7 +51,14 @@ export interface LifecycleSnapshotEvidence {
 }
 
 export interface LifecycleDiscoveryState {
-  readonly version: 1;
+  /**
+   * Bumped to 2: every `compareStatus` written by version 1 was computed
+   * against the PR's pinned fork point and is therefore `ahead` by
+   * construction. Those values must not survive the deploy, so the version
+   * bump discards them — a version mismatch fails `stateSchema`, which the
+   * incremental source quarantines and reseeds from a full read.
+   */
+  readonly version: 2;
   readonly evidence: LifecycleSnapshotEvidence;
   /** Exact terminal proof retained only for the currently surviving implementation claim. */
   readonly terminalClaims: readonly TerminalClaimEvidence[];
@@ -475,7 +482,7 @@ const restCacheSchema = z.object({
 }).strict();
 
 const stateSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   evidence: evidenceSchema,
   terminalClaims: z.array(terminalClaimSchema).default([]),
   openPullRequestEvidence: z.array(pullRequestSchema),

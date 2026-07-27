@@ -89,6 +89,23 @@ function equalBodies(): Record<string, unknown> {
   };
 }
 
+/**
+ * Merge-path PRs are force-refreshed so their `compareStatus` cannot go stale
+ * against a moving base tip. Tests whose subject is the conditional-equality
+ * path itself must therefore use a PR that is *not* on the merge path, in both
+ * the live body and the cached snapshot.
+ */
+const OFF_MERGE_PATH = { mergeStateStatus: 'BLOCKED' } as const;
+
+function offMergePathBodies(): Record<string, unknown> {
+  const bodies = equalBodies();
+  bodies.detail = {
+    ...(bodies.detail as Record<string, unknown>),
+    mergeable_state: 'blocked',
+  };
+  return bodies;
+}
+
 function probeWith(
   bodies: Record<string, unknown>,
   later304 = false,
@@ -142,10 +159,10 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   });
 
   it('normalizes a cold 200 against full evidence, then reuses every ETag on 304', async () => {
-    const context = probeWith(equalBodies(), true);
+    const context = probeWith(offMergePathBodies(), true);
 
-    await expect(context.probe.changed(pr())).resolves.toBe(false);
-    await expect(context.probe.changed(pr())).resolves.toBe(false);
+    await expect(context.probe.changed(pr(OFF_MERGE_PATH))).resolves.toBe(false);
+    await expect(context.probe.changed(pr(OFF_MERGE_PATH))).resolves.toBe(false);
 
     expect(context.calls).toHaveLength(12);
     expect(context.meter.read()).toMatchObject({
@@ -164,6 +181,51 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     await expect(probe.changed(pr({ compareStatus: undefined }))).resolves.toBe(true);
   });
 
+  /**
+   * `compareStatus` is the only cached field whose truth depends on a commit
+   * outside the PR. None of the conditional reads observe the base branch tip,
+   * so a cached value must expire on its own or a PR that has fallen behind its
+   * base keeps a stale `ahead` forever: `mergeState` stays `clean`, the
+   * controller's ladder guard is never entered, `update-branch` is never
+   * scheduled, and the merge executor's own fresh compare refuses it every
+   * cycle. Livelock.
+   */
+  it('expires a cached compareStatus on every cycle even when PR detail is unchanged', async () => {
+    const context = probeWith(equalBodies(), true);
+
+    // Byte-identical evidence on both cycles: every ETag returns 304, so the
+    // conditional path on its own would report "unchanged" forever.
+    await expect(context.probe.changed(pr({ compareStatus: 'ahead' }))).resolves.toBe(true);
+    await expect(context.probe.changed(pr({ compareStatus: 'ahead' }))).resolves.toBe(true);
+    // The conditional evidence is still read and still validated — the forced
+    // refresh is applied after it, not instead of it.
+    expect(context.calls).toHaveLength(12);
+    expect(context.meter.read()).toMatchObject({ restNotModified: 6 });
+  });
+
+  it('still fails closed on malformed evidence for a merge-path PR', async () => {
+    const bodies = equalBodies();
+    (bodies.detail as Record<string, unknown>).number = 999;
+    const context = probeWith(bodies);
+
+    // The forced refresh must not become a shortcut past the identity guard.
+    await expect(context.probe.changed(pr({ compareStatus: 'ahead' }))).rejects.toThrow(
+      /does not match/i,
+    );
+  });
+
+  it.each([
+    ['ahead' as const],
+    ['identical' as const],
+    ['behind' as const],
+    ['diverged' as const],
+    ['unknown' as const],
+  ])('expires a cached %s compareStatus for a mergeability-clean PR', async (compareStatus) => {
+    const context = probeWith(equalBodies(), true);
+
+    await expect(context.probe.changed(pr({ compareStatus }))).resolves.toBe(true);
+  });
+
   it('forces refresh when cached PR evidence is explicitly incomplete', async () => {
     const context = probeWith(equalBodies());
 
@@ -174,7 +236,7 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   });
 
   it('uses the workflow run id from a check-run details URL', async () => {
-    const bodies = equalBodies();
+    const bodies = offMergePathBodies();
     bodies.checks = {
       total_count: 1,
       check_runs: [{
@@ -188,6 +250,7 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     };
 
     await expect(probeWith(bodies).probe.changed(pr({
+      ...OFF_MERGE_PATH,
       checks: [{
         name: 'test',
         status: 'COMPLETED',
@@ -226,15 +289,16 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   });
 
   it('normalizes documented null PR body and user values to empty strings', async () => {
-    const bodies = equalBodies();
+    const bodies = offMergePathBodies();
     bodies.detail = {
       ...(bodies.detail as Record<string, unknown>),
       body: null,
       user: null,
     };
 
-    await expect(probeWith(bodies).probe.changed(pr({ body: '', author: '' })))
-      .resolves.toBe(false);
+    await expect(
+      probeWith(bodies).probe.changed(pr({ ...OFF_MERGE_PATH, body: '', author: '' })),
+    ).resolves.toBe(false);
   });
 
   it.each(['body', 'user'] as const)(
@@ -275,7 +339,7 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   });
 
   it('ignores unstructured maintainer prose as lifecycle authority', async () => {
-    const bodies = equalBodies();
+    const bodies = offMergePathBodies();
     bodies.comments = [{
       id: 1,
       body: 'Please do not merge this PR until I investigate.',
@@ -284,7 +348,7 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
       user: { login: 'maintainer' },
     }];
 
-    await expect(probeWith(bodies).probe.changed(pr())).resolves.toBe(false);
+    await expect(probeWith(bodies).probe.changed(pr(OFF_MERGE_PATH))).resolves.toBe(false);
   });
 
   it.each([

@@ -33,7 +33,7 @@ function state(): LifecycleDiscoveryState {
     reviews: [],
   };
   return {
-    version: 1,
+    version: 2,
     evidence: {
       project: {
         items: [{
@@ -242,6 +242,26 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await store.save(terminal);
 
     await expect(store.load()).resolves.toEqual(terminal);
+  });
+
+  /**
+   * Every `compareStatus` a version-1 cache holds was computed against the PR's
+   * pinned fork point and is therefore `ahead` by construction. Those values
+   * must not survive the deploy, so a version-1 envelope has to be rejected —
+   * the incremental source quarantines a corrupt cache and reseeds from a full
+   * read, which is exactly the migration we want.
+   */
+  it('rejects a version 1 envelope so pre-fix compareStatus values cannot survive', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    await chmod(directory, 0o700);
+    await writeFile(
+      join(directory, 'lifecycle-cache.json'),
+      JSON.stringify({ ...state(), version: 1 }),
+      { mode: 0o600 },
+    );
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+
+    await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
   });
 
   it('loads a legacy cache without terminal claim evidence as an empty fail-closed ledger', async () => {
