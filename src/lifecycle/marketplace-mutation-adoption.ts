@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import {
@@ -16,7 +17,6 @@ import {
 import { readAttemptManifest, type AttemptManifest } from './attempt-workspace.js';
 import {
   publishAdoptionReceipt,
-  readAdoptionReceiptState,
   type AdoptionReceiptExactFacts,
   type AdoptionReceiptPorts,
 } from './marketplace-adoption-receipt.js';
@@ -39,6 +39,8 @@ import type {
 } from './marketplace-mutation-git.js';
 import {
   MarketplaceVerificationError,
+  buildJinnMonoV1VerificationPlan,
+  marketplaceVerificationPlanDigest,
   type MarketplaceMutationVerificationPort,
 } from './marketplace-mutation-verification.js';
 import {
@@ -202,6 +204,11 @@ function receiptSafeDetail(detail: string): string {
   return `${truncated}${suffix}`;
 }
 
+function observationFileDigest(path: string): string {
+  const bytes = readFileSync(path);
+  return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+}
+
 function readObservationFile(path: string): VerifiedSolutionObservation {
   const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown;
   if (
@@ -345,7 +352,11 @@ function mutationWorkflow(workflow: AutopilotWorkflow): MarketplaceMutationWorkf
 function authorityFailure(
   parsed: ParsedObservation | Omit<ParsedObservation, 'patch' | 'artifact'>,
   authority: MarketplaceMutationAuthority,
-  options: { readonly allowHuman: boolean; readonly allowClosedChild?: boolean },
+  options: {
+    readonly allowHuman: boolean;
+    readonly allowClosedChild?: boolean;
+    readonly allowAdvancedHead?: boolean;
+  },
 ): StableFailure | null {
   const { session } = parsed;
   const manifest = authority.manifest;
@@ -407,7 +418,7 @@ function authorityFailure(
     };
   }
   if (
-    authority.remoteHead !== manifest.expectedHead
+    (!options.allowAdvancedHead && authority.remoteHead !== session.expectedHead)
     || pullRequest.head !== authority.remoteHead
     || pullRequest.headRefName !== session.branch
     || pullRequest.baseRefName !== session.targetBase
@@ -671,6 +682,32 @@ function verificationMatches(
     && isDeepStrictEqual(stored.commands, verification.commands);
 }
 
+function boundVerificationReusable(
+  stored: MarketplaceVerificationEvidence | undefined,
+  artifact: MarketplaceArtifactEvidence,
+  session: AutopilotSessionCapsule,
+  patch: ValidatedMarketplacePatch,
+  repositoryPath: string,
+): boolean {
+  if (stored === undefined) return false;
+  try {
+    const plan = buildJinnMonoV1VerificationPlan({
+      repositoryPath,
+      touchedPaths: patch.touchedPaths,
+    });
+    return verificationMatches(stored, artifact, {
+      profile: session.verificationProfile as MarketplaceVerificationEvidence['profile'],
+      artifactDigest: artifact.digest,
+      expectedTree: artifact.expectedTree,
+      planDigest: marketplaceVerificationPlanDigest(plan),
+      commands: stored.commands,
+      verifiedAt: stored.verifiedAt,
+    });
+  } catch {
+    return false;
+  }
+}
+
 function completionReadbackFailure(
   parsed: ParsedObservation,
   authority: MarketplaceMutationAuthority,
@@ -726,7 +763,7 @@ function buildCompletionEvidence(
       branch: authority.pullRequest.headRefName,
       claimOid: authority.manifest.claimOid,
       checkpointOid,
-      resultingHead: checkpointOid,
+      resultingHead,
       lifecycleStatus: 'In Review',
       confirmedAt: now().toISOString(),
     };
@@ -855,7 +892,63 @@ async function adoptManifest(
     };
   }
 
-  const observation = readObservationFile(progress.delivery.observationPath);
+  const observationPath = progress.delivery.observationPath;
+  if (observationFileDigest(observationPath) !== progress.delivery.observationDigest) {
+    let mismatchParsed: Omit<ParsedObservation, 'patch' | 'artifact'>;
+    try {
+      mismatchParsed = baseParsedObservation(readObservationFile(observationPath));
+    } catch {
+      mismatchParsed = {
+        observation: {
+          status: 'verified',
+          role: 'solution',
+          task: {
+            taskId: progress.delivery.taskId,
+            taskCid: progress.delivery.taskCid,
+            createdAtBlock: progress.delivery.taskCreationBlock,
+            createdAtTx: progress.delivery.taskCreationTransaction,
+          },
+          attempt: {
+            attemptIndex: progress.delivery.attemptIndex,
+            requestId: progress.delivery.requestId,
+            operator: progress.delivery.solverSafe,
+            createdAtBlock: progress.delivery.deliveryBlock,
+          },
+          delivery: {
+            envelopeCid: progress.delivery.deliveryEnvelopeCid,
+            envelopeDigest: progress.delivery.deliveryEnvelopeDigest.replace(/^sha256:/, '0x'),
+            publisherAgentId: progress.delivery.publisherAgentId,
+            transactionHash: progress.delivery.deliveryTransaction,
+            blockNumber: progress.delivery.deliveryBlock,
+          },
+          envelope: {
+            cid: progress.delivery.deliveryEnvelopeCid,
+            digest: progress.delivery.deliveryEnvelopeDigest.replace(/^sha256:/, '0x'),
+            executionSchema: 'jinn.execution.v1',
+            solverType: 'jinn-repo.v1',
+            role: 'solution',
+            participant: {
+              safeAddress: progress.delivery.solverSafe,
+              agentEoa: progress.delivery.solverAgentEoa,
+            },
+            signer: progress.delivery.signer,
+          },
+          session: {} as AutopilotSessionCapsule,
+          result: {} as AutopilotMutationResult,
+          correlation: progress.delivery.correlation,
+        } as VerifiedSolutionObservation,
+        session: {} as AutopilotSessionCapsule,
+        result: {} as AutopilotMutationResult,
+        correlation: progress.delivery.correlation,
+      };
+    }
+    const mismatchAuthority = await readAuthority(manifestPath, [], deps);
+    return stableReject(mismatchParsed, {
+      reason: 'correlation-mismatch',
+      detail: 'Solution observation bytes do not match the durable digest',
+    }, mismatchAuthority, deps, []);
+  }
+  const observation = readObservationFile(observationPath);
   const validation = pureValidateObservation(
     observation,
     progress.delivery,
@@ -877,6 +970,7 @@ async function adoptManifest(
   let failure = authorityFailure(parsed, authority, {
     allowHuman: parsed.result.outcome === 'human',
     allowClosedChild: true,
+    allowAdvancedHead: progress.hostCommit !== undefined,
   });
   if (failure !== null) {
     return stableReject(parsed, failure, authority, deps, touchedPaths);
@@ -980,9 +1074,13 @@ async function adoptManifest(
     if (gitState.status === 'pending' || gitState.status === 'committed') {
       const expectedTree = gitState.expectedTree;
       artifactRecord = progress.artifact ?? artifactEvidence(patch, expectedTree);
-      const needsVerification = progress.verification === undefined
-        || progress.verification.artifactDigest !== artifactRecord.digest
-        || progress.verification.expectedTree !== artifactRecord.expectedTree;
+      const needsVerification = !boundVerificationReusable(
+        progress.verification,
+        artifactRecord,
+        session,
+        patch,
+        authority.manifest.paths.worktree,
+      );
       if (gitState.status === 'pending' && needsVerification) {
         if (deadlineExceeded()) {
           return stableReject(parsed, {
@@ -1054,6 +1152,7 @@ async function adoptManifest(
         failure = authorityFailure(parsed, authority, {
           allowHuman: false,
           allowClosedChild: true,
+          allowAdvancedHead: progress.hostCommit !== undefined,
         });
         if (failure !== null) return stableReject(parsed, failure, authority, deps, touchedPaths);
         const hostCommit = gitState.status === 'committed'
@@ -1159,6 +1258,7 @@ async function adoptManifest(
   failure = authorityFailure(parsed, authority, {
     allowHuman: false,
     allowClosedChild: true,
+    allowAdvancedHead: progress.hostCommit !== undefined,
   });
   if (failure !== null) {
     return stableReject(parsed, failure, authority, deps, touchedPaths, progress.reviewAnchor);
@@ -1185,27 +1285,39 @@ async function adoptManifest(
     progress = progressFromManifest(manifest)!;
   }
 
-  let reviewAnchor = progress.reviewAnchor;
-  if (reviewAnchor === undefined) {
-    const acquired = await deps.reviewAnchors.acquireOrRecover({
-      origin: reviewOrigin(manifestPath, requestDigest, progress.delivery),
-      prNumber: authority.pullRequest.number,
-      expectedHead: resultingHead,
-    });
-    if (acquired.status === 'recoverable') {
-      return {
-        status: 'recoverable',
-        stage: 'review-anchor',
-        detail: acquired.detail,
-      };
-    }
-    if (acquired.status === 'rejected' || acquired.status === 'already-approved') {
-      return stableReject(parsed, {
-        reason: acquired.status === 'already-approved' ? 'receipt-contradiction' : 'policy-human',
-        detail: acquired.detail,
-      }, authority, deps, touchedPaths);
-    }
-    reviewAnchor = acquired.anchor;
+  const acquired = await deps.reviewAnchors.acquireOrRecover({
+    origin: reviewOrigin(manifestPath, requestDigest, progress.delivery),
+    prNumber: authority.pullRequest.number,
+    expectedHead: resultingHead,
+  });
+  if (acquired.status === 'recoverable') {
+    return {
+      status: 'recoverable',
+      stage: 'review-anchor',
+      detail: acquired.detail,
+    };
+  }
+  if (acquired.status === 'rejected' || acquired.status === 'already-approved') {
+    return stableReject(parsed, {
+      reason: acquired.status === 'already-approved' ? 'receipt-contradiction' : 'policy-human',
+      detail: acquired.detail,
+    }, authority, deps, touchedPaths);
+  }
+  let reviewAnchor = acquired.anchor;
+  if (
+    progress.reviewAnchor !== undefined
+    && (
+      progress.reviewAnchor.generation !== reviewAnchor.generation
+      || progress.reviewAnchor.refOid !== reviewAnchor.refOid
+      || progress.reviewAnchor.head !== resultingHead
+    )
+  ) {
+    return stableReject(parsed, {
+      reason: 'receipt-contradiction',
+      detail: 'Stored review anchor does not match the active exact head',
+    }, authority, deps, touchedPaths, reviewAnchor);
+  }
+  if (progress.reviewAnchor === undefined) {
     await deps.onBoundary?.('review-anchor-published');
     deps.transition(
       manifestPath,

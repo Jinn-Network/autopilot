@@ -960,7 +960,7 @@ export function decodeMarketplaceExecutionV3State(
     const completionChildIssue = decodedCompletion.operation === 'child-complete'
       ? decodedCompletion.childIssueNumber
       : undefined;
-    if (decodedCompletion.resultingHead !== decodedHostCommit.head
+    if (decodedCompletion.checkpointOid !== decodedHostCommit.head
       || decodedCompletion.claimOid !== decodedDelivery.correlation.claimOid
       || completionPrNumber !== decodedDelivery.correlation.prNumber
       || completionChildIssue !== decodedHostCommit.trailers.childIssueNumber

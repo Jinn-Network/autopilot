@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import {
   mkdtempSync,
   mkdirSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -48,6 +47,8 @@ import type {
 } from '../../src/lifecycle/marketplace-mutation-git.js';
 import {
   MarketplaceVerificationError,
+  buildJinnMonoV1VerificationPlan,
+  marketplaceVerificationPlanDigest,
   type MarketplaceMutationVerificationPort,
 } from '../../src/lifecycle/marketplace-mutation-verification.js';
 import {
@@ -72,10 +73,11 @@ const STALE = gitOid('9'.repeat(40));
 const NOW = '2026-07-27T12:08:00.000Z';
 const REQUEST_ID = `0x${'1'.repeat(64)}`;
 const ENVELOPE_CID = 'bafy-envelope-solution';
+const PATCH_PATH = 'packages/autopilot/src/a.ts';
 const PATCH = [
-  'diff --git a/a.ts b/a.ts',
-  '--- a/a.ts',
-  '+++ b/a.ts',
+  `diff --git a/${PATCH_PATH} b/${PATCH_PATH}`,
+  `--- a/${PATCH_PATH}`,
+  `+++ b/${PATCH_PATH}`,
   '@@ -1 +1 @@',
   '-old',
   '+new',
@@ -265,11 +267,16 @@ function branchClaim(workflow: MutationWorkflow): BranchClaim {
 }
 
 function verificationEvidence(expectedTree: GitOid): MarketplaceVerificationEvidence {
+  const patch = validateMarketplacePatch(new TextEncoder().encode(PATCH));
+  const plan = buildJinnMonoV1VerificationPlan({
+    repositoryPath: '/tmp/worktree',
+    touchedPaths: patch.touchedPaths,
+  });
   return {
     profile: 'jinn-mono.v1',
-    artifactDigest: validateMarketplacePatch(new TextEncoder().encode(PATCH)).artifactDigest,
+    artifactDigest: patch.artifactDigest,
     expectedTree,
-    planDigest: `sha256:${'e'.repeat(64)}`,
+    planDigest: marketplaceVerificationPlanDigest(plan),
     commands: [{
       label: 'typecheck',
       command: 'yarn',
@@ -361,6 +368,8 @@ class Harness implements
   humanMutations = 0;
   reviewAnchorMutations = 0;
   reviewAnchorReleases = 0;
+  receiptAuthors: readonly string[] = ['jinn-autopilot'];
+  phaseCompleteHead: GitOid = HOST_COMMIT;
   patchError?: Error;
   observeCalls = 0;
   nextCommentId = 9001;
@@ -508,15 +517,8 @@ class Harness implements
       this.remoteHead = STALE;
       this.prHead = STALE;
     }
-    const authorityExpectedHead = this.remoteHead === HOST_COMMIT
-      && this.currentManifest.expectedHead === EXPECTED
-      ? HOST_COMMIT
-      : this.currentManifest.expectedHead;
     return {
-      manifest: {
-        ...this.currentManifest,
-        expectedHead: authorityExpectedHead,
-      },
+      manifest: this.currentManifest,
       latestClaimOid: this.currentClaimOid,
       latestClaim: this.currentClaim,
       remoteHead: this.remoteHead,
@@ -537,7 +539,7 @@ class Harness implements
         codeOwnerRequired: this.codeOwnerRequired,
       },
       ...(this.child === undefined ? {} : { child: this.child }),
-      receiptAuthors: ['jinn-autopilot'],
+      receiptAuthors: this.receiptAuthors,
     };
   }
 
@@ -588,10 +590,6 @@ class Harness implements
       this.checkpointMutations += 1;
       this.remoteHead = HOST_COMMIT;
       this.prHead = HOST_COMMIT;
-      this.currentManifest = {
-        ...this.currentManifest,
-        expectedHead: HOST_COMMIT,
-      };
       return { status: 'already-applied', head: HOST_COMMIT };
     },
     implementationComplete: async (_manifest, summary) => {
@@ -599,15 +597,11 @@ class Harness implements
       if (this.currentClaim.phaseComplete !== true) {
         this.completionMutations += 1;
         this.currentClaim = { ...this.currentClaim, phaseComplete: true };
-        this.currentClaimOid = HOST_COMMIT;
-        this.remoteHead = HOST_COMMIT;
-        this.prHead = HOST_COMMIT;
-        this.currentManifest = {
-          ...this.currentManifest,
-          expectedHead: HOST_COMMIT,
-        };
+        this.currentClaimOid = this.phaseCompleteHead;
+        this.remoteHead = this.phaseCompleteHead;
+        this.prHead = this.phaseCompleteHead;
       }
-      return { status: 'complete', head: HOST_COMMIT };
+      return { status: 'complete', head: this.phaseCompleteHead };
     },
     childComplete: async () => {
       if (this.child?.open === true) {
@@ -615,10 +609,6 @@ class Harness implements
         this.child = { ...this.child, open: false };
         this.remoteHead = HOST_COMMIT;
         this.prHead = HOST_COMMIT;
-        this.currentManifest = {
-          ...this.currentManifest,
-          expectedHead: HOST_COMMIT,
-        };
       }
       return { status: 'closed' };
     },
@@ -647,7 +637,7 @@ class Harness implements
   async createPrComment(input: { readonly expectedHead: GitOid; readonly body: string }) {
     const comment = {
       id: this.nextCommentId,
-      authorLogin: 'jinn-autopilot',
+      authorLogin: this.receiptAuthors[0] ?? 'jinn-autopilot',
       body: input.body,
       createdAt: NOW,
       updatedAt: NOW,
@@ -708,14 +698,71 @@ async function adopt(harness: Harness) {
   return harness.coordinator().adopt(harness.manifestPath);
 }
 
+function writeObservationFile(
+  harness: Harness,
+  obs: VerifiedSolutionObservation,
+) {
+  const content = `${JSON.stringify(obs, null, 2)}\n`;
+  writeFileSync(harness.delivery.observationPath, content);
+  const observationDigest = `sha256:${createHash('sha256').update(content).digest('hex')}`;
+  harness.delivery = {
+    ...harness.delivery,
+    observationDigest,
+  };
+  const state = harness.currentManifest.execution.state;
+  if (state.schemaVersion !== 'marketplace-execution-v3' || !('delivery' in state)) {
+    throw new Error('expected marketplace solution-observed state');
+  }
+  harness.currentManifest = decodeAttemptManifest({
+    ...harness.currentManifest,
+    execution: {
+      ...harness.currentManifest.execution,
+      state: {
+        ...state,
+        delivery: {
+          ...state.delivery,
+          observationDigest,
+        },
+      },
+    },
+  });
+  writeFileSync(
+    harness.manifestPath,
+    `${JSON.stringify(harness.currentManifest, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+}
+
 describe('marketplace mutation adoption validation', () => {
+  it('rejects untrusted receipt authors before effects', async () => {
+    const harness = new Harness();
+    harness.receiptAuthors = ['evil-bot'];
+    await expect(adopt(harness)).resolves.toMatchObject({
+      status: 'rejected',
+      reason: 'untrusted-operator',
+    });
+    expect(harness.applyMutations).toBe(0);
+    expect(harness.comments).toHaveLength(1);
+  });
+
+  it('rejects observation digest mismatch before effects', async () => {
+    const harness = new Harness();
+    writeFileSync(harness.delivery.observationPath, '{"tampered":true}\n');
+    await expect(adopt(harness)).resolves.toMatchObject({
+      status: 'rejected',
+      reason: 'correlation-mismatch',
+    });
+    expect(harness.applyMutations).toBe(0);
+    expect(harness.comments).toHaveLength(1);
+  });
+
   it('rejects correlation mismatch before patch effects', async () => {
     const harness = new Harness();
     const obs = observation('implement', {
       ...mutationResult(),
       correlation: { ...correlation(), requestId: `0x${'f'.repeat(64)}` },
     });
-    writeFileSync(harness.delivery.observationPath, `${JSON.stringify(obs, null, 2)}\n`);
+    writeObservationFile(harness, obs);
     await expect(adopt(harness)).resolves.toMatchObject({
       status: 'rejected',
       reason: 'correlation-mismatch',
@@ -756,7 +803,7 @@ describe('marketplace mutation adoption validation', () => {
   it('calls Human protocol before publishing policy-human', async () => {
     const harness = new Harness();
     const obs = observation('implement', mutationResult('human'));
-    writeFileSync(harness.delivery.observationPath, `${JSON.stringify(obs, null, 2)}\n`);
+    writeObservationFile(harness, obs);
     const result = await adopt(harness);
     expect(result).toMatchObject({ status: 'rejected', reason: 'policy-human' });
     expect(harness.humanMutations).toBe(1);
@@ -796,6 +843,96 @@ describe('marketplace mutation adoption success', () => {
     });
   });
 
+  it('persists implementation completion evidence with distinct phase-complete head', async () => {
+    const harness = new Harness();
+    harness.phaseCompleteHead = COMPLETION;
+    const result = await adopt(harness);
+    expect(result).toMatchObject({ status: 'accepted', resultingHead: COMPLETION });
+    const state = readAttemptManifest(harness.manifestPath).execution.state;
+    if (state.schemaVersion !== 'marketplace-execution-v3' || state.status !== 'receipt-published') {
+      throw new Error('expected receipt-published marketplace state');
+    }
+    expect(state.progress.completion).toEqual({
+      operation: 'implementation-complete',
+      prNumber: 2101,
+      branch: 'codex/issue-2001',
+      claimOid: CLAIM,
+      checkpointOid: HOST_COMMIT,
+      resultingHead: COMPLETION,
+      lifecycleStatus: 'In Review',
+      confirmedAt: expect.any(String),
+    });
+  });
+
+  it('persists child completion evidence with distinct host and resulting heads', async () => {
+    const harness = new Harness('fix-child');
+    const result = await adopt(harness);
+    expect(result).toMatchObject({ status: 'accepted', resultingHead: HOST_COMMIT });
+    const state = readAttemptManifest(harness.manifestPath).execution.state;
+    if (state.schemaVersion !== 'marketplace-execution-v3' || state.status !== 'receipt-published') {
+      throw new Error('expected receipt-published marketplace state');
+    }
+    expect(state.progress.completion).toEqual({
+      operation: 'child-complete',
+      childIssueNumber: 2069,
+      parentPrNumber: 2101,
+      parentBranch: 'codex/issue-2001',
+      claimOid: CLAIM,
+      checkpointOid: HOST_COMMIT,
+      resultingHead: HOST_COMMIT,
+      childClosed: true,
+      lifecycleStatus: 'In Review',
+      confirmedAt: expect.any(String),
+    });
+  });
+
+  it('accepts child already closed when durable host commit exists', async () => {
+    const harness = new Harness('fix-child');
+    harness.child = { ...harness.child!, open: false };
+    harness.gitState = {
+      status: 'committed',
+      expectedTree: HOST_TREE,
+      commit: hostCommitEvidence(2069),
+    };
+    harness.remoteHead = HOST_COMMIT;
+    harness.prHead = HOST_COMMIT;
+    harness.transition(harness.manifestPath, harness.requestDigest, {
+      status: 'solution-verified',
+      artifact: {
+        digest: validateMarketplacePatch(new TextEncoder().encode(PATCH)).artifactDigest,
+        byteLength: PATCH.length,
+        touchedPaths: [PATCH_PATH],
+        expectedTree: HOST_TREE,
+      },
+      verification: verificationEvidence(HOST_TREE),
+    }, harness.clock);
+    harness.transition(harness.manifestPath, harness.requestDigest, {
+      status: 'host-committed',
+      hostCommit: hostCommitEvidence(2069),
+    }, harness.clock);
+    await expect(adopt(harness)).resolves.toMatchObject({ status: 'accepted' });
+    expect(harness.childCloseMutations).toBe(0);
+  });
+
+  it('re-verifies bound evidence when plan digest mismatches', async () => {
+    const harness = new Harness();
+    harness.gitState = { status: 'pending', expectedTree: HOST_TREE };
+    const mismatched = verificationEvidence(HOST_TREE);
+    harness.transition(harness.manifestPath, harness.requestDigest, {
+      status: 'solution-verified',
+      artifact: {
+        digest: validateMarketplacePatch(new TextEncoder().encode(PATCH)).artifactDigest,
+        byteLength: PATCH.length,
+        touchedPaths: [PATCH_PATH],
+        expectedTree: HOST_TREE,
+      },
+      verification: { ...mismatched, planDigest: `sha256:${'d'.repeat(64)}` },
+    }, harness.clock);
+    const verifySpy = vi.spyOn(harness, 'verify');
+    await adopt(harness);
+    expect(verifySpy).toHaveBeenCalledTimes(1);
+  });
+
   it('reuses bound verification evidence after crash', async () => {
     const harness = new Harness();
     harness.gitState = { status: 'pending', expectedTree: HOST_TREE };
@@ -804,7 +941,7 @@ describe('marketplace mutation adoption success', () => {
       artifact: {
         digest: validateMarketplacePatch(new TextEncoder().encode(PATCH)).artifactDigest,
         byteLength: PATCH.length,
-        touchedPaths: ['a.ts'],
+        touchedPaths: [PATCH_PATH],
         expectedTree: HOST_TREE,
       },
       verification: verificationEvidence(HOST_TREE),
@@ -862,6 +999,22 @@ describe('marketplace mutation adoption success', () => {
 });
 
 describe('marketplace mutation adoption recovery', () => {
+  it('re-acquires review anchor after review-anchored transition', async () => {
+    const harness = new Harness();
+    harness.crashBoundary = 'review-anchor-published';
+    await expect(adopt(harness)).resolves.toMatchObject({ status: 'recoverable' });
+    const anchor = harness.reviewAnchor!;
+    harness.transition(harness.manifestPath, harness.requestDigest, {
+      status: 'review-anchored',
+      reviewAnchor: anchor,
+    }, harness.clock);
+    harness.reviewAnchorMutations = 0;
+    const acquireSpy = vi.spyOn(harness, 'acquireOrRecover');
+    await expect(adopt(harness)).resolves.toMatchObject({ status: 'accepted' });
+    expect(acquireSpy).toHaveBeenCalledTimes(1);
+    expect(harness.reviewAnchorMutations).toBe(0);
+  });
+
   it.each([
     'patch-applied',
     'verification-persisted',
@@ -901,6 +1054,15 @@ describe('marketplace mutation adoption recovery', () => {
     expect(harness.humanMutations).toBe(1);
     expect(harness.reviewAnchorReleases).toBe(1);
     expect(harness.comments).toHaveLength(1);
+  });
+
+  it('continues adoption after deadline once durable effects exist', async () => {
+    const harness = new Harness();
+    harness.crashBoundary = 'host-commit-created';
+    await expect(adopt(harness)).resolves.toMatchObject({ status: 'recoverable' });
+    expect(harness.commitMutations).toBe(1);
+    harness.clock = () => new Date('2026-07-27T13:30:00.000Z');
+    await expect(adopt(harness)).resolves.toMatchObject({ status: 'accepted' });
   });
 
   it('rejects at adoption cutoff before durable effects', async () => {
