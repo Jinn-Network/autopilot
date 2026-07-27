@@ -13,6 +13,7 @@ import type {
   LifecycleSnapshotSource,
   SnapshotReadMode,
 } from '../../src/lifecycle/snapshot.js';
+import { LifecycleRateLimitError } from '../../src/lifecycle/snapshot.js';
 import { IncrementalSnapshotUnavailableError } from '../../src/lifecycle/incremental-snapshot-source.js';
 import {
   LifecycleDiscoveryCacheCorruptError,
@@ -752,6 +753,116 @@ describe('LifecycleSnapshotCoordinator', () => {
     fail = false;
     await coordinator.read(500);
     expect(reads).toEqual(['full', 'incremental', 'full']);
+  });
+
+  it('names both causes distinctly when full and fallback fail identically', async () => {
+    const detail = '✖ Invalid input → at openPullRequestEvidence[54].branchClaim';
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: source([], async () => {
+        throw new LifecycleDiscoveryCacheCorruptError(
+          `discovery cache at /state/cache.json failed to save: ${detail}`,
+        );
+      }),
+      configuredMode: 'incremental',
+      fullReconcileMs: DEFAULT_FULL_RECONCILE_MS,
+      startupFull: true,
+      allowPartial: false,
+      now: () => START,
+      readUsage: () => EMPTY_GITHUB_USAGE,
+    });
+
+    const error = await coordinator.read(500).then(
+      () => { throw new Error('expected read to reject'); },
+      (rejection: unknown) => rejection,
+    );
+
+    expect(error).toBeInstanceOf(AggregateError);
+    const message = (error as AggregateError).message;
+    expect(message).toContain('Full reconciliation and incremental fallback both failed');
+    // Both causes are the same type with the same text from two different call
+    // sites: the diagnostic must still attribute each one to its own path.
+    expect(message).toContain('[full]');
+    expect(message).toContain('[incremental fallback]');
+    expect(
+      message.split('[full]')[1]?.split('[incremental fallback]')[0],
+    ).toContain(detail);
+    expect(message.split('[incremental fallback]')[1]).toContain(detail);
+    expect(message).toContain('LifecycleDiscoveryCacheCorruptError');
+    expect((error as AggregateError).errors).toHaveLength(2);
+  });
+
+  it('carries nested aggregate and cause chains into the both-failed diagnostic', async () => {
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: source([], async (mode) => {
+        if (mode === 'full') {
+          throw new AggregateError(
+            [new Error('graphql command exploded'), new Error('usage probe exploded')],
+            'GitHub command and usage probe failed',
+          );
+        }
+        throw new Error('incremental read exploded', {
+          cause: new Error('ENOENT: cache file missing'),
+        });
+      }),
+      configuredMode: 'incremental',
+      fullReconcileMs: DEFAULT_FULL_RECONCILE_MS,
+      startupFull: true,
+      allowPartial: false,
+      now: () => START,
+      readUsage: () => EMPTY_GITHUB_USAGE,
+    });
+
+    await expect(coordinator.read(500)).rejects.toThrow(/graphql command exploded/);
+    await expect(coordinator.read(500)).rejects.toThrow(/usage probe exploded/);
+    await expect(coordinator.read(500)).rejects.toThrow(/ENOENT: cache file missing/);
+  });
+
+  it('bounds the both-failed diagnostic so a huge validation report cannot flood the log', async () => {
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: source([], async (mode) => {
+        throw new Error(`${mode} failed: ${'✖ Invalid input → at x; '.repeat(4_000)}`);
+      }),
+      configuredMode: 'incremental',
+      fullReconcileMs: DEFAULT_FULL_RECONCILE_MS,
+      startupFull: true,
+      allowPartial: false,
+      now: () => START,
+      readUsage: () => EMPTY_GITHUB_USAGE,
+    });
+
+    const error = await coordinator.read(500).then(
+      () => { throw new Error('expected read to reject'); },
+      (rejection: unknown) => rejection,
+    );
+
+    const message = (error as AggregateError).message;
+    expect(message.length).toBeLessThanOrEqual(2_200);
+    expect(message).toContain('full failed');
+    expect(message).toContain('incremental failed');
+    expect(message).toContain('truncated');
+  });
+
+  it('still rethrows a rate-limit fallback failure unwrapped', async () => {
+    const coordinator = new LifecycleSnapshotCoordinator({
+      source: source([], async (mode) => {
+        if (mode === 'full') throw new Error('full failed');
+        throw new LifecycleRateLimitError(12, 500);
+      }),
+      configuredMode: 'incremental',
+      fullReconcileMs: DEFAULT_FULL_RECONCILE_MS,
+      startupFull: true,
+      allowPartial: false,
+      now: () => START,
+      readUsage: () => EMPTY_GITHUB_USAGE,
+    });
+
+    const error = await coordinator.read(500).then(
+      () => { throw new Error('expected read to reject'); },
+      (rejection: unknown) => rejection,
+    );
+
+    expect(error).toBeInstanceOf(LifecycleRateLimitError);
+    expect(error).not.toBeInstanceOf(AggregateError);
   });
 
   it('does not advance the last successful full when a later due full and fallback both fail', async () => {
