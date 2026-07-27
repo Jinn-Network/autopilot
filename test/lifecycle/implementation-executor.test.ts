@@ -597,7 +597,7 @@ describe('implementation action executor', () => {
       claimAttempt: ATTEMPT_A,
     }, deps)).resolves.toEqual(expect.objectContaining({
       status: 'ineligible',
-      detail: expect.stringContaining('missing or closed'),
+      detail: expect.stringContaining('has no authority projection'),
     }));
     expect(claims).toEqual([]);
     expect(events).toEqual([]);
@@ -837,9 +837,15 @@ describe('implementation action executor', () => {
   });
 
   it.each([
-    ['missing issue', { issue: null }, 'missing or closed'],
-    ['closed issue', { issue: issue({ open: false }) }, 'missing or closed'],
-    ['changed issue', { issue: issue({ number: 43 }) }, 'missing or closed'],
+    // Each of the three issue-authority causes carries its own message; they
+    // were previously one collapsed "missing or closed" string.
+    ['missing issue', { issue: null }, 'has no authority projection'],
+    ['attributed missing issue', {
+      issue: null,
+      issueRefusal: 'issue #42 is absent from the snapshot issue index',
+    }, 'has no authority projection: issue #42 is absent from the snapshot issue index'],
+    ['closed issue', { issue: issue({ open: false }) }, 'issue #42 is closed.'],
+    ['changed issue', { issue: issue({ number: 43 }) }, 'changed to issue #43'],
     ['missing PR', { pullRequest: null }, 'is missing'],
     ['changed PR', { pullRequest: { ...pr(), number: 85, state: 'OPEN' } }, 'PR #84'],
     ['closed PR', { pullRequest: { ...pr(), state: 'CLOSED' } }, 'not open'],
@@ -931,6 +937,53 @@ describe('implementation action executor', () => {
     expect(events).toEqual([]);
     expect(human).toEqual([]);
     expect(mutations).toEqual([]);
+  });
+
+  // The collapsed "missing or closed" message named a cause the production
+  // port cannot produce (its projection hardcodes `open: true` and copies the
+  // matched number), so an issue withheld for a stacking reason was reported
+  // as missing. Each condition must now be separately identifiable, and the
+  // port's own attribution must reach the operator-facing line verbatim.
+  it('reports each stale recovery issue-authority cause distinguishably', async () => {
+    const reject = async (changed: Record<string, unknown>) => {
+      const state = staleRecoveryState(changed);
+      const { deps } = harness({
+        readIssue: async () => state.issue,
+        readStaleRecovery: async () => state,
+        listOpenPullRequests: async () => [state.pullRequest],
+      });
+      const result = await executeImplementationAction({
+        kind: 'claim-implementation',
+        intent: 'stale-recovery',
+        issueNumber: 42,
+        prNumber: 84,
+        expectedHead: ADOPTED_HEAD,
+        branch: gitRefName('existing/issue-42'),
+        claimAttempt: ATTEMPT_A,
+      }, deps);
+      expect(result.status).toBe('ineligible');
+      return (result as { detail: string }).detail;
+    };
+
+    const absent = await reject({ issue: null });
+    const closed = await reject({ issue: issue({ open: false }) });
+    const changed = await reject({ issue: issue({ number: 43 }) });
+    expect(new Set([absent, closed, changed]).size).toBe(3);
+    expect(absent).not.toContain('closed');
+    expect(closed).not.toContain('changed');
+
+    // The stacking refusal the live #2040 strand actually hit: present, open,
+    // and withheld only because no blocker PR cleared the author boundary.
+    const attributed = await reject({
+      issue: null,
+      issueRefusal:
+        'issue #2040 is open but has no authorized stacking base — blocker issue #2039 '
+        + 'has an open PR #2081 by outsider, and no author is on the dispatch author allowlist',
+    });
+    expect(attributed).toContain('#2039');
+    expect(attributed).toContain('PR #2081');
+    expect(attributed).toContain('allowlist');
+    expect(attributed).not.toBe(absent);
   });
 
   it('rejects ordinary In Progress work with its specific eligibility evidence', async () => {

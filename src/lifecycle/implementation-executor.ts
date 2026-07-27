@@ -79,6 +79,14 @@ export interface ImplementationIssue {
 
 export interface StaleImplementationRecoveryState {
   readonly issue: ImplementationIssue | null;
+  /**
+   * Why the authority port withheld `issue`, when it did. Same shape as
+   * `TargetedAuthorityRefusal` in `targeted-action-reader.ts`: a `null`
+   * projection alone is unattributable, so the port names the cause at the
+   * site that produced it and the rejection message repeats it verbatim.
+   * Absent when the port has nothing more specific to say than `issue: null`.
+   */
+  readonly issueRefusal?: string;
   readonly projectStatus: 'Todo' | 'In Progress' | 'Human' | 'In Review' | 'Done' | null;
   readonly humanHold: boolean;
   readonly pullRequest: (ImplementationPullRequest & {
@@ -519,8 +527,22 @@ function staleRecoveryRejection(
   if (state.humanHold) {
     return `Stale recovery for issue #${action.issueNumber} is blocked by Human authority.`;
   }
-  if (state.issue === null || !state.issue.open || state.issue.number !== action.issueNumber) {
-    return `Stale recovery issue #${action.issueNumber} is missing or closed.`;
+  // Three separately identifiable causes. They were collapsed into one
+  // "missing or closed" message, which misattributed the only cause the
+  // production port can actually produce here — a withheld projection for an
+  // issue that is present and open — as a missing or closed issue.
+  if (state.issue === null) {
+    return state.issueRefusal === undefined
+      ? `Stale recovery issue #${action.issueNumber} has no authority projection.`
+      : `Stale recovery issue #${action.issueNumber} has no authority projection: ${
+        state.issueRefusal
+      }`;
+  }
+  if (!state.issue.open) {
+    return `Stale recovery issue #${action.issueNumber} is closed.`;
+  }
+  if (state.issue.number !== action.issueNumber) {
+    return `Stale recovery issue #${action.issueNumber} changed to issue #${state.issue.number}.`;
   }
   if (state.projectStatus !== 'In Progress') {
     return `Stale recovery Project status changed from In Progress to ${
