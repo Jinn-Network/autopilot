@@ -134,17 +134,23 @@ const COMMAND_FAILED_PREFIX = 'Command failed: ';
  *
  * The exact extent comes from the rejection's own `cmd` field, which Node sets
  * to the same string it interpolated (`child_process`'s `exithandler` assigns
- * `ex.cmd = cmd`). When that field is missing, or the message does not begin
- * with the argv Node says it does, the boundary is unknowable and the whole
- * message is refused as evidence — the fail-closed direction, and lossless in
- * practice: an `execFile` rejection whose `stderr` is empty has nothing after
- * the argv anyway, and message evidence is consulted only when stderr is empty.
+ * `ex.cmd = cmd`). A STRICT PREFIX is not that extent: Node interpolates the
+ * argv and then either ends the message or writes `\n` before stderr, so the
+ * remainder after `cmd` must be empty or start with `\n`. Anything else means
+ * `cmd` names less than the whole echoed argv and the rest is still the
+ * caller's own argument text. So when the field is missing, when the message
+ * does not begin with the argv `cmd` names, or when it names only a prefix of
+ * it, the boundary is unknowable and the whole message is refused as evidence —
+ * the fail-closed direction, and lossless in practice: an `execFile` rejection
+ * whose `stderr` is empty has nothing after the argv anyway, and message
+ * evidence is consulted only when stderr is empty.
  */
 function messageEvidence(message: string, echoedArgv: string): string {
   if (!message.startsWith(COMMAND_FAILED_PREFIX)) return message;
   const body = message.slice(COMMAND_FAILED_PREFIX.length);
   if (echoedArgv.length === 0 || !body.startsWith(echoedArgv)) return '';
   const rest = body.slice(echoedArgv.length);
+  if (rest.length !== 0 && !rest.startsWith('\n')) return '';
   return rest.startsWith('\n') ? rest.slice(1) : rest;
 }
 

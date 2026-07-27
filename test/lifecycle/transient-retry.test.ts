@@ -158,6 +158,18 @@ describe('classifyTransportFault', () => {
     })).toBeNull();
   });
 
+  it('refuses message evidence when `cmd` is only a strict prefix of the echoed argv', () => {
+    // A `cmd` that merely STARTS the echoed argv does not establish the
+    // boundary: everything after it is still the caller's own argument text.
+    // Node always ends the argv at the message's end or at a `\n`, so a
+    // remainder that begins with anything else means the extent is unknown.
+    expect(classifyTransportFault({
+      cmd: 'gh api graphql',
+      stderr: '',
+      message: 'Command failed: gh api graphql -f query=query{\n  connection reset by peer\n}',
+    })).toBeNull();
+  });
+
   it('still reads the stderr that follows a multi-line echoed command line', () => {
     // The strip must remove the argv exactly, not the whole message: a real
     // fault appended after a multi-line document is still evidence.
@@ -275,9 +287,11 @@ describe('isRetryableReadCommand', () => {
  * is admitted. Change the call site and the assertion follows it.
  *
  * They cover the two argv-constructing shapes the metered boundary actually
- * carries — REST `gh api` reads (the merge port's changed-file, file-listing and
- * compare reads, `src/lifecycle/merge-executor-production.ts:241`, `:279`,
- * `:308`) and the reader's `git -C <path> ls-remote` reads
+ * carries — the REST `gh api` reads in `src/lifecycle/github-changed-files.ts`,
+ * called from `merge-executor-production.ts:117` and
+ * `review-executor-production.ts:252` (`readExactChangedFiles`) and from
+ * `github-reader.ts:1395` (`readExactCompareStatus`) — and the reader's
+ * `git -C <path> ls-remote` reads
  * (`src/lifecycle/github-reader.ts:854`). The meter's own GraphQL quota probe is
  * covered the same way, through the real boundary, in the accounting block
  * below. Call sites reached only through much larger fixtures are not
@@ -310,8 +324,9 @@ describe('argv derived from production call sites', () => {
         }
         return '';
       },
-      // Rendered as `[argv, verdict]` pairs so a failure names the exact
-      // production argv that lost coverage rather than reporting `false`.
+      // Rendered as `[argv, verdict]` pairs, and asserted by filtering to the
+      // non-retryable ones, so a failure prints the exact production argv that
+      // lost coverage rather than reporting `false`.
       admitted: () => calls.map(([command, args]) => [
         [command, ...args].join(' '),
         isRetryableReadCommand(command, args) ? 'retryable' : 'NOT RETRYABLE',
@@ -332,7 +347,7 @@ describe('argv derived from production call sites', () => {
 
     const observed = recording.admitted();
     expect(observed).toHaveLength(2);
-    expect(observed.map(([, verdict]) => verdict)).toEqual(['retryable', 'retryable']);
+    expect(observed.filter(([, verdict]) => verdict !== 'retryable')).toEqual([]);
   });
 
   it('admits every command the production exact compare read emits', async () => {
@@ -347,7 +362,7 @@ describe('argv derived from production call sites', () => {
 
     const observed = recording.admitted();
     expect(observed).toHaveLength(2);
-    expect(observed.map(([, verdict]) => verdict)).toEqual(['retryable', 'retryable']);
+    expect(observed.filter(([, verdict]) => verdict !== 'retryable')).toEqual([]);
   });
 
   it("admits the reader's own git ls-remote reads", async () => {
@@ -364,7 +379,7 @@ describe('argv derived from production call sites', () => {
 
     const observed = recording.admitted();
     expect(observed).toHaveLength(2);
-    expect(observed.map(([, verdict]) => verdict)).toEqual(['retryable', 'retryable']);
+    expect(observed.filter(([, verdict]) => verdict !== 'retryable')).toEqual([]);
   });
 });
 
