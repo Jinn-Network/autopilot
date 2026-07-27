@@ -314,6 +314,95 @@ describe('marketplace patch validation', () => {
     ]);
   });
 
+  it.each([
+    ['rename old path', [
+      'diff --git a/src/a b/old.ts b/src/new.ts',
+      'similarity index 100%',
+      'rename from src/a b/old.ts',
+      'rename to src/new.ts',
+    ], ['src/a b/old.ts', 'src/new.ts']],
+    ['rename new path', [
+      'diff --git a/src/old.ts b/src/a b/new.ts',
+      'similarity index 100%',
+      'rename from src/old.ts',
+      'rename to src/a b/new.ts',
+    ], ['src/a b/new.ts', 'src/old.ts']],
+    ['copy old path', [
+      'diff --git a/src/a b/source.ts b/src/copy.ts',
+      'similarity index 100%',
+      'copy from src/a b/source.ts',
+      'copy to src/copy.ts',
+    ], ['src/a b/source.ts', 'src/copy.ts']],
+    ['copy new path', [
+      'diff --git a/src/source.ts b/src/a b/copy.ts',
+      'similarity index 100%',
+      'copy from src/source.ts',
+      'copy to src/a b/copy.ts',
+    ], ['src/a b/copy.ts', 'src/source.ts']],
+    ['old file header', [
+      'diff --git a/src/a b/old.ts b/src/new.ts',
+      'index 7898192..422c2b7 100644',
+      '--- a/src/a b/old.ts',
+      '+++ b/src/new.ts',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+    ], ['src/a b/old.ts', 'src/new.ts']],
+    ['new file header', [
+      'diff --git a/src/old.ts b/src/a b/new.ts',
+      'index 7898192..422c2b7 100644',
+      '--- a/src/old.ts',
+      '+++ b/src/a b/new.ts',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+    ], ['src/a b/new.ts', 'src/old.ts']],
+  ] as const)('uses subsequent %s evidence to disambiguate an internal b/ path', (_label, lines, touchedPaths) => {
+    expect(validateMarketplacePatch(patchLines(lines)).touchedPaths).toEqual(touchedPaths);
+  });
+
+  it('rejects an ambiguous differing unquoted diff when no path evidence resolves it', () => {
+    expectPolicyReason(patchLines([
+      'diff --git a/src/a b/old.ts b/src/new.ts',
+      'old mode 100644',
+      'new mode 100755',
+    ]), 'malformed-patch');
+  });
+
+  it('treats paired no-newline markers on identical lines as no effect', () => {
+    expectPolicyReason(patchLines([
+      'diff --git a/src/value.ts b/src/value.ts',
+      '--- a/src/value.ts',
+      '+++ b/src/value.ts',
+      '@@ -1 +1 @@',
+      '-same',
+      '\\ No newline at end of file',
+      '+same',
+      '\\ No newline at end of file',
+    ]), 'malformed-patch');
+  });
+
+  it.each([
+    ['old side', [
+      '-same',
+      '\\ No newline at end of file',
+      '+same',
+    ]],
+    ['new side', [
+      '-same',
+      '+same',
+      '\\ No newline at end of file',
+    ]],
+  ] as const)('treats an asymmetric no-newline marker on the %s as an effect', (_label, hunkLines) => {
+    expect(validateMarketplacePatch(patchLines([
+      'diff --git a/src/value.ts b/src/value.ts',
+      '--- a/src/value.ts',
+      '+++ b/src/value.ts',
+      '@@ -1 +1 @@',
+      ...hunkLines,
+    ])).touchedPaths).toEqual(['src/value.ts']);
+  });
+
   it('rejects a literal tab in rename metadata instead of truncating the destination', () => {
     expectPolicyReason(patchLines([
       'diff --git a/src/value.ts b/src/safe.ts',
@@ -431,6 +520,40 @@ describe('marketplace patch validation', () => {
     expectPolicyReason(patchLines(lines), 'unsafe-path');
   });
 
+  const driveRelativeSurfaceCases = [
+    ['diff old', 'diff --git a/C:owned.ts b/src/value.ts'],
+    ['diff new', 'diff --git a/src/value.ts b/C:owned.ts'],
+    ['old header', '--- a/C:owned.ts'],
+    ['new header', '+++ b/C:owned.ts'],
+    ['rename from', 'rename from C:owned.ts'],
+    ['rename to', 'rename to C:owned.ts'],
+    ['copy from', 'copy from C:owned.ts'],
+    ['copy to', 'copy to C:owned.ts'],
+  ] as const;
+
+  it.each(driveRelativeSurfaceCases)('rejects drive-relative Windows paths on the %s surface', (surface, replacement) => {
+    const lines = [
+      'diff --git a/src/value.ts b/src/value.ts',
+      'similarity index 100%',
+      'rename from src/value.ts',
+      'rename to src/other.ts',
+      '--- a/src/value.ts',
+      '+++ b/src/value.ts',
+    ];
+    const indexBySurface: Readonly<Record<typeof surface, number>> = {
+      'diff old': 0,
+      'diff new': 0,
+      'old header': 4,
+      'new header': 5,
+      'rename from': 2,
+      'rename to': 3,
+      'copy from': 2,
+      'copy to': 3,
+    };
+    lines[indexBySurface[surface]] = replacement;
+    expectPolicyReason(patchLines(lines), 'unsafe-path');
+  });
+
   it.each([
     ['old mode', 'old mode 120000'],
     ['new mode', 'new mode 160000'],
@@ -471,27 +594,61 @@ describe('marketplace patch validation', () => {
     ['pnpm lock', 'pnpm-lock.yaml'],
     ['Yarn metadata', '.yarn/install-state.gz'],
     ['Yarn config', '.yarnrc.yml'],
+    ['npm config', '.npmrc'],
+    ['pnpm hook', '.pnpmfile.cjs'],
+    ['pnpm config', '.pnpmrc'],
+    ['Bun config', 'bunfig.toml'],
+    ['Deno manifest', 'deno.json'],
     ['PnP loader', '.pnp.cjs'],
     ['PnP data', '.pnp.data.json'],
     ['pnpm workspace manifest', 'pnpm-workspace.yaml'],
     ['node_modules', 'packages/app/node_modules/pkg/index.js'],
     ['tsconfig', 'packages/app/tsconfig.build.json'],
     ['Vitest config', 'vitest.config.ts'],
+    ['qualified Vitest hermetic config', 'client/vitest.hermetic.config.ts'],
+    ['qualified Vitest acceptance config', 'client/vitest.acceptance.config.ts'],
+    ['qualified Vitest release config', 'client/vitest.release-tier-1.config.ts'],
     ['Vite config', 'vite.config.ts'],
     ['Vitest workspace', 'vitest.workspace.ts'],
     ['Vitest projects', 'vitest.projects.ts'],
     ['Jest config', 'jest.config.js'],
+    ['Mocha config', '.mocharc.cjs'],
+    ['Mocha options', 'mocha.opts'],
+    ['Karma config', 'karma.conf.js'],
+    ['WebdriverIO config', 'wdio.conf.ts'],
+    ['qualified WebdriverIO config', 'wdio.shared.conf.ts'],
+    ['Jasmine config', 'jasmine.json'],
+    ['Vitest setup', 'vitest.setup.ts'],
+    ['Jest setup', 'jest.setup.js'],
+    ['setupTests file', 'setupTests.ts'],
     ['generic test config', 'test.config.ts'],
     ['test directory', 'test/lifecycle/new-policy.ts'],
     ['tests directory', 'src/tests/new-policy.ts'],
     ['__tests__ directory', 'src/__tests__/new-policy.ts'],
+    ['spec directory', 'spec/new-policy.ts'],
+    ['specs directory', 'src/specs/new-policy.ts'],
     ['test file', 'src/value.test.ts'],
     ['spec file', 'src/value.spec.ts'],
+    ['e2e file', 'src/value.e2e.ts'],
     ['snapshot file', 'src/value.snap'],
     ['snapshot directory', 'src/__snapshots__/value.ts.snap'],
     ['snapshots directory', 'src/snapshots/value.json'],
   ])('rejects the %s verification-control surface', (_label, path) => {
     expectPolicyReason(ordinaryPatch(path), 'verification-control');
+  });
+
+  it.each([
+    ['npmrc parser', 'src/npmrc-parser.ts'],
+    ['pnpm hook reader', 'src/pnpmfile-reader.ts'],
+    ['Mocha reader', 'src/mocharc-reader.ts'],
+    ['Karma confirmation', 'src/karma-confirmation.ts'],
+    ['Webdriver configuration model', 'src/wdio-configuration.ts'],
+    ['Vitest config domain model', 'src/vitest-hermetic-config.ts'],
+    ['contest domain source', 'src/contest.ts'],
+    ['snapshot store', 'src/snapshot-store.ts'],
+    ['package locker', 'src/package-locker.ts'],
+  ])('allows ordinary source with a %s name', (_label, path) => {
+    expect(validateMarketplacePatch(ordinaryPatch(path)).touchedPaths).toEqual([path]);
   });
 
   it('rejects a traditional second file diff appended after a completed Git hunk', () => {
@@ -781,5 +938,40 @@ describe('marketplace patch worktree application', () => {
 
     expect(seen).toEqual([expected, expected]);
     expect(result.artifact).toEqual(expected);
+  });
+
+  it('isolates the check, apply, and returned artifact buffers from malicious runners', async () => {
+    const fixture = await repositoryFixture();
+    const artifact = ordinaryPatch();
+    const expected = Uint8Array.from(artifact);
+    let checkInput: Uint8Array | undefined;
+    let applyInput: Uint8Array | undefined;
+    let appliedBytes: Uint8Array | undefined;
+    const runGit: MarketplacePatchGitRunner = async (args, options) => {
+      if (args.includes('ls-files')) return new Uint8Array();
+      if (args.includes('--check')) {
+        checkInput = options.stdin!;
+        options.stdin!.fill(0x78);
+      } else {
+        applyInput = options.stdin!;
+        appliedBytes = Uint8Array.from(options.stdin!);
+        options.stdin!.fill(0x79);
+      }
+      return new Uint8Array();
+    };
+
+    const result = await applyMarketplacePatchToWorktree(
+      applicationInput(fixture, artifact),
+      { worktreeProof: proof(), runGit },
+    );
+
+    expect(appliedBytes).toEqual(expected);
+    expect(checkInput).not.toBe(applyInput);
+    expect(checkInput).not.toBe(result.artifact);
+    expect(applyInput).not.toBe(result.artifact);
+    expect(result.artifact).toEqual(expected);
+    expect(result.artifactDigest).toBe(
+      'sha256:d4d30ac1c78a621963a23ada7d68180fcfe7551cbb23668e4b3a301f7576a8a3',
+    );
   });
 });

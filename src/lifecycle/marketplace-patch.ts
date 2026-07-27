@@ -120,7 +120,12 @@ function parseGitToken(input: string, start = 0): ParsedToken {
   reject('malformed-patch', 'Marketplace patch has an unterminated quoted path');
 }
 
-function parseDiffPaths(line: string): readonly string[] {
+interface DiffPathCandidate {
+  readonly oldPath: string;
+  readonly newPath: string;
+}
+
+function parseDiffPathCandidates(line: string): readonly DiffPathCandidate[] {
   const rest = line.slice('diff --git '.length);
   if (rest.startsWith('"')) {
     const first = parseGitToken(rest);
@@ -134,9 +139,9 @@ function parseDiffPaths(line: string): readonly string[] {
       if (rest.slice(second.end).trim().length !== 0) {
         reject('malformed-patch', 'Marketplace patch diff header has trailing data');
       }
-      return [first.value, second.value];
+      return [{ oldPath: first.value, newPath: second.value }];
     }
-    return [first.value, rest.slice(cursor)];
+    return [{ oldPath: first.value, newPath: rest.slice(cursor) }];
   }
 
   const quotedBoundary = rest.indexOf(' "b/');
@@ -145,7 +150,7 @@ function parseDiffPaths(line: string): readonly string[] {
     if (rest.slice(second.end).trim().length !== 0) {
       reject('malformed-patch', 'Marketplace patch diff header has trailing data');
     }
-    return [rest.slice(0, quotedBoundary), second.value];
+    return [{ oldPath: rest.slice(0, quotedBoundary), newPath: second.value }];
   }
   const boundaries: number[] = [];
   let boundary = rest.indexOf(' b/');
@@ -160,15 +165,20 @@ function parseDiffPaths(line: string): readonly string[] {
       && newPath.startsWith('b/')
       && oldPath.slice(2) === newPath.slice(2);
   });
-  const selectedBoundary = samePathBoundaries.length === 1
-    ? samePathBoundaries[0]
-    : boundaries.length === 1
-      ? boundaries[0]
-      : undefined;
-  if (selectedBoundary === undefined) {
+  if (samePathBoundaries.length === 1) {
+    const selectedBoundary = samePathBoundaries[0]!;
+    return [{
+      oldPath: rest.slice(0, selectedBoundary),
+      newPath: rest.slice(selectedBoundary + 1),
+    }];
+  }
+  if (boundaries.length === 0) {
     reject('malformed-patch', 'Marketplace patch diff header paths are missing or ambiguous');
   }
-  return [rest.slice(0, selectedBoundary), rest.slice(selectedBoundary + 1)];
+  return boundaries.map((selectedBoundary) => ({
+    oldPath: rest.slice(0, selectedBoundary),
+    newPath: rest.slice(selectedBoundary + 1),
+  }));
 }
 
 function parseSinglePath(raw: string, allowTimestamp: boolean): string {
@@ -195,13 +205,23 @@ const PACKAGE_CONTROL_FILES = new Set([
   'yarn.lock',
   'pnpm-lock.yaml',
   'pnpm-workspace.yaml',
+  '.npmrc',
+  'npmrc',
+  '.pnpmrc',
+  '.pnpmfile.cjs',
+  '.pnpmfile.js',
   'bun.lock',
   'bun.lockb',
+  'bunfig.toml',
+  'deno.json',
+  'deno.jsonc',
   '.yarnrc',
   '.yarnrc.yml',
   '.pnp.cjs',
   '.pnp.js',
   '.pnp.loader.mjs',
+  'mocha.opts',
+  'jasmine.json',
 ]);
 
 function isVerificationControl(path: string, segments: readonly string[]): boolean {
@@ -215,13 +235,20 @@ function isVerificationControl(path: string, segments: readonly string[]): boole
       || segment === 'test'
       || segment === 'tests'
       || segment === '__tests__'
+      || segment === 'spec'
+      || segment === 'specs'
+      || segment === '__specs__'
       || segment === '__snapshots__'
       || segment === 'snapshots')
     || lowerBasename.startsWith('.pnp.')
     || lowerBasename.startsWith('.yarnrc')
     || /^tsconfig(?:\.[^.]+)*\.json$/i.test(basename)
-    || /^(?:vite|vitest|jest|playwright|cypress|ava|test)\.(?:config|workspace|projects|preset)\.[^.]+$/i.test(basename)
-    || /\.(?:test|spec)\.[^.]+$/i.test(basename)
+    || /^(?:vite|vitest|jest|playwright|cypress|ava|test)(?:\.[^.]+)*\.(?:config|workspace|projects|preset)(?:\.[^.]+)+$/i.test(basename)
+    || /^(?:karma|wdio)(?:\.[^.]+)*\.conf(?:\.[^.]+)+$/i.test(basename)
+    || /^\.mocharc(?:\.[^.]+)?$/i.test(basename)
+    || /^(?:vitest|jest)\.(?:setup|global-setup|global-teardown)\.[^.]+$/i.test(basename)
+    || /^setupTests\.[^.]+$/i.test(basename)
+    || /\.(?:test|spec|e2e|integration)\.[^.]+$/i.test(basename)
     || /\.snap$/i.test(basename)
     || path === '';
 }
@@ -238,7 +265,7 @@ function validatePath(
     rawPath.length === 0
     || rawPath.startsWith('/')
     || rawPath.includes('\\')
-    || /^[A-Za-z]:[\\/]/.test(rawPath)
+    || /^[A-Za-z]:/.test(rawPath)
     || /[\u0000-\u001f\u007f]/.test(rawPath)
     || rawPath !== rawPath.normalize('NFC')
   ) {
@@ -262,7 +289,7 @@ function validatePath(
     path.length === 0
     || path.startsWith('/')
     || path.startsWith('\\')
-    || /^[A-Za-z]:[\\/]/.test(path)
+    || /^[A-Za-z]:/.test(path)
     || /[\u0000-\u001f\u007f]/.test(path)
     || path !== path.normalize('NFC')
   ) {
@@ -330,6 +357,9 @@ interface HunkCounts {
 
 interface FileEffect {
   changedLines: boolean;
+  readonly diffPathCandidates: readonly DiffPathCandidate[];
+  oldHeaderPath?: string | null;
+  newHeaderPath?: string | null;
   oldMode?: DirectMode['mode'];
   newMode?: DirectMode['mode'];
   newFileMode?: DirectMode['mode'];
@@ -340,8 +370,30 @@ interface FileEffect {
   copyTo?: string;
 }
 
-function finishFileEffect(effect: FileEffect | null): void {
+function finishFileEffect(effect: FileEffect | null, touchedPaths: Set<string>): void {
   if (effect === null) return;
+  const oldEvidence = [effect.oldHeaderPath, effect.renameFrom, effect.copyFrom]
+    .filter((path): path is string => path !== undefined && path !== null);
+  const newEvidence = [effect.newHeaderPath, effect.renameTo, effect.copyTo]
+    .filter((path): path is string => path !== undefined && path !== null);
+  const selectedCandidate = effect.diffPathCandidates.length === 1
+    ? effect.diffPathCandidates[0]!
+    : (() => {
+      const matchingCandidates = effect.diffPathCandidates.filter((candidate) =>
+        candidate.oldPath.startsWith('a/')
+        && candidate.newPath.startsWith('b/')
+        && oldEvidence.every((path) => candidate.oldPath.slice(2) === path)
+        && newEvidence.every((path) => candidate.newPath.slice(2) === path));
+      if (matchingCandidates.length !== 1) {
+        reject('malformed-patch', 'Marketplace patch diff header paths are missing or ambiguous');
+      }
+      return matchingCandidates[0]!;
+    })();
+  const oldPath = validatePath(selectedCandidate.oldPath, { expectedPrefix: 'a/' });
+  const newPath = validatePath(selectedCandidate.newPath, { expectedPrefix: 'b/' });
+  if (oldPath !== null) touchedPaths.add(oldPath);
+  if (newPath !== null) touchedPaths.add(newPath);
+
   if (
     (effect.oldMode === undefined) !== (effect.newMode === undefined)
     || (effect.renameFrom === undefined) !== (effect.renameTo === undefined)
@@ -391,8 +443,30 @@ function parsePatchPaths(text: string): readonly string[] {
   let newLines = 0;
   let removedLines: string[] = [];
   let addedLines: string[] = [];
-  let sawNoNewlineMarker = false;
+  let oldNoNewline = false;
+  let newNoNewline = false;
+  let lastHunkSide: 'old' | 'new' | 'context' | null = null;
+  let hunkPending = false;
   let fileEffect: FileEffect | null = null;
+  const recordNoNewlineMarker = (line: string): void => {
+    if (line !== '\\ No newline at end of file' || !hunkPending || lastHunkSide === null) {
+      reject('malformed-patch', 'Marketplace patch contains a misplaced newline marker');
+    }
+    if (lastHunkSide === 'old' || lastHunkSide === 'context') oldNoNewline = true;
+    if (lastHunkSide === 'new' || lastHunkSide === 'context') newNoNewline = true;
+  };
+  const finishHunk = (): void => {
+    if (!hunkPending) return;
+    if (
+      oldNoNewline !== newNoNewline
+      || removedLines.length !== addedLines.length
+      || removedLines.some((removed, index) => removed !== addedLines[index])
+    ) {
+      fileEffect!.changedLines = true;
+    }
+    hunkPending = false;
+    lastHunkSide = null;
+  };
   for (const line of text.split('\n')) {
     if (
       line.startsWith('diff --cc ')
@@ -406,19 +480,22 @@ function parsePatchPaths(text: string): readonly string[] {
     }
     if (phase === 'hunk') {
       if (line.startsWith('\\ ')) {
-        sawNoNewlineMarker = true;
+        recordNoNewlineMarker(line);
         continue;
       }
       const prefix = line[0];
       if (prefix === ' ') {
         oldLines -= 1;
         newLines -= 1;
+        lastHunkSide = 'context';
       } else if (prefix === '-') {
         oldLines -= 1;
         removedLines.push(line.slice(1));
+        lastHunkSide = 'old';
       } else if (prefix === '+') {
         newLines -= 1;
         addedLines.push(line.slice(1));
+        lastHunkSide = 'new';
       } else {
         reject('malformed-patch', 'Marketplace patch hunk has an invalid content line');
       }
@@ -426,38 +503,34 @@ function parsePatchPaths(text: string): readonly string[] {
         reject('malformed-patch', 'Marketplace patch hunk contains too many lines');
       }
       if (oldLines === 0 && newLines === 0) {
-        if (
-          sawNoNewlineMarker
-          || removedLines.length !== addedLines.length
-          || removedLines.some((removed, index) => removed !== addedLines[index])
-        ) {
-          fileEffect!.changedLines = true;
-        }
         phase = 'body';
       }
       continue;
     }
     if (line.startsWith('diff --git ')) {
-      finishFileEffect(fileEffect);
-      fileEffect = { changedLines: false };
+      finishHunk();
+      finishFileEffect(fileEffect, touchedPaths);
+      fileEffect = {
+        changedLines: false,
+        diffPathCandidates: parseDiffPathCandidates(line),
+      };
       phase = 'header';
-      const [oldPath, newPath] = parseDiffPaths(line);
-      const validatedOldPath = validatePath(oldPath!, { expectedPrefix: 'a/' });
-      const validatedNewPath = validatePath(newPath!, { expectedPrefix: 'b/' });
-      if (validatedOldPath !== null) touchedPaths.add(validatedOldPath);
-      if (validatedNewPath !== null) touchedPaths.add(validatedNewPath);
       continue;
     }
     if (line.startsWith('@@ ')) {
       if (phase !== 'header' && phase !== 'body') {
         reject('malformed-patch', 'Marketplace patch hunk is outside a Git file diff');
       }
+      finishHunk();
       const counts = parseHunkCounts(line);
       oldLines = counts.oldLines;
       newLines = counts.newLines;
       removedLines = [];
       addedLines = [];
-      sawNoNewlineMarker = false;
+      oldNoNewline = false;
+      newNoNewline = false;
+      lastHunkSide = null;
+      hunkPending = true;
       phase = oldLines === 0 && newLines === 0 ? 'body' : 'hunk';
       continue;
     }
@@ -469,7 +542,7 @@ function parsePatchPaths(text: string): readonly string[] {
     }
     if (phase === 'body') {
       if (line.startsWith('\\ ')) {
-        fileEffect!.changedLines = true;
+        recordNoNewlineMarker(line);
         continue;
       }
       if (line.length === 0) continue;
@@ -493,6 +566,13 @@ function parsePatchPaths(text: string): readonly string[] {
           ? { allowDevNull: true, expectedPrefix: 'b/' }
           : {});
       if (path !== null) touchedPaths.add(path);
+      if (prefix === '--- ' || prefix === '+++ ') {
+        const kind = prefix === '--- ' ? 'oldHeaderPath' : 'newHeaderPath';
+        if (Object.hasOwn(fileEffect!, kind)) {
+          reject('malformed-patch', 'Marketplace patch repeats file path metadata');
+        }
+        fileEffect![kind] = path;
+      }
       if (
         prefix === 'rename from '
         || prefix === 'rename to '
@@ -516,7 +596,8 @@ function parsePatchPaths(text: string): readonly string[] {
   if (phase === 'hunk') {
     reject('malformed-patch', 'Marketplace patch ends inside an incomplete hunk');
   }
-  finishFileEffect(fileEffect);
+  finishHunk();
+  finishFileEffect(fileEffect, touchedPaths);
   if (touchedPaths.size === 0) {
     reject('malformed-patch', 'Marketplace patch does not contain a file diff');
   }
@@ -845,6 +926,7 @@ export async function applyMarketplacePatchToWorktree(
   ports: MarketplacePatchApplicationPorts,
 ): Promise<ValidatedMarketplacePatch> {
   const validated = validateMarketplacePatch(input.artifact);
+  const canonicalArtifact = Uint8Array.from(validated.artifact);
   const authority = await ports.worktreeProof.prove({
     manifestPath: input.manifestPath,
     worktreePath: input.worktreePath,
@@ -855,7 +937,7 @@ export async function applyMarketplacePatchToWorktree(
   const runGit = ports.runGit ?? runMarketplacePatchGit;
   const lstat = ports.lstat ?? marketplacePatchLstat;
   await proveIndexAndFilesystem(validated, input.worktreePath, runGit, lstat);
-  await runApplyStage(runGit, input.worktreePath, validated.artifact, true);
-  await runApplyStage(runGit, input.worktreePath, validated.artifact, false);
-  return validated;
+  await runApplyStage(runGit, input.worktreePath, Uint8Array.from(canonicalArtifact), true);
+  await runApplyStage(runGit, input.worktreePath, Uint8Array.from(canonicalArtifact), false);
+  return { ...validated, artifact: Uint8Array.from(canonicalArtifact) };
 }
