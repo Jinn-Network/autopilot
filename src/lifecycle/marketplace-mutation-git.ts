@@ -103,10 +103,20 @@ function isChildWorkflow(workflow: MarketplaceMutationWorkflow): boolean {
 }
 
 /**
- * Canonical digest of the marketplace-to-host correlation. Derived only from
- * the durable correlation identity — never from repository-local topology — so
- * the same delivery yields the same digest wherever it is adopted, and a
- * post-crash reconstruction reproduces exactly what the commit recorded.
+ * Canonical digest of the marketplace-to-host correlation. It is a pure
+ * function of the delivered identity — never of repository-local topology — so
+ * the same delivery yields the same digest wherever it is adopted.
+ *
+ * It is deliberately *not* a function of the commit object. Reconstruction
+ * after a crash re-derives the digest from the identity the caller supplies and
+ * then verifies that identity against the commit; it does not read the identity
+ * out of the commit. Every field except `workflow` is verified that way, since
+ * each has a literal trailer. `workflow` is folded into the preimage but is not
+ * recorded on the commit at all, so it is not recoverable from the commit
+ * object: two identities differing only in `workflow` accept the same commit and
+ * yield different digests. That is sound because `workflow` is durable
+ * host-side state — the v3 execution state names the workflow that adopted the
+ * delivery — but no caller may treat the digest as derivable from Git alone.
  */
 function correlationDigestOf(identity: MarketplaceMutationCommitIdentity): string {
   const preimage = [
@@ -145,6 +155,17 @@ function assertCoherentIdentity(identity: MarketplaceMutationCommitIdentity): vo
   }
   if (identity.reconcileBase !== undefined && identity.workflow !== 'reconcile') {
     invalid(`Marketplace ${identity.workflow} host commit forbids a reconcile base`);
+  }
+  // The commit message is the only durable carrier of the correlation, so an
+  // identity whose trailers do not read back out of the message it composes
+  // must be refused before `commit-tree` can advance HEAD onto a commit this
+  // module would then be unable to reconstruct.
+  const parsed = parseHostCommitTrailers(messageOf(identity));
+  const detail = 'detail' in parsed
+    ? parsed.detail
+    : trailerDisagreement(expectedTrailerFieldsOf(identity), parsed.fields);
+  if (detail !== undefined) {
+    invalid(`Marketplace host commit message does not read back: ${detail}`);
   }
 }
 
@@ -199,6 +220,36 @@ function trailerLinesOf(identity: MarketplaceMutationCommitIdentity): readonly s
 
 function messageOf(identity: MarketplaceMutationCommitIdentity): string {
   return [identity.summary.trim(), '', ...trailerLinesOf(identity)].join('\n');
+}
+
+function expectedTrailerFieldsOf(
+  identity: MarketplaceMutationCommitIdentity,
+): ReadonlyMap<string, string> {
+  return new Map<string, string>(
+    trailerLinesOf(identity).map((line) => {
+      const separator = line.indexOf(': ');
+      return [line.slice(0, separator), line.slice(separator + 2)];
+    }),
+  );
+}
+
+/**
+ * The single reason `observed` fails to be exactly `expected`, or `undefined`
+ * when the two agree field for field.
+ */
+function trailerDisagreement(
+  expected: ReadonlyMap<string, string>,
+  observed: ReadonlyMap<string, string>,
+): string | undefined {
+  for (const [key, value] of expected) {
+    const seen = observed.get(key);
+    if (seen === undefined) return `missing correlation trailer: ${key}`;
+    if (seen !== value) return `correlation trailer ${key} is ${seen}, not ${value}`;
+  }
+  for (const key of observed.keys()) {
+    if (!expected.has(key)) return `unexpected correlation trailer: ${key}`;
+  }
+  return undefined;
 }
 
 /**
@@ -274,10 +325,14 @@ export function createMarketplaceMutationGitPort(
     await gitLine(identity, ['read-tree', `${identity.expectedHead}^{tree}`], { indexFile });
     // `--cached` keeps this entirely inside the scratch index: Task 3 already
     // applied the patch to the real worktree and this must not re-apply it.
-    await gitLine(identity, ['apply', '--cached', '-'], {
-      indexFile,
-      stdin: Uint8Array.from(identity.artifact),
-    });
+    // The `--check` dry run precedes the real apply under the same options, as
+    // the plan requires; `--3way` is never used.
+    for (const check of [['--check'], []]) {
+      await gitLine(identity, ['apply', '--cached', ...check, '-'], {
+        indexFile,
+        stdin: Uint8Array.from(identity.artifact),
+      });
+    }
     const tree = gitOid(await gitLine(identity, ['write-tree'], { indexFile }));
     const base = gitOid(await gitLine(identity, ['rev-parse', `${identity.expectedHead}^{tree}`]));
     if (tree === base) {
@@ -300,12 +355,16 @@ export function createMarketplaceMutationGitPort(
     return gitOid(await gitLine(identity, ['write-tree'], { indexFile }));
   });
 
+  /**
+   * Paths differing between two trees, read from raw `-z` output rather than a
+   * trimmed line, so a path with leading or trailing spaces is reported intact.
+   */
   const divergentPathsOf = async (
     identity: MarketplaceMutationCommitIdentity,
     left: GitOid,
     right: GitOid,
   ): Promise<readonly string[]> => (
-    await gitLine(identity, ['diff', '--name-only', '-z', left, right])
+    await git(identity, ['diff', '--name-only', '-z', left, right])
   ).split('\0').filter((path) => path.length > 0);
 
   const parentsOf = async (
@@ -358,24 +417,11 @@ export function createMarketplaceMutationGitPort(
     }
     const parsed = parseHostCommitTrailers(await messageAt(identity, candidate));
     if ('detail' in parsed) return { detail: `${candidate}: ${parsed.detail}` };
-    const expectedFields = new Map<string, string>(
-      trailerLinesOf(identity).map((line) => {
-        const separator = line.indexOf(': ');
-        return [line.slice(0, separator), line.slice(separator + 2)];
-      }),
+    const disagreement = trailerDisagreement(
+      expectedTrailerFieldsOf(identity),
+      parsed.fields,
     );
-    for (const [key, value] of expectedFields) {
-      const observed = parsed.fields.get(key);
-      if (observed === undefined) return { detail: `${candidate}: missing correlation trailer: ${key}` };
-      if (observed !== value) {
-        return { detail: `${candidate}: correlation trailer ${key} is ${observed}, not ${value}` };
-      }
-    }
-    for (const key of parsed.fields.keys()) {
-      if (!expectedFields.has(key)) {
-        return { detail: `${candidate}: unexpected correlation trailer: ${key}` };
-      }
-    }
+    if (disagreement !== undefined) return { detail: `${candidate}: ${disagreement}` };
     return {
       head: candidate,
       tree,
@@ -470,12 +516,36 @@ export function createMarketplaceMutationGitPort(
     return { status: 'committed', expectedTree, commit: evidence };
   };
 
+  /**
+   * Points the attempt's real index at `HEAD` once the host commit exists.
+   *
+   * Task 3 applies the delivered patch to the working tree without `--index`,
+   * so the real index still describes the pre-delivery tree; a commit built
+   * from a scratch index therefore leaves every delivered path staged as a
+   * reversal of the commit just made, and the worktree reads dirty forever to
+   * attempt reclamation and the drift sweep. `read-tree` without `-u` rewrites
+   * the index alone and never touches a working-tree file, which is safe here
+   * precisely because the worktree already equals the committed tree — that is
+   * what `pending`, and the committed branch's tree comparison, established.
+   */
+  const alignIndexWithHead = async (
+    identity: MarketplaceMutationCommitIdentity,
+  ): Promise<void> => {
+    await gitLine(identity, ['read-tree', 'HEAD']);
+  };
+
   return {
     readState,
 
     async commit(identity) {
       const state = await readState(identity);
-      if (state.status === 'committed') return state.commit;
+      if (state.status === 'committed') {
+        // A crash between the ref move and the refresh below lands here; the
+        // recovery must leave the index consistent too, or that window is
+        // permanently dirty.
+        await alignIndexWithHead(identity);
+        return state.commit;
+      }
       if (state.status !== 'pending') {
         throw new MarketplaceMutationGitError(
           'not-pending',
@@ -489,9 +559,13 @@ export function createMarketplaceMutationGitPort(
         ...parents.flatMap((parent) => ['-p', parent]),
       ], { stdin: encoder.encode(messageOf(identity)) }));
       await gitLine(identity, ['update-ref', 'HEAD', created, identity.expectedHead]);
+      await alignIndexWithHead(identity);
       const evidence = await reconstruct(identity, state.expectedTree, created);
       if ('detail' in evidence) {
-        throw new Error(`Marketplace host commit did not reconstruct: ${evidence.detail}`);
+        throw new MarketplaceMutationGitError(
+          'identity-invalid',
+          `Marketplace host commit did not reconstruct: ${evidence.detail}`,
+        );
       }
       return evidence;
     },

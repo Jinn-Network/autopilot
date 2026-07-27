@@ -7,9 +7,12 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   createMarketplaceMutationGitPort,
-  MarketplaceMutationGitError,
   type MarketplaceMutationCommitIdentity,
 } from '../../src/lifecycle/marketplace-mutation-git.js';
+import {
+  decodeMarketplaceExecutionV3State,
+  type MarketplaceHostCommitEvidence,
+} from '../../src/lifecycle/marketplace-execution-state.js';
 import { runMarketplacePatchGit } from '../../src/lifecycle/marketplace-patch.js';
 import { gitOid, type GitOid } from '../../src/lifecycle/types.js';
 
@@ -24,6 +27,17 @@ afterEach(() => {
 async function git(cwd: string, args: readonly string[]): Promise<string> {
   const result = await execFileAsync('git', [...args], { cwd, encoding: 'utf8' });
   return result.stdout;
+}
+
+/** The process exit status of a Git command, for predicate commands. */
+async function gitExitCode(cwd: string, args: readonly string[]): Promise<number> {
+  try {
+    await execFileAsync('git', [...args], { cwd, encoding: 'utf8' });
+    return 0;
+  } catch (error) {
+    const code = (error as { readonly code?: unknown }).code;
+    return typeof code === 'number' ? code : -1;
+  }
 }
 
 function bytes(text: string): Uint8Array {
@@ -132,6 +146,118 @@ function identity(
   };
 }
 
+/**
+ * Correlation identity that the strict execution-state decoder accepts: a UUID
+ * attempt, a decimal task ID and a 32-byte request ID. The generic tests above
+ * use readable placeholders; the decoder-conformance test must not.
+ */
+const DECODER_ATTEMPT_ID = '11111111-1111-4111-8111-111111111111';
+const DECODER_RUNNER_DIR = '/tmp/autopilot/v2/runner-a';
+const DECODER_ATTEMPT_DIR = `${DECODER_RUNNER_DIR}/implement/issue-42-${DECODER_ATTEMPT_ID}`;
+const DECODER_TASK_ID = '501';
+const DECODER_REQUEST_ID = `0x${'9'.repeat(64)}`;
+const DECODER_ENVELOPE_CID = 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid';
+const DECODER_TASK_CID = 'bafybeigdyrzt5m6u2r3o4exampletaskcid';
+const DECODER_SOLVER_CID = 'bafybeigdyrzt5m6u2r3o4examplesolvercid';
+const DECODER_CREATION_TX = `0x${'d'.repeat(64)}`;
+
+function fill(character: string): string {
+  return `sha256:${character.repeat(64)}`;
+}
+
+/**
+ * The smallest v3 execution state that carries a host commit, so the evidence
+ * this port produces is decoded by the very function the lifecycle uses rather
+ * than merely inspected for shape.
+ */
+function hostCommittedState(
+  fix: Fixture,
+  evidence: MarketplaceHostCommitEvidence,
+): unknown {
+  return {
+    schemaVersion: 'marketplace-execution-v3',
+    status: 'host-committed',
+    requestPath: `${DECODER_ATTEMPT_DIR}/marketplace-request.json`,
+    requestDigest: fill('b'),
+    solverNetSelectionPath:
+      `${DECODER_ATTEMPT_DIR}/marketplace-request.json.solvernet-selection.json`,
+    preparedAt: '2020-01-01T00:00:00.000Z',
+    agentSoftDeadline: '2020-01-01T01:00:00.000Z',
+    adoptionDeadline: '2020-01-01T02:00:00.000Z',
+    submission: {
+      schemaVersion: 1,
+      generatedAt: '2020-01-01T00:00:00.000Z',
+      verb: 'tasks submit',
+      id: `autopilot:${DECODER_ATTEMPT_ID}`,
+      creatorMultisig: `0x${'c'.repeat(40)}`,
+      taskId: DECODER_TASK_ID,
+      taskCid: DECODER_TASK_CID,
+      creationTx: DECODER_CREATION_TX,
+      creationBlock: 501,
+      solverNetManifestCid: DECODER_SOLVER_CID,
+      status: 'submitted',
+      idempotent: false,
+    },
+    submittedAt: '2020-01-01T00:01:00.000Z',
+    delivery: {
+      observationPath: `${DECODER_ATTEMPT_DIR}/delivery.json`,
+      observationDigest: fill('b'),
+      taskId: DECODER_TASK_ID,
+      taskCid: DECODER_TASK_CID,
+      taskCreationTransaction: DECODER_CREATION_TX,
+      taskCreationBlock: 501,
+      solverNetManifestCid: DECODER_SOLVER_CID,
+      attemptIndex: 0,
+      requestId: DECODER_REQUEST_ID,
+      deliveryEnvelopeCid: DECODER_ENVELOPE_CID,
+      deliveryEnvelopeDigest: fill('e'),
+      deliveryTransaction: `0x${'f'.repeat(64)}`,
+      deliveryBlock: 502,
+      solverSafe: `0x${'1'.repeat(40)}`,
+      solverAgentEoa: `0x${'2'.repeat(40)}`,
+      signer: `0x${'2'.repeat(40)}`,
+      publisherAgentId: '501',
+      correlation: {
+        taskId: DECODER_TASK_ID,
+        attemptIndex: 0,
+        requestId: DECODER_REQUEST_ID,
+        deliveryEnvelopeCid: DECODER_ENVELOPE_CID,
+        v2AttemptId: DECODER_ATTEMPT_ID,
+        claimOid: fix.baseHead,
+        prNumber: 42,
+        expectedHead: fix.baseHead,
+      },
+      observedAt: '2020-01-01T00:02:00.000Z',
+    },
+    artifact: {
+      digest: sha256(VALUE_PATCH),
+      byteLength: VALUE_PATCH.byteLength,
+      touchedPaths: ['src/value.ts'],
+      expectedTree: fix.targetTree,
+    },
+    verification: {
+      profile: 'jinn-mono.v1',
+      artifactDigest: sha256(VALUE_PATCH),
+      expectedTree: fix.targetTree,
+      planDigest: fill('5'),
+      commands: [{
+        label: 'typecheck',
+        command: 'yarn',
+        args: ['typecheck'],
+        cwdRelative: '.',
+        status: 'passed',
+        exitCode: 0,
+        stdoutDigest: fill('6'),
+        stderrDigest: fill('7'),
+        startedAt: '2020-01-01T00:03:00.000Z',
+        completedAt: '2020-01-01T00:04:00.000Z',
+      }],
+      verifiedAt: '2020-01-01T00:04:00.000Z',
+    },
+    hostCommit: evidence,
+  };
+}
+
 /** The exact host-commit message this port is expected to write. */
 function hostMessage(childIssueNumber?: number): string {
   return [
@@ -213,7 +339,6 @@ describe('marketplace mutation git port', () => {
         name: 'MarketplaceMutationGitError',
         reason: 'no-op-patch',
       });
-    expect(MarketplaceMutationGitError).toBeTypeOf('function');
   });
 
   it('contradicts when the worktree carries a path outside the delivered patch', async () => {
@@ -312,10 +437,14 @@ describe('marketplace mutation git port', () => {
     const created = await port.commit(reconcile);
 
     expect(created.parents).toEqual([fix.baseHead, fix.sideHead]);
-    // The reconcile leg exists to make the base an ancestor of the PR branch.
-    await expect(git(fix.root, [
+    // The reconcile leg exists to make the base an ancestor of the PR branch:
+    // `merge-base --is-ancestor` answers that as an exit status, 0 for yes.
+    expect(await gitExitCode(fix.root, [
       'merge-base', '--is-ancestor', fix.sideHead, created.head,
-    ])).resolves.toBeDefined();
+    ])).toBe(0);
+    expect(await gitExitCode(fix.root, [
+      'merge-base', '--is-ancestor', created.head, fix.sideHead,
+    ])).toBe(1);
     expect(await port.readState(reconcile))
       .toEqual({ status: 'committed', expectedTree: fix.targetTree, commit: created });
   });
@@ -502,7 +631,7 @@ describe('marketplace mutation git port', () => {
       });
   });
 
-  it('produces evidence shaped exactly as the execution-state decoder demands', async () => {
+  it('produces evidence the execution-state decoder accepts unchanged', async () => {
     const fix = await fixture();
     write(fix.root, 'src/value.ts', 'new\n');
     const port = createMarketplaceMutationGitPort();
@@ -510,7 +639,20 @@ describe('marketplace mutation git port', () => {
     const created = await port.commit(identity(fix, {
       workflow: 'ci-failure',
       childIssueNumber: 12,
+      taskId: DECODER_TASK_ID,
+      requestId: DECODER_REQUEST_ID,
+      deliveryEnvelopeCid: DECODER_ENVELOPE_CID,
+      v2AttemptId: DECODER_ATTEMPT_ID,
     }));
+
+    // The binding constraint: this exact object must survive the strict,
+    // exact-key decoder the lifecycle runs over persisted execution state.
+    const decoded = decodeMarketplaceExecutionV3State(
+      hostCommittedState(fix, created),
+      DECODER_ATTEMPT_DIR,
+    );
+    expect(decoded.status).toBe('host-committed');
+    expect(decoded.status === 'host-committed' && decoded.hostCommit).toEqual(created);
 
     expect(Object.keys(created).sort()).toEqual([
       'artifactDigest', 'correlationDigest', 'createdAt', 'head', 'parents',
@@ -544,5 +686,127 @@ describe('marketplace mutation git port', () => {
 
     expect(same.correlationDigest).toBe(first.correlationDigest);
     expect(changed.correlationDigest).not.toBe(first.correlationDigest);
+  });
+
+  it('leaves the attempt worktree clean once the host commit exists', async () => {
+    const fix = await fixture();
+    write(fix.root, 'src/value.ts', 'new\n');
+    const port = createMarketplaceMutationGitPort();
+
+    await port.commit(identity(fix));
+
+    // Task 3 applied the patch without `--index`, so the real index still held
+    // the pre-delivery tree. Unless the commit refreshes it, every later
+    // cleanliness check — attempt reclamation, drift sweep — reads this
+    // worktree as permanently dirty.
+    expect((await git(fix.root, ['status', '--porcelain', '--untracked-files=all'])).trim())
+      .toBe('');
+    expect((await git(fix.root, ['diff', '--cached', '--name-status'])).trim()).toBe('');
+    expect((await git(fix.root, ['show', '-s', '--format=%T', 'HEAD'])).trim())
+      .toBe(fix.targetTree);
+    expect((await git(fix.root, ['show', 'HEAD:src/value.ts']))).toBe('new\n');
+  });
+
+  it('reclaims a worktree a crash left between the ref move and the index refresh', async () => {
+    const fix = await fixture();
+    write(fix.root, 'src/value.ts', 'new\n');
+    // Crash exactly inside the window: HEAD has already advanced, the real
+    // index still describes the attempt head. Only real-index reads carry no
+    // `GIT_INDEX_FILE`; every scratch-index read must keep working.
+    const crashing = createMarketplaceMutationGitPort({
+      runGit: async (args, options) => {
+        if (args[0] === 'read-tree' && options.env?.GIT_INDEX_FILE === undefined) {
+          throw new Error('crashed before the index refresh');
+        }
+        return runMarketplacePatchGit(args, options);
+      },
+    });
+
+    await expect(crashing.commit(identity(fix)))
+      .rejects.toThrow('crashed before the index refresh');
+    const moved = (await git(fix.root, ['rev-parse', 'HEAD'])).trim();
+    expect(moved).not.toBe(fix.baseHead);
+    expect((await git(fix.root, ['status', '--porcelain'])).trim()).not.toBe('');
+
+    const recovered = await createMarketplaceMutationGitPort().commit(identity(fix));
+
+    expect(recovered.head).toBe(moved);
+    expect((await git(fix.root, ['status', '--porcelain', '--untracked-files=all'])).trim())
+      .toBe('');
+  });
+
+  it('checks the delivered patch before applying it to the scratch index', async () => {
+    const fix = await fixture();
+    const seen: string[][] = [];
+    const port = createMarketplaceMutationGitPort({
+      runGit: async (args, options) => {
+        seen.push([...args]);
+        return runMarketplacePatchGit(args, options);
+      },
+    });
+
+    await port.readState(identity(fix));
+
+    const applies = seen.filter((args) => args[0] === 'apply');
+    expect(applies).toHaveLength(2);
+    expect(applies[0]).toContain('--check');
+    expect(applies[1]).not.toContain('--check');
+  });
+
+  it('refuses an identity whose trailers would not survive the commit message', async () => {
+    const fix = await fixture();
+    write(fix.root, 'src/value.ts', 'new\n');
+    const port = createMarketplaceMutationGitPort();
+
+    // A newline in a trailer value injects a second trailer line. The commit
+    // must never be written, let alone become HEAD, on an identity the module
+    // cannot read back.
+    await expect(port.commit(identity(fix, {
+      taskId: 'task-7\nJinn-Marketplace-Request: injected',
+    }))).rejects.toMatchObject({
+      name: 'MarketplaceMutationGitError',
+      reason: 'identity-invalid',
+    });
+
+    expect((await git(fix.root, ['rev-parse', 'HEAD'])).trim()).toBe(fix.baseHead);
+  });
+
+  it('refuses to commit a worktree the delivered patch was never applied to', async () => {
+    const fix = await fixture();
+    const port = createMarketplaceMutationGitPort();
+
+    await expect(port.commit(identity(fix))).rejects.toMatchObject({
+      name: 'MarketplaceMutationGitError',
+      reason: 'not-pending',
+    });
+
+    expect((await git(fix.root, ['rev-parse', 'HEAD'])).trim()).toBe(fix.baseHead);
+  });
+
+  it('contradicts a head that is not a first-parent descendant of the attempt head', async () => {
+    const fix = await fixture();
+    await git(fix.root, ['reset', '--hard', fix.ancestorHead]);
+    const port = createMarketplaceMutationGitPort();
+
+    const state = await port.readState(identity(fix));
+
+    expect(state.status).toBe('contradiction');
+    expect(state.status === 'contradiction' && state.detail)
+      .toContain('not a first-parent descendant');
+  });
+
+  it('contradicts a worktree edited after the host commit was created', async () => {
+    const fix = await fixture();
+    write(fix.root, 'src/value.ts', 'new\n');
+    const port = createMarketplaceMutationGitPort();
+    const created = await port.commit(identity(fix));
+    write(fix.root, 'docs/notes.md', 'edited after the host commit\n');
+
+    const state = await port.readState(identity(fix));
+
+    expect(state.status).toBe('contradiction');
+    expect(state.status === 'contradiction' && state.detail)
+      .toContain('diverges from committed head tree');
+    expect((await git(fix.root, ['rev-parse', 'HEAD'])).trim()).toBe(created.head);
   });
 });
