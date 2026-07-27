@@ -707,6 +707,30 @@ describe('marketplace mutation git port', () => {
     expect((await git(fix.root, ['show', 'HEAD:src/value.ts']))).toBe('new\n');
   });
 
+  it('requires commit() after readState reports committed while the real index is stale', async () => {
+    const fix = await fixture();
+    write(fix.root, 'src/value.ts', 'new\n');
+    const crashing = createMarketplaceMutationGitPort({
+      runGit: async (args, options) => {
+        if (args[0] === 'read-tree' && options.env?.GIT_INDEX_FILE === undefined) {
+          throw new Error('crashed before the index refresh');
+        }
+        return runMarketplacePatchGit(args, options);
+      },
+    });
+    await expect(crashing.commit(identity(fix)))
+      .rejects.toThrow('crashed before the index refresh');
+
+    const port = createMarketplaceMutationGitPort();
+    const observed = await port.readState(identity(fix));
+    expect(observed.status).toBe('committed');
+    expect((await git(fix.root, ['status', '--porcelain'])).trim()).not.toBe('');
+
+    await port.commit(identity(fix));
+    expect((await git(fix.root, ['status', '--porcelain', '--untracked-files=all'])).trim())
+      .toBe('');
+  });
+
   it('reclaims a worktree a crash left between the ref move and the index refresh', async () => {
     const fix = await fixture();
     write(fix.root, 'src/value.ts', 'new\n');

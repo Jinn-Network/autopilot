@@ -1,13 +1,20 @@
-import { expect, describe, it } from 'vitest';
+import { afterEach, expect, describe, it, vi } from 'vitest';
 import {
   MarketplaceMachineCliFailure,
   MarketplaceMachineCliProtocolError,
+  MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES,
+  MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS,
   marketplaceMachineEnvironment,
   parseMarketplaceMachineFailure,
   resolveInstalledJinnBinary,
+  runMarketplaceMachineSubprocess,
 } from '../../src/lifecycle/marketplace-cli.js';
 
 describe('marketplace machine CLI boundary', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('resolves the executable declared by the installed client package', () => {
     expect(resolveInstalledJinnBinary()).toContain(
       '/node_modules/@jinn-network/client/dist/bin/jinn.js',
@@ -48,6 +55,28 @@ describe('marketplace machine CLI boundary', () => {
     expect(envelope.code).toBe('transient_error');
     expect(() => { throw new MarketplaceMachineCliFailure(envelope, result.stderr); })
       .toThrow('RPC endpoint unavailable');
+  });
+
+  it('rejects marketplace machine subprocess output above the bounded limit', async () => {
+    const overLimit = MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES + 1;
+    await expect(runMarketplaceMachineSubprocess(
+      process.execPath,
+      ['-e', `process.stdout.write('x'.repeat(${overLimit}))`],
+      { environment: process.env },
+    )).rejects.toThrow(/output limit/i);
+  });
+
+  it('times out a hung marketplace machine subprocess', async () => {
+    vi.useFakeTimers();
+    const pending = runMarketplaceMachineSubprocess(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1_000_000)'],
+      { environment: process.env },
+    );
+    await vi.advanceTimersByTimeAsync(MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS + 1);
+    await expect(pending).rejects.toThrow(
+      new RegExp(`${MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS}ms`),
+    );
   });
 
   it('rejects a malformed or mismatched nonzero client failure envelope', () => {

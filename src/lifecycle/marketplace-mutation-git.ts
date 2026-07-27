@@ -46,10 +46,32 @@ export type MarketplaceMutationGitState =
     }
   | { readonly status: 'contradiction'; readonly detail: string };
 
+/**
+ * Git port for marketplace host commits.
+ *
+ * **Stale real-index obligation.** Task 3 applies delivered patches to the
+ * working tree without `--index`, so the real index can lag behind HEAD after a
+ * host commit. If `readState` returns `{ status: 'committed' }`, the ref has
+ * already advanced but the real index may still describe the pre-delivery tree
+ * (for example after a crash between `update-ref` and index alignment).
+ * **Callers MUST invoke `commit()`** before relying on worktree or index
+ * cleanliness; `commit()` is idempotent and performs the required index repair
+ * when status is already `committed`.
+ */
 export interface MarketplaceMutationGitPort {
+  /**
+   * Observes host-commit state from git facts without mutating the real index.
+   *
+   * A `committed` result means the host ref moved forward; callers still owe the
+   * stale real-index repair described on {@link MarketplaceMutationGitPort}.
+   */
   readState(
     identity: MarketplaceMutationCommitIdentity,
   ): Promise<MarketplaceMutationGitState>;
+  /**
+   * Creates the host commit from a pending worktree, or repairs a `committed`
+   * state by aligning the real index with HEAD.
+   */
   commit(
     identity: MarketplaceMutationCommitIdentity,
   ): Promise<MarketplaceHostCommitEvidence>;

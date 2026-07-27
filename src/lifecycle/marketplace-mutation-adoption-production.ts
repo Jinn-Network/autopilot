@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process';
 import { cp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -53,11 +52,15 @@ import {
   type MarketplaceVerificationDockerRunner,
 } from './marketplace-mutation-verification-production.js';
 import type { MarketplaceMutationVerificationPort } from './marketplace-mutation-verification.js';
+import type {
+  MarketplaceAttemptWorktreeProofPort,
+  MarketplacePatchApplicationPorts,
+} from './marketplace-patch.js';
 import {
   applyMarketplacePatchToWorktree,
+  runMarketplacePatchGit,
   validateMarketplacePatch,
   type MarketplaceAttemptWorktreeProof,
-  type MarketplaceAttemptWorktreeProofPort,
 } from './marketplace-patch.js';
 import type { MarketplaceReviewAnchorOrigin } from './marketplace-review-anchor.js';
 import { transitionMarketplaceAdoption } from './marketplace-adoption-state.js';
@@ -592,6 +595,15 @@ export interface ProductionMarketplaceMutationAdoptionOptions {
   readonly dockerRunner?: MarketplaceVerificationDockerRunner;
 }
 
+export function makeProductionMarketplacePatchPorts(
+  worktreeProof: MarketplaceAttemptWorktreeProofPort,
+): MarketplacePatchApplicationPorts {
+  return {
+    worktreeProof,
+    runGit: runMarketplacePatchGit,
+  };
+}
+
 export function makeProductionMarketplaceMutationAdoptionCoordinator(
   options: ProductionMarketplaceMutationAdoptionOptions,
 ): MarketplaceMutationAdoptionCoordinator {
@@ -663,36 +675,10 @@ export function makeProductionMarketplaceMutationAdoptionCoordinator(
       environment: ambient,
     }),
     validatePatch: validateMarketplacePatch,
-    applyPatch: (input) => applyMarketplacePatchToWorktree(input, {
-      worktreeProof,
-      runGit: async (args, gitOptions) => new Promise<Uint8Array>((resolve, reject) => {
-        const child = spawn('git', [...args], {
-          cwd: gitOptions.cwd,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          ...(gitOptions.env === undefined
-            ? {}
-            : { env: { ...process.env, ...gitOptions.env } }),
-        });
-        const stdout: Buffer[] = [];
-        const stderr: Buffer[] = [];
-        child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
-        child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
-        if (gitOptions.stdin !== undefined) {
-          child.stdin.write(gitOptions.stdin);
-        }
-        child.stdin.end();
-        child.on('error', reject);
-        child.on('close', (code) => {
-          if (code !== 0) {
-            reject(new Error(
-              Buffer.concat(stderr).toString('utf8') || `git exited ${code}`,
-            ));
-            return;
-          }
-          resolve(Uint8Array.from(Buffer.concat(stdout)));
-        });
-      }),
-    }),
+    applyPatch: (input) => applyMarketplacePatchToWorktree(
+      input,
+      makeProductionMarketplacePatchPorts(worktreeProof),
+    ),
     git: createMarketplaceMutationGitPort(),
     verification,
     implementation,

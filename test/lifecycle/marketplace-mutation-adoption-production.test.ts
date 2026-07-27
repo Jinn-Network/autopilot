@@ -21,10 +21,14 @@ import {
   makeProductionMarketplaceAdoptionReceiptPorts,
   makeProductionMarketplaceMutationAdoptionCoordinator,
   makeProductionMarketplaceMutationAuthorityPort,
+  makeProductionMarketplacePatchPorts,
   secureMarketplaceAdoptionGitHubRunner,
   shouldExcludeWorktreeVerificationCopyPath,
   copyWorktreeForVerification,
 } from '../../src/lifecycle/marketplace-mutation-adoption-production.js';
+import {
+  runMarketplacePatchGit,
+} from '../../src/lifecycle/marketplace-patch.js';
 import {
   buildJinnMonoV1VerificationPlan,
   marketplaceVerificationPlanDigest,
@@ -600,6 +604,15 @@ describe('production marketplace mutation authority port', () => {
         }),
       }),
     );
+  });
+});
+
+describe('production marketplace patch application ports', () => {
+  it('wires the hardened marketplace patch git runner into production applyPatch', () => {
+    const ports = makeProductionMarketplacePatchPorts({
+      prove: async () => { throw new Error('unused'); },
+    });
+    expect(ports.runGit).toBe(runMarketplacePatchGit);
   });
 });
 

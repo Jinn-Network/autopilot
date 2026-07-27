@@ -89,6 +89,19 @@ export function resolveInstalledJinnBinary(): string {
   return binary;
 }
 
+export const MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS = 300_000;
+export const MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+
+export class MarketplaceMachineSubprocessPolicyError extends Error {
+  readonly reason: 'timeout' | 'output-limit';
+
+  constructor(reason: 'timeout' | 'output-limit', message: string) {
+    super(message);
+    this.name = 'MarketplaceMachineSubprocessPolicyError';
+    this.reason = reason;
+  }
+}
+
 export const runMarketplaceMachineSubprocess: MarketplaceMachineSubprocess = (
   command,
   args,
@@ -98,17 +111,63 @@ export const runMarketplaceMachineSubprocess: MarketplaceMachineSubprocess = (
     env: options.environment,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk: Buffer) => {
-    stdout += chunk.toString();
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  let outputBytes = 0;
+  let settled = false;
+  let timedOut = false;
+  let exceededOutput = false;
+
+  const stop = (reason: 'timeout' | 'output'): void => {
+    if (settled) return;
+    if (reason === 'timeout') timedOut = true;
+    else exceededOutput = true;
+    child.kill('SIGKILL');
+  };
+  const timer = setTimeout(
+    () => stop('timeout'),
+    MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS,
+  );
+  const collect = (target: Buffer[], chunk: Buffer): void => {
+    if (settled) return;
+    outputBytes += chunk.byteLength;
+    if (outputBytes > MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES) {
+      stop('output');
+      return;
+    }
+    target.push(chunk);
+  };
+  child.stdout.on('data', (chunk: Buffer) => collect(stdout, chunk));
+  child.stderr.on('data', (chunk: Buffer) => collect(stderr, chunk));
+  child.on('error', (error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    reject(error);
   });
-  child.stderr.on('data', (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-  child.on('error', reject);
   child.on('close', (exitCode) => {
-    resolve({ exitCode: exitCode ?? 50, stdout, stderr });
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if (timedOut) {
+      reject(new MarketplaceMachineSubprocessPolicyError(
+        'timeout',
+        `${command} ${args.join(' ')} exceeded ${MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS}ms`,
+      ));
+      return;
+    }
+    if (exceededOutput) {
+      reject(new MarketplaceMachineSubprocessPolicyError(
+        'output-limit',
+        `${command} ${args.join(' ')} exceeded its output limit`,
+      ));
+      return;
+    }
+    resolve({
+      exitCode: exitCode ?? 50,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8'),
+    });
   });
 });
 
