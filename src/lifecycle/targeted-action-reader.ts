@@ -443,6 +443,31 @@ export function makeTargetedActionReader(
       const cycleOpen = new Map(cycleSnapshot.pullRequests
         .filter((pr) => pr.state === 'OPEN')
         .map((pr) => [pr.number, pr]));
+      /** True when the cycle-cached row is exactly the row the index reports. */
+      const cacheIsFresh = (
+        prior: GitHubLifecycleSnapshot['pullRequests'][number],
+        entry: PullRequestIndexEntry,
+      ): boolean => (
+        prior.updatedAt !== undefined
+        && prior.updatedAt === entry.updatedAt
+        && prior.headOid === entry.headOid
+        && prior.headRefName === entry.headRefName
+        && prior.baseRefName === entry.baseRefName
+        && prior.isDraft === entry.isDraft
+      );
+      /**
+       * One live read per PR number, reserved once and reused. The base chain
+       * walk and the refresh loop below need the same rows, and reading a PR
+       * once must not bill the rate limit twice.
+       */
+      const liveByNumber = new Map<number, RawPullRequest | null>();
+      const readLive = async (number: number): Promise<RawPullRequest | null> => {
+        if (!liveByNumber.has(number)) {
+          await reserve(TARGETED_PR_RESERVE);
+          liveByNumber.set(number, await options.readPullRequest(number));
+        }
+        return liveByNumber.get(number) ?? null;
+      };
       // Ref names the target is stacked on, walked through the index so a
       // multi-level stack keeps every parent authority-bearing, plus every
       // issue those parents are evidence for. The target's mapping is resolved
@@ -450,10 +475,10 @@ export function makeTargetedActionReader(
       // mapping turns ambiguous as soon as a second open PR contends for that
       // ancestor's issue. So authority reaches the whole transitive chain, not
       // just the target issue's direct blockers.
-      const baseChain = ((): {
+      const baseChain = await (async (): Promise<{
         readonly refNames: ReadonlySet<string>;
         readonly issueNumbers: ReadonlySet<number>;
-      } => {
+      }> => {
         const byHeadRefName = new Map<string, PullRequestIndexEntry>();
         for (const entry of indexed.values()) {
           if (entry.number !== prNumber) byHeadRefName.set(entry.headRefName, entry);
@@ -467,11 +492,29 @@ export function makeTargetedActionReader(
           if (parent === undefined) break;
           const cached = cycleSnapshot.pullRequests
             .find((pr) => pr.number === parent.number);
-          for (const number of evidencedIssueNumbers({
-            closingIssueNumbers: cached?.closingIssueNumbers,
-            headRefName: parent.headRefName,
-            body: cached?.body,
-          })) {
+          const prior = cycleOpen.get(parent.number);
+          // An index row carries only a branch name, so an ancestor whose
+          // branch is off the stable pattern has no closure knowable from the
+          // index alone. Read the ancestor live before composing the closure
+          // rather than let it fall silently empty: an ancestor missing from
+          // the cycle cache would otherwise hide every contender for its
+          // issue, and the read would fail open precisely when a contender is
+          // churning. This reaches only PRs heading the target's own base
+          // chain, which already bear on its authority — no unrelated PR gains
+          // a veto. A read that fails here contributes nothing and needs no
+          // refusal of its own; the refresh loop below refuses on the same
+          // ancestor, which heads a base chain branch.
+          const live = prior !== undefined && cacheIsFresh(prior, parent)
+            ? null
+            : await readLive(parent.number);
+          for (const number of [
+            ...evidencedIssueNumbers({
+              closingIssueNumbers: cached?.closingIssueNumbers,
+              headRefName: parent.headRefName,
+              body: cached?.body,
+            }),
+            ...(live === null ? [] : evidencedIssueNumbers(live)),
+          ]) {
             issues.add(number);
           }
           base = parent.baseRefName;
@@ -532,20 +575,11 @@ export function makeTargetedActionReader(
           continue;
         }
         const prior = cycleOpen.get(entry.number);
-        if (
-          prior !== undefined
-          && prior.updatedAt !== undefined
-          && prior.updatedAt === entry.updatedAt
-          && prior.headOid === entry.headOid
-          && prior.headRefName === entry.headRefName
-          && prior.baseRefName === entry.baseRefName
-          && prior.isDraft === entry.isDraft
-        ) {
+        if (prior !== undefined && cacheIsFresh(prior, entry)) {
           refreshed.push(prior);
           continue;
         }
-        await reserve(TARGETED_PR_RESERVE);
-        const live = await options.readPullRequest(entry.number);
+        const live = await readLive(entry.number);
         const mismatch = describeExactMismatch(entry, live, true);
         if (live === null || mismatch !== null) {
           // Only PRs the subject's authority actually rests on may veto the

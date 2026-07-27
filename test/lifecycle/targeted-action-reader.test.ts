@@ -1839,4 +1839,197 @@ describe('targeted action reader unrelated open PR churn', () => {
       /PR #401 maps to target base chain issue #9 and its headOid moved/,
     );
   });
+
+  /**
+   * The cached row is the only evidence left when a contender's live read
+   * comes back empty and its branch is off the stable pattern. Dropping the
+   * cached arm of the contention predicate would classify this contender as
+   * unrelated and let the target resolve against a PR that may already have
+   * been retargeted onto the target issue.
+   */
+  it('refuses a cached same-issue contender whose live re-read returns nothing', async () => {
+    const subject = target();
+    const contender = rawPullRequest({
+      number: 777,
+      title: 'Competing target implementation',
+      body: 'Competing work.',
+      headRefName: 'feature/dup-42',
+      headOid: RACING_LIVE_HEAD,
+      labels: [],
+      closingIssueNumbers: [42],
+      updatedAt: '2026-07-22T09:45:00.000Z',
+    });
+    const reader = vetoReader({
+      // The index row is ahead of the cycle-cached row, so the contender is
+      // re-read; the re-read then finds nothing.
+      index: [
+        indexEntry(subject),
+        indexEntry(contender, {
+          headOid: RACING_INDEX_HEAD,
+          updatedAt: '2026-07-22T10:01:00.000Z',
+        }),
+      ],
+      reads: new Map<number, RawPullRequest | null>([
+        [subject.number, subject],
+        [contender.number, null],
+      ]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject, contender), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #777 closes the target issue #42 and the live re-read returned no PR/,
+    );
+  });
+
+  /**
+   * A two-deep stack whose grandparent sits on a branch the stable-branch
+   * pattern cannot decode. Its issue closure is therefore knowable only from a
+   * row — cached or live — never from the index row's branch name, which is
+   * all the base chain walk holds for an ancestor missing from the cycle
+   * cache. Every other base-chain case in this file stacks on `autopilot/N`,
+   * where the branch name alone carries the closure and hides the gap.
+   */
+  const offPatternStack = () => ({
+    subject: rawPullRequest({ baseRefName: 'autopilot/7' }),
+    parent: rawPullRequest({
+      number: 201,
+      title: 'Parent of the stack',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+      headRefName: 'autopilot/7',
+      baseRefName: 'feature/g',
+      headOid: 'f'.repeat(40),
+      closingIssueNumbers: [7],
+    }),
+    grandparent: rawPullRequest({
+      number: 301,
+      title: 'Grandparent of the stack',
+      body: 'Grandparent work.',
+      headRefName: 'feature/g',
+      baseRefName: 'next',
+      headOid: '0'.repeat(40),
+      closingIssueNumbers: [9],
+    }),
+    contender: rawPullRequest({
+      number: 401,
+      title: 'Competing grandparent implementation',
+      body: 'Closes #9',
+      headRefName: 'feature/dup-9',
+      headOid: RACING_LIVE_HEAD,
+      labels: [],
+      closingIssueNumbers: [9],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    }),
+  });
+
+  const stackedCycle = (
+    ...pullRequests: readonly RawPullRequest[]
+  ): GitHubLifecycleSnapshot => {
+    const base = cycleSnapshot();
+    return {
+      ...base,
+      project: {
+        ...base.project,
+        items: [
+          base.project.items[0]!,
+          { ...base.project.items[0]!, id: 'item-7', number: 7 },
+          { ...base.project.items[0]!, id: 'item-9', number: 9 },
+        ],
+      },
+      issues: [
+        { ...base.issues[0]!, blockedOn: 'Another issue', blockedByIssues: [7] },
+        {
+          ...base.issues[0]!,
+          number: 7,
+          title: 'Parent issue',
+          projectItemId: 'item-7',
+          blockedOn: 'Another issue',
+          blockedByIssues: [9],
+        },
+        {
+          ...base.issues[0]!,
+          number: 9,
+          title: 'Grandparent issue',
+          projectItemId: 'item-9',
+        },
+      ],
+      pullRequests: pullRequests.map((pr) => decodePullRequestSnapshot(pr)),
+    };
+  };
+
+  const offPatternReader = (input: {
+    readonly stack: ReturnType<typeof offPatternStack>;
+    readonly contenderIndexHeadOid?: string;
+  }) => {
+    const { subject, parent, grandparent, contender } = input.stack;
+    return vetoReader({
+      index: [
+        indexEntry(subject),
+        indexEntry(parent),
+        indexEntry(grandparent),
+        indexEntry(contender, input.contenderIndexHeadOid === undefined
+          ? {}
+          : { headOid: input.contenderIndexHeadOid }),
+      ],
+      reads: new Map([
+        [subject.number, subject],
+        [parent.number, parent],
+        [grandparent.number, grandparent],
+        [contender.number, contender],
+      ]),
+      dependencies: [7],
+      blockedOn: 'Another issue',
+    });
+  };
+
+  // Control: the grandparent's closure is cached, so the contender is seen.
+  it('refuses a racing contender for a cached off-pattern grandparent issue', async () => {
+    const stack = offPatternStack();
+    const reader = offPatternReader({ stack, contenderIndexHeadOid: RACING_INDEX_HEAD });
+
+    const read = await reader.readPullRequest(
+      stackedCycle(stack.subject, stack.parent, stack.grandparent),
+      stack.subject.number,
+    );
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #401 maps to target base chain issue #9 and its headOid moved/,
+    );
+  });
+
+  // Counterfactual: the same uncached grandparent, contender quiescent. The
+  // contender survives into the composed snapshot and contends there.
+  it('leaves an uncached off-pattern grandparent ambiguous against a quiescent contender', async () => {
+    const stack = offPatternStack();
+    const reader = offPatternReader({ stack });
+
+    const snapshot = snapshotOf(await reader.readPullRequest(
+      stackedCycle(stack.subject, stack.parent),
+      stack.subject.number,
+    ));
+
+    expect(snapshot?.pullRequests.map((pr) => pr.number)).toEqual([101, 201, 301, 401]);
+    expect(snapshot?.pullRequestMappings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'ambiguous', prNumber: stack.subject.number }),
+    ]));
+  });
+
+  // Probe: identical to the counterfactual except the contender is churning.
+  // Churn must never buy authority that quiescence denies.
+  it('refuses a racing contender for an uncached off-pattern grandparent issue', async () => {
+    const stack = offPatternStack();
+    const reader = offPatternReader({ stack, contenderIndexHeadOid: RACING_INDEX_HEAD });
+
+    const read = await reader.readPullRequest(
+      stackedCycle(stack.subject, stack.parent),
+      stack.subject.number,
+    );
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #401 maps to target base chain issue #9 and its headOid moved/,
+    );
+  });
 });
