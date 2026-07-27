@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   makeTargetedActionReader,
+  targetedAuthorityRefusalDetail,
+  targetedAuthoritySnapshot as snapshotOf,
 } from '../../src/lifecycle/targeted-action-reader.js';
 import { GitHubRateLimitReserveError } from '../../src/lifecycle/github-usage.js';
 import {
@@ -312,6 +314,24 @@ function executeTargetedRecovery(
   } satisfies ImplementationExecutorDeps);
 }
 
+function indexEntry(pr: RawPullRequest, overrides: {
+  readonly headOid?: string;
+  readonly updatedAt?: string;
+} = {}) {
+  return {
+    number: pr.number,
+    title: pr.title,
+    state: 'OPEN' as const,
+    updatedAt: overrides.updatedAt ?? pr.updatedAt!,
+    headOid: overrides.headOid ?? pr.headOid,
+    headRefName: pr.headRefName,
+    baseRefName: pr.baseRefName,
+    isDraft: pr.isDraft,
+    closedAt: null,
+    mergedAt: null,
+  };
+}
+
 describe('targeted action reader', () => {
   it('hydrates only the requested PR and its mapped Project item', async () => {
     const calls: string[] = [];
@@ -337,7 +357,7 @@ describe('targeted action reader', () => {
       },
     });
 
-    const snapshot = await reader.readPullRequest(cycleSnapshot(), 101);
+    const snapshot = snapshotOf(await reader.readPullRequest(cycleSnapshot(), 101));
 
     expect(calls).toEqual([
       'quota',
@@ -428,7 +448,7 @@ describe('targeted action reader', () => {
       readBlockedByIssueNumbers: async () => [],
     });
 
-    const snapshot = await reader.readPullRequest(cycle, target.number);
+    const snapshot = snapshotOf(await reader.readPullRequest(cycle, target.number));
 
     expect(snapshot?.pullRequestMappings).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -540,7 +560,7 @@ describe('targeted action reader', () => {
     const calls: number[] = [];
     const reader = staleRecoveryReader(fixture, null, calls);
 
-    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(fixture.cycle, 101));
 
     expect(targeted).not.toBeNull();
     expect(calls).toEqual([101, 201]);
@@ -553,7 +573,7 @@ describe('targeted action reader', () => {
     const fixture = staleRecoveryCycle();
     const reader = staleRecoveryReader(fixture, null);
     const events: string[] = [];
-    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(fixture.cycle, 101));
     const result = targeted === null
       ? 'withheld'
       : await executeTargetedRecovery(targeted, events);
@@ -575,7 +595,7 @@ describe('targeted action reader', () => {
     };
     const reader = staleRecoveryReader(fixture, mergedBlocker);
 
-    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(fixture.cycle, 101));
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -669,10 +689,10 @@ describe('targeted action reader', () => {
       pullRequests: [decodePullRequestSnapshot(implementation)],
     };
 
-    const targeted = await reader.readStaleRecoveryPullRequest(
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(
       cycleWithoutMergedOutcome,
       2040,
-    );
+    ));
     const port = makeProductionImplementationActionPort({
       repositoryPath: '/repo',
       worktreeBase: '/attempts',
@@ -699,7 +719,7 @@ describe('targeted action reader', () => {
     };
     const reader = staleRecoveryReader(fixture, liveBlocker);
 
-    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(fixture.cycle, 101));
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -715,7 +735,7 @@ describe('targeted action reader', () => {
       author: 'outsider',
     });
 
-    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(fixture.cycle, 101));
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -777,7 +797,7 @@ describe('targeted action reader', () => {
     });
     const events: string[] = [];
 
-    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(fixture.cycle, 101));
     const result = targeted === null
       ? 'withheld'
       : await executeTargetedRecovery(targeted, events);
@@ -830,7 +850,7 @@ describe('targeted action reader', () => {
       readPullRequestOutcomeNumbersClosingIssues: async () => new Set([201, 202]),
     });
 
-    const targeted = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(fixture.cycle, 101));
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -846,10 +866,10 @@ describe('targeted action reader', () => {
       pullRequests: fixture.cycle.pullRequests.filter((pr) => pr.number !== 201),
     };
 
-    const targeted = await reader.readStaleRecoveryPullRequest(
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(
       withoutBlockerEvidence,
       101,
-    );
+    ));
 
     expect(targeted).not.toBeNull();
     await expect(staleRecoveryTarget(targeted!)).resolves.toMatchObject({
@@ -936,7 +956,7 @@ describe('targeted action reader', () => {
       readPullRequestOutcomeNumbersClosingIssues: async () => new Set([201, 202]),
     });
 
-    const targeted = await reader.readStaleRecoveryPullRequest(cycle, 101);
+    const targeted = snapshotOf(await reader.readStaleRecoveryPullRequest(cycle, 101));
 
     expect(calls).toEqual([101, 201, 202]);
     expect(reserveReads).toBe(4);
@@ -1321,5 +1341,358 @@ describe('targeted action reader', () => {
 
     await expect(reader.readPullRequest(cycleSnapshot(), 101))
       .rejects.toThrow(/native issue.*closed/i);
+  });
+});
+
+describe('targeted action reader unrelated open PR churn', () => {
+  const RACING_INDEX_HEAD = 'd'.repeat(40);
+  const RACING_LIVE_HEAD = 'e'.repeat(40);
+
+  const target = () => rawPullRequest();
+
+  const racing = (overrides: Partial<RawPullRequest> = {}) => rawPullRequest({
+    number: 999,
+    title: 'Unrelated racing PR',
+    body: '<!-- jinn-autopilot:v2 issue=77 branch=autopilot/77 -->',
+    headRefName: 'autopilot/77',
+    headOid: RACING_LIVE_HEAD,
+    closingIssueNumbers: [77],
+    updatedAt: '2026-07-22T10:01:00.000Z',
+    ...overrides,
+  });
+
+  const vetoReader = (input: {
+    readonly index: readonly ReturnType<typeof indexEntry>[];
+    readonly reads: ReadonlyMap<number, RawPullRequest | null>;
+    readonly dependencies?: readonly number[];
+  }) => makeTargetedActionReader({
+    authorAllowlist: new Set(['oaksprout']),
+    rateLimitFloor: 500,
+    readGraphQlRemaining: async () => 4_000,
+    readPullRequest: async (number) => input.reads.get(number) ?? null,
+    readOpenPullRequestIndex: async () => input.index,
+    readProjectItem: async () => ({
+      id: 'item-42',
+      status: 'In Review',
+      blockedOn: 'Nothing',
+    }),
+    readIssue: async (number) => ({
+      number,
+      title: `Issue ${number}`,
+      open: true,
+      author: 'oaksprout',
+      labels: [],
+    }),
+    readBlockedByIssueNumbers: async () => input.dependencies ?? [],
+  });
+
+  const cycleWith = (
+    ...pullRequests: readonly RawPullRequest[]
+  ): GitHubLifecycleSnapshot => ({
+    ...cycleSnapshot(),
+    pullRequests: pullRequests.map((pr) => decodePullRequestSnapshot(pr)),
+  });
+
+  it('keeps review authority when an unrelated PR races the cycle snapshot', async () => {
+    const subject = target();
+    const other = racing();
+    const reader = vetoReader({
+      // The racing PR was created after the cycle snapshot and its branch is
+      // still receiving pushes, so the ETag-cached index row is behind the
+      // live head.
+      index: [indexEntry(subject), indexEntry(other, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map([[subject.number, subject], [other.number, other]]),
+    });
+
+    const snapshot = snapshotOf(await reader.readPullRequest(cycleWith(subject), subject.number));
+
+    expect(snapshot).not.toBeNull();
+    expect(snapshot?.pullRequests.map((pr) => pr.number)).toEqual([subject.number]);
+    expect(snapshot?.pullRequestMappings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'resolved', prNumber: subject.number }),
+    ]));
+  });
+
+  it('refuses authority when the target base-chain parent races the cycle snapshot', async () => {
+    const subject = rawPullRequest({ baseRefName: 'autopilot/7' });
+    const parent = rawPullRequest({
+      number: 201,
+      title: 'Parent of the stack',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+      headRefName: 'autopilot/7',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [7],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(parent, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map([[subject.number, subject], [parent.number, parent]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #201 heads the target base chain branch autopilot\/7 and its headOid moved/,
+    );
+  });
+
+  it('refuses authority when a blocker-closing PR races the cycle snapshot', async () => {
+    const subject = target();
+    const blocker = rawPullRequest({
+      number: 201,
+      title: 'Blocker implementation',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+      headRefName: 'autopilot/7',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [7],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(blocker, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map([[subject.number, subject], [blocker.number, blocker]]),
+      dependencies: [7],
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #201 closes target blocker issue #7 and its headOid moved/,
+    );
+  });
+
+  it('refuses authority when a same-issue mapping contender races the cycle snapshot', async () => {
+    const subject = target();
+    const contender = rawPullRequest({
+      number: 102,
+      title: 'Competing implementation',
+      body: 'Closes #42',
+      headRefName: 'feature/duplicate-42',
+      headOid: RACING_LIVE_HEAD,
+      labels: [],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(contender, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map([[subject.number, subject], [contender.number, contender]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #102 closes the target issue #42 and its headOid moved/,
+    );
+  });
+
+  it('refuses authority when an unclassifiable index row cannot be re-read', async () => {
+    const subject = target();
+    const other = racing();
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(other, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map<number, RawPullRequest | null>([
+        [subject.number, subject],
+        [other.number, null],
+      ]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #999 has no live or cached evidence to classify it against the target/,
+    );
+  });
+
+  it('drops an unrelated PR whose live evidence is incomplete', async () => {
+    const subject = target();
+    const other = racing({ evidenceIncompleteReason: 'PR #999 labels were truncated' });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(other)],
+      reads: new Map([[subject.number, subject], [other.number, other]]),
+    });
+
+    const snapshot = snapshotOf(await reader.readPullRequest(cycleWith(subject), subject.number));
+
+    expect(snapshot?.pullRequests.map((pr) => pr.number)).toEqual([subject.number]);
+  });
+
+  it('refuses authority when a blocker-closing PR has incomplete live evidence', async () => {
+    const subject = target();
+    const blocker = rawPullRequest({
+      number: 201,
+      title: 'Blocker implementation',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+      headRefName: 'autopilot/7',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [7],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+      evidenceIncompleteReason: 'PR #201 labels were truncated',
+    });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(blocker)],
+      reads: new Map([[subject.number, subject], [blocker.number, blocker]]),
+      dependencies: [7],
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #201 closes target blocker issue #7 and its live evidence is incomplete/,
+    );
+  });
+
+  it('refuses authority when only the index row shares the target head branch', async () => {
+    const subject = target();
+    const renamedTwin = rawPullRequest({
+      number: 555,
+      title: 'Duplicate branch PR renamed mid-cycle',
+      body: '<!-- jinn-autopilot:v2 issue=88 branch=autopilot/42-moved -->',
+      headRefName: 'autopilot/42-moved',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [88],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      // The cached index row still shows this PR on the target head branch.
+      index: [
+        indexEntry(subject),
+        { ...indexEntry(renamedTwin), headRefName: 'autopilot/42' },
+      ],
+      reads: new Map([[subject.number, subject], [renamedTwin.number, renamedTwin]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #555 shares the target head branch autopilot\/42 and its headRefName moved/,
+    );
+  });
+
+  it('refuses authority when only the index row heads the target base chain', async () => {
+    const subject = rawPullRequest({ baseRefName: 'autopilot/7' });
+    const renamedParent = rawPullRequest({
+      number: 201,
+      title: 'Parent renamed mid-cycle',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7-moved -->',
+      headRefName: 'autopilot/7-moved',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [7],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [
+        indexEntry(subject),
+        { ...indexEntry(renamedParent), headRefName: 'autopilot/7' },
+      ],
+      reads: new Map([[subject.number, subject], [renamedParent.number, renamedParent]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #201 heads the target base chain branch autopilot\/7 and its headRefName moved/,
+    );
+  });
+
+  it('refuses authority when a two-level base-chain grandparent races the cycle', async () => {
+    const subject = rawPullRequest({ baseRefName: 'autopilot/7' });
+    const parent = rawPullRequest({
+      number: 201,
+      title: 'Parent of the stack',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+      headRefName: 'autopilot/7',
+      baseRefName: 'autopilot/9',
+      headOid: 'f'.repeat(40),
+      closingIssueNumbers: [7],
+    });
+    const grandparent = rawPullRequest({
+      number: 301,
+      title: 'Grandparent of the stack',
+      body: '<!-- jinn-autopilot:v2 issue=9 branch=autopilot/9 -->',
+      headRefName: 'autopilot/9',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [9],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [
+        indexEntry(subject),
+        indexEntry(parent),
+        indexEntry(grandparent, { headOid: RACING_INDEX_HEAD }),
+      ],
+      reads: new Map([
+        [subject.number, subject],
+        [parent.number, parent],
+        [grandparent.number, grandparent],
+      ]),
+    });
+
+    const read = await reader.readPullRequest(
+      cycleWith(subject, parent),
+      subject.number,
+    );
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #301 heads the target base chain branch autopilot\/9 and its headOid moved/,
+    );
+  });
+
+  it('refuses authority when only the live read places a PR in the base chain', async () => {
+    const subject = rawPullRequest({ baseRefName: 'autopilot/7' });
+    const renamed = rawPullRequest({
+      number: 201,
+      title: 'Renamed parent branch',
+      body: '<!-- jinn-autopilot:v2 issue=7 branch=autopilot/7 -->',
+      headRefName: 'autopilot/7',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [7],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      // The cached index row still carries the pre-rename branch, so only the
+      // live read shows this PR heading the target base chain.
+      index: [
+        indexEntry(subject),
+        { ...indexEntry(renamed), headRefName: 'autopilot/7-old' },
+      ],
+      reads: new Map([[subject.number, subject], [renamed.number, renamed]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #201 heads the target base chain branch autopilot\/7 and its headRefName moved/,
+    );
+  });
+
+  it('refuses authority when a PR sharing the target head branch races the cycle', async () => {
+    const subject = target();
+    const twin = rawPullRequest({
+      number: 555,
+      title: 'Duplicate branch PR',
+      body: '<!-- jinn-autopilot:v2 issue=88 branch=autopilot/42 -->',
+      headRefName: 'autopilot/42',
+      headOid: RACING_LIVE_HEAD,
+      closingIssueNumbers: [88],
+      updatedAt: '2026-07-22T10:01:00.000Z',
+    });
+    const reader = vetoReader({
+      index: [indexEntry(subject), indexEntry(twin, { headOid: RACING_INDEX_HEAD })],
+      reads: new Map([[subject.number, subject], [twin.number, twin]]),
+    });
+
+    const read = await reader.readPullRequest(cycleWith(subject), subject.number);
+
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #555 shares the target head branch autopilot\/42 and its headOid moved/,
+    );
   });
 });
