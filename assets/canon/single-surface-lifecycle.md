@@ -77,7 +77,7 @@ Each state is a predicate, never a stored value. HUMAN overrides everything.
 
 | State | Predicate |
 |---|---|
-| ELIGIBLE | issue open ∧ triaged ∧ no hold ∧ no claim branch ∧ no open PR |
+| ELIGIBLE | issue open ∧ triaged ∧ no hold ∧ no claim branch ∧ no open PR ∧ no review-follow-up hold (§5.1) |
 | CLAIMED | claim commit on `autopilot/<N>`, no PR yet (transient; ages into reap) |
 | IN PROGRESS | open **draft** PR |
 | DELIVERED | non-draft ∧ `engine:review` ∧ completion marker ∧ no verdict for head |
@@ -163,7 +163,31 @@ follow-ups in the same session command:
   idempotent on `pr+head+index` and runs before terminal publish. These
   issues never carry `review-finding`/`reconcile` labels or the child
   marker, never appear in `openChildKinds`, and **do not** move the parent
-  into BLOCKED-BY-CHILD.
+  into BLOCKED-BY-CHILD. They are non-blocking *for the parent*; the
+  dependency runs the other way. Because a follow-up describes code that so
+  far exists only on the parent's branch, the **review-follow-up hold** of §3
+  applies: a follow-up is not ELIGIBLE while the PR named by its marker's
+  `pr=` is still OPEN in the snapshot — a query over the marker and that PR's
+  state, nothing else. A marker-shaped comment that does not parse holds too
+  (fail-closed; the marker is machine-written, so a malformed one is
+  corruption, and it is reported as its own reason rather than as a parent-PR
+  block). The hold applies to eligibility only; it never sets a hold label,
+  files a dependency, or moves the board.
+  A parent that is MERGED, or absent from the snapshot (which carries only
+  OPEN and MERGED PRs, so closed-unmerged and pruned-merged parents are
+  indistinguishable), does not gate: the follow-up returns to ordinary
+  eligibility rather than stalling forever.
+  The hold has no timeout, escalation, or human door of its own; it is bounded
+  by the parent's own lifecycle instead. The parent leaves OPEN by merging or
+  by being closed, and either outcome releases the follow-up on the next
+  cycle — merged parents are pruned once their issues reach Done, and closed
+  parents are dropped by the reader. If a parent is never terminal — a human
+  parks it under the §6.3 overlay, whose exit is explicit human action only,
+  and no engine path closes a PR — the follow-up stalls for exactly as long as
+  the parent does. That stall is silent apart from the eligibility explainer,
+  which names the blocking parent PR. Giving it an independent door is
+  deliberately not attempted here: the parent is the thing needing attention,
+  and it already carries the overlay.
 - **Request changes:** native REQUEST_CHANGES (head-bound) + one
   `review-finding` child per round listing all **blocking** findings
   (reviewer may split genuinely independent findings) + release the claim

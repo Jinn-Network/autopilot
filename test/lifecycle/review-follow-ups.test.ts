@@ -1,7 +1,9 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   MAX_REVIEW_FOLLOW_UPS_PER_PASS,
   fileReviewFollowUps,
+  hasReviewFollowUpMarkerTag,
   formatReviewFollowUpMarker,
   parseReviewFollowUpMarker,
   parseReviewFollowUpsPayload,
@@ -9,6 +11,22 @@ import {
 } from '../../src/lifecycle/review-follow-ups.js';
 
 const HEAD = 'a'.repeat(40);
+
+/**
+ * The marker template as canon §5.1 literally prints it. Read from the canon
+ * asset rather than retyped, so the test tracks the file that agents quote.
+ */
+const CANON_MARKER_TEMPLATE = (() => {
+  const canon = readFileSync(
+    new URL('../../assets/canon/single-surface-lifecycle.md', import.meta.url),
+    'utf8',
+  );
+  const match = canon.match(/`(<!-- jinn-autopilot:review-follow-up [^`]*-->)`/);
+  if (match === null) {
+    throw new Error('canon §5.1 no longer prints a review-follow-up marker template');
+  }
+  return match[1]!;
+})();
 
 describe('review-follow-up marker', () => {
   it('round-trips pr+head+index and never looks like a child marker', () => {
@@ -188,5 +206,61 @@ describe('fileReviewFollowUps', () => {
       }),
     ).rejects.toThrow(/child marker|jinn-autopilot:child/i);
     expect(created).toHaveLength(0);
+  });
+});
+
+describe('hasReviewFollowUpMarkerTag', () => {
+  // Separates "no marker" from "marker present but malformed" so eligibility
+  // can fail closed on the second without gating ordinary issues.
+  it('matches a machine marker whose head or index is corrupt', () => {
+    expect(hasReviewFollowUpMarkerTag(formatReviewFollowUpMarker(84, HEAD, 0))).toBe(true);
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-up pr=84 -->')).toBe(true);
+    expect(
+      hasReviewFollowUpMarkerTag('<!--jinn-autopilot:review-follow-up pr=84 head=abc-->'),
+    ).toBe(true);
+    expect(
+      hasReviewFollowUpMarkerTag(
+        `<!-- jinn-autopilot:review-follow-up pr=84 head=${HEAD} index=x -->`,
+      ),
+    ).toBe(true);
+  });
+
+  it('does not match prose, a different tag, or a longer tag name', () => {
+    expect(hasReviewFollowUpMarkerTag('See jinn-autopilot:review-follow-up for the format.')).toBe(false);
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:child pr=84 kind=review-finding -->')).toBe(false);
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-ups pr=84 -->')).toBe(false);
+    // The separator before `pr=` is required, not optional: the pattern is the
+    // full marker regex truncated, not a loose prefix that lets the tag run on
+    // into the first field.
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-uppr=84 -->')).toBe(false);
+    expect(hasReviewFollowUpMarkerTag('')).toBe(false);
+  });
+
+  // The permanent hold must not fire on documentation. Issues in this repo are
+  // routinely written by agents told to cite canon, and canon §5.1 prints the
+  // marker *template* verbatim; before the `pr=\d` requirement that template
+  // matched, stranding any such issue at `eligible: false` forever.
+  it('does not match the canon §5.1 marker template, bare or fenced', () => {
+    expect(CANON_MARKER_TEMPLATE).toContain('jinn-autopilot:review-follow-up');
+    expect(parseReviewFollowUpMarker(CANON_MARKER_TEMPLATE)).toBeNull();
+
+    expect(hasReviewFollowUpMarkerTag(CANON_MARKER_TEMPLATE)).toBe(false);
+    expect(
+      hasReviewFollowUpMarkerTag(
+        `Per canon §5.1 the body marker is:\n\n\`\`\`\n${CANON_MARKER_TEMPLATE}\n\`\`\`\n`,
+      ),
+    ).toBe(false);
+    expect(
+      hasReviewFollowUpMarkerTag(`Body marker: \`${CANON_MARKER_TEMPLATE}\`.`),
+    ).toBe(false);
+  });
+
+  // The deliberate cost of requiring `pr=<digit>`: a corruption that eats the
+  // `pr=` field itself is no longer detectable as a marker, and such a body
+  // falls through to ordinary triage instead of the permanent hold. Pinned so
+  // the trade stays a decision rather than a regression.
+  it('gives up on corruption that destroys the pr= field itself', () => {
+    expect(hasReviewFollowUpMarkerTag('<!--jinn-autopilot:review-follow-up garbage-->')).toBe(false);
+    expect(hasReviewFollowUpMarkerTag('<!-- jinn-autopilot:review-follow-up pr= -->')).toBe(false);
   });
 });

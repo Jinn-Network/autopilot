@@ -13,6 +13,10 @@ import {
 } from './codecs.js';
 import { parseChildMarker, isMachineChildIssue, type ChildKind } from './child-issues.js';
 import {
+  hasReviewFollowUpMarkerTag,
+  parseReviewFollowUpMarker,
+} from './review-follow-ups.js';
+import {
   gitOid,
   isoTimestamp,
   type BranchClaim,
@@ -839,12 +843,38 @@ function resolveMappings(
   };
 }
 
+type ReviewFollowUpBlock =
+  | { readonly cause: 'parent-open'; readonly parentPr: number }
+  | { readonly cause: 'unparseable-marker' };
+
+/**
+ * Review follow-up (canon §3, §5.1): held while the parent PR named by its
+ * machine marker is still OPEN in this snapshot, because the reviewed code
+ * exists only on that branch. Marker `pr=` and PR state are the only inputs.
+ * A marker-shaped comment that does not parse fails closed. Absence of the
+ * parent does not gate — canon §5.1 carries that boundary and its argument.
+ */
+function reviewFollowUpBlock(
+  issue: PolledIssue,
+  openPrNumbers: ReadonlySet<number>,
+): ReviewFollowUpBlock | null {
+  const body = issue.body ?? '';
+  const marker = parseReviewFollowUpMarker(body);
+  if (marker === null) {
+    return hasReviewFollowUpMarkerTag(body) ? { cause: 'unparseable-marker' } : null;
+  }
+  return openPrNumbers.has(marker.parentPr)
+    ? { cause: 'parent-open', parentPr: marker.parentPr }
+    : null;
+}
+
 function eligibilityEvidence(
   issue: PolledIssue,
   eligible: boolean,
   authorDisallowed: boolean,
   stackReady: ReadonlyMap<number, unknown>,
   hasClaimBranch = false,
+  followUpBlock: ReviewFollowUpBlock | null = null,
 ): { readonly reason: IssueEligibilityReason; readonly detail: string } {
   if (eligible) return { reason: 'eligible', detail: 'All implementation admission gates pass' };
   if (issue.blockedOn === 'Another issue' && !stackReady.has(issue.number)) {
@@ -874,13 +904,30 @@ function eligibilityEvidence(
       detail: 'Machine child issue is not currently selectable',
     };
   }
-  const sourceReason =
+  const triageReason =
     issue.shape === null ? 'Issue Type is not set'
       : issue.priority === null ? 'Priority is not set'
         : !issue.onBoard || issue.projectItemId === null ? 'Issue is not on the Project'
           : issue.blockedOn === 'Human' ? 'Project Blocked on is Human'
-            : `Project Blocked on is ${issue.blockedOn ?? 'unset'}`;
-  return { reason: 'not-selected', detail: sourceReason };
+            : null;
+  if (triageReason !== null) return { reason: 'not-selected', detail: triageReason };
+  // Below the whole cascade on purpose: an untriaged, author-disallowed or
+  // already-claimed follow-up must report *that* failure, not the parent PR.
+  if (followUpBlock !== null) {
+    return followUpBlock.cause === 'parent-open'
+      ? {
+          reason: 'dependency-blocked',
+          detail: `Review follow-up is blocked by open parent PR #${followUpBlock.parentPr}`,
+        }
+      : {
+          reason: 'not-selected',
+          detail: 'Review follow-up marker is present but could not be parsed',
+        };
+  }
+  return {
+    reason: 'not-selected',
+    detail: `Project Blocked on is ${issue.blockedOn ?? 'unset'}`,
+  };
 }
 
 function openChildrenByParent(
@@ -957,6 +1004,9 @@ function lifecycleItems(
   const ready = new Set(selected.ready.map((issue) => issue.number));
   const skippedForAuthor = new Set(selected.skippedForAuthor.map((issue) => issue.number));
   const childrenByParent = openChildrenByParent([...byIssue.values()]);
+  const openPrNumbers = new Set(
+    prs.filter((pr) => pr.state === 'OPEN').map((pr) => pr.number),
+  );
   const out: LifecycleItem[] = [];
   for (const issue of issues) {
     if (issuesWithPr.has(issue.number)) continue;
@@ -966,7 +1016,9 @@ function lifecycleItems(
       projectBlockedOn: issue.blockedOn,
     });
     const selectedReady = ready.has(issue.number);
-    const eligible = selectedReady && !sourceHumanHold;
+    // Review follow-ups wait on their parent PR's branch (canon §5.1).
+    const followUpBlock = reviewFollowUpBlock(issue, openPrNumbers);
+    const eligible = selectedReady && !sourceHumanHold && followUpBlock === null;
     const holdDetail = issue.blockedOn === 'Human'
       ? 'Project Blocked on is Human'
       : issueLabels.includes('autopilot:human')
@@ -987,6 +1039,7 @@ function lifecycleItems(
         skippedForAuthor.has(issue.number),
         stackReady,
         claimBranchIssues.has(issue.number),
+        followUpBlock,
       );
     const sourceHumanReason: HumanReason | undefined = sourceHumanHold
       ? {

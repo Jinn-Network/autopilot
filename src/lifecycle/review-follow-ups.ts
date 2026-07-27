@@ -63,6 +63,36 @@ export function formatReviewFollowUpMarker(
   return `<!-- ${REVIEW_FOLLOW_UP_MARKER_TAG} pr=${parentPr} head=${normalizedHead} index=${index} -->`;
 }
 
+/**
+ * True when the body carries a *marker-shaped* review-follow-up comment.
+ * Callers pair this with {@link parseReviewFollowUpMarker} to tell "no marker"
+ * apart from "marker present but malformed"; the second fails closed into a
+ * hold that never self-heals, so the shape must be one only the machine
+ * writes.
+ *
+ * The pattern is exactly {@link REVIEW_FOLLOW_UP_MARKER_RE} truncated after
+ * the first digit of `pr=`: every marker `formatReviewFollowUpMarker` emits
+ * matches, and so does one whose `head` or `index` is corrupt. Requiring that
+ * digit is what keeps documentation out. Canon §5.1 prints the template
+ * `<!-- jinn-autopilot:review-follow-up pr=<N> head=<sha> index=<i> -->`
+ * verbatim, and issues here are routinely written by agents told to cite
+ * canon; on the bare tag that template matched, so quoting canon stranded an
+ * issue at `eligible: false` forever under a reason that reads like an
+ * ordinary triage miss. `pr=<` is not `pr=<digit>`, so it no longer does.
+ *
+ * The trade: corruption that destroys the `pr=` field itself is no longer
+ * detected, and such a body falls through to ordinary triage. That is the
+ * cheaper failure — it is recoverable and visible, where a false positive is
+ * neither — and `pr=` is the one field the hold actually reads.
+ */
+const REVIEW_FOLLOW_UP_MARKER_TAG_RE = new RegExp(
+  `<!--\\s*${REVIEW_FOLLOW_UP_MARKER_TAG}\\s+pr=\\d`,
+);
+
+export function hasReviewFollowUpMarkerTag(body: string): boolean {
+  return REVIEW_FOLLOW_UP_MARKER_TAG_RE.test(body);
+}
+
 export function parseReviewFollowUpMarker(
   body: string,
 ): { readonly parentPr: number; readonly head: string; readonly index: number } | null {

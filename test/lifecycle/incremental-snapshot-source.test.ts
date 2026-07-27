@@ -2206,6 +2206,74 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     expect(reconciled.parityUnavailableReason).toMatch(/fingerprint|conditional|ETag/i);
   });
 
+  // R8 — narrow fail-open, pinned rather than fixed. The review-follow-up gate
+  // (snapshot.ts) can only fire on a parent PR this snapshot actually carries.
+  // Incremental composition filters open PRs through `relevantToLifecycle`,
+  // which keeps an OPEN PR only if it carries `engine:review` or has an
+  // associated issue that is neither Done nor off-board. A parent with neither
+  // vanishes and the gate silently does not fire — while the same world under
+  // a full read does gate. Engine-authored parents are protected in practice
+  // because their `autopilot/<n>` head contributes an associated issue; this
+  // test records the residual hole and its exact shape.
+  it('cannot gate a review follow-up whose parent PR is filtered out of the incremental snapshot', async () => {
+    const context = harness();
+    const orphanParent = rawPr({
+      labels: [],
+      headRefName: 'feature/no-stable-issue',
+      closingIssueNumbers: [42],
+    });
+    const followUp = {
+      ...issue('Todo'),
+      number: 50,
+      title: 'Follow-up from review',
+      projectItemId: 'PVTI_50',
+      body: `<!-- jinn-autopilot:review-follow-up pr=101 head=${HEAD_A} index=0 -->\n\nFix it.`,
+    };
+    // Issue 42 is Done, so PR #101's only associated issue is off the pipeline.
+    context.reader.project = {
+      ...project('Done'),
+      items: [
+        ...project('Done').items,
+        {
+          id: 'PVTI_50',
+          number: 50,
+          contentType: 'Issue' as const,
+          status: 'Todo',
+          priority: 'P1',
+          effort: 'Medium',
+          blockedOn: 'Nothing',
+          issueType: 'feat',
+          blockedByIssues: [],
+          sprintIterationId: 'sprint',
+        },
+      ],
+    };
+    context.rest.project = context.reader.project;
+    context.reader.issues = [issue('Done'), followUp];
+    context.rest.issues = [issueIndex(), { ...issueIndex(), number: 50 }];
+    context.reader.fullPrs = [orphanParent];
+    context.reader.targeted.set(101, orphanParent);
+    context.rest.openPrs = [openIndex({ headRefName: 'feature/no-stable-issue' })];
+
+    const full = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    context.setNow('2026-07-22T10:10:00.000Z');
+    const incremental = await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
+
+    // Full read: the parent is visible, so the gate fires.
+    expect(full.pullRequests.map((pr) => pr.number)).toContain(101);
+    expect(full.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+    });
+    // Incremental read: relevantToLifecycle drops the same parent, and the
+    // follow-up is released even though the parent is still OPEN upstream.
+    expect(incremental.pullRequests.map((pr) => pr.number)).not.toContain(101);
+    expect(incremental.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
   it('does not replace the last complete seed when full persistence fails', async () => {
     const context = harness();
     await context.source.read({ mode: 'full', rateLimitFloor: 500 });

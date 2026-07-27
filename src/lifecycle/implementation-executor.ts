@@ -15,6 +15,10 @@ import {
   type CredentialPool,
   type SelectedCredential,
 } from './credentials.js';
+import {
+  hasReviewFollowUpMarkerTag,
+  parseReviewFollowUpMarker,
+} from './review-follow-ups.js';
 import type { HumanReason, ImplementationClaimAction } from './types.js';
 import type {
   LocalImplementationSessionExecutionRequest,
@@ -475,6 +479,39 @@ export function makeCanonicalImplementationSpawner(
   };
 }
 
+/**
+ * Stale recovery deliberately bypasses `issue.eligible` (an issue in recovery
+ * always has its own open PR, so its lifecycle item is `kind: 'pull-request'`
+ * and `eligible` is structurally false). That bypass also skipped the canon
+ * §5.1 review-follow-up gate, so a follow-up claimed before the projection
+ * gate could see its parent would be resumed into the same escalation. Re-apply
+ * just that conjunct here, from the same two authoritative facts.
+ */
+async function reviewFollowUpRecoveryRejection(
+  issueNumber: number,
+  body: string,
+  readParentPullRequest: ImplementationExecutorDeps['readParentPullRequest'],
+): Promise<string | null> {
+  const marker = parseReviewFollowUpMarker(body);
+  if (marker === null) {
+    return hasReviewFollowUpMarkerTag(body)
+      ? `Stale recovery issue #${issueNumber} carries an unparseable review follow-up marker.`
+      : null;
+  }
+  // Fail closed, as the child-claim gate below does for the same missing dep:
+  // the marker parsed, so a parent dependency is asserted, and without the
+  // lookup it cannot be checked.
+  if (readParentPullRequest === undefined) {
+    return `Parent PR lookup is unavailable for review follow-up issue #${issueNumber}.`;
+  }
+  // The production port resolves only OPEN pull requests, so non-null is
+  // exactly the positive OPEN evidence the projection gate fires on.
+  const parent = await readParentPullRequest(marker.parentPr);
+  return parent === null
+    ? null
+    : `Stale recovery issue #${issueNumber} is a review follow-up blocked by open parent PR #${marker.parentPr}.`;
+}
+
 function staleRecoveryRejection(
   action: Extract<ImplementationClaimAction, { intent: 'stale-recovery' }>,
   state: StaleImplementationRecoveryState,
@@ -565,7 +602,12 @@ export async function executeImplementationAction(
     ? recovery!.issue
     : await deps.readIssue(issueNumber);
   if (isStaleRecovery && recovery !== null) {
-    const rejection = staleRecoveryRejection(action, recovery);
+    const rejection = staleRecoveryRejection(action, recovery)
+      ?? await reviewFollowUpRecoveryRejection(
+        issueNumber,
+        recovery.issue?.body ?? '',
+        deps.readParentPullRequest,
+      );
     if (rejection !== null) {
       return { status: 'ineligible', issueNumber, detail: rejection };
     }
