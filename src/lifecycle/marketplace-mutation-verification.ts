@@ -254,14 +254,25 @@ function workspaceOf(rawPath: string): JinnMonoWorkspace {
   return entry.path;
 }
 
+function isWideningManifestOrLockfilePath(rawPath: string): boolean {
+  const path = canonicalPath(rawPath);
+  if (path === 'package.json' || path === 'yarn.lock') {
+    return true;
+  }
+  const slashIndex = path.lastIndexOf('/');
+  if (slashIndex === -1) {
+    return false;
+  }
+  const parent = path.slice(0, slashIndex);
+  const file = path.slice(slashIndex + 1);
+  if (file !== 'package.json' && file !== 'yarn.lock') {
+    return false;
+  }
+  return JINN_MONO_V1_WORKSPACES.some((candidate) => parent === candidate.path);
+}
+
 function touchesPackageManifestOrLockfile(rawPaths: readonly string[]): boolean {
-  return rawPaths.some((rawPath) => {
-    const path = canonicalPath(rawPath);
-    return path === 'package.json'
-      || path === 'yarn.lock'
-      || path.endsWith('/package.json')
-      || path.endsWith('/yarn.lock');
-  });
+  return rawPaths.some(isWideningManifestOrLockfilePath);
 }
 
 /**
@@ -281,8 +292,13 @@ export function buildJinnMonoV1VerificationPlan(input: {
   readonly repositoryPath: string;
   readonly touchedPaths: readonly string[];
 }): MarketplaceVerificationPlan {
-  const touched = new Set(input.touchedPaths.map(workspaceOf));
-  if (touched.size === 0) {
+  const widenToAllWorkspaces = touchesPackageManifestOrLockfile(input.touchedPaths);
+  const touched = new Set(
+    input.touchedPaths
+      .filter((rawPath) => !isWideningManifestOrLockfilePath(rawPath))
+      .map(workspaceOf),
+  );
+  if (touched.size === 0 && !widenToAllWorkspaces) {
     throw new MarketplaceVerificationError(
       'empty-selection',
       'stable-rejection',
@@ -290,7 +306,6 @@ export function buildJinnMonoV1VerificationPlan(input: {
     );
   }
   const allWorkspaces = JINN_MONO_V1_WORKSPACES.map((entry) => entry.path);
-  const widenToAllWorkspaces = touchesPackageManifestOrLockfile(input.touchedPaths);
   const atRiskSet = widenToAllWorkspaces
     ? new Set(allWorkspaces)
     : closure(touched, dependentsOf);

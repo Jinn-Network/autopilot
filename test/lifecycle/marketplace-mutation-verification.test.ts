@@ -188,6 +188,7 @@ describe('buildJinnMonoV1VerificationPlan', () => {
     'README.md',
     'docs/architecture.md',
     'scripts/release.mjs',
+    'scripts/yarn.lock',
     'packages/not-a-workspace/src/index.ts',
     'apps/other-bot/src/index.ts',
     // Sibling directories whose names *begin* with a workspace path. Matching
@@ -355,6 +356,28 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
     const plan = buildJinnMonoV1VerificationPlan({
       repositoryPath: REPO,
       touchedPaths: ['apps/broadcast-bot/package.json', 'packages/sdk/src/index.ts'],
+    });
+
+    expect(new Set(plan.workspaces)).toEqual(new Set(ALL_MONO_WORKSPACES));
+    expect(plan.workspaces).toHaveLength(ALL_MONO_WORKSPACES.length);
+    expect(plan.atRiskWorkspaces).toEqual(plan.workspaces);
+  });
+
+  it('widens closure to every workspace when the root yarn.lock is touched', () => {
+    const plan = buildJinnMonoV1VerificationPlan({
+      repositoryPath: REPO,
+      touchedPaths: ['yarn.lock'],
+    });
+
+    expect(new Set(plan.workspaces)).toEqual(new Set(ALL_MONO_WORKSPACES));
+    expect(plan.workspaces).toHaveLength(ALL_MONO_WORKSPACES.length);
+    expect(plan.atRiskWorkspaces).toEqual(plan.workspaces);
+  });
+
+  it('widens closure to every workspace when the root package.json is touched', () => {
+    const plan = buildJinnMonoV1VerificationPlan({
+      repositoryPath: REPO,
+      touchedPaths: ['package.json'],
     });
 
     expect(new Set(plan.workspaces)).toEqual(new Set(ALL_MONO_WORKSPACES));
