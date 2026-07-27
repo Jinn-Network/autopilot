@@ -685,21 +685,25 @@ describe('update-branch failure classification', () => {
   }
 
   function updateBranchPort(input: {
-    readonly updateBranch: () => Promise<void>;
+    readonly updateBranch: () => Promise<string>;
     readonly heads: readonly string[];
     readonly sleeps: number[];
   }) {
     let readbacks = 0;
     const runner = async (command: string, args: readonly string[]): Promise<string> => {
       if (args[0] === 'pr' && args[1] === 'update-branch') {
-        await input.updateBranch();
-        return '';
+        return input.updateBranch();
       }
       if (args[0] === 'pr' && args[1] === 'view') {
         const head = input.heads[Math.min(readbacks, input.heads.length - 1)];
         readbacks += 1;
         if (head === undefined) throw new Error('gh: connection reset by peer');
         return JSON.stringify({ headRefOid: head });
+      }
+      // These cases are about a head that genuinely needs updating, so the
+      // executor's up-to-date staleness guard must not short-circuit them.
+      if (args.some((arg) => arg.includes('/compare/'))) {
+        return JSON.stringify({ status: 'behind' });
       }
       return candidateRunner(1, ['GREETING.md'])(command, args);
     };
@@ -736,7 +740,7 @@ describe('update-branch failure classification', () => {
   it('tolerates the documented 202 async queue and reports the later head move', async () => {
     const sleeps: number[] = [];
     const { port } = updateBranchPort({
-      updateBranch: async () => {},
+      updateBranch: async () => '\u2713 PR branch updated\n',
       // 202 Accepted: the head has not moved yet on the first readback.
       heads: [HEAD, HEAD, OTHER_HEAD],
       sleeps,
@@ -753,7 +757,7 @@ describe('update-branch failure classification', () => {
   it('reports a still-queued update as pending, never rejected', async () => {
     const sleeps: number[] = [];
     const { port } = updateBranchPort({
-      updateBranch: async () => {},
+      updateBranch: async () => '\u2713 PR branch updated\n',
       heads: [HEAD],
       sleeps,
     });
@@ -821,7 +825,7 @@ describe('update-branch failure classification', () => {
   it('treats an unreadable head as undetermined rather than a refusal', async () => {
     const sleeps: number[] = [];
     const { port } = updateBranchPort({
-      updateBranch: async () => {},
+      updateBranch: async () => '\u2713 PR branch updated\n',
       heads: [undefined as unknown as string],
       sleeps,
     });
@@ -851,5 +855,91 @@ describe('update-branch failure classification', () => {
       prNumber: 84,
       reason: 'update-branch-rate-limited',
     });
+  });
+});
+
+/**
+ * The `already-up-to-date` outcome, straight from `gh`'s own behaviour.
+ *
+ * `gh pr update-branch` (cli/cli v2.78, `pkg/cmd/pr/update-branch/update_branch.go`)
+ * runs its own compare first. When `behind_by == 0` it prints
+ * `PR branch already up-to-date` to **stdout** and returns nil — exit 0, no API
+ * mutation at all. `defaultRunner` returns stdout, so this is observable;
+ * gh's failure messages go to stderr and are not.
+ *
+ * That is the exact shape of PR #2229: `ahead_by=4, behind_by=0`, reported by
+ * the old code as `rejected (update-branch-rejected)` — the same string it
+ * emitted for PR #2130, whose true cause was the opposite.
+ */
+describe('update-branch reports nothing-to-do as success', () => {
+  const ACCOUNT_2229 = {
+    login: 'implementation-bot',
+    normalizedLogin: 'implementation-bot',
+    implementationToken: 'selected-secret',
+  } as const;
+
+  function pick() {
+    const selection = selectCredential(new CredentialPool([ACCOUNT_2229]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    return selection.credential;
+  }
+
+  function port(update: () => Promise<string>, sleeps: number[]) {
+    let readbacks = 0;
+    return {
+      readbacks: () => readbacks,
+      value: makeProductionMergeActionPort({
+        readSnapshot: async () => snapshot(),
+        authorAllowlist: new Set(['implementation-bot']),
+        expectedBaseRefName: 'stack/base',
+        runner: async (command, args) => {
+          if (args[0] === 'pr' && args[1] === 'update-branch') return update();
+          if (args[0] === 'pr' && args[1] === 'view') {
+            readbacks += 1;
+            return JSON.stringify({ headRefOid: HEAD });
+          }
+          return candidateRunner(1, ['GREETING.md'])(command, args);
+        },
+        sleep: async (milliseconds: number) => { sleeps.push(milliseconds); },
+      }),
+    };
+  }
+
+  it.each([
+    ['gh success line', '✓ PR branch already up-to-date\n'],
+    ['unstyled variant', 'PR branch already up to date\n'],
+  ])('reports %s as already-up-to-date, not rejected', async (_name, output) => {
+    const sleeps: number[] = [];
+    const harness = port(async () => output, sleeps);
+
+    await expect(harness.value.updateBranch!({
+      prNumber: 2229,
+      expectedHead: HEAD,
+      credential: pick(),
+    })).resolves.toEqual({ status: 'already-up-to-date', head: HEAD });
+    // Nothing is queued, so nothing is worth waiting for.
+    expect(harness.readbacks()).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('does not mistake a real update for an up-to-date no-op', async () => {
+    const sleeps: number[] = [];
+    const harness = port(async () => '✓ PR branch updated\n', sleeps);
+
+    await expect(harness.value.updateBranch!({
+      prNumber: 2130,
+      expectedHead: HEAD,
+      credential: pick(),
+    })).resolves.toMatchObject({ status: 'pending', failure: 'queued' });
+  });
+
+  it.each([
+    ['gh pre-flight refusal', 'Cannot update PR branch due to conflicts'],
+    [
+      'GraphQL mutation refusal',
+      'GraphQL: merge conflict between base and head (updatePullRequestBranch)',
+    ],
+  ])('classifies the real gh conflict wording (%s) as conflict', (_name, text) => {
+    expect(classifyUpdateBranchFailure(text)).toBe('conflict');
   });
 });

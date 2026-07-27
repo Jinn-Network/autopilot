@@ -58,6 +58,15 @@ export interface ProductionMergeActionPortOptions {
 const UPDATE_BRANCH_READBACK_ATTEMPTS = 4;
 const UPDATE_BRANCH_READBACK_DELAY_MS = 1_500;
 
+/**
+ * `gh pr update-branch` compares before it mutates. When `behind_by == 0` it
+ * prints this to **stdout** and exits 0 without calling the API at all
+ * (`cli/cli` v2.78, `pkg/cmd/pr/update-branch/update_branch.go`). `defaultRunner`
+ * returns stdout, so this is directly observable — unlike gh's failure messages,
+ * which go to stderr.
+ */
+const ALREADY_UP_TO_DATE_PATTERN = /already\s+up[-\s]?to[-\s]?date/i;
+
 function errorText(error: unknown): string {
   return error instanceof Error
     ? `${error.message}\n${String((error as { stderr?: unknown }).stderr ?? '')}`
@@ -71,9 +80,15 @@ function errorText(error: unknown): string {
  * Ordering is load-bearing. GitHub serves *secondary* rate limits as HTTP 403,
  * so the rate-limit probe must run before the permission probe or every
  * throttle would be misreported as a branch-protection refusal — which is
- * exactly the class of false diagnosis this function exists to stop. HTTP 422
- * is the documented "cannot be updated" answer for this endpoint and is the
- * only status that genuinely means merge conflict.
+ * exactly the class of false diagnosis this function exists to stop.
+ *
+ * Both transports are covered. `gh pr update-branch` drives the GraphQL
+ * `updatePullRequestBranch` mutation, whose conflict answer is the literal
+ * `GraphQL: merge conflict between base and head (updatePullRequestBranch)`,
+ * and gh's own pre-flight refusal is `Cannot update PR branch due to conflicts`
+ * — neither carries an HTTP status. The REST endpoint answers HTTP 422 for the
+ * same condition. Conflict prose and 422 are both matched so the classification
+ * does not depend on which transport produced the failure.
  *
  * Anything unrecognised is `unclassified`, never `conflict`: asserting a
  * conflict we cannot see is the failure mode that misled the operator on
@@ -466,19 +481,23 @@ export function makeProductionMergeActionPort(
     updateBranch: ({ prNumber, expectedHead, credential }): Promise<UpdateBranchOutcome> =>
       withCredential(credential, async ({ run }) => {
         let failure: UpdateBranchFailureClass | undefined;
+        let alreadyUpToDate = false;
         try {
-          await run('gh', [
+          const output = await run('gh', [
             'pr', 'update-branch', String(prNumber),
             '--repo', repositorySlug,
           ]);
+          alreadyUpToDate = ALREADY_UP_TO_DATE_PATTERN.test(output);
         } catch (error) {
           failure = classifyUpdateBranchFailure(errorText(error));
         }
         // A non-zero exit is not proof the request failed to land, so even a
         // durable-looking refusal gets one readback — it just gets no poll.
+        // Nothing is in flight when gh never called the API, so an
+        // already-up-to-date answer skips the poll for the same reason.
         const durable = failure !== undefined
           && DURABLE_UPDATE_BRANCH_FAILURES.has(failure);
-        const attempts = durable
+        const attempts = durable || alreadyUpToDate
           ? 1
           : Math.max(1, options.updateBranchReadback?.attempts
             ?? UPDATE_BRANCH_READBACK_ATTEMPTS);
@@ -513,6 +532,11 @@ export function makeProductionMergeActionPort(
             head: expectedHead,
             failure,
           };
+        }
+        if (alreadyUpToDate) {
+          // gh compared and found `behind_by == 0`. The head correctly did not
+          // move; that is success with nothing to do, not a refusal.
+          return { status: 'already-up-to-date' as const, head: expectedHead };
         }
         // The queue call itself succeeded. An unchanged head after the whole
         // readback budget is the 202-async case (or a readback we could not

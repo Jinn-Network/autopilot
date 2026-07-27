@@ -137,6 +137,16 @@ export const DURABLE_UPDATE_BRANCH_FAILURES: ReadonlySet<UpdateBranchFailureClas
 
 export type UpdateBranchOutcome =
   | { readonly status: 'updated' | 'changed-head'; readonly head: GitOid }
+  /**
+   * There was nothing to update: the head is not behind its base. Success, not
+   * failure, and distinct from `updated` because the head did not move.
+   *
+   * `gh pr update-branch` compares before it mutates and, when `behind_by == 0`,
+   * prints `PR branch already up-to-date` to stdout and **exits 0** without
+   * calling the API at all (`cli/cli` v2.78 `update_branch.go`). The old port
+   * saw exit 0, read an unchanged head, and reported `rejected`.
+   */
+  | { readonly status: 'already-up-to-date'; readonly head: GitOid }
   | {
       readonly status: 'rejected' | 'pending';
       readonly head: GitOid;
@@ -339,11 +349,25 @@ export async function executeMergeAction(
  * later succeeded with nothing changed but time.
  *
  * `rejected` now means only "GitHub durably refused" (`conflict` / `forbidden`).
- * `pending` means "undetermined, retry is meaningful". Neither is `updated`.
+ * `pending` means "undetermined, retry is meaningful". `already-up-to-date`
+ * means there was nothing to do. None of them is `updated`.
+ *
+ * Second live case, opposite cause, identical old output: PR #2229 was reported
+ * `rejected` while sitting at `ahead_by=4, behind_by=0` — nothing to update at
+ * all. One string covered "retry this", "nothing to do here", and "this
+ * genuinely conflicts"; the operator could not tell them apart.
+ *
+ * The statuses are deliberately self-describing, because the runtime handler
+ * that surfaces them forwards `reason` for only some statuses.
  */
 export type UpdateBranchResult =
   | { readonly status: 'updated'; readonly prNumber: number; readonly head: GitOid }
   | { readonly status: 'changed-head'; readonly prNumber: number; readonly head: GitOid }
+  | {
+      readonly status: 'already-up-to-date';
+      readonly prNumber: number;
+      readonly head: GitOid;
+    }
   | {
       readonly status: 'ineligible' | 'rejected' | 'pending';
       readonly prNumber: number;
@@ -364,6 +388,24 @@ export async function executeUpdateBranchAction(
   if (candidate.head !== action.expectedHead) {
     return { status: 'changed-head', prNumber: action.prNumber, head: candidate.head };
   }
+  // Staleness guard. The ladder only ever schedules `update-branch` for a
+  // `behind`/`diverged` compare, but that decision is made against the cycle
+  // snapshot; by the time this executes the base may already have been merged
+  // in, leaving nothing to do. Observed live on PR #2229, dispatched from a
+  // stale `behind` and sitting at `ahead_by=4, behind_by=0` by the time the
+  // mutation ran — which the old code reported as `rejected`.
+  //
+  // This is the *fresh* candidate read, so `ahead`/`identical` means the base
+  // tip is genuinely an ancestor of the head and there is nothing to merge in.
+  // `unknown` deliberately does not short-circuit: it cannot rule out `behind`,
+  // so the work still happens.
+  if (candidate.compareStatus === 'ahead' || candidate.compareStatus === 'identical') {
+    return {
+      status: 'already-up-to-date',
+      prNumber: action.prNumber,
+      head: candidate.head,
+    };
+  }
   const selection = selectCredential(deps.credentials, { phase: 'merge' });
   if (selection.status !== 'selected') {
     return { status: 'ineligible', prNumber: action.prNumber, reason: 'credential-unavailable' };
@@ -383,6 +425,12 @@ export async function executeUpdateBranchAction(
       return { status: 'updated', prNumber: action.prNumber, head: outcome.head };
     case 'changed-head':
       return { status: 'changed-head', prNumber: action.prNumber, head: outcome.head };
+    case 'already-up-to-date':
+      return {
+        status: 'already-up-to-date',
+        prNumber: action.prNumber,
+        head: outcome.head,
+      };
     case 'rejected':
       return {
         status: 'rejected',

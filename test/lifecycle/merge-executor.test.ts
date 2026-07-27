@@ -222,10 +222,13 @@ describe('merge gate approval authority is not loosened', () => {
  * branch update. That is the fail-open shape these tests pin shut.
  */
 describe('update-branch outcome mapping fails closed', () => {
+  // `behind` so the staleness guard does not short-circuit: these tests are
+  // about mapping the port's answer, not about skipping the call.
   const updateHarness = (
     outcome: Awaited<ReturnType<NonNullable<MergeExecutorDeps['updateBranch']>>>,
   ) => ({
     ...harness().deps,
+    readCandidate: async () => candidate({ compareStatus: 'behind' as const }),
     updateBranch: async () => outcome,
   });
 
@@ -292,6 +295,7 @@ describe('update-branch outcome mapping fails closed', () => {
       { prNumber: 84, expectedHead: HEAD },
       {
         ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'behind' as const }),
         updateBranch: async () => ({
           status: 'queued-somewhere-new',
           head: HEAD,
@@ -307,5 +311,113 @@ describe('update-branch outcome mapping fails closed', () => {
       prNumber: 84,
       reason: 'update-branch-unclassified',
     });
+  });
+});
+
+/**
+ * The two live shapes, side by side. Both were reported as the same opaque
+ * `rejected (update-branch-rejected)` string by the old code, and their true
+ * causes are opposites:
+ *
+ * - PR #2130: genuinely behind, update-branch reported `rejected`, the
+ *   identical operation later succeeded unchanged. "Retry this."
+ * - PR #2229: `ahead_by=4, behind_by=0` — nothing to update at all, dispatched
+ *   from a stale `behind` in the cycle snapshot. "Nothing to do here."
+ *
+ * An operator handed one string for both cannot tell them apart, and cannot
+ * tell either from a real merge conflict.
+ */
+describe('update-branch distinguishes the live #2130 and #2229 shapes', () => {
+  it('reports the #2229 shape as already-up-to-date without touching GitHub', async () => {
+    let mutations = 0;
+    const result = await executeUpdateBranchAction(
+      { prNumber: 2229, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        // Fresh candidate read: the base was merged in between the scheduling
+        // snapshot and this execution, so there is nothing left to merge.
+        readCandidate: async () => candidate({ compareStatus: 'ahead' }),
+        updateBranch: async () => {
+          mutations += 1;
+          throw new Error('update-branch must not run for an up-to-date head');
+        },
+      },
+    );
+
+    expect(result).toEqual({
+      status: 'already-up-to-date',
+      prNumber: 2229,
+      head: HEAD,
+    });
+    expect(mutations).toBe(0);
+  });
+
+  it('reports an identical head as already-up-to-date too', async () => {
+    const result = await executeUpdateBranchAction(
+      { prNumber: 2229, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'identical' }),
+        updateBranch: async () => { throw new Error('must not run'); },
+      },
+    );
+
+    expect(result).toMatchObject({ status: 'already-up-to-date' });
+  });
+
+  it.each(['behind', 'diverged', 'unknown'] as const)(
+    'still performs the update for a %s head',
+    async (compareStatus) => {
+      let mutations = 0;
+      const moved = gitOid('8'.repeat(40));
+      const result = await executeUpdateBranchAction(
+        { prNumber: 2130, expectedHead: HEAD },
+        {
+          ...harness().deps,
+          readCandidate: async () => candidate({ compareStatus }),
+          updateBranch: async () => {
+            mutations += 1;
+            return { status: 'updated', head: moved };
+          },
+        },
+      );
+
+      expect(result).toEqual({ status: 'updated', prNumber: 2130, head: moved });
+      expect(mutations).toBe(1);
+    },
+  );
+
+  it('gives the #2130 and #2229 shapes different reported statuses', async () => {
+    const stale = await executeUpdateBranchAction(
+      { prNumber: 2229, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'ahead' }),
+        updateBranch: async () => { throw new Error('must not run'); },
+      },
+    );
+    // #2130: genuinely behind, GitHub queued the update (202) and the head had
+    // not moved yet when we looked.
+    const inFlight = await executeUpdateBranchAction(
+      { prNumber: 2130, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'behind' }),
+        updateBranch: async () => ({ status: 'pending', head: HEAD, failure: 'queued' }),
+      },
+    );
+    const conflicted = await executeUpdateBranchAction(
+      { prNumber: 2131, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'behind' }),
+        updateBranch: async () => ({ status: 'rejected', head: HEAD, failure: 'conflict' }),
+      },
+    );
+
+    expect(stale.status).toBe('already-up-to-date');
+    expect(inFlight).toMatchObject({ status: 'pending', reason: 'update-branch-queued' });
+    expect(conflicted).toMatchObject({ status: 'rejected', reason: 'update-branch-conflict' });
+    expect(new Set([stale.status, inFlight.status, conflicted.status]).size).toBe(3);
   });
 });
