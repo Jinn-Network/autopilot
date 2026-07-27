@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { DEFAULT_FLOOR } from '../dispatcher/rate-limit-guard.js';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
+import { withTransientReadRetry } from './transient-retry.js';
 
 /** GraphQL points reserved to finish a complete lifecycle scan safely. */
 export const FULL_SCAN_RESERVE = 450;
@@ -43,6 +44,12 @@ export interface GitHubUsage {
   readonly accountingComplete: boolean;
   /** Human-readable reason accounting was incomplete; set only when incomplete. */
   readonly incompleteReason?: string;
+  /**
+   * Transport faults retried on allowlisted reads this cycle; present only when
+   * at least one retry happened, so a retried action is never indistinguishable
+   * from a first-attempt success.
+   */
+  readonly transientRetries?: number;
 }
 
 export const EMPTY_GITHUB_USAGE: GitHubUsage = Object.freeze({
@@ -166,6 +173,8 @@ export class GitHubUsageMeter {
   private restRequests = 0;
   private restNotModified = 0;
   private cacheHits = 0;
+  private transientRetries = 0;
+  private transientRetryReason: string | null = null;
   private incompleteReason: string | null = null;
   private opaqueQueue: Promise<void> = Promise.resolve();
 
@@ -295,6 +304,25 @@ export class GitHubUsageMeter {
     this.cacheHits += 1;
   }
 
+  /**
+   * Records one allowlisted read whose transport fault was retried. The faulted
+   * attempt returned no response, so whether GitHub charged it is unknowable —
+   * it can be neither decoded as evidence nor guessed at. That makes accounting
+   * incomplete, which is exactly what the flag already means: reported quota
+   * numbers are best-effort for this cycle.
+   *
+   * The retry reason is held separately rather than pushed through
+   * `markIncomplete`, whose first-wins `??=` would let an early retry
+   * permanently mask a later genuine skew reason. `read()` reports both.
+   */
+  recordTransientReadRetry(command: string, fault: string): void {
+    this.transientRetries += 1;
+    this.transientRetryReason = `${this.transientRetries} `
+      + `${this.transientRetries === 1 ? 'read was' : 'reads were'} retried through a `
+      + `transport fault (latest: ${command}, ${fault}); `
+      + 'the faulted attempts\' quota cost is unevidenced';
+  }
+
   reset(): void {
     this.graphqlRequests = 0;
     this.graphqlCost = 0;
@@ -302,6 +330,8 @@ export class GitHubUsageMeter {
     this.restRequests = 0;
     this.restNotModified = 0;
     this.cacheHits = 0;
+    this.transientRetries = 0;
+    this.transientRetryReason = null;
     this.incompleteReason = null;
   }
 
@@ -314,6 +344,10 @@ export class GitHubUsageMeter {
     for (const quota of this.quotaByCredential.values()) {
       if (lowest === undefined || quota.remaining < lowest.remaining) lowest = quota;
     }
+    // Both incompleteness reasons are reported: a retry must never mask a
+    // genuine quota-evidence skew recorded later in the same cycle.
+    const reasons = [this.incompleteReason, this.transientRetryReason]
+      .filter((reason): reason is string => reason !== null);
     return Object.freeze({
       graphqlRequests: this.graphqlRequests,
       graphqlCost: this.graphqlCost,
@@ -322,8 +356,9 @@ export class GitHubUsageMeter {
       restRequests: this.restRequests,
       restNotModified: this.restNotModified,
       cacheHits: this.cacheHits,
-      accountingComplete: this.incompleteReason === null,
-      ...(this.incompleteReason === null ? {} : { incompleteReason: this.incompleteReason }),
+      accountingComplete: reasons.length === 0,
+      ...(reasons.length === 0 ? {} : { incompleteReason: reasons.join('; ') }),
+      ...(this.transientRetries === 0 ? {} : { transientRetries: this.transientRetries }),
     });
   }
 }
@@ -359,15 +394,79 @@ export function commandErrorStdout(error: unknown): string | null {
  * GraphQL probes reconcile their observed cost without assigning a guessed
  * fixed cost. The original command options are reused for both probes, which
  * keeps selected credential overlays intact.
+ *
+ * This is also the one place transport-fault retry is applied, and it is applied
+ * beneath the meter on purpose (#2168):
+ *
+ *   - Metering stays exact. One logical request contributes one metered request
+ *     however many transport attempts it took, so a retry can never inflate REST
+ *     counts or double-decode a GraphQL rate-limit response.
+ *   - The meter's own before/after quota probes are allowlisted GraphQL reads,
+ *     so a blip on a probe no longer aborts the metered command it brackets.
+ *   - Only real subprocess failures reach the classifier. Engine-level errors
+ *     raised above this line (invalid JSON, returned GraphQL errors, reserve
+ *     refusals) are never retried, because they are not transport faults.
+ *
+ * The retry's reach is exactly this boundary's reach, which is not every command
+ * the engine issues: a port constructed without an explicit runner falls back to
+ * `defaultRunner` and is unmetered and unretried. In the production orchestrator
+ * the shared runner (`scripts/run-autopilot-v2.ts:496`) is threaded into the
+ * lifecycle reader, the conditional REST client and the active runtime's action
+ * ports, so those are covered; the CLI and triage entry points are not.
+ *
+ * Retryability is decided entirely by the positive read allowlist in
+ * `transient-retry.ts`; every mutation crossing this boundary keeps exactly one
+ * attempt.
+ *
+ * WHY THE TWO JOBS ARE COUPLED HERE RATHER THAN COMPOSED BY CALLERS. This
+ * function now does two things — meter, and retry — and the obvious split is to
+ * export them separately and let each installer write
+ * `makeGitHubUsageCommandRunner(withTransientReadRetry(raw, …), meter)`. That is
+ * mechanically possible; it is refused because it converts two structural
+ * guarantees into call-site conventions:
+ *
+ *   - ORDER. Retry must sit BENEATH the meter. Composed the other way round —
+ *     `withTransientReadRetry(makeGitHubUsageCommandRunner(raw, meter))`, which
+ *     reads just as naturally — every retried attempt is separately metered, so
+ *     a transport blip silently inflates REST counts and re-runs the opaque
+ *     probe pair. Nothing in the type signature distinguishes the two
+ *     compositions: both are `CommandRunner`. Owning the order here makes the
+ *     wrong one unwritable.
+ *   - COVERAGE. Three call sites install this boundary — the orchestrator's
+ *     shared runner (`scripts/run-autopilot-v2.ts:496`), `GhLifecycleReader`
+ *     (`src/lifecycle/github-reader.ts:793`) and `ConditionalRestClient`
+ *     (`src/lifecycle/github-rest.ts:260`) — and each of the latter two builds
+ *     it internally for callers who passed only a raw runner. Splitting makes
+ *     every one of them re-derive the wiring, including the `onRetry` sink that
+ *     needs this exact meter; one installer that forgot would lose retry
+ *     coverage with no test failing, which is the same silent-drift failure mode
+ *     the derived-argv tests in `test/lifecycle/transient-retry.test.ts` exist to
+ *     prevent.
+ *
+ * The coupling is also narrow in substance: the retry decision itself lives
+ * entirely in `transient-retry.ts`, and this function contributes only the
+ * ordering and the `onRetry` sink. Nothing here inspects argv to decide
+ * retryability.
  */
 export function makeGitHubUsageCommandRunner(
-  run: CommandRunner,
+  rawRun: CommandRunner,
   meter: GitHubUsageMeter,
   config: { readonly rateLimitFloor?: number } = {},
 ): CommandRunner {
+  // No backoff seam is forwarded: retry timing is not configurable from here,
+  // so no caller can zero the backoff of a production runner.
+  const run = withTransientReadRetry(rawRun, {
+    onRetry: (event) => meter.recordTransientReadRetry(event.command, event.fault),
+  });
   const probeArgs = ['api', 'graphql', '-f', `query=${OPAQUE_USAGE_PROBE}`];
   return async (command, args, options) => {
     if (command !== 'gh') return run(command, args, options);
+    // NOTE: this meter routes GraphQL by argument position (`args[1]`), so an
+    // invocation like `gh api -X GET graphql …` would be metered down the REST
+    // branch. That is a pre-existing metering imprecision, not a safety hole —
+    // the retry allowlist finds the `graphql` operand positionally-independently
+    // and is what decides whether anything may be re-sent. Left unchanged here
+    // deliberately; changing metering shape is out of scope for this fix.
     if (args[0] === 'api' && args[1] !== 'graphql') {
       if (args.includes('--paginate')) {
         // --paginate collapses N HTTP pages into a single gh invocation, so the

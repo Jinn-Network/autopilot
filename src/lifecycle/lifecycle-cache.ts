@@ -405,6 +405,9 @@ const usageSchema = z.object({
   // caches predate the flag and are read as complete.
   accountingComplete: z.boolean().default(true),
   incompleteReason: z.string().optional(),
+  // Present only for a cycle that retried a transport fault on an allowlisted
+  // read; absent means no read was retried, which is also how legacy caches read.
+  transientRetries: nonNegativeInteger.optional(),
 }).strict();
 
 const evidenceSchema = z.object({
