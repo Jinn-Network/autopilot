@@ -32,7 +32,7 @@ import {
   terminalBranchClaimTrailers,
 } from './codecs.js';
 import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
-import { readExactCompareStatus } from './github-changed-files.js';
+import { readExactCompareEvidence } from './github-changed-files.js';
 import { gitOid, gitRefName, type GitOid, type GitRefName } from './types.js';
 import {
   GitHubUsageMeter,
@@ -1390,16 +1390,23 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       humanReason: humanEvidence?.reason ?? null,
       mergedAt: pr.mergedAt,
       mergeCommitOid: pr.mergeCommit?.oid ?? null,
+      // One compare request answers two questions: whether the head is behind
+      // its base, and what diff the head presents against it. The digest rides
+      // along on the response `compareStatus` already needs, so proving that an
+      // approval still describes the current head costs no extra API call.
       ...(pr.state === 'OPEN' && looksFalseCleanMergeState(pr.mergeable, pr.mergeStateStatus)
-        ? {
-            compareStatus: await readExactCompareStatus({
-              run: this.run,
-              prNumber: pr.number,
-              expectedHead: gitOid(pr.headRefOid),
-              expectedBaseRefName: pr.baseRefName,
-              repositorySlug: this.repositorySlug,
-            }),
-          }
+        ? await readExactCompareEvidence({
+            run: this.run,
+            prNumber: pr.number,
+            expectedHead: gitOid(pr.headRefOid),
+            expectedBaseRefName: pr.baseRefName,
+            repositorySlug: this.repositorySlug,
+          }).then((evidence) => ({
+            compareStatus: evidence.status,
+            ...(evidence.reviewedDiffDigest === undefined
+              ? {}
+              : { reviewedDiffDigest: evidence.reviewedDiffDigest }),
+          }))
         : {}),
     };
   }

@@ -1,6 +1,10 @@
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
 import {
+  reviewedDiffDigestFromCompare,
+  type ReviewedDiffDigestResult,
+} from './reviewed-diff-digest.js';
+import {
   decodeCompareStatus,
   gitOid,
   gitRefName,
@@ -10,6 +14,11 @@ import {
 } from './types.js';
 
 export const GITHUB_CHANGED_FILES_MAX = 3_000;
+
+export type {
+  ReviewedDiffDigestResult,
+  ReviewedDiffDigestUnavailableReason,
+} from './reviewed-diff-digest.js';
 
 export type { CompareStatus } from './types.js';
 
@@ -142,6 +151,26 @@ export async function readExactChangedFiles(
 export async function readExactCompareStatus(
   options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
 ): Promise<CompareStatus> {
+  return (await readExactCompareEvidence(options)).status;
+}
+
+export interface ExactCompareEvidence {
+  readonly status: CompareStatus;
+  /**
+   * Identity of the diff this head presents against its base branch tip, or
+   * `undefined` when it could not be proven. Derived from the very same
+   * response `status` comes from, so it costs no additional request.
+   *
+   * `undefined` is not "no change": every consumer must fall back to requiring
+   * exact head identity when it is absent.
+   */
+  readonly reviewedDiffDigest?: string;
+}
+
+/** See `readExactCompareStatus` for the full head/base authority analysis. */
+export async function readExactCompareEvidence(
+  options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
+): Promise<ExactCompareEvidence> {
   const repositorySlug = options.repositorySlug ?? REPO;
   const metadata = JSON.parse(await options.run('gh', [
     'api', `repos/${repositorySlug}/pulls/${options.prNumber}`,
@@ -165,6 +194,68 @@ export async function readExactCompareStatus(
   const compare = JSON.parse(await options.run('gh', [
     'api',
     `repos/${repositorySlug}/compare/heads/${compareBase}...${options.expectedHead}`,
-  ])) as { status?: unknown };
-  return decodeCompareStatus(compare.status);
+  ])) as { status?: unknown; files?: unknown };
+  const digest = reviewedDiffDigestFromCompare(compare.files);
+  return {
+    status: decodeCompareStatus(compare.status),
+    ...(digest.status === 'digest' ? { reviewedDiffDigest: digest.digest } : {}),
+  };
+}
+
+export interface ReadReviewedDiffDigestOptions {
+  readonly run: CommandRunner;
+  readonly prNumber: number;
+  readonly expectedHead: GitOid;
+  readonly expectedBaseRefName: string;
+  readonly context: string;
+  readonly repositorySlug?: string;
+}
+
+/**
+ * Read both completeness authorities and digest the PR's diff against its base
+ * branch tip.
+ *
+ * Never throws: every failure is an `unavailable` result, because the only
+ * correct response to a failure here is to leave the merge gate's head-identity
+ * requirement in place. A thrown error would instead have to be caught by every
+ * caller and mapped to the same thing, which is exactly how a fail-open slips
+ * in.
+ */
+export async function readReviewedDiffDigest(
+  options: ReadReviewedDiffDigestOptions,
+): Promise<ReviewedDiffDigestResult> {
+  const repositorySlug = options.repositorySlug ?? REPO;
+  let changedFiles: ExactChangedFiles;
+  try {
+    changedFiles = await readExactChangedFiles({
+      run: options.run,
+      prNumber: options.prNumber,
+      expectedHead: options.expectedHead,
+      expectedBaseRefName: options.expectedBaseRefName,
+      context: options.context,
+      repositorySlug,
+    });
+  } catch {
+    return { status: 'unavailable', reason: 'changed-files-unreadable' };
+  }
+  let compare: unknown;
+  try {
+    // `heads/` and `gitRefName` are load-bearing for the same reasons as in
+    // `readExactCompareStatus`: a same-named tag must not hijack resolution and
+    // a base name containing `..` must not inject a second separator.
+    compare = JSON.parse(await options.run('gh', [
+      'api',
+      `repos/${repositorySlug}/compare/`
+      + `heads/${gitRefName(changedFiles.baseRefName)}...${options.expectedHead}`,
+    ]));
+  } catch {
+    return { status: 'unavailable', reason: 'compare-unreadable' };
+  }
+  if (typeof compare !== 'object' || compare === null || Array.isArray(compare)) {
+    return { status: 'unavailable', reason: 'compare-malformed' };
+  }
+  return reviewedDiffDigestFromCompare(
+    (compare as { files?: unknown }).files,
+    changedFiles,
+  );
 }

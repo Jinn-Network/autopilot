@@ -153,6 +153,89 @@ function reader(overrides: Partial<GitHubLifecycleReader> = {}): GitHubLifecycle
   };
 }
 
+describe('terminal verdict head binding', () => {
+  const MERGED_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
+
+  async function build(overrides) {
+    const base = page('page-2').nodes[0];
+    const pr = {
+      ...base,
+      reviewClaim: {
+        oid: REVIEW_REF,
+        payload: JSON.stringify({
+          protocolVersion: 2,
+          prNumber: 101,
+          generation: '22222222-2222-4222-8222-222222222222',
+          attempt: '33333333-3333-4333-8333-333333333333',
+          reviewer: 'reviewer',
+          head: HEAD,
+          state: 'terminal-approved',
+          recordedAt: '2026-07-20T09:00:00.000Z',
+          verdict: {
+            marker: '44444444-4444-4444-8444-444444444444',
+            state: 'APPROVE',
+          },
+        }),
+      },
+      ...overrides,
+    };
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => ({
+        nodes: [pr],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readBranchClaims: async () => [],
+    }), { authorAllowlist: new Set(['trusted']), defaultBranch: 'next' });
+    return snapshot.lifecycle.items.find((item) => item.kind === 'pull-request');
+  }
+
+  // Measured on Jinn-Network/mono: `update-branch` re-points every existing
+  // review's `commit_id` onto the new merge commit (PR #2130 ends with three
+  // reviews naming three different marker heads and one shared `commit_id`),
+  // while an ordinary push leaves `commit_id` alone (PR #2232). The signed
+  // marker is the binding GitHub does not rewrite.
+  it('reports the head the marker names, not the commit_id GitHub rewrote', async () => {
+    const item = await build({
+      headOid: MERGED_HEAD,
+      reviews: [{
+        ...page('page-2').nodes[0].reviews[0],
+        commitId: MERGED_HEAD,
+      }],
+    });
+    expect(item.head).toBe(MERGED_HEAD);
+    expect(item.terminalVerdict).toMatchObject({ head: HEAD, state: 'APPROVE' });
+  });
+
+  it('still reports the reviewed head when nothing moved', async () => {
+    const item = await build({});
+    expect(item.terminalVerdict).toMatchObject({ head: HEAD, state: 'APPROVE' });
+  });
+
+  it('produces no verdict for a review body that does not carry the signed marker', async () => {
+    const item = await build({
+      headOid: MERGED_HEAD,
+      reviews: [{
+        ...page('page-2').nodes[0].reviews[0],
+        commitId: MERGED_HEAD,
+        body: 'Looks good to me.',
+      }],
+    });
+    expect(item.terminalVerdict).toBeUndefined();
+  });
+
+  it('produces no verdict for a marker signed by a different reviewer identity', async () => {
+    const item = await build({
+      headOid: MERGED_HEAD,
+      reviews: [{
+        ...page('page-2').nodes[0].reviews[0],
+        reviewer: 'marker-copying-bot',
+        commitId: MERGED_HEAD,
+      }],
+    });
+    expect(item.terminalVerdict).toBeUndefined();
+  });
+});
+
 describe('buildGitHubLifecycleSnapshot', () => {
   it('uses the canonical resolver to enroll the complete #2084 stacked mapping once', async () => {
     const stackedIssue = {

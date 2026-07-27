@@ -14,6 +14,8 @@ import type {
 } from '../../src/lifecycle/snapshot.js';
 import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
 import { resolveStructuredPullRequestMappings } from '../../src/lifecycle/pr-mapping.js';
+import { evaluateMergeGate } from '../../src/lifecycle/merge-executor.js';
+import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 
 const HEAD = gitOid('1'.repeat(40));
 const OTHER_HEAD = gitOid('2'.repeat(40));
@@ -974,5 +976,367 @@ describe('update-branch reports nothing-to-do as success', () => {
     ],
   ])('classifies the real gh conflict wording (%s) as conflict', (_name, text) => {
     expect(classifyUpdateBranchFailure(text)).toBe('conflict');
+  });
+});
+
+/**
+ * Carrying an approval across an `update-branch` head.
+ *
+ * `update-branch` merges the base into the PR branch. That mints a new head
+ * commit but changes nothing the reviewer read, and GitHub re-points the
+ * existing review's `commit_id` onto the merge commit (measured on
+ * Jinn-Network/mono PR #2130: three reviews, three different signed marker
+ * heads, one shared `commit_id`). The signed marker still names the head that
+ * was actually reviewed, and the reviewed-diff digest is what proves the new
+ * head presents the same diff.
+ */
+const CARRIED_HEAD = gitOid('5'.repeat(40));
+
+const REVIEWED_FILES = [
+  {
+    filename: 'GREETING.md',
+    status: 'modified',
+    sha: 'a'.repeat(40),
+    additions: 1,
+    deletions: 1,
+    patch: '@@ -1,1 +1,1 @@\n-hello\n+hi',
+  },
+] as const;
+
+function digestFor(files: readonly Record<string, unknown>[]): string {
+  const result = reviewedDiffDigestFromCompare(files, {
+    baseOid: BASE,
+    baseRefName: gitRefName('stack/base'),
+    files: files.map((file) => file.filename as string),
+    complete: true,
+  });
+  if (result.status !== 'digest') throw new Error(`expected a digest: ${result.reason}`);
+  return result.digest;
+}
+
+const REVIEWED_DIGEST = digestFor(REVIEWED_FILES);
+
+interface CarriedSnapshotOptions {
+  readonly recordedDigest?: string;
+  readonly reviews?: readonly NativeReviewSnapshot[];
+  readonly prOverrides?: Record<string, unknown>;
+}
+
+/**
+ * The PR head has moved from HEAD to CARRIED_HEAD; the claim, the terminal
+ * verdict and the signed marker are all still bound to HEAD.
+ */
+function carriedSnapshot(options: CarriedSnapshotOptions = {}): GitHubLifecycleSnapshot {
+  const base = snapshot();
+  const recordedDigest = 'recordedDigest' in options
+    ? options.recordedDigest
+    : REVIEWED_DIGEST;
+  return {
+    ...base,
+    pullRequests: base.pullRequests.map((pr) => ({
+      ...pr,
+      headOid: CARRIED_HEAD,
+      // GitHub re-points the prior review onto the merge commit.
+      reviews: options.reviews ?? [approvedReview({ commitId: CARRIED_HEAD })],
+      ...options.prOverrides,
+    })),
+    lifecycle: {
+      ...base.lifecycle,
+      items: base.lifecycle.items.map((item) => (
+        item.kind === 'pull-request'
+          ? {
+              ...item,
+              head: CARRIED_HEAD,
+              reviewClaim: {
+                ...item.reviewClaim,
+                ...(recordedDigest === undefined
+                  ? {}
+                  : { reviewedDiffDigest: recordedDigest }),
+              },
+            }
+          : item
+      )),
+    },
+  } as unknown as GitHubLifecycleSnapshot;
+}
+
+function carriedRunner(compareFiles: unknown, filenames: readonly string[] = ['GREETING.md']) {
+  return async (command: string, args: readonly string[]): Promise<string> => {
+    expect(command).toBe('gh');
+    const endpoint = args.find((arg) => arg.startsWith('repos/'));
+    if (endpoint === 'repos/Jinn-Network/mono/pulls/84') {
+      return JSON.stringify({
+        changed_files: filenames.length,
+        head: { sha: CARRIED_HEAD },
+        base: { ref: 'stack/base', sha: BASE },
+      });
+    }
+    if (endpoint?.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
+      return JSON.stringify([filenames.map((filename) => ({ filename }))]);
+    }
+    if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
+      return JSON.stringify({
+        content: Buffer.from('# no owned paths\n').toString('base64'),
+      });
+    }
+    if (endpoint?.startsWith('repos/Jinn-Network/mono/compare/')) {
+      expect(endpoint).toBe(
+        `repos/Jinn-Network/mono/compare/heads/stack/base...${CARRIED_HEAD}`,
+      );
+      return JSON.stringify({ status: 'ahead', files: compareFiles });
+    }
+    throw new Error(`unexpected ${command} ${args.join(' ')}`);
+  };
+}
+
+function carriedPort(
+  snapshotValue: GitHubLifecycleSnapshot,
+  compareFiles: unknown,
+  filenames: readonly string[] = ['GREETING.md'],
+) {
+  return makeProductionMergeActionPort({
+    readSnapshot: async () => snapshotValue,
+    authorAllowlist: new Set(['implementation-bot']),
+    expectedBaseRefName: 'stack/base',
+    runner: carriedRunner(compareFiles, filenames),
+  });
+}
+
+describe('approval carry across an update-branch head', () => {
+  it('carries the approval when the new head presents the reviewed diff', async () => {
+    const candidate = await carriedPort(carriedSnapshot(), REVIEWED_FILES)
+      .readCandidate(84);
+    expect(candidate).not.toBeNull();
+    expect(candidate!.head).toBe(CARRIED_HEAD);
+    expect(candidate!.terminalApprovalMatches).toBe(true);
+    expect(evaluateMergeGate(candidate!)).toEqual({ pass: true, reasons: [] });
+  });
+
+  it('merges at the new head under the carried approval', async () => {
+    const merged = await executeMergeAction(
+      {
+        prNumber: 84,
+        expectedHead: CARRIED_HEAD,
+        expectedBaseRefName: gitRefName('stack/base'),
+      },
+      {
+        ...carriedPort(carriedSnapshot(), REVIEWED_FILES),
+        credentials: new CredentialPool([{
+          login: 'implementation-bot',
+          normalizedLogin: 'implementation-bot',
+          implementationToken: 'selected-secret',
+        }]),
+        mergeExactHead: async () => ({
+          status: 'merged',
+          head: CARRIED_HEAD,
+          mergeCommitOid: gitOid('9'.repeat(40)),
+        }),
+        reconcileDone: async () => undefined,
+      },
+    );
+    expect(merged).toMatchObject({ status: 'merged', head: CARRIED_HEAD });
+  });
+
+  it('does not carry when a base change altered a file the PR also changed', async () => {
+    // Same paths, different merged result: the base moved lines the PR's hunk
+    // is anchored on, so the patch — and therefore the digest — differs.
+    const rebased = [{
+      ...REVIEWED_FILES[0],
+      patch: '@@ -7,1 +7,1 @@\n-hello\n+hi',
+    }];
+    const candidate = await carriedPort(carriedSnapshot(), rebased).readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(false);
+    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+  });
+
+  it('does not carry when a worker pushed a real code change', async () => {
+    const pushed = [
+      REVIEWED_FILES[0],
+      {
+        filename: 'src/backdoor.ts',
+        status: 'added',
+        sha: 'b'.repeat(40),
+        additions: 1,
+        deletions: 0,
+        patch: '@@ -0,0 +1 @@\n+exfiltrate();',
+      },
+    ];
+    const candidate = await carriedPort(
+      carriedSnapshot(),
+      pushed,
+      ['GREETING.md', 'src/backdoor.ts'],
+    ).readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(false);
+    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+  });
+
+  it('does not carry a claim written before digests existed', async () => {
+    const candidate = await carriedPort(
+      carriedSnapshot({ recordedDigest: undefined }),
+      REVIEWED_FILES,
+    ).readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(false);
+    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+  });
+
+  it.each([
+    [
+      'a file GitHub cannot represent as a patch',
+      [{ filename: 'GREETING.md', status: 'modified', sha: 'a'.repeat(40) }],
+      ['GREETING.md'],
+    ],
+    [
+      'a compare response carrying no files at all',
+      undefined,
+      ['GREETING.md'],
+    ],
+    [
+      'a compare file set that disagrees with the proven changed-file list',
+      REVIEWED_FILES,
+      ['GREETING.md', 'src/hidden.ts'],
+    ],
+  ])('does not carry with %s', async (_name, compareFiles, filenames) => {
+    const candidate = await carriedPort(
+      carriedSnapshot(),
+      compareFiles,
+      filenames,
+    ).readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(false);
+    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+  });
+
+  it('does not carry a digest that matches some other PR head state', async () => {
+    const candidate = await carriedPort(
+      carriedSnapshot({ recordedDigest: digestFor([{
+        filename: 'GREETING.md',
+        status: 'modified',
+        sha: 'a'.repeat(40),
+        additions: 1,
+        deletions: 1,
+        patch: '@@ -1,1 +1,1 @@\n-hello\n+something-else',
+      }]) }),
+      REVIEWED_FILES,
+    ).readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(false);
+  });
+
+  it('still requires the signed marker naming the reviewed head', async () => {
+    const candidate = await carriedPort(
+      carriedSnapshot({
+        reviews: [approvedReview({
+          commitId: CARRIED_HEAD,
+          body: 'Approved, but with no engine signature.',
+        })],
+      }),
+      REVIEWED_FILES,
+    ).readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(false);
+  });
+
+  it('still refuses a superseding dismissal at the new head', async () => {
+    const candidate = await carriedPort(
+      carriedSnapshot({
+        reviews: [
+          approvedReview({ commitId: CARRIED_HEAD }),
+          approvedReview({
+            commitId: CARRIED_HEAD,
+            state: 'DISMISSED',
+            body: '',
+            submittedAt: '2026-07-20T00:02:00.000Z',
+          }),
+        ],
+      }),
+      REVIEWED_FILES,
+    ).readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(false);
+  });
+
+  it.each([
+    [
+      'draft',
+      { prOverrides: { isDraft: true } },
+      'draft',
+    ],
+    [
+      'human',
+      { prOverrides: { labels: ['engine:review', 'autopilot:human'] } },
+      'human',
+    ],
+    [
+      'checks-not-green',
+      {
+        prOverrides: {
+          checks: [{ name: 'ci', status: 'COMPLETED', conclusion: 'FAILURE' }],
+        },
+      },
+      'checks-not-green',
+    ],
+    [
+      'mergeability',
+      { prOverrides: { mergeability: 'CONFLICTING', mergeStateStatus: 'DIRTY' } },
+      'mergeability',
+    ],
+    [
+      'review-label',
+      { prOverrides: { labels: [] } },
+      'review-label',
+    ],
+    [
+      'changes-requested',
+      {
+        reviews: [
+          approvedReview({ commitId: CARRIED_HEAD }),
+          approvedReview({
+            reviewer: 'human-dev',
+            state: 'CHANGES_REQUESTED',
+            commitId: CARRIED_HEAD,
+            body: 'Not yet.',
+            submittedAt: '2026-07-20T00:03:00.000Z',
+          }),
+        ],
+      },
+      'changes-requested',
+    ],
+  ])('a matching digest does not unblock %s', async (_name, options, reason) => {
+    const candidate = await carriedPort(
+      carriedSnapshot(options as CarriedSnapshotOptions),
+      REVIEWED_FILES,
+    ).readCandidate(84);
+    // The approval itself still carries — only the independent reason blocks.
+    expect(candidate!.terminalApprovalMatches).toBe(true);
+    const gate = evaluateMergeGate(candidate!);
+    expect(gate.pass).toBe(false);
+    expect(gate.reasons).toContain(reason);
+    expect(gate.reasons).not.toContain('terminal-approval');
+  });
+
+  it('a matching digest does not unblock a disallowed author', async () => {
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => carriedSnapshot(),
+      authorAllowlist: new Set(['someone-else']),
+      expectedBaseRefName: 'stack/base',
+      runner: carriedRunner(REVIEWED_FILES),
+    });
+    const candidate = await port.readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(true);
+    expect(evaluateMergeGate(candidate!).reasons).toContain('author');
+  });
+
+  it('a matching digest does not unblock a behind head', async () => {
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => carriedSnapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: async (command, args) => {
+        const endpoint = args.find((arg) => arg.startsWith('repos/'));
+        if (endpoint?.startsWith('repos/Jinn-Network/mono/compare/')) {
+          return JSON.stringify({ status: 'behind', files: REVIEWED_FILES });
+        }
+        return carriedRunner(REVIEWED_FILES)(command, args);
+      },
+    });
+    const candidate = await port.readCandidate(84);
+    expect(candidate!.terminalApprovalMatches).toBe(true);
+    expect(evaluateMergeGate(candidate!).reasons).toContain('behind');
   });
 });

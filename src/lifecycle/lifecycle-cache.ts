@@ -267,6 +267,15 @@ const mappingDiagnosticSchema = z.object({
   detail: z.string().min(1),
   signature: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
+/**
+ * Mirrors `REVIEWED_DIFF_DIGEST_PATTERN`. Optional on purpose: a cache written
+ * before this field existed simply has no digest, and no digest means the merge
+ * gate keeps requiring exact head identity — byte-for-byte today's behaviour.
+ * That is why this addition needs no `version` bump the way `compareStatus`
+ * did: version 1's `compareStatus` values were actively *wrong* and had to be
+ * discarded, whereas an absent digest is already the safe value.
+ */
+const reviewedDiffDigestSchema = z.string().regex(/^v1:[0-9a-f]{64}$/);
 const reviewClaimBase = {
   kind: z.literal('review-claim'),
   protocolVersion: z.literal(2),
@@ -301,11 +310,13 @@ const reviewClaimSchema = z.union([
     ...reviewClaimBase,
     state: z.literal('verdict-intent'),
     verdict: verdictSchema,
+    reviewedDiffDigest: reviewedDiffDigestSchema.optional(),
   }).strict(),
   z.object({
     ...reviewClaimBase,
     state: z.literal('terminal-approved'),
     verdict: approvedVerdictSchema,
+    reviewedDiffDigest: reviewedDiffDigestSchema.optional(),
   }).strict(),
 ]);
 
@@ -327,6 +338,7 @@ const pullRequestSchema = z.object({
   mergeability: z.enum(['MERGEABLE', 'CONFLICTING', 'UNKNOWN']),
   mergeStateStatus: z.string(),
   compareStatus: z.enum(COMPARE_STATUSES).optional(),
+  reviewedDiffDigest: reviewedDiffDigestSchema.optional(),
   checks: z.array(z.object({
     name: z.string(),
     status: z.string(),

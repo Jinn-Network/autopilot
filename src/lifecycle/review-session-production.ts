@@ -30,6 +30,7 @@ import {
   sanitizedGitHubCommandOverlay,
 } from './credentials.js';
 import { makeGitProtocolPort } from './git-protocol.js';
+import { readReviewedDiffDigest } from './github-changed-files.js';
 import { validateCanonicalGitHubHttpsRemote } from './implementation-executor.js';
 import { GhLifecycleReader } from './github-reader.js';
 import { ConditionalRestClient } from './github-rest.js';
@@ -839,6 +840,26 @@ export function makeProductionReviewSessionPort(
 
     async readNativeReviews(prNumber, expectedHead) {
       return readNativeReviews(currentManifest(), prNumber, expectedHead);
+    },
+
+    /**
+     * Identity of the diff being reviewed, recorded on the claim so that a
+     * later `update-branch` head can be proven to present the same diff.
+     *
+     * `readReviewedDiffDigest` never throws; an unprovable digest comes back as
+     * `unavailable` and is recorded as nothing at all, leaving the merge gate's
+     * exact-head requirement in place.
+     */
+    async readReviewedDiffDigest(prNumber, expectedHead) {
+      const manifest = currentManifest();
+      const result = await readReviewedDiffDigest({
+        run: (command, args) => run(manifest, command, args),
+        prNumber,
+        expectedHead,
+        expectedBaseRefName: manifest.targetBase,
+        context: 'Review',
+      });
+      return result.status === 'digest' ? result.digest : undefined;
     },
 
     async hasHumanHold(_issueNumber, prNumber, expectedHead) {

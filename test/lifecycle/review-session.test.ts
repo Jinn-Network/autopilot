@@ -923,4 +923,80 @@ describe('review session protocol', () => {
     expect(filed).toBe(false);
   });
 
+
+  const DIGEST = `v1:${'d'.repeat(64)}`;
+
+  it('records the reviewed diff digest on the intent and the terminal approval', async () => {
+    const h = harness();
+    const heads: GitOid[] = [];
+    h.port.readReviewedDiffDigest = async (prNumber, expectedHead) => {
+      expect(prNumber).toBe(84);
+      heads.push(expectedHead);
+      return DIGEST;
+    };
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+
+    // Digested once, at the head the reviewer read.
+    expect(heads).toEqual([HEAD]);
+    expect(h.authority.record).toMatchObject({
+      state: 'terminal-approved',
+      head: HEAD,
+      reviewedDiffDigest: DIGEST,
+    });
+  });
+
+  it('does not digest a REQUEST_CHANGES verdict', async () => {
+    const h = harness();
+    let calls = 0;
+    h.port.readReviewedDiffDigest = async () => {
+      calls += 1;
+      return DIGEST;
+    };
+
+    await h.protocol.reviewVerdict(h.manifest, 'REQUEST_CHANGES', 'Not yet.');
+    expect(calls).toBe(0);
+    expect(h.authority.record).not.toHaveProperty('reviewedDiffDigest');
+  });
+
+  it.each([
+    ['the port does not implement it', undefined],
+    ['the port cannot prove a digest', async () => undefined],
+    ['the port throws', async () => { throw new Error('HTTP 500'); }],
+  ])('approves without a digest when %s', async (_name, reader) => {
+    const h = harness();
+    if (reader !== undefined) h.port.readReviewedDiffDigest = reader;
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+    // No digest recorded means the merge gate keeps requiring exact head
+    // identity: today's behaviour, never a silent carry.
+    expect(h.authority.record).toMatchObject({ state: 'terminal-approved' });
+    expect(h.authority.record).not.toHaveProperty('reviewedDiffDigest');
+  });
+
+  it('reuses the durable intent digest on a retry instead of re-reading it', async () => {
+    const h = harness({ state: 'verdict-intent', verdictState: 'APPROVE' });
+    h.authority = {
+      reviewRefOid: h.authority.reviewRefOid,
+      record: {
+        ...h.authority.record,
+        reviewedDiffDigest: DIGEST,
+      },
+    };
+    let calls = 0;
+    h.port.readReviewedDiffDigest = async () => {
+      calls += 1;
+      return `v1:${'e'.repeat(64)}`;
+    };
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+    expect(calls).toBe(0);
+    expect(h.authority.record).toMatchObject({
+      state: 'terminal-approved',
+      reviewedDiffDigest: DIGEST,
+    });
+  });
 });

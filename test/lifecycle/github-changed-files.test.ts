@@ -1,14 +1,85 @@
 import { describe, expect, it } from 'vitest';
 import {
   readExactChangedFiles,
+  readExactCompareEvidence,
   readExactCompareStatus,
 } from '../../src/lifecycle/github-changed-files.js';
+import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 import { chooseIntegrationLadderAction } from '../../src/lifecycle/integration-ladder.js';
 import { evaluateMergeGate, type MergeCandidate } from '../../src/lifecycle/merge-executor.js';
 import { gitOid, gitRefName, type CompareStatus } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
 const BASE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+describe('readExactCompareEvidence', () => {
+  const COMPARE_FILE = {
+    filename: 'src/a.ts',
+    status: 'modified',
+    patch: '@@ -1,1 +1,1 @@\n-old\n+new',
+  };
+
+  async function evidence(compare: unknown) {
+    const calls: string[] = [];
+    const result = await readExactCompareEvidence({
+      run: async (_command, args) => {
+        calls.push(args[1]!);
+        if (args[1] === 'repos/Jinn-Network/mono/pulls/101') {
+          return JSON.stringify({
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: BASE },
+          });
+        }
+        return JSON.stringify(compare);
+      },
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'next',
+      repositorySlug: 'Jinn-Network/mono',
+    });
+    return { result, calls };
+  }
+
+  it('derives status and the reviewed-diff digest from one compare request', async () => {
+    const { result, calls } = await evidence({ status: 'ahead', files: [COMPARE_FILE] });
+    const expected = reviewedDiffDigestFromCompare([COMPARE_FILE]);
+    expect(expected.status).toBe('digest');
+    expect(result).toEqual({
+      status: 'ahead',
+      reviewedDiffDigest: expected.status === 'digest' ? expected.digest : undefined,
+    });
+    // No second request: the digest rides the response `status` already needs.
+    expect(calls).toEqual([
+      'repos/Jinn-Network/mono/pulls/101',
+      `repos/Jinn-Network/mono/compare/heads/next...${HEAD}`,
+    ]);
+  });
+
+  it.each([
+    ['a compare with no files array', { status: 'ahead' }],
+    [
+      'a file GitHub could not represent as a patch',
+      { status: 'ahead', files: [{ filename: 'logo.png', status: 'modified' }] },
+    ],
+  ])('keeps the status but omits the digest for %s', async (_name, compare) => {
+    const { result } = await evidence(compare);
+    expect(result).toEqual({ status: 'ahead' });
+    expect(result).not.toHaveProperty('reviewedDiffDigest');
+  });
+
+  it('still refuses a compare whose head or base authority moved', async () => {
+    await expect(readExactCompareEvidence({
+      run: async () => JSON.stringify({
+        head: { sha: 'f'.repeat(40) },
+        base: { ref: 'next', sha: BASE },
+      }),
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'next',
+      repositorySlug: 'Jinn-Network/mono',
+    })).rejects.toThrow(/lost exact PR authority/);
+  });
+});
 
 describe('readExactCompareStatus', () => {
   it('binds compare status to a fresh exact head/base read', async () => {

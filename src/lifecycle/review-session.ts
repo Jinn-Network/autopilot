@@ -106,6 +106,19 @@ export interface ReviewSessionPort {
     marker: string,
     body: string,
   ): Promise<void>;
+  /**
+   * Identity of the diff the reviewer is being asked to approve, recorded on
+   * the claim so a later head can be proven to present the same diff.
+   *
+   * Optional port method returning an optional value: a port that does not
+   * implement it, and any read that cannot prove the digest, both leave the
+   * claim without one, and a claim without one is exactly today's behaviour —
+   * the merge gate keeps requiring exact head identity.
+   */
+  readReviewedDiffDigest?(
+    prNumber: number,
+    expectedHead: GitOid,
+  ): Promise<string | undefined>;
   fileFindingChild?(input: {
     readonly parentPr: number;
     readonly title: string;
@@ -272,6 +285,7 @@ function nextRecord(
   state: 'active' | 'verdict-intent' | 'terminal-approved' | 'human' | 'stale',
   now: Date,
   verdict?: { readonly state: ReviewVerdictState; readonly marker: string },
+  reviewedDiffDigest?: string,
 ): ReviewClaimRecord {
   const common = {
     kind: 'review-claim' as const,
@@ -283,17 +297,47 @@ function nextRecord(
     head: manifest.expectedHead as GitOid,
     recordedAt: now.toISOString(),
   };
+  // The digest describes a verdict's subject; the codec rejects it on any other
+  // state, so it is attached only where it means something.
+  const withDigest = reviewedDiffDigest === undefined
+    ? {}
+    : { reviewedDiffDigest };
   if (state === 'verdict-intent') {
     if (verdict === undefined) throw new Error('Verdict intent requires verdict metadata');
-    return { ...common, state, verdict };
+    return { ...common, ...withDigest, state, verdict };
   }
   if (state === 'terminal-approved') {
     if (verdict?.state !== 'APPROVE') {
       throw new Error('Terminal approval requires approval metadata');
     }
-    return { ...common, state, verdict: { ...verdict, state: 'APPROVE' } };
+    return {
+      ...common,
+      ...withDigest,
+      state,
+      verdict: { ...verdict, state: 'APPROVE' },
+    };
   }
   return { ...common, state };
+}
+
+/**
+ * Never throws and never propagates a port failure: an unreadable digest must
+ * leave the claim without one, which is byte-for-byte the pre-existing
+ * behaviour, and must not fail an otherwise valid approval.
+ */
+async function readReviewedDiffDigest(
+  manifest: AttemptManifest,
+  port: ReviewSessionPort,
+): Promise<string | undefined> {
+  if (port.readReviewedDiffDigest === undefined) return undefined;
+  try {
+    return await port.readReviewedDiffDigest(
+      manifest.prNumber!,
+      manifest.expectedHead as GitOid,
+    );
+  } catch {
+    return undefined;
+  }
 }
 
 async function publishRecord(
@@ -610,11 +654,18 @@ async function reviewVerdict(
       state: 'verdict-intent',
     };
   } else if (authority.record.state === 'active') {
+    // Recorded once, at the head the reviewer read, and never recomputed for a
+    // later head: the whole point is that this value describes *what was
+    // reviewed*. Retries reuse the durable `verdict-intent` record above rather
+    // than re-reading, so the recorded digest cannot drift under a retry.
     intent = nextRecord(
       manifest,
       'verdict-intent',
       port.now(),
       { state, marker: port.nextMarker() },
+      state === 'APPROVE'
+        ? await readReviewedDiffDigest(manifest, port)
+        : undefined,
     ) as Extract<ReviewClaimRecord, { readonly state: 'verdict-intent' }>;
     const published = await publishRecord(manifest, authority, intent, port);
     if (published.status !== 'published') return { status: published.status, head };
@@ -670,6 +721,7 @@ async function reviewVerdict(
       'terminal-approved',
       port.now(),
       intent.verdict,
+      intent.reviewedDiffDigest,
     );
     const published = await publishRecord(manifest, authority, terminal, port);
     if (published.status !== 'published') return { status: published.status, head };

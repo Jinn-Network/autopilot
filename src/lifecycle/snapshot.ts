@@ -12,6 +12,7 @@ import {
   mappingDiagnosticSignature,
 } from './codecs.js';
 import { parseChildMarker, isMachineChildIssue, type ChildKind } from './child-issues.js';
+import { isReviewedDiffDigest } from './reviewed-diff-digest.js';
 import {
   hasReviewFollowUpMarkerTag,
   parseReviewFollowUpMarker,
@@ -131,6 +132,13 @@ export interface PullRequestSnapshot {
   readonly mergeability: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
   readonly compareStatus?: CompareStatus;
+  /**
+   * Identity of the diff this head presents against its base branch tip, read
+   * from the same compare response as `compareStatus`. Absent whenever it could
+   * not be proven — see `reviewed-diff-digest.ts`. Absence must never be read
+   * as "the diff is unchanged".
+   */
+  readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
   readonly reviews: readonly NativeReviewSnapshot[];
@@ -184,6 +192,7 @@ export interface RawPullRequest {
   readonly mergeability: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
   readonly compareStatus?: CompareStatus;
+  readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
   readonly reviews: readonly RawNativeReview[];
@@ -440,6 +449,9 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       mergeability: raw.mergeability,
       mergeStateStatus: raw.mergeStateStatus,
       ...(raw.compareStatus === undefined ? {} : { compareStatus: raw.compareStatus }),
+      ...(isReviewedDiffDigest(raw.reviewedDiffDigest)
+        ? { reviewedDiffDigest: raw.reviewedDiffDigest }
+        : {}),
       checks: raw.checks.map((check) => ({ ...check })),
       ...(raw.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
       reviews,
@@ -530,17 +542,34 @@ function terminalVerdict(pr: PullRequestSnapshot) {
     verdict: claim.verdict.state,
   });
   const nativeState = claim.verdict.state === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED';
+  // Selected by the signed marker, not by `commit_id`.
+  //
+  // `commit_id` is not a stable head binding. Measured on Jinn-Network/mono:
+  // when `update-branch` merges the base into the PR branch, GitHub re-points
+  // every existing review's `commit_id` onto the new merge commit — PR #2130
+  // ended with three reviews whose markers name three different heads
+  // (2aa7c2d…, 01aa754…, 09f2da4…) and whose `commit_id` all read as the final
+  // head, with 01aa754… being literally the first parent of that head. An
+  // ordinary worker push leaves `commit_id` alone (PR #2232: head 75b6e35e,
+  // review `commit_id` 080cdc6d).
+  //
+  // The marker is engine-signed and encodes `head=<claim.head>`, so it survives
+  // that rewrite and is the stronger of the two bindings. Filtering on it and
+  // reporting `head: claim.head` therefore *tightens* the identity rather than
+  // relaxing it, and is unchanged in the common case where the head has not
+  // moved and `commit_id === claim.head` anyway. Every consumer of
+  // `terminalVerdict.head` still requires it to equal the item head before it
+  // grants anything, except the digest-proven carry in `engineApprovedAtHead`.
   const review = pr.reviews
     .filter((candidate) => (
-      candidate.commitId === claim.head
-      && candidate.reviewer.toLowerCase() === claim.reviewer.toLowerCase()
+      candidate.reviewer.toLowerCase() === claim.reviewer.toLowerCase()
       && candidate.state === nativeState
       && candidate.body.includes(expectedMarker)
     ))
     .sort((left, right) => right.submittedAt.localeCompare(left.submittedAt))[0];
   if (review === undefined) return undefined;
   return {
-    head: review.commitId,
+    head: claim.head,
     state: claim.verdict.state,
     recordedAt: review.submittedAt,
     marker: claim.verdict.marker,
@@ -689,6 +718,9 @@ function lifecyclePr(
       : { implementationSummary: pr.implementationCompletionSummary }),
     ...(reviewClaim === undefined ? {} : { reviewClaim }),
     ...(terminalVerdict(pr) === undefined ? {} : { terminalVerdict: terminalVerdict(pr) }),
+    ...(pr.reviewedDiffDigest === undefined
+      ? {}
+      : { reviewedDiffDigest: pr.reviewedDiffDigest }),
   };
 }
 
