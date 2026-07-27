@@ -212,12 +212,24 @@ export function makeProductionMergeActionPort(
     });
     const { baseRefName: compareBaseRefName, files } = changedFiles;
     // CODEOWNERS is read at the base branch *tip*, not at the PR's pinned fork
-    // point (`baseOid`). GitHub enforces the CODEOWNERS in effect at the tip,
-    // so reading the fork-point blob missed every rule added after the PR
-    // forked and let `codeownerSensitive` under-report — failing OPEN on a
-    // safety signal. Moving to the tip can only ever add ownership rules the
-    // fork point lacked, so the change is monotone in the safe direction: it
-    // can turn a `false` into a `true`, never the reverse.
+    // point (`baseOid`), because the tip is what GitHub enforces at merge time.
+    // This makes `codeownerSensitive` agree with the enforcing authority.
+    //
+    // The fork-point read could disagree in BOTH directions, and neither
+    // direction is safe to hand-wave:
+    //   - a rule ADDED to the base after the PR forked was absent from the
+    //     fork-point blob, so a change touching a newly-owned path
+    //     under-reported as not sensitive — the fail-open direction;
+    //   - a rule DELETED or NARROWED on the base after the PR forked was still
+    //     present in the fork-point blob, so a change over-reported as
+    //     sensitive and was routed to a human GitHub would not have asked for.
+    //
+    // Note explicitly that this fix is therefore NOT monotone: moving to the
+    // tip can turn `codeownerSensitive` from `true` to `false` whenever a rule
+    // was removed, and an ordinary commit is enough to do that. The
+    // justification is correctness — one authority, the one that actually
+    // gates the merge — not conservatism. Do not restate it as "can only add
+    // sensitivity"; that claim is false.
     //
     // `baseOid` stays the authority for the changed-files diff, which is
     // genuinely computed against the fork point. The `heads/` prefix keeps a

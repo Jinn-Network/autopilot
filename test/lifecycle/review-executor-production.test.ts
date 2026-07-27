@@ -806,6 +806,25 @@ describe('review CODEOWNERS is read at the base branch tip', () => {
     expect(harness.refs).toEqual(['ref=heads/next']);
   });
 
+  /**
+   * The `true -> false` direction, stated explicitly. CODEOWNERS entries can be
+   * deleted or narrowed by an ordinary commit, so the tip policy is not a
+   * superset of the fork-point policy and this fix is not monotone. Routing to
+   * a human on the strength of a rule GitHub no longer enforces was the
+   * fork-point read's over-reporting failure, and dropping it here is correct.
+   */
+  it('stops routing to a human once the owning rule is deleted from the base', async () => {
+    const harness = port({
+      atForkPoint: '/client/src/dashboard/spa/src/pages/ @Jinn-Network/codeowners\n',
+      atTip: '# ownership withdrawn\n',
+    });
+
+    await expect(harness.value.readCandidate(84)).resolves.toMatchObject({
+      approvalPolicy: 'approve-eligible',
+    });
+    expect(harness.refs).toEqual(['ref=heads/next']);
+  });
+
   it('pins the base through heads/ so a same-named tag cannot hijack the policy', async () => {
     const harness = port({ atForkPoint: '', atTip: '' });
 

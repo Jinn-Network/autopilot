@@ -644,6 +644,39 @@ describe('merge candidate CODEOWNERS authority', () => {
     ]);
   });
 
+  /**
+   * The other direction, stated explicitly because it refutes the tempting
+   * "reading the tip can only ADD sensitivity" argument. CODEOWNERS entries can
+   * be deleted or narrowed by an ordinary commit, so the tip policy is NOT a
+   * superset of the fork-point policy and this fix is NOT monotone: it can turn
+   * `codeownerSensitive` from `true` to `false`.
+   *
+   * That is correct behaviour — GitHub will not enforce a rule that no longer
+   * exists at the tip, so the old fork-point read was over-reporting and
+   * routing changes to a human GitHub never asked for. The justification for
+   * the fix is agreement with the enforcing authority, not conservatism.
+   */
+  it('drops sensitivity for a rule deleted from the base after the PR forked', async () => {
+    const seen: string[] = [];
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: codeownersRunner({
+        atForkPoint: '/client/src/dashboard/spa/src/pages/ @Jinn-Network/codeowners\n',
+        // The rule was removed from the base branch after this PR forked, so
+        // GitHub will not enforce it at merge time.
+        atTip: '# ownership withdrawn\n',
+        seen,
+      }),
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      codeownersComplete: true,
+      codeownerSensitive: false,
+    });
+  });
+
   it('pins CODEOWNERS through heads/ so a same-named tag cannot hijack it', async () => {
     const seen: string[] = [];
     const port = makeProductionMergeActionPort({

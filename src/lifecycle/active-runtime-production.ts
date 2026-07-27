@@ -1001,11 +1001,16 @@ export function makeProductionActiveRuntime(
           }),
           credentials,
         });
+        // Forward the reason whenever the result carries one, rather than
+        // enumerating the statuses that happen to have one today. The previous
+        // `status === 'ineligible' || status === 'rejected'` allowlist went
+        // stale the moment `pending` was added: the operator saw the status
+        // with none of `update-branch-queued` / `-rate-limited` / `-unavailable`
+        // / `-unclassified` telling them which it was. A presence test cannot
+        // go stale that way.
         return {
           status: result.status,
-          ...(result.status === 'ineligible' || result.status === 'rejected'
-            ? { reason: result.reason }
-            : {}),
+          ...('reason' in result ? { reason: result.reason } : {}),
         };
       },
 

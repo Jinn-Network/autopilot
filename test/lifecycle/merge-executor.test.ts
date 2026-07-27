@@ -421,3 +421,61 @@ describe('update-branch distinguishes the live #2130 and #2229 shapes', () => {
     expect(new Set([stale.status, inFlight.status, conflicted.status]).size).toBe(3);
   });
 });
+
+/**
+ * Structural invariant the runtime projection depends on.
+ *
+ * `active-runtime-production.ts` forwards a result's `reason` by testing for
+ * its presence. That is only sound if every `UpdateBranchResult` variant which
+ * does not identify itself by a head carries a non-empty reason — otherwise an
+ * outcome would reach the operator as a bare status with no explanation, which
+ * is exactly what happened when the projection used a status allowlist and
+ * `pending` was added outside it.
+ */
+describe('every non-head update-branch result explains itself', () => {
+  it.each([
+    ['pending', 'queued'],
+    ['pending', 'rate-limited'],
+    ['pending', 'unavailable'],
+    ['pending', 'unclassified'],
+    ['rejected', 'conflict'],
+    ['rejected', 'forbidden'],
+  ] as const)('%s/%s carries a forwardable reason', async (status, failure) => {
+    const result = await executeUpdateBranchAction(
+      { prNumber: 84, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'behind' as const }),
+        updateBranch: async () => ({ status, head: HEAD, failure }),
+      },
+    );
+
+    expect('reason' in result).toBe(true);
+    expect((result as { reason: string }).reason).toMatch(/^update-branch-\S+$/);
+  });
+
+  it('identifies every head-bearing result by its head instead', async () => {
+    const moved = gitOid('9'.repeat(40));
+    const updated = await executeUpdateBranchAction(
+      { prNumber: 84, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'behind' as const }),
+        updateBranch: async () => ({ status: 'updated', head: moved }),
+      },
+    );
+    const upToDate = await executeUpdateBranchAction(
+      { prNumber: 84, expectedHead: HEAD },
+      {
+        ...harness().deps,
+        readCandidate: async () => candidate({ compareStatus: 'ahead' as const }),
+        updateBranch: async () => { throw new Error('must not run'); },
+      },
+    );
+
+    for (const result of [updated, upToDate]) {
+      expect('reason' in result).toBe(false);
+      expect(result).toHaveProperty('head');
+    }
+  });
+});
