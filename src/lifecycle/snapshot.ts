@@ -904,10 +904,17 @@ function eligibilityEvidence(
       detail: 'Machine child issue is not currently selectable',
     };
   }
+  // Explainer only — the disjunction is unchanged, so `eligible` is identical
+  // either way (it is computed by the caller and never reads `triageReason`).
+  // Board membership is tested first because `shape` and `priority` are Project
+  // *board* fields: an issue that is not on the board necessarily reads both as
+  // null, and the old order reported "Issue Type is not set" for it. That sends
+  // an operator to set a field on an item that has no board row to set it on.
+  // The most fundamental unmet condition is the actionable one.
   const triageReason =
-    issue.shape === null ? 'Issue Type is not set'
-      : issue.priority === null ? 'Priority is not set'
-        : !issue.onBoard || issue.projectItemId === null ? 'Issue is not on the Project'
+    !issue.onBoard || issue.projectItemId === null ? 'Issue is not on the Project'
+      : issue.shape === null ? 'Issue Type is not set'
+        : issue.priority === null ? 'Priority is not set'
           : issue.blockedOn === 'Human' ? 'Project Blocked on is Human'
             : null;
   if (triageReason !== null) return { reason: 'not-selected', detail: triageReason };
