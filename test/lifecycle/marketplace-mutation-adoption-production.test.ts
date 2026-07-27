@@ -763,7 +763,7 @@ describe('production default docker verification sandbox', () => {
       deadline: '2020-01-01T02:00:00.000Z',
     })).rejects.toMatchObject({
       reason: 'runner-failed',
-      disposition: 'stable-rejection',
+      disposition: 'recoverable',
       message: expect.stringMatching(/docker daemon/i),
     });
     expect(dockerRunner).not.toHaveBeenCalled();

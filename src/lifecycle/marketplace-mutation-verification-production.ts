@@ -413,14 +413,14 @@ async function ensureProductionVerificationInfrastructure(
   if (!(await inspector.inspectDaemon())) {
     throw new MarketplaceVerificationError(
       'runner-failed',
-      'stable-rejection',
+      'recoverable',
       'Docker daemon is not reachable for marketplace verification',
     );
   }
   if (!(await inspector.inspectImage(JINN_MONO_V1_VERIFICATION_NODE_IMAGE))) {
     throw new MarketplaceVerificationError(
       'runner-failed',
-      'stable-rejection',
+      'recoverable',
       `Pinned marketplace verification image is unavailable: ${JINN_MONO_V1_VERIFICATION_NODE_IMAGE}`,
     );
   }
