@@ -68,6 +68,22 @@ export interface LifecycleDiscoveryState {
   readonly openPullRequests: readonly PullRequestIndexEntry[] | null;
   /** Last complete recently-closed index, used to avoid repeated classifications. */
   readonly recentlyClosedPullRequests: readonly PullRequestIndexEntry[];
+  /**
+   * Accumulated PR numbers positively observed CLOSED with `merged_at: null`.
+   *
+   * `recentlyClosedPullRequests` is windowed by `recentlyClosedCutoff`, which
+   * every full read resets to `now - RECENTLY_CLOSED_OVERLAP_MS`; a PR that
+   * closed unmerged therefore leaves that index within one full-read period.
+   * The review-follow-up parent gate needs the fact to outlive the window, so
+   * it is carried here as a bare number set.
+   *
+   * Deliberately *not* version-gated. Absence carries no wrong claim — it means
+   * "nothing observed yet", which is exactly the pre-existing behaviour — so an
+   * older cache is safe to load and simply begins accumulating. That is the
+   * opposite of the version-1 `compareStatus` situation, where every persisted
+   * value was affirmatively wrong and had to be discarded.
+   */
+  readonly closedUnmergedPullRequests?: readonly number[];
   /** Fixed overlap boundary selected by the last full oracle and reused until the next one. */
   readonly recentlyClosedCutoff: string;
   readonly restCache: readonly PersistedConditionalRestCacheEntry[];
@@ -488,6 +504,7 @@ const stateSchema = z.object({
   openPullRequestEvidence: z.array(pullRequestSchema),
   openPullRequests: z.array(pullRequestIndexSchema).nullable(),
   recentlyClosedPullRequests: z.array(pullRequestIndexSchema),
+  closedUnmergedPullRequests: z.array(z.number().int().positive()).optional(),
   recentlyClosedCutoff: exactTimestamp,
   restCache: z.array(restCacheSchema),
 }).strict().superRefine((state, context) => {
@@ -650,6 +667,33 @@ const stateSchema = z.object({
     }
     if (openIndex.has(pr.number)) {
       issue(['recentlyClosedPullRequests'], `PR #${pr.number} is also in the open index`);
+    }
+  }
+  const closedUnmerged = state.closedUnmergedPullRequests ?? [];
+  unique(
+    closedUnmerged.map((number) => ({ number })),
+    (entry) => String(entry.number),
+    ['closedUnmergedPullRequests'],
+    'closed-unmerged PR number',
+  );
+  const mergedClosed = new Map(
+    state.recentlyClosedPullRequests.map((pr) => [pr.number, pr.mergedAt]),
+  );
+  for (const number of closedUnmerged) {
+    // The set gates dispatch, so a number in it must not be contradicted by a
+    // live index in the same state: a PR that is open again, or one the closed
+    // index says was merged, is not closed-unmerged and must have been dropped.
+    if (openIndex.has(number)) {
+      issue(
+        ['closedUnmergedPullRequests'],
+        `PR #${number} is in the open index and cannot be closed-unmerged`,
+      );
+    }
+    if ((mergedClosed.get(number) ?? null) !== null) {
+      issue(
+        ['closedUnmergedPullRequests'],
+        `PR #${number} is merged in the closed index and cannot be closed-unmerged`,
+      );
     }
   }
   for (const pr of state.openPullRequestEvidence) {

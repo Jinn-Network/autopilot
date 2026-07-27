@@ -291,6 +291,11 @@ function composeTargeted(
     snapshotMode: cycle.snapshotMode ?? 'incremental',
     lastFullReconciliationAt: cycle.lastFullReconciliationAt,
     githubUsage: cycle.githubUsage,
+    // Carried forward: a targeted recompose must not release a review follow-up
+    // the cycle snapshot holds on a closed-unmerged parent.
+    ...(cycle.closedUnmergedPullRequests === undefined
+      ? {}
+      : { closedUnmergedPullRequests: cycle.closedUnmergedPullRequests }),
     ...(cycle.snapshotAuthority === undefined
       ? {}
       : {

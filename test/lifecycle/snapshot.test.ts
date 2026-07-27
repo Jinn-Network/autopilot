@@ -12,6 +12,7 @@ import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import type { PolledIssue } from '../../src/dispatcher/types.js';
 import {
   buildGitHubLifecycleSnapshot,
+  composeGitHubLifecycleSnapshot,
   SnapshotDecodeError,
   type GitHubLifecycleReader,
   type PullRequestPage,
@@ -2235,12 +2236,146 @@ describe('buildGitHubLifecycleSnapshot', () => {
     });
   });
 
+  // The absent case above stays fail-open on purpose. What was missing is a
+  // *positive* discriminator for the one absence that is not "merged and
+  // pruned": a parent closed without merging, whose reviewed code is on no
+  // base branch at all. Both directions are asserted here — the set gates, and
+  // an absent parent that is NOT in the set still releases — because a gate
+  // that fired on absence would strand every correctly-merged parent's
+  // follow-ups, which is the failure the fail-open boundary exists to avoid.
+  function composeFollowUp(closedUnmerged?: readonly number[]) {
+    return composeGitHubLifecycleSnapshot({
+      project: {
+        items: [],
+        rateLimit: { remaining: 4_000, used: 1_000, resetAt: '2026-07-20T13:00:00.000Z' },
+        currentSprintIterationId: 'sprint',
+      },
+      issues: [followUpIssue(909)],
+      pullRequests: [],
+      branches: [],
+    }, {
+      authorAllowlist: new Set(['trusted']),
+      capturedAt: '2026-07-20T12:00:00.000Z',
+      snapshotMode: 'incremental',
+      lastFullReconciliationAt: '2026-07-20T11:00:00.000Z',
+      githubUsage: {
+        graphqlRequests: 3,
+        graphqlCost: 20,
+        graphqlRemaining: 3_980,
+        graphqlResetAt: '2026-07-20T13:00:00.000Z',
+        restRequests: 2,
+        restNotModified: 0,
+        cacheHits: 0,
+      },
+      ...(closedUnmerged === undefined
+        ? {}
+        : { closedUnmergedPullRequests: closedUnmerged }),
+    });
+  }
+
+  it('holds a review follow-up whose parent PR is known closed-unmerged', () => {
+    const snapshot = composeFollowUp([909]);
+
+    expect(snapshot.pullRequests.some((pr) => pr.number === 909)).toBe(false);
+    expect(snapshot.closedUnmergedPullRequests).toEqual([909]);
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+    });
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)?.eligibilityDetail)
+      .toContain('#909 was closed without merging');
+  });
+
+  it('still releases a review follow-up whose absent parent is not known closed-unmerged', () => {
+    // Same fixture, empty evidence: "merged and pruned" must not be punished.
+    for (const closedUnmerged of [undefined, [], [910]] as const) {
+      const snapshot = composeFollowUp(closedUnmerged);
+      expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+        eligible: true,
+        eligibilityReason: 'eligible',
+      });
+    }
+  });
+
   // R1: the explainer branch must sit BELOW the whole cascade. Shipped above
   // `authorDisallowed` it reported the parent PR for issues that were actually
   // untriaged or author-disallowed, hiding the real failure. The untriaged
   // window is real: review-follow-ups-production.ts creates the issue and only
   // then calls ensureTriageComplete. Mutant M9 (move the branch back above the
   // cascade) survived without these two cases.
+  // Explainer precedence. `shape` and `priority` are Project board fields, so
+  // an off-board issue necessarily reads both as null. Testing `shape` first
+  // told the operator to set an Issue Type on an item with no board row to set
+  // it on. Both directions are pinned: reordering back flips the first case,
+  // and deleting the `shape` arm flips the second.
+  it('explains an off-board issue as off-board, not as a missing Issue Type', () => {
+    const offBoard = {
+      ...issue(),
+      number: 77,
+      status: null,
+      shape: null,
+      priority: null,
+      onBoard: false,
+      projectItemId: null,
+      body: '',
+    };
+    const snapshot = composeGitHubLifecycleSnapshot({
+      project: {
+        items: [],
+        rateLimit: { remaining: 4_000, used: 1_000, resetAt: '2026-07-20T13:00:00.000Z' },
+        currentSprintIterationId: 'sprint',
+      },
+      issues: [offBoard],
+      pullRequests: [],
+      branches: [],
+    }, {
+      authorAllowlist: new Set(['trusted']),
+      capturedAt: '2026-07-20T12:00:00.000Z',
+      snapshotMode: 'incremental',
+      lastFullReconciliationAt: '2026-07-20T11:00:00.000Z',
+      githubUsage: {
+        graphqlRequests: 3,
+        graphqlCost: 20,
+        graphqlRemaining: 3_980,
+        graphqlResetAt: '2026-07-20T13:00:00.000Z',
+        restRequests: 2,
+        restNotModified: 0,
+        cacheHits: 0,
+      },
+    });
+
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 77)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'not-selected',
+      eligibilityDetail: 'Issue is not on the Project',
+    });
+  });
+
+  it('still explains an on-board issue with no Issue Type as a missing Issue Type', async () => {
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo', shape: null }],
+      readPullRequests: async () => ({
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readProjectSnapshot: async () => ({
+        items: [],
+        rateLimit: { remaining: 4_000, used: 1_000, resetAt: '2026-07-20T13:00:00.000Z' },
+        currentSprintIterationId: 'sprint',
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 42)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'not-selected',
+      eligibilityDetail: 'Issue Type is not set',
+    });
+  });
+
   it('reports the triage failure, not the parent PR, for an untriaged review follow-up', async () => {
     const untriaged = { ...followUpIssue(101), shape: null };
     const source = reader({

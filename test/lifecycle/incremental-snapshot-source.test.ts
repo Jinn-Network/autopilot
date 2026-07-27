@@ -1391,6 +1391,59 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     expect(context.store.state?.recentlyClosedPullRequests).toEqual(context.rest.closedPrs);
   });
 
+  // Durability is the whole point. `recentlyClosedCutoff` is reset to
+  // `now - RECENTLY_CLOSED_OVERLAP_MS` (5 minutes) by every full read, so a
+  // closed-unmerged PR leaves `recentlyClosedPullRequests` within one full-read
+  // period. A gate that read only that index would block a review follow-up for
+  // one window and then release it — a delay, not a fix.
+  it('accumulates closed-unmerged PR numbers and keeps them after the closed index ages out', async () => {
+    const context = harness();
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    context.rest.closedPrs = [openIndex({
+      number: 104,
+      title: 'closed without merge',
+      state: 'CLOSED',
+      updatedAt: '2026-07-22T10:20:00.000Z',
+      headOid: HEAD_D,
+      headRefName: 'feature/closed',
+      closedAt: '2026-07-22T10:20:00.000Z',
+    })];
+    context.reader.targeted.set(104, null);
+    context.setNow('2026-07-22T10:30:00.000Z');
+    const seen = await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
+
+    expect(seen.closedUnmergedPullRequests).toEqual([104]);
+    expect(context.store.state?.closedUnmergedPullRequests).toEqual([104]);
+
+    // The index ages out; the fact must not.
+    context.rest.closedPrs = [];
+    context.setNow('2026-07-22T11:00:00.000Z');
+    const afterFull = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(afterFull.closedUnmergedPullRequests).toEqual([104]);
+    expect(context.store.state?.recentlyClosedPullRequests).toEqual([]);
+    expect(context.store.state?.closedUnmergedPullRequests).toEqual([104]);
+
+    // ...but a later merge retires it, so a reopened-and-merged parent's
+    // follow-ups are never stranded by a fact that stopped being true.
+    context.rest.closedPrs = [openIndex({
+      number: 104,
+      title: 'closed without merge',
+      state: 'CLOSED',
+      updatedAt: '2026-07-22T11:20:00.000Z',
+      headOid: HEAD_D,
+      headRefName: 'feature/closed',
+      closedAt: '2026-07-22T11:20:00.000Z',
+      mergedAt: '2026-07-22T11:20:00.000Z',
+    })];
+    context.setNow('2026-07-22T11:30:00.000Z');
+    const afterMerge = await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
+
+    expect(afterMerge.closedUnmergedPullRequests).toEqual([]);
+    expect(context.store.state?.closedUnmergedPullRequests).toEqual([]);
+  });
+
   it('preserves REST baselines across an hourly full oracle without rehydrating omitted PRs', async () => {
     const context = harness();
     const unrelatedOne = rawPr({

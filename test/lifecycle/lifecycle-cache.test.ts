@@ -527,6 +527,24 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await expect(store.load()).resolves.toEqual(incremental);
   });
 
+  it('round-trips the accumulated closed-unmerged PR set, and loads a cache without one', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const withSet: LifecycleDiscoveryState = {
+      ...state(),
+      closedUnmergedPullRequests: [909, 1_701],
+    };
+
+    await expect(store.save(withSet)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(withSet);
+
+    // Absence is not a wrong claim, only "nothing observed yet", so a cache
+    // written before the field existed loads rather than quarantining.
+    const legacy = state();
+    await expect(store.save(legacy)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(legacy);
+  });
+
   it('round-trips a closed PR whose close timestamp follows its update timestamp', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
@@ -787,6 +805,44 @@ describe('LifecycleDiscoveryCacheStore', () => {
         ...state().evidence,
         pullRequests: [{ ...state().evidence.pullRequests[0]!, state: 'MERGED' as const }],
       },
+    })],
+    // The closed-unmerged set gates review-follow-up dispatch, so a number in
+    // it that the same state contradicts is corruption, not a stale hint.
+    ['closed-unmerged PR that the open index says is open', () => ({
+      ...state(),
+      openPullRequests: [{
+        number: 101,
+        title: 'cached',
+        state: 'OPEN' as const,
+        updatedAt: '2026-07-22T09:30:00.000Z',
+        headOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+        isDraft: false,
+        closedAt: null,
+        mergedAt: null,
+      }],
+      closedUnmergedPullRequests: [101],
+    })],
+    ['closed-unmerged PR that the closed index says was merged', () => ({
+      ...state(),
+      recentlyClosedPullRequests: [{
+        number: 909,
+        title: 'cached',
+        state: 'CLOSED' as const,
+        updatedAt: '2026-07-22T09:30:00.000Z',
+        headOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        headRefName: 'autopilot/909',
+        baseRefName: 'next',
+        isDraft: false,
+        closedAt: '2026-07-22T09:30:00.000Z',
+        mergedAt: '2026-07-22T09:30:00.000Z',
+      }],
+      closedUnmergedPullRequests: [909],
+    })],
+    ['duplicate closed-unmerged PR number', () => ({
+      ...state(),
+      closedUnmergedPullRequests: [909, 909],
     })],
   ] as const)('rejects semantic corruption: %s', async (_label, makeState) => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));

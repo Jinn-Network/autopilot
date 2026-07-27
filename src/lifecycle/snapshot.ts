@@ -284,6 +284,12 @@ export interface GitHubLifecycleSnapshot {
   readonly scopedIssueNumbers?: readonly number[];
   /** Validated global count used to preserve fresh-work backpressure in a scoped view. */
   readonly globalOpenPipelineBacklog?: number;
+  /**
+   * PR numbers this source has positively observed CLOSED without a merge.
+   * Absent when the source cannot produce that evidence; never inferred from a
+   * PR merely being missing from `pullRequests`.
+   */
+  readonly closedUnmergedPullRequests?: readonly number[];
 }
 
 export function decodeBranchClaimSnapshot(raw: RawBranchClaim): BranchClaimSnapshot {
@@ -845,26 +851,47 @@ function resolveMappings(
 
 type ReviewFollowUpBlock =
   | { readonly cause: 'parent-open'; readonly parentPr: number }
+  | { readonly cause: 'parent-closed-unmerged'; readonly parentPr: number }
   | { readonly cause: 'unparseable-marker' };
 
 /**
  * Review follow-up (canon §3, §5.1): held while the parent PR named by its
  * machine marker is still OPEN in this snapshot, because the reviewed code
  * exists only on that branch. Marker `pr=` and PR state are the only inputs.
- * A marker-shaped comment that does not parse fails closed. Absence of the
- * parent does not gate — canon §5.1 carries that boundary and its argument.
+ * A marker-shaped comment that does not parse fails closed.
+ *
+ * Absence of the parent still does not gate — canon §5.1 carries that boundary
+ * and its argument: the world snapshot drops closed-unmerged PRs
+ * (`github-reader.ts`, `if (pr.state === 'CLOSED') continue`) and prunes merged
+ * ones once their issues reach Done, so absence is dominated by "merged and
+ * pruned" and blocking on it would strand every follow-up permanently.
+ *
+ * `closedUnmergedPrNumbers` is the discriminator that absence is not: it is
+ * *positive* evidence, sourced from `state=closed && merged_at=null` REST index
+ * rows. A merged parent can never appear in it (a merge always sets
+ * `merged_at`), so this gate cannot strand a correctly-merged parent's
+ * follow-ups — the failure the fail-open boundary was chosen to avoid. What it
+ * does catch is the case the boundary was blind to: a parent closed *without*
+ * merging, whose reviewed code exists nowhere, whose follow-up would otherwise
+ * be dispatched against a base that lacks it. That block is permanent by
+ * design and correctly so — no machine can land code that was never merged —
+ * and it names the parent so an operator can act.
  */
 function reviewFollowUpBlock(
   issue: PolledIssue,
   openPrNumbers: ReadonlySet<number>,
+  closedUnmergedPrNumbers: ReadonlySet<number>,
 ): ReviewFollowUpBlock | null {
   const body = issue.body ?? '';
   const marker = parseReviewFollowUpMarker(body);
   if (marker === null) {
     return hasReviewFollowUpMarkerTag(body) ? { cause: 'unparseable-marker' } : null;
   }
-  return openPrNumbers.has(marker.parentPr)
-    ? { cause: 'parent-open', parentPr: marker.parentPr }
+  if (openPrNumbers.has(marker.parentPr)) {
+    return { cause: 'parent-open', parentPr: marker.parentPr };
+  }
+  return closedUnmergedPrNumbers.has(marker.parentPr)
+    ? { cause: 'parent-closed-unmerged', parentPr: marker.parentPr }
     : null;
 }
 
@@ -904,25 +931,39 @@ function eligibilityEvidence(
       detail: 'Machine child issue is not currently selectable',
     };
   }
+  // Explainer only — the disjunction is unchanged, so `eligible` is identical
+  // either way. Board membership is tested first because `shape` and `priority`
+  // are Project *board* fields: an issue that is not on the board necessarily
+  // reads both as null, and the old order reported "Issue Type is not set" for
+  // it. That sends an operator to set a field on an item that has no board row
+  // to set it on. The most fundamental unmet condition is the actionable one.
   const triageReason =
-    issue.shape === null ? 'Issue Type is not set'
-      : issue.priority === null ? 'Priority is not set'
-        : !issue.onBoard || issue.projectItemId === null ? 'Issue is not on the Project'
+    !issue.onBoard || issue.projectItemId === null ? 'Issue is not on the Project'
+      : issue.shape === null ? 'Issue Type is not set'
+        : issue.priority === null ? 'Priority is not set'
           : issue.blockedOn === 'Human' ? 'Project Blocked on is Human'
             : null;
   if (triageReason !== null) return { reason: 'not-selected', detail: triageReason };
   // Below the whole cascade on purpose: an untriaged, author-disallowed or
   // already-claimed follow-up must report *that* failure, not the parent PR.
   if (followUpBlock !== null) {
-    return followUpBlock.cause === 'parent-open'
-      ? {
-          reason: 'dependency-blocked',
-          detail: `Review follow-up is blocked by open parent PR #${followUpBlock.parentPr}`,
-        }
-      : {
-          reason: 'not-selected',
-          detail: 'Review follow-up marker is present but could not be parsed',
-        };
+    if (followUpBlock.cause === 'parent-open') {
+      return {
+        reason: 'dependency-blocked',
+        detail: `Review follow-up is blocked by open parent PR #${followUpBlock.parentPr}`,
+      };
+    }
+    if (followUpBlock.cause === 'parent-closed-unmerged') {
+      return {
+        reason: 'dependency-blocked',
+        detail: `Review follow-up parent PR #${followUpBlock.parentPr} was closed without `
+          + 'merging, so the reviewed code is on no base branch',
+      };
+    }
+    return {
+      reason: 'not-selected',
+      detail: 'Review follow-up marker is present but could not be parsed',
+    };
   }
   return {
     reason: 'not-selected',
@@ -953,6 +994,7 @@ function lifecycleItems(
   project: ProjectSnapshot,
   defaultBranch: string,
   closingIssueEvidenceComplete: boolean,
+  closedUnmergedPrNumbers: ReadonlySet<number>,
 ): {
   readonly items: readonly LifecycleItem[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
@@ -1017,7 +1059,11 @@ function lifecycleItems(
     });
     const selectedReady = ready.has(issue.number);
     // Review follow-ups wait on their parent PR's branch (canon §5.1).
-    const followUpBlock = reviewFollowUpBlock(issue, openPrNumbers);
+    const followUpBlock = reviewFollowUpBlock(
+      issue,
+      openPrNumbers,
+      closedUnmergedPrNumbers,
+    );
     const eligible = selectedReady && !sourceHumanHold && followUpBlock === null;
     const holdDetail = issue.blockedOn === 'Human'
       ? 'Project Blocked on is Human'
@@ -1114,6 +1160,12 @@ export function composeGitHubLifecycleSnapshot(
     readonly scopedIssueNumbers?: readonly number[];
     readonly globalOpenPipelineBacklog?: number;
     readonly closingIssueEvidenceIncomplete?: true;
+    /**
+     * PR numbers observed CLOSED with no merge. Positive evidence only — a
+     * source that cannot produce it omits the option and the review-follow-up
+     * parent gate degrades to the pre-existing fail-open boundary.
+     */
+    readonly closedUnmergedPullRequests?: readonly number[];
   },
 ): GitHubLifecycleSnapshot {
   isoTimestamp(options.capturedAt);
@@ -1126,6 +1178,12 @@ export function composeGitHubLifecycleSnapshot(
     )
   ) {
     throw new Error('Global open-pipeline backlog must be a non-negative integer');
+  }
+  const closedUnmerged = new Set(options.closedUnmergedPullRequests ?? []);
+  for (const number of closedUnmerged) {
+    if (!Number.isSafeInteger(number) || number <= 0) {
+      throw new Error('Closed-unmerged PR numbers must be positive integers');
+    }
   }
   const mappingEvidenceComplete = options.closingIssueEvidenceIncomplete !== true
     && evidence.pullRequests.every((pr) => (
@@ -1143,6 +1201,7 @@ export function composeGitHubLifecycleSnapshot(
     evidence.project,
     options.defaultBranch ?? 'next',
     mappingEvidenceComplete,
+    closedUnmerged,
   );
   return deepFreeze({
     project: evidence.project,
@@ -1158,6 +1217,12 @@ export function composeGitHubLifecycleSnapshot(
     snapshotComplete: mappingEvidenceComplete,
     lastFullReconciliationAt: options.lastFullReconciliationAt,
     githubUsage: options.githubUsage,
+    ...(options.closedUnmergedPullRequests === undefined
+      ? {}
+      : {
+          closedUnmergedPullRequests: [...closedUnmerged]
+            .sort((left, right) => left - right),
+        }),
     ...(options.parityDifferences === undefined
       ? {}
       : { parityDifferences: [...options.parityDifferences] }),

@@ -214,6 +214,33 @@ function relevantToLifecycle(
   });
 }
 
+/**
+ * Carry the closed-unmerged PR set forward across a cycle.
+ *
+ * Additions are positive evidence only: a recently-closed index row with
+ * `mergedAt === null`. A merged PR always carries `merged_at`, so no merge can
+ * ever enter this set — which is what makes the review-follow-up parent gate
+ * unable to strand a correctly-merged parent's follow-ups.
+ *
+ * Removals keep the set from outliving its own truth. A PR that was closed
+ * unmerged can be reopened and then merged; it re-enters the open index on
+ * reopen and the closed index with a `mergedAt` on merge, and either sighting
+ * retires it here.
+ */
+function accumulateClosedUnmerged(
+  prior: readonly number[] | undefined,
+  openIndex: readonly PullRequestIndexEntry[],
+  closedIndex: readonly PullRequestIndexEntry[],
+): readonly number[] {
+  const accumulated = new Set(prior ?? []);
+  for (const entry of closedIndex) {
+    if (entry.mergedAt === null) accumulated.add(entry.number);
+    else accumulated.delete(entry.number);
+  }
+  for (const entry of openIndex) accumulated.delete(entry.number);
+  return [...accumulated].sort((left, right) => left - right);
+}
+
 function retainMerged(pr: PullRequestSnapshot, project: ProjectSnapshot): boolean {
   if (pr.state !== 'MERGED') return true;
   const statuses = projectIssueStatuses(project);
@@ -725,6 +752,10 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       githubUsage: this.fullReader.githubUsage(),
       snapshotAuthority: 'scoped',
       scopedIssueNumbers: requested,
+      // Carried, not re-derived: the scoped read has no PR index of its own,
+      // and dropping the set here would make a pre-dispatch view release a
+      // follow-up the global view holds.
+      closedUnmergedPullRequests: prior.closedUnmergedPullRequests ?? [],
       globalOpenPipelineBacklog: prior.evidence.pullRequests.filter((pr) => (
         pr.state === 'OPEN' && pr.labels.includes('engine:review')
       )).length,
@@ -799,6 +830,14 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       }
     }
     const cacheBaseline = parityCandidate?.next ?? prior;
+    // Accumulate from the same baseline the rest of the cache is carried from,
+    // so the full read cannot forget a closed-unmerged PR that fell outside the
+    // 5-minute overlap the full cutoff resets to.
+    const closedUnmerged = accumulateClosedUnmerged(
+      cacheBaseline?.closedUnmergedPullRequests,
+      openAfter,
+      recentlyClosed,
+    );
     const terminalClaims = await this.backfillTerminalClaims(
       cacheBaseline?.terminalClaims ?? [],
       provisional,
@@ -816,6 +855,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       snapshotMode: 'full',
       lastFullReconciliationAt: capturedAt,
       githubUsage: this.fullReader.githubUsage(),
+      closedUnmergedPullRequests: closedUnmerged,
     });
     const oracleGraphQlCost = full.githubUsage!.graphqlCost - oracleGraphQlCostAtStart;
     if (!Number.isSafeInteger(oracleGraphQlCost) || oracleGraphQlCost < 0) {
@@ -839,6 +879,8 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
           snapshotMode: 'incremental',
           lastFullReconciliationAt: parityCandidate.snapshot.lastFullReconciliationAt!,
           githubUsage: parityCandidate.snapshot.githubUsage!,
+          closedUnmergedPullRequests:
+            parityCandidate.next.closedUnmergedPullRequests ?? [],
         },
       );
       differences = parityDifferences(candidateAtOracleCompletion, full);
@@ -853,6 +895,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
           snapshotMode: 'full',
           lastFullReconciliationAt: full.capturedAt,
           githubUsage: full.githubUsage!,
+          closedUnmergedPullRequests: closedUnmerged,
           ...(differences === undefined ? {} : { parityDifferences: differences }),
           ...(parityUnavailableReason === undefined
             ? {}
@@ -893,6 +936,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         .sort((left, right) => left.number - right.number),
       openPullRequests: [...openAfter],
       recentlyClosedPullRequests: [...recentlyClosed],
+      closedUnmergedPullRequests: [...closedUnmerged],
       recentlyClosedCutoff: cutoff,
       restCache: this.conditionalRest.exportCache(),
     };
@@ -931,6 +975,11 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     );
     const openByNumber = uniqueByNumber(openIndex, 'open PR index');
     const closedByNumber = uniqueByNumber(closedIndex, 'recently-closed PR index');
+    const closedUnmerged = accumulateClosedUnmerged(
+      prior.closedUnmergedPullRequests,
+      openIndex,
+      closedIndex,
+    );
     for (const number of openByNumber.keys()) {
       if (closedByNumber.has(number)) {
         throw new IncrementalSnapshotInconsistentError(
@@ -1124,6 +1173,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       snapshotMode: 'incremental',
       lastFullReconciliationAt: lastFull,
       githubUsage: usage,
+      closedUnmergedPullRequests: closedUnmerged,
     });
     const next: LifecycleDiscoveryState = {
       version: 2,
@@ -1133,6 +1183,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         .sort((left, right) => left.number - right.number),
       openPullRequests: [...openIndex],
       recentlyClosedPullRequests: [...closedIndex],
+      closedUnmergedPullRequests: [...closedUnmerged],
       recentlyClosedCutoff: prior.recentlyClosedCutoff,
       restCache: this.conditionalRest.exportCache(),
     };
