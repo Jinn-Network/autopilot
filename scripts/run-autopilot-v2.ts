@@ -74,6 +74,8 @@ import {
   makeGitHubUsageCommandRunner,
   makeProductionReconciliationWriter,
   makeTargetedActionReader,
+  targetedAuthorityRefusalDetail,
+  targetedAuthoritySnapshot,
   assertRateLimitReserve,
   MAX_FULL_RECONCILIATION_AGE_MS,
   REVIEW_CLAIM_ACTION_RESERVE,
@@ -673,8 +675,9 @@ export async function runAutopilotV2(
             repositoryPath,
             cycleSnapshot,
             ...reconciliationTargets,
-            readCanonicalSnapshot: (prNumber) =>
-              targeted.readPullRequest(cycleSnapshot, prNumber),
+            readCanonicalSnapshot: async (prNumber) => targetedAuthoritySnapshot(
+              await targeted.readPullRequest(cycleSnapshot, prNumber),
+            ),
             credential: selection.credential,
             credentials,
             runner,
@@ -698,12 +701,15 @@ export async function runAutopilotV2(
         readReservedReviewSnapshot: (cycleSnapshot, prNumber) =>
           targeted.readReservedPullRequest(cycleSnapshot, prNumber),
         readImplementationSnapshot: async (cycleSnapshot, action) => {
-          const targetedSnapshot = action.intent === 'stale-recovery'
+          const read = action.intent === 'stale-recovery'
             ? await targeted.readStaleRecoveryPullRequest(cycleSnapshot, action.prNumber)
             : (await targeted.readIssue(cycleSnapshot, action.issueNumber))?.snapshot ?? null;
+          const targetedSnapshot = targetedAuthoritySnapshot(read);
           if (targetedSnapshot === null) {
+            const detail = targetedAuthorityRefusalDetail(read);
             throw new Error(
-              `Targeted implementation authority for issue #${action.issueNumber} is unavailable`,
+              `Targeted implementation authority for issue #${action.issueNumber} is unavailable`
+              + (detail === null ? '' : ` (${detail})`),
             );
           }
           return targetedSnapshot;

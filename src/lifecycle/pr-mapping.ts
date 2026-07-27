@@ -70,13 +70,28 @@ function lifecycleMarkers(body: string): readonly LifecycleMarker[] {
   }));
 }
 
-function evidencedIssueNumbers(
-  pr: StructuredMappingPullRequest,
+/**
+ * Every issue a pull request is evidence for. This is the predicate that
+ * decides contention here: it feeds the unique-open-PR-per-issue count and the
+ * parent-contender count. Any caller deciding whether some other PR bears on a
+ * PR's mapping must reuse this exact predicate, because a narrower private copy
+ * silently classifies a live contender as unrelated.
+ *
+ * The parameter is widened past {@link StructuredMappingPullRequest} so a REST
+ * index row, which carries only a head ref name, reads through the same
+ * predicate. An absent field simply contributes no evidence.
+ */
+export function evidencedIssueNumbers(
+  pr: {
+    readonly closingIssueNumbers?: readonly number[];
+    readonly headRefName: string;
+    readonly body?: string;
+  },
 ): Set<number> {
-  const numbers = new Set(pr.closingIssueNumbers);
+  const numbers = new Set(pr.closingIssueNumbers ?? []);
   const branchIssue = stableBranchIssue(pr.headRefName);
   if (branchIssue !== undefined) numbers.add(branchIssue);
-  for (const marker of lifecycleMarkers(pr.body)) numbers.add(marker.issueNumber);
+  for (const marker of lifecycleMarkers(pr.body ?? '')) numbers.add(marker.issueNumber);
   return numbers;
 }
 

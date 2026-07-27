@@ -75,6 +75,11 @@ import type {
   TargetedIssueActionContext,
   TargetedNativeIssue,
   TargetedOpenPullRequest,
+  TargetedPullRequestRead,
+} from './targeted-action-reader.js';
+import {
+  targetedAuthorityRefusalDetail,
+  targetedAuthoritySnapshot,
 } from './targeted-action-reader.js';
 import type {
   GitOid,
@@ -145,11 +150,11 @@ export interface ProductionActiveRuntimeOptions {
   readonly readReviewSnapshot: (
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
-  ) => Promise<GitHubLifecycleSnapshot | null>;
+  ) => Promise<TargetedPullRequestRead>;
   readonly readReservedReviewSnapshot: (
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
-  ) => Promise<GitHubLifecycleSnapshot | null>;
+  ) => Promise<TargetedPullRequestRead>;
   /** Exact issue/PR closure reads used by implementation without a global scan. */
   readonly readImplementationSnapshot: (
     cycleSnapshot: GitHubLifecycleSnapshot,
@@ -423,9 +428,14 @@ export function makeProductionActiveRuntime(
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
   ) => async (): Promise<GitHubLifecycleSnapshot> => {
-    const targeted = await options.readReviewSnapshot(cycleSnapshot, prNumber);
+    const read = await options.readReviewSnapshot(cycleSnapshot, prNumber);
+    const targeted = targetedAuthoritySnapshot(read);
     if (targeted === null) {
-      throw new Error(`Targeted PR authority for #${prNumber} is unavailable`);
+      const detail = targetedAuthorityRefusalDetail(read);
+      throw new Error(
+        `Targeted PR authority for #${prNumber} is unavailable`
+        + (detail === null ? '' : ` (${detail})`),
+      );
     }
     return targeted;
   };
@@ -518,12 +528,17 @@ export function makeProductionActiveRuntime(
     credentials: CredentialPool,
     cycleSnapshot: GitHubLifecycleSnapshot,
   ): Promise<void> => {
-    const authoritySnapshot = await options.readReviewSnapshot(
+    const authorityRead = await options.readReviewSnapshot(
       cycleSnapshot,
       input.candidate.number,
     );
+    const authoritySnapshot = targetedAuthoritySnapshot(authorityRead);
     if (authoritySnapshot === null || authoritySnapshot.snapshotComplete !== true) {
-      throw new Error('Review Human escalation live mapping authority is unavailable');
+      const detail = targetedAuthorityRefusalDetail(authorityRead);
+      throw new Error(
+        'Review Human escalation live mapping authority is unavailable'
+        + (detail === null ? '' : ` (${detail})`),
+      );
     }
     const diagnostic = authoritySnapshot.diagnostics.find((candidate) => (
       candidate.pullRequests.some((pr) => (
@@ -690,8 +705,9 @@ export function makeProductionActiveRuntime(
       readBlockedByIssueNumbers: options.readBlockedByIssueNumbers,
       readOpenPullRequestsByIssue: options.readOpenPullRequestsByIssue,
       readIssueActionContext: options.readIssueActionContext,
-      readCanonicalSnapshot: (prNumber) =>
-        options.readReviewSnapshot(authoritySnapshot, prNumber),
+      readCanonicalSnapshot: async (prNumber) => targetedAuthoritySnapshot(
+        await options.readReviewSnapshot(authoritySnapshot, prNumber),
+      ),
       credential: selection.credential,
       credentials,
       runner,

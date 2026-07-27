@@ -19,6 +19,7 @@ import {
   type RawPullRequest,
 } from './snapshot.js';
 import type { PullRequestIndexEntry } from './github-rest-discovery.js';
+import { evidencedIssueNumbers } from './pr-mapping.js';
 
 export interface TargetedNativeIssue {
   readonly number: number;
@@ -90,20 +91,59 @@ export interface TargetedIssueSnapshot {
   readonly snapshot: GitHubLifecycleSnapshot;
 }
 
+/**
+ * Attributed refusal of a targeted authority read. Carries the PR and the
+ * disagreement that withheld authority so callers can report a cause instead
+ * of an unattributable "authority is unavailable".
+ */
+export interface TargetedAuthorityRefusal {
+  readonly authorityRefusal: string;
+}
+
+/**
+ * A targeted PR authority read: the composed snapshot, an attributed refusal,
+ * or a bare `null` for refusals that are already self-explanatory to callers.
+ */
+export type TargetedPullRequestRead =
+  | GitHubLifecycleSnapshot
+  | TargetedAuthorityRefusal
+  | null;
+
+export function isTargetedAuthorityRefusal(
+  read: TargetedPullRequestRead,
+): read is TargetedAuthorityRefusal {
+  return read !== null
+    && typeof (read as TargetedAuthorityRefusal).authorityRefusal === 'string';
+}
+
+/** Narrows a targeted read to its snapshot, treating any refusal as `null`. */
+export function targetedAuthoritySnapshot(
+  read: TargetedPullRequestRead,
+): GitHubLifecycleSnapshot | null {
+  return read === null || isTargetedAuthorityRefusal(read) ? null : read;
+}
+
+/** Reads the attributed refusal detail, or `null` when there is none. */
+export function targetedAuthorityRefusalDetail(
+  read: TargetedPullRequestRead,
+): string | null {
+  return isTargetedAuthorityRefusal(read) ? read.authorityRefusal : null;
+}
+
 export interface TargetedActionReader {
   readPullRequest(
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
-  ): Promise<GitHubLifecycleSnapshot | null>;
+  ): Promise<TargetedPullRequestRead>;
   readStaleRecoveryPullRequest(
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
-  ): Promise<GitHubLifecycleSnapshot | null>;
+  ): Promise<TargetedPullRequestRead>;
   /** Uses quota already reserved once for the enclosing review cohort. */
   readReservedPullRequest(
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
-  ): Promise<GitHubLifecycleSnapshot | null>;
+  ): Promise<TargetedPullRequestRead>;
   readIssue(
     cycleSnapshot: GitHubLifecycleSnapshot,
     issueNumber: number,
@@ -131,6 +171,38 @@ function completeCycle(snapshot: GitHubLifecycleSnapshot): asserts snapshot is G
   ) {
     throw new Error('Targeted action authority requires a complete cycle snapshot');
   }
+}
+
+function refusal(detail: string): TargetedAuthorityRefusal {
+  return { authorityRefusal: detail };
+}
+
+/**
+ * Describes the first disagreement between a REST index row and its live
+ * re-read, or `null` when the live read is byte-exact on identity.
+ */
+function describeExactMismatch(
+  entry: PullRequestIndexEntry,
+  live: RawPullRequest | null,
+  requireOpenIdentity: boolean,
+): string | null {
+  if (live === null) return 'the live re-read returned no PR';
+  if (requireOpenIdentity) {
+    if (live.number !== entry.number) {
+      return `the live re-read returned PR #${live.number}`;
+    }
+    if (live.state !== 'OPEN') return `its live state is ${live.state}`;
+  }
+  if (live.headOid !== entry.headOid) {
+    return `its headOid moved from ${entry.headOid} to ${live.headOid}`;
+  }
+  if (live.headRefName !== entry.headRefName) {
+    return `its headRefName moved from ${entry.headRefName} to ${live.headRefName}`;
+  }
+  if (live.baseRefName !== entry.baseRefName) {
+    return `its baseRefName moved from ${entry.baseRefName} to ${live.baseRefName}`;
+  }
+  return null;
 }
 
 function issueNumbers(raw: RawPullRequest): readonly number[] {
@@ -293,7 +365,7 @@ export function makeTargetedActionReader(
     prNumber: number,
     reserveQuota: boolean,
     hydrateRecoveryBlockers: boolean,
-  ): Promise<GitHubLifecycleSnapshot | null> => {
+  ): Promise<TargetedPullRequestRead> => {
     positiveNumber(prNumber, 'Target PR number');
     completeCycle(cycleSnapshot);
     if (reserveQuota) await reserve(TARGETED_PR_RESERVE);
@@ -321,6 +393,7 @@ export function makeTargetedActionReader(
       throw new Error(`Target issue #${issueNumber} is absent from the cycle snapshot`);
     }
     const dependencies = await options.readBlockedByIssueNumbers(issueNumber);
+    const dependencySet = new Set(dependencies);
     const liveIssue: PolledIssue = {
       ...existingIssue,
       title: native.title,
@@ -356,17 +429,145 @@ export function makeTargetedActionReader(
         indexed.set(entry.number, entry);
       }
       const targetIndex = indexed.get(prNumber);
-      if (
-        targetIndex === undefined
-        || targetIndex.headOid !== raw.headOid
-        || targetIndex.headRefName !== raw.headRefName
-        || targetIndex.baseRefName !== raw.baseRefName
-      ) {
-        return null;
+      if (targetIndex === undefined) {
+        return refusal(
+          `Target PR #${prNumber} is absent from the complete open PR index`,
+        );
+      }
+      const targetMismatch = describeExactMismatch(targetIndex, raw, false);
+      if (targetMismatch !== null) {
+        return refusal(
+          `Target PR #${prNumber} live read disagrees with its open PR index row: ${targetMismatch}`,
+        );
       }
       const cycleOpen = new Map(cycleSnapshot.pullRequests
         .filter((pr) => pr.state === 'OPEN')
         .map((pr) => [pr.number, pr]));
+      /** True when the cycle-cached row is exactly the row the index reports. */
+      const cacheIsFresh = (
+        prior: GitHubLifecycleSnapshot['pullRequests'][number],
+        entry: PullRequestIndexEntry,
+      ): boolean => (
+        prior.updatedAt !== undefined
+        && prior.updatedAt === entry.updatedAt
+        && prior.headOid === entry.headOid
+        && prior.headRefName === entry.headRefName
+        && prior.baseRefName === entry.baseRefName
+        && prior.isDraft === entry.isDraft
+      );
+      /**
+       * One live read per PR number, reserved once and reused. The base chain
+       * walk and the refresh loop below need the same rows, and reading a PR
+       * once must not bill the rate limit twice.
+       */
+      const liveByNumber = new Map<number, RawPullRequest | null>();
+      const readLive = async (number: number): Promise<RawPullRequest | null> => {
+        if (!liveByNumber.has(number)) {
+          await reserve(TARGETED_PR_RESERVE);
+          liveByNumber.set(number, await options.readPullRequest(number));
+        }
+        return liveByNumber.get(number) ?? null;
+      };
+      // Ref names the target is stacked on, walked through the index so a
+      // multi-level stack keeps every parent authority-bearing, plus every
+      // issue those parents are evidence for. The target's mapping is resolved
+      // only while each ancestor's own mapping resolves, and an ancestor's
+      // mapping turns ambiguous as soon as a second open PR contends for that
+      // ancestor's issue. So authority reaches the whole transitive chain, not
+      // just the target issue's direct blockers.
+      const baseChain = await (async (): Promise<{
+        readonly refNames: ReadonlySet<string>;
+        readonly issueNumbers: ReadonlySet<number>;
+      }> => {
+        const byHeadRefName = new Map<string, PullRequestIndexEntry>();
+        for (const entry of indexed.values()) {
+          if (entry.number !== prNumber) byHeadRefName.set(entry.headRefName, entry);
+        }
+        const refNames = new Set<string>();
+        const issues = new Set<number>();
+        let base: string | undefined = raw.baseRefName;
+        while (base !== undefined && !refNames.has(base)) {
+          refNames.add(base);
+          const parent: PullRequestIndexEntry | undefined = byHeadRefName.get(base);
+          if (parent === undefined) break;
+          const cached = cycleSnapshot.pullRequests
+            .find((pr) => pr.number === parent.number);
+          const prior = cycleOpen.get(parent.number);
+          // An index row carries only a branch name, so an ancestor whose
+          // branch is off the stable pattern has no closure knowable from the
+          // index alone. Read the ancestor live before composing the closure
+          // rather than let it fall silently empty: an ancestor missing from
+          // the cycle cache would otherwise hide every contender for its
+          // issue, and the read would fail open precisely when a contender is
+          // churning. This reaches only PRs heading the target's own base
+          // chain, which already bear on its authority — no unrelated PR gains
+          // a veto. A read that fails here contributes nothing and needs no
+          // refusal of its own; the refresh loop below refuses on the same
+          // ancestor, which heads a base chain branch.
+          const live = prior !== undefined && cacheIsFresh(prior, parent)
+            ? null
+            : await readLive(parent.number);
+          for (const number of [
+            ...evidencedIssueNumbers({
+              closingIssueNumbers: cached?.closingIssueNumbers,
+              headRefName: parent.headRefName,
+              body: cached?.body,
+            }),
+            ...(live === null ? [] : evidencedIssueNumbers(live)),
+          ]) {
+            issues.add(number);
+          }
+          base = parent.baseRefName;
+        }
+        return { refNames, issueNumbers: issues };
+      })();
+      /**
+       * Names the role that makes another open PR part of the subject's
+       * authority, or `null` when the PR has no bearing on it and may be
+       * dropped from the composed snapshot.
+       */
+      const authorityRole = (
+        entry: PullRequestIndexEntry,
+        live: RawPullRequest | null,
+      ): string | null => {
+        if (entry.headRefName === raw.headRefName) {
+          return `shares the target head branch ${raw.headRefName}`;
+        }
+        if (baseChain.refNames.has(entry.headRefName)) {
+          return `heads the target base chain branch ${entry.headRefName}`;
+        }
+        const priorRecord = cycleSnapshot.pullRequests
+          .find((pr) => pr.number === entry.number);
+        if (live === null) {
+          if (priorRecord === undefined) {
+            return 'has no live or cached evidence to classify it against the target';
+          }
+        } else {
+          if (live.headRefName === raw.headRefName) {
+            return `shares the target head branch ${raw.headRefName}`;
+          }
+          if (baseChain.refNames.has(live.headRefName)) {
+            return `heads the target base chain branch ${live.headRefName}`;
+          }
+        }
+        // The same predicate the mapping resolver uses to decide contention,
+        // read over every row shape we hold: the fresher index row's branch,
+        // the cached row, and the live row.
+        const mapped = new Set<number>([
+          ...evidencedIssueNumbers({
+            closingIssueNumbers: priorRecord?.closingIssueNumbers,
+            headRefName: entry.headRefName,
+            body: priorRecord?.body,
+          }),
+          ...(live === null ? [] : evidencedIssueNumbers(live)),
+        ]);
+        if (mapped.has(issueNumber)) return `closes the target issue #${issueNumber}`;
+        const blocked = [...mapped].find((number) => dependencySet.has(number));
+        if (blocked !== undefined) return `closes target blocker issue #${blocked}`;
+        const stacked = [...mapped].find((number) => baseChain.issueNumbers.has(number));
+        if (stacked !== undefined) return `maps to target base chain issue #${stacked}`;
+        return null;
+      };
       const refreshed: GitHubLifecycleSnapshot['pullRequests'][number][] = [];
       for (const entry of [...indexed.values()].sort((left, right) => left.number - right.number)) {
         if (entry.number === prNumber) {
@@ -374,32 +575,37 @@ export function makeTargetedActionReader(
           continue;
         }
         const prior = cycleOpen.get(entry.number);
-        if (
-          prior !== undefined
-          && prior.updatedAt !== undefined
-          && prior.updatedAt === entry.updatedAt
-          && prior.headOid === entry.headOid
-          && prior.headRefName === entry.headRefName
-          && prior.baseRefName === entry.baseRefName
-          && prior.isDraft === entry.isDraft
-        ) {
+        if (prior !== undefined && cacheIsFresh(prior, entry)) {
           refreshed.push(prior);
           continue;
         }
-        await reserve(TARGETED_PR_RESERVE);
-        const live = await options.readPullRequest(entry.number);
-        if (
-          live === null
-          || live.state !== 'OPEN'
-          || live.number !== entry.number
-          || live.headOid !== entry.headOid
-          || live.headRefName !== entry.headRefName
-          || live.baseRefName !== entry.baseRefName
-        ) {
-          return null;
+        const live = await readLive(entry.number);
+        const mismatch = describeExactMismatch(entry, live, true);
+        if (live === null || mismatch !== null) {
+          // Only PRs the subject's authority actually rests on may veto the
+          // read; every other churning PR is dropped, the same way a blocker
+          // PR that reads null is filtered out below.
+          const role = authorityRole(entry, live);
+          if (role !== null) {
+            return refusal(
+              `Target PR #${prNumber} authority withheld: `
+              + `PR #${entry.number} ${role} and ${mismatch}`,
+            );
+          }
+          continue;
         }
         const decodedLive = decodePullRequestSnapshot(live);
-        if (decodedLive.evidenceIncompleteReason !== undefined) return null;
+        if (decodedLive.evidenceIncompleteReason !== undefined) {
+          const role = authorityRole(entry, live);
+          if (role !== null) {
+            return refusal(
+              `Target PR #${prNumber} authority withheld: PR #${entry.number} ${role} `
+              + `and its live evidence is incomplete `
+              + `(${decodedLive.evidenceIncompleteReason})`,
+            );
+          }
+          continue;
+        }
         refreshed.push(decodedLive);
       }
       pullRequests = [
@@ -416,7 +622,6 @@ export function makeTargetedActionReader(
         defaultBranch,
       );
     }
-    const dependencySet = new Set(dependencies);
     const blockerPullRequestNumbers = new Set(cycleSnapshot.pullRequests
       .filter((pr) => (
         pr.number !== prNumber

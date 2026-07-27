@@ -34,6 +34,11 @@ import type {
   ReviewExecutorDeps,
 } from './review-executor.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
+import type { TargetedPullRequestRead } from './targeted-action-reader.js';
+import {
+  targetedAuthorityRefusalDetail,
+  targetedAuthoritySnapshot,
+} from './targeted-action-reader.js';
 import {
   gitOid,
   gitRefName,
@@ -52,7 +57,7 @@ export interface ProductionReviewActionPortOptions {
   readonly projectMapping?: ProjectMapping;
   readonly readSnapshot: (
     prNumber: number,
-  ) => Promise<GitHubLifecycleSnapshot | null>;
+  ) => Promise<TargetedPullRequestRead>;
   readonly changedFiles?: (prNumber: number) => Promise<readonly string[]>;
   readonly codeownersText?: (input: {
     readonly prNumber: number;
@@ -176,9 +181,14 @@ export function makeProductionReviewActionPort(
     readonly expectedIssueNumber?: number;
     readonly pullRequestLabels?: readonly string[];
   }): Promise<boolean> => {
-    const snapshot = await options.readSnapshot(input.prNumber);
+    const read = await options.readSnapshot(input.prNumber);
+    const snapshot = targetedAuthoritySnapshot(read);
     if (snapshot === null) {
-      throw new Error('Fresh review Human authority is unavailable');
+      const detail = targetedAuthorityRefusalDetail(read);
+      throw new Error(
+        'Fresh review Human authority is unavailable'
+        + (detail === null ? '' : ` (${detail})`),
+      );
     }
     const mapping = snapshot.pullRequestMappings?.find(
       (entry) => entry.prNumber === input.prNumber,
@@ -341,12 +351,12 @@ export function makeProductionReviewActionPort(
 
   return {
     readCandidate: async (prNumber) => {
-      const snapshot = await options.readSnapshot(prNumber);
+      const snapshot = targetedAuthoritySnapshot(await options.readSnapshot(prNumber));
       return snapshot === null ? null : candidateFromSnapshot(snapshot, prNumber);
     },
 
     confirmAcquisition: async ({ prNumber }) => {
-      const snapshot = await options.readSnapshot(prNumber);
+      const snapshot = targetedAuthoritySnapshot(await options.readSnapshot(prNumber));
       return snapshot === null ? null : candidateFromSnapshot(snapshot, prNumber);
     },
 
