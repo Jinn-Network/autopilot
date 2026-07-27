@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  classifyUpdateBranchFailure,
   makeProductionMergeActionPort,
 } from '../../src/lifecycle/merge-executor-production.js';
-import { executeMergeAction } from '../../src/lifecycle/merge-executor.js';
+import {
+  executeMergeAction,
+  executeUpdateBranchAction,
+} from '../../src/lifecycle/merge-executor.js';
 import { CredentialPool, selectCredential } from '../../src/lifecycle/credentials.js';
 import type {
   GitHubLifecycleSnapshot,
@@ -153,7 +157,13 @@ function candidateRunner(changedFiles: number, filenames: readonly string[]) {
       return JSON.stringify([filenames.map((filename) => ({ filename }))]);
     }
     if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
-      expect(endpoint).toContain(`ref=${BASE}`);
+      // GitHub enforces the CODEOWNERS at the base branch *tip*. Reading the
+      // PR's pinned fork point (BASE) misses every rule added since the fork
+      // and lets `codeownerSensitive` under-report.
+      expect(endpoint).toBe(
+        'repos/Jinn-Network/mono/contents/.github/CODEOWNERS?ref=heads/stack/base',
+      );
+      expect(endpoint).not.toContain(BASE);
       return JSON.stringify({
         content: Buffer.from('# no owned paths\n').toString('base64'),
       });
@@ -579,5 +589,390 @@ describe('production head-pinned merge port', () => {
       codeownersComplete: true,
       codeownerSensitive: false,
     });
+  });
+});
+
+/**
+ * CODEOWNERS authority. `ExactChangedFiles` carries both `baseOid` (the PR's
+ * pinned fork point, correct for the changed-files diff) and `baseRefName` (the
+ * base branch, which resolves to its tip at request time). GitHub enforces the
+ * CODEOWNERS in effect at the *tip*, so the sensitivity signal must be read
+ * there. Reading the fork point could only under-report — a fail OPEN.
+ */
+describe('merge candidate CODEOWNERS authority', () => {
+  const OWNED_FILE = 'client/src/dashboard/spa/src/pages/Home.tsx';
+
+  function codeownersRunner(input: {
+    readonly atForkPoint: string;
+    readonly atTip: string;
+    readonly seen: string[];
+  }) {
+    return async (command: string, args: readonly string[]): Promise<string> => {
+      const endpoint = args.find((arg) => arg.startsWith('repos/'));
+      if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
+        input.seen.push(endpoint);
+        const forkPoint = endpoint.includes(`ref=${BASE}`);
+        return JSON.stringify({
+          content: Buffer.from(forkPoint ? input.atForkPoint : input.atTip)
+            .toString('base64'),
+        });
+      }
+      return candidateRunner(1, [OWNED_FILE])(command, args);
+    };
+  }
+
+  it('reads CODEOWNERS at the base branch tip, not at the pinned fork point', async () => {
+    const seen: string[] = [];
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: codeownersRunner({
+        // The rule was added to the base branch *after* this PR forked.
+        atForkPoint: '# no owned paths\n',
+        atTip: '/client/src/dashboard/spa/src/pages/ @Jinn-Network/codeowners\n',
+        seen,
+      }),
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      codeownersComplete: true,
+      codeownerSensitive: true,
+    });
+    expect(seen).toEqual([
+      'repos/Jinn-Network/mono/contents/.github/CODEOWNERS?ref=heads/stack/base',
+    ]);
+  });
+
+  /**
+   * The other direction, stated explicitly because it refutes the tempting
+   * "reading the tip can only ADD sensitivity" argument. CODEOWNERS entries can
+   * be deleted or narrowed by an ordinary commit, so the tip policy is NOT a
+   * superset of the fork-point policy and this fix is NOT monotone: it can turn
+   * `codeownerSensitive` from `true` to `false`.
+   *
+   * That is correct behaviour — GitHub will not enforce a rule that no longer
+   * exists at the tip, so the old fork-point read was over-reporting and
+   * routing changes to a human GitHub never asked for. The justification for
+   * the fix is agreement with the enforcing authority, not conservatism.
+   */
+  it('drops sensitivity for a rule deleted from the base after the PR forked', async () => {
+    const seen: string[] = [];
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: codeownersRunner({
+        atForkPoint: '/client/src/dashboard/spa/src/pages/ @Jinn-Network/codeowners\n',
+        // The rule was removed from the base branch after this PR forked, so
+        // GitHub will not enforce it at merge time.
+        atTip: '# ownership withdrawn\n',
+        seen,
+      }),
+    });
+
+    await expect(port.readCandidate(84)).resolves.toMatchObject({
+      codeownersComplete: true,
+      codeownerSensitive: false,
+    });
+  });
+
+  it('pins CODEOWNERS through heads/ so a same-named tag cannot hijack it', async () => {
+    const seen: string[] = [];
+    const port = makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: codeownersRunner({
+        atForkPoint: '',
+        atTip: '',
+        seen,
+      }),
+    });
+
+    await port.readCandidate(84);
+    expect(seen[0]).toContain('ref=heads/stack/base');
+  });
+});
+
+/**
+ * `update-branch` diagnosis. `PUT /pulls/{n}/update-branch` answers **202
+ * Accepted**: GitHub queues the update and the head has not moved when the call
+ * returns. The old port read the head back exactly once and called any
+ * unchanged head `rejected`, which reported a merge conflict for an update
+ * merely in flight — and identically for a 403 refusal, a secondary rate limit,
+ * and a dropped socket. Live evidence: PR #2130 was reported `rejected`, then
+ * the identical operation later succeeded unchanged.
+ */
+describe('update-branch failure classification', () => {
+  const ACCOUNT = {
+    login: 'implementation-bot',
+    normalizedLogin: 'implementation-bot',
+    implementationToken: 'selected-secret',
+  } as const;
+
+  function credential() {
+    const selection = selectCredential(new CredentialPool([ACCOUNT]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    return selection.credential;
+  }
+
+  function updateBranchPort(input: {
+    readonly updateBranch: () => Promise<string>;
+    readonly heads: readonly string[];
+    readonly sleeps: number[];
+  }) {
+    let readbacks = 0;
+    const runner = async (command: string, args: readonly string[]): Promise<string> => {
+      if (args[0] === 'pr' && args[1] === 'update-branch') {
+        return input.updateBranch();
+      }
+      if (args[0] === 'pr' && args[1] === 'view') {
+        const head = input.heads[Math.min(readbacks, input.heads.length - 1)];
+        readbacks += 1;
+        if (head === undefined) throw new Error('gh: connection reset by peer');
+        return JSON.stringify({ headRefOid: head });
+      }
+      // These cases are about a head that genuinely needs updating, so the
+      // executor's up-to-date staleness guard must not short-circuit them.
+      if (args.some((arg) => arg.includes('/compare/'))) {
+        return JSON.stringify({ status: 'behind' });
+      }
+      return candidateRunner(1, ['GREETING.md'])(command, args);
+    };
+    return {
+      readbacks: () => readbacks,
+      port: makeProductionMergeActionPort({
+        readSnapshot: async () => snapshot(),
+        authorAllowlist: new Set(['implementation-bot']),
+        expectedBaseRefName: 'stack/base',
+        runner,
+        sleep: async (milliseconds: number) => { input.sleeps.push(milliseconds); },
+      }),
+    };
+  }
+
+  it.each([
+    ['422 unprocessable', 'gh: HTTP 422: Unprocessable Entity', 'conflict'],
+    ['merge conflict prose', 'merge conflict between base and head', 'conflict'],
+    ['403 refusal', 'gh: HTTP 403: Resource not accessible by integration', 'forbidden'],
+    ['401 credentials', 'gh: HTTP 401: Bad credentials', 'forbidden'],
+    ['secondary rate limit', 'HTTP 403: You have exceeded a secondary rate limit', 'rate-limited'],
+    ['primary rate limit', 'gh: HTTP 429: API rate limit exceeded', 'rate-limited'],
+    ['server error', 'gh: HTTP 502: Bad Gateway', 'unavailable'],
+    ['socket failure', 'dial tcp: ECONNRESET', 'unavailable'],
+    ['nothing recognisable', 'gh: something nobody has seen before', 'unclassified'],
+  ] as const)('classifies %s as %s', (_name, text, expected) => {
+    expect(classifyUpdateBranchFailure(text)).toBe(expected);
+  });
+
+  it('never guesses conflict for an unrecognised failure', () => {
+    expect(classifyUpdateBranchFailure('totally novel gh failure')).not.toBe('conflict');
+  });
+
+  it('tolerates the documented 202 async queue and reports the later head move', async () => {
+    const sleeps: number[] = [];
+    const { port } = updateBranchPort({
+      updateBranch: async () => '\u2713 PR branch updated\n',
+      // 202 Accepted: the head has not moved yet on the first readback.
+      heads: [HEAD, HEAD, OTHER_HEAD],
+      sleeps,
+    });
+
+    await expect(port.updateBranch!({
+      prNumber: 84,
+      expectedHead: HEAD,
+      credential: credential(),
+    })).resolves.toEqual({ status: 'updated', head: OTHER_HEAD });
+    expect(sleeps.length).toBeGreaterThan(0);
+  });
+
+  it('reports a still-queued update as pending, never rejected', async () => {
+    const sleeps: number[] = [];
+    const { port } = updateBranchPort({
+      updateBranch: async () => '\u2713 PR branch updated\n',
+      heads: [HEAD],
+      sleeps,
+    });
+
+    await expect(port.updateBranch!({
+      prNumber: 84,
+      expectedHead: HEAD,
+      credential: credential(),
+    })).resolves.toEqual({ status: 'pending', head: HEAD, failure: 'queued' });
+  });
+
+  it.each([
+    ['gh: HTTP 422: Unprocessable Entity', 'rejected', 'conflict'],
+    ['gh: HTTP 403: Resource not accessible by integration', 'rejected', 'forbidden'],
+    ['HTTP 403: You have exceeded a secondary rate limit', 'pending', 'rate-limited'],
+    ['gh: HTTP 503: Service Unavailable', 'pending', 'unavailable'],
+    ['gh: unexplained failure', 'pending', 'unclassified'],
+  ] as const)('maps %s to %s/%s', async (message, status, failure) => {
+    const sleeps: number[] = [];
+    const { port } = updateBranchPort({
+      updateBranch: async () => { throw new Error(message); },
+      heads: [HEAD],
+      sleeps,
+    });
+
+    await expect(port.updateBranch!({
+      prNumber: 84,
+      expectedHead: HEAD,
+      credential: credential(),
+    })).resolves.toEqual({ status, head: HEAD, failure });
+  });
+
+  it('does not burn the readback budget on a durable conflict', async () => {
+    const sleeps: number[] = [];
+    const harness = updateBranchPort({
+      updateBranch: async () => { throw new Error('gh: HTTP 422: Unprocessable Entity'); },
+      heads: [HEAD],
+      sleeps,
+    });
+
+    await harness.port.updateBranch!({
+      prNumber: 84,
+      expectedHead: HEAD,
+      credential: credential(),
+    });
+    expect(harness.readbacks()).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('accepts a head move even when the update-branch call reported an error', async () => {
+    const sleeps: number[] = [];
+    const { port } = updateBranchPort({
+      updateBranch: async () => { throw new Error('gh: HTTP 422: Unprocessable Entity'); },
+      heads: [OTHER_HEAD],
+      sleeps,
+    });
+
+    await expect(port.updateBranch!({
+      prNumber: 84,
+      expectedHead: HEAD,
+      credential: credential(),
+    })).resolves.toEqual({ status: 'updated', head: OTHER_HEAD });
+  });
+
+  it('treats an unreadable head as undetermined rather than a refusal', async () => {
+    const sleeps: number[] = [];
+    const { port } = updateBranchPort({
+      updateBranch: async () => '\u2713 PR branch updated\n',
+      heads: [undefined as unknown as string],
+      sleeps,
+    });
+
+    await expect(port.updateBranch!({
+      prNumber: 84,
+      expectedHead: HEAD,
+      credential: credential(),
+    })).resolves.toEqual({ status: 'pending', head: HEAD, failure: 'unavailable' });
+  });
+
+  it('surfaces a throttled update to the executor as pending, not rejected', async () => {
+    const sleeps: number[] = [];
+    const { port } = updateBranchPort({
+      updateBranch: async () => {
+        throw new Error('HTTP 403: You have exceeded a secondary rate limit');
+      },
+      heads: [HEAD],
+      sleeps,
+    });
+
+    await expect(executeUpdateBranchAction({ prNumber: 84, expectedHead: HEAD }, {
+      ...port,
+      credentials: new CredentialPool([ACCOUNT]),
+    })).resolves.toEqual({
+      status: 'pending',
+      prNumber: 84,
+      reason: 'update-branch-rate-limited',
+    });
+  });
+});
+
+/**
+ * The `already-up-to-date` outcome, straight from `gh`'s own behaviour.
+ *
+ * `gh pr update-branch` (cli/cli v2.78, `pkg/cmd/pr/update-branch/update_branch.go`)
+ * runs its own compare first. When `behind_by == 0` it prints
+ * `PR branch already up-to-date` to **stdout** and returns nil — exit 0, no API
+ * mutation at all. `defaultRunner` returns stdout, so this is observable;
+ * gh's failure messages go to stderr and are not.
+ *
+ * That is the exact shape of PR #2229: `ahead_by=4, behind_by=0`, reported by
+ * the old code as `rejected (update-branch-rejected)` — the same string it
+ * emitted for PR #2130, whose true cause was the opposite.
+ */
+describe('update-branch reports nothing-to-do as success', () => {
+  const ACCOUNT_2229 = {
+    login: 'implementation-bot',
+    normalizedLogin: 'implementation-bot',
+    implementationToken: 'selected-secret',
+  } as const;
+
+  function pick() {
+    const selection = selectCredential(new CredentialPool([ACCOUNT_2229]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    return selection.credential;
+  }
+
+  function port(update: () => Promise<string>, sleeps: number[]) {
+    let readbacks = 0;
+    return {
+      readbacks: () => readbacks,
+      value: makeProductionMergeActionPort({
+        readSnapshot: async () => snapshot(),
+        authorAllowlist: new Set(['implementation-bot']),
+        expectedBaseRefName: 'stack/base',
+        runner: async (command, args) => {
+          if (args[0] === 'pr' && args[1] === 'update-branch') return update();
+          if (args[0] === 'pr' && args[1] === 'view') {
+            readbacks += 1;
+            return JSON.stringify({ headRefOid: HEAD });
+          }
+          return candidateRunner(1, ['GREETING.md'])(command, args);
+        },
+        sleep: async (milliseconds: number) => { sleeps.push(milliseconds); },
+      }),
+    };
+  }
+
+  it.each([
+    ['gh success line', '✓ PR branch already up-to-date\n'],
+    ['unstyled variant', 'PR branch already up to date\n'],
+  ])('reports %s as already-up-to-date, not rejected', async (_name, output) => {
+    const sleeps: number[] = [];
+    const harness = port(async () => output, sleeps);
+
+    await expect(harness.value.updateBranch!({
+      prNumber: 2229,
+      expectedHead: HEAD,
+      credential: pick(),
+    })).resolves.toEqual({ status: 'already-up-to-date', head: HEAD });
+    // Nothing is queued, so nothing is worth waiting for.
+    expect(harness.readbacks()).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('does not mistake a real update for an up-to-date no-op', async () => {
+    const sleeps: number[] = [];
+    const harness = port(async () => '✓ PR branch updated\n', sleeps);
+
+    await expect(harness.value.updateBranch!({
+      prNumber: 2130,
+      expectedHead: HEAD,
+      credential: pick(),
+    })).resolves.toMatchObject({ status: 'pending', failure: 'queued' });
+  });
+
+  it.each([
+    ['gh pre-flight refusal', 'Cannot update PR branch due to conflicts'],
+    [
+      'GraphQL mutation refusal',
+      'GraphQL: merge conflict between base and head (updatePullRequestBranch)',
+    ],
+  ])('classifies the real gh conflict wording (%s) as conflict', (_name, text) => {
+    expect(classifyUpdateBranchFailure(text)).toBe('conflict');
   });
 });

@@ -291,3 +291,97 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
     expect(changed.complete).toBe(true);
   });
 });
+
+/**
+ * `gitRefName` is a safety filter, not a re-implementation of git.
+ *
+ * Since the snapshot reader started passing arbitrary PR base refs through it,
+ * every over-rejection has repo-wide blast radius: one PR based on a branch the
+ * validator dislikes throws and aborts the *entire* snapshot read, not just
+ * that PR. So the validator must reject exactly what is unsafe and nothing
+ * more.
+ */
+describe('gitRefName tracks git ref rules, not a stricter invention', () => {
+  it.each([
+    ['closing bracket', 'feat/x]y'],
+    ['bracket pair remainder', 'release/v1]'],
+    ['braces', 'feat/x{y}'],
+    ['parentheses', 'feat/(x)'],
+    ['semicolon', 'feat/x;y'],
+    ['exclamation', 'feat/x!y'],
+    ['plain nested path', 'stack/base/child'],
+  ])('accepts a ref git itself accepts (%s)', (_name, ref) => {
+    // Verified against `git check-ref-format refs/heads/<ref>`, which exits 0
+    // for every entry here.
+    expect(gitRefName(ref)).toBe(ref);
+  });
+
+  /**
+   * `..` stays rejected because it is load-bearing for compare-URL safety: a
+   * base branch named `x...y` would inject a second `...` separator into
+   * `compare/heads/{base}...{head}` and silently change which comparison runs.
+   */
+  it.each([
+    ['range separator', 'a..b'],
+    ['triple-dot injection', 'x...y'],
+    ['whitespace', 'a b'],
+    ['tab', 'a\tb'],
+    ['tilde', 'a~1'],
+    ['caret', 'a^2'],
+    ['colon', 'a:b'],
+    ['question mark', 'a?b'],
+    ['glob', 'a*b'],
+    ['open bracket', 'a[b'],
+    ['backslash', 'a\\b'],
+    ['reflog syntax', 'a@{1}'],
+    ['leading slash', '/a'],
+    ['trailing slash', 'a/'],
+    ['empty segment', 'a//b'],
+    ['lock suffix', 'a.lock'],
+    ['segment lock suffix', 'a.lock/b'],
+    ['leading dot', '.a'],
+    ['trailing dot', 'a.'],
+    ['bare at', '@'],
+    ['empty', ''],
+  ])('still rejects an unsafe or invalid ref (%s)', (_name, ref) => {
+    expect(() => gitRefName(ref)).toThrow(/Invalid Git ref name/i);
+  });
+
+  it('reads changed files for a PR whose base branch contains a bracket', async () => {
+    const base = 'release/v1]rc';
+    await expect(readExactChangedFiles({
+      run: async () => JSON.stringify({
+        changed_files: 1,
+        head: { sha: HEAD },
+        base: { ref: base, sha: BASE },
+      }),
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: base,
+      context: 'Merge',
+      repositorySlug: 'Jinn-Network/mono',
+      readFiles: async () => ['README.md'],
+    })).resolves.toMatchObject({ baseRefName: base, complete: true });
+  });
+
+  it('compares a base branch containing a bracket instead of aborting the read', async () => {
+    const base = 'release/v1]rc';
+    const calls: string[] = [];
+    const status = await readExactCompareStatus({
+      run: async (_command, args) => {
+        calls.push(args[1]!);
+        if (args[1] === 'repos/Jinn-Network/mono/pulls/101') {
+          return JSON.stringify({ head: { sha: HEAD }, base: { ref: base, sha: BASE } });
+        }
+        return JSON.stringify({ status: 'behind' });
+      },
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: base,
+      repositorySlug: 'Jinn-Network/mono',
+    });
+
+    expect(status).toBe('behind');
+    expect(calls[1]).toBe(`repos/Jinn-Network/mono/compare/heads/${base}...${HEAD}`);
+  });
+});

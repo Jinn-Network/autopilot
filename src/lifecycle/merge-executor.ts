@@ -109,6 +109,50 @@ export type ExactMergeOutcome =
       readonly reason?: string;
     };
 
+/**
+ * Why an `update-branch` attempt did not move the head. The port classifies the
+ * failure once, at the only place that can still see the error text; every
+ * consumer downstream reasons about the class, never about a raw message.
+ *
+ * `conflict` and `forbidden` are *durable*: the head will not move without
+ * human intervention (a real merge conflict; a branch-protection, permission,
+ * or credential refusal). `queued`, `rate-limited`, `unavailable` and
+ * `unclassified` are *undetermined*: the request may have been accepted, may
+ * have been throttled, or may never have reached GitHub, and a later identical
+ * attempt can still succeed.
+ */
+export const UPDATE_BRANCH_FAILURE_CLASSES = [
+  'conflict',
+  'forbidden',
+  'queued',
+  'rate-limited',
+  'unavailable',
+  'unclassified',
+] as const;
+
+export type UpdateBranchFailureClass = typeof UPDATE_BRANCH_FAILURE_CLASSES[number];
+
+export const DURABLE_UPDATE_BRANCH_FAILURES: ReadonlySet<UpdateBranchFailureClass> =
+  new Set<UpdateBranchFailureClass>(['conflict', 'forbidden']);
+
+export type UpdateBranchOutcome =
+  | { readonly status: 'updated' | 'changed-head'; readonly head: GitOid }
+  /**
+   * There was nothing to update: the head is not behind its base. Success, not
+   * failure, and distinct from `updated` because the head did not move.
+   *
+   * `gh pr update-branch` compares before it mutates and, when `behind_by == 0`,
+   * prints `PR branch already up-to-date` to stdout and **exits 0** without
+   * calling the API at all (`cli/cli` v2.78 `update_branch.go`). The old port
+   * saw exit 0, read an unchanged head, and reported `rejected`.
+   */
+  | { readonly status: 'already-up-to-date'; readonly head: GitOid }
+  | {
+      readonly status: 'rejected' | 'pending';
+      readonly head: GitOid;
+      readonly failure: UpdateBranchFailureClass;
+    };
+
 export interface MergeExecutorDeps {
   readCandidate(prNumber: number): Promise<MergeCandidate | null>;
   readonly credentials: CredentialPool;
@@ -128,7 +172,7 @@ export interface MergeExecutorDeps {
     readonly prNumber: number;
     readonly expectedHead: GitOid;
     readonly credential: SelectedCredential;
-  }): Promise<{ readonly status: 'updated' | 'changed-head' | 'rejected'; readonly head: GitOid }>;
+  }): Promise<UpdateBranchOutcome>;
   fileReconcileChild?(input: {
     readonly prNumber: number;
     readonly effort: 'low' | 'medium' | 'high';
@@ -292,10 +336,43 @@ export async function executeMergeAction(
   };
 }
 
+/**
+ * `pending` is a first-class outcome, not a flavour of `rejected`.
+ *
+ * `PUT /repos/{o}/{r}/pulls/{n}/update-branch` is documented to answer **202
+ * Accepted**: GitHub *queues* the update and the PR head has not moved by the
+ * time the call returns. The previous implementation read the head back once
+ * and called an unchanged head `rejected`, which reported a merge conflict for
+ * an update that was merely in flight, and equally for a 403 branch-protection
+ * refusal, a secondary rate limit, and a dropped connection. Live evidence:
+ * PR #2130's update-branch was reported `rejected`; the identical operation
+ * later succeeded with nothing changed but time.
+ *
+ * `rejected` now means only "GitHub durably refused" (`conflict` / `forbidden`).
+ * `pending` means "undetermined, retry is meaningful". `already-up-to-date`
+ * means there was nothing to do. None of them is `updated`.
+ *
+ * Second live case, opposite cause, identical old output: PR #2229 was reported
+ * `rejected` while sitting at `ahead_by=4, behind_by=0` — nothing to update at
+ * all. One string covered "retry this", "nothing to do here", and "this
+ * genuinely conflicts"; the operator could not tell them apart.
+ *
+ * The statuses are deliberately self-describing, because the runtime handler
+ * that surfaces them forwards `reason` for only some statuses.
+ */
 export type UpdateBranchResult =
   | { readonly status: 'updated'; readonly prNumber: number; readonly head: GitOid }
   | { readonly status: 'changed-head'; readonly prNumber: number; readonly head: GitOid }
-  | { readonly status: 'ineligible' | 'rejected'; readonly prNumber: number; readonly reason: string };
+  | {
+      readonly status: 'already-up-to-date';
+      readonly prNumber: number;
+      readonly head: GitOid;
+    }
+  | {
+      readonly status: 'ineligible' | 'rejected' | 'pending';
+      readonly prNumber: number;
+      readonly reason: string;
+    };
 
 export async function executeUpdateBranchAction(
   action: { readonly prNumber: number; readonly expectedHead: GitOid },
@@ -311,6 +388,24 @@ export async function executeUpdateBranchAction(
   if (candidate.head !== action.expectedHead) {
     return { status: 'changed-head', prNumber: action.prNumber, head: candidate.head };
   }
+  // Staleness guard. The ladder only ever schedules `update-branch` for a
+  // `behind`/`diverged` compare, but that decision is made against the cycle
+  // snapshot; by the time this executes the base may already have been merged
+  // in, leaving nothing to do. Observed live on PR #2229, dispatched from a
+  // stale `behind` and sitting at `ahead_by=4, behind_by=0` by the time the
+  // mutation ran — which the old code reported as `rejected`.
+  //
+  // This is the *fresh* candidate read, so `ahead`/`identical` means the base
+  // tip is genuinely an ancestor of the head and there is nothing to merge in.
+  // `unknown` deliberately does not short-circuit: it cannot rule out `behind`,
+  // so the work still happens.
+  if (candidate.compareStatus === 'ahead' || candidate.compareStatus === 'identical') {
+    return {
+      status: 'already-up-to-date',
+      prNumber: action.prNumber,
+      head: candidate.head,
+    };
+  }
   const selection = selectCredential(deps.credentials, { phase: 'merge' });
   if (selection.status !== 'selected') {
     return { status: 'ineligible', prNumber: action.prNumber, reason: 'credential-unavailable' };
@@ -320,13 +415,44 @@ export async function executeUpdateBranchAction(
     expectedHead: action.expectedHead,
     credential: selection.credential,
   });
-  if (outcome.status === 'changed-head') {
-    return { status: 'changed-head', prNumber: action.prNumber, head: outcome.head };
+  // Fail closed by construction: `updated` is reachable only from the single
+  // literal `updated` arm. Every other arm — including the `default`, which
+  // TypeScript proves unreachable today and which exists so that a variant
+  // added later cannot silently inherit success — lands on a non-success
+  // status. There is no fallthrough `return { status: 'updated' }`.
+  switch (outcome.status) {
+    case 'updated':
+      return { status: 'updated', prNumber: action.prNumber, head: outcome.head };
+    case 'changed-head':
+      return { status: 'changed-head', prNumber: action.prNumber, head: outcome.head };
+    case 'already-up-to-date':
+      return {
+        status: 'already-up-to-date',
+        prNumber: action.prNumber,
+        head: outcome.head,
+      };
+    case 'rejected':
+      return {
+        status: 'rejected',
+        prNumber: action.prNumber,
+        reason: `update-branch-${outcome.failure}`,
+      };
+    case 'pending':
+      return {
+        status: 'pending',
+        prNumber: action.prNumber,
+        reason: `update-branch-${outcome.failure}`,
+      };
+    default: {
+      const exhaustive: never = outcome;
+      void exhaustive;
+      return {
+        status: 'pending',
+        prNumber: action.prNumber,
+        reason: 'update-branch-unclassified',
+      };
+    }
   }
-  if (outcome.status === 'rejected') {
-    return { status: 'rejected', prNumber: action.prNumber, reason: 'update-branch-rejected' };
-  }
-  return { status: 'updated', prNumber: action.prNumber, head: outcome.head };
 }
 
 export type FileReconcileChildResult =

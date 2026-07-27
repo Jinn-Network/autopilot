@@ -12,7 +12,10 @@ import type {
   MergeCandidate,
   MergeExecutorDeps,
   ExactMergeOutcome,
+  UpdateBranchFailureClass,
+  UpdateBranchOutcome,
 } from './merge-executor.js';
+import { DURABLE_UPDATE_BRANCH_FAILURES } from './merge-executor.js';
 import { readExactChangedFiles } from './github-changed-files.js';
 import { withSelectedCredential } from './production-auth.js';
 import type {
@@ -34,6 +37,87 @@ export interface ProductionMergeActionPortOptions {
   readonly projectMapping?: ProjectMapping;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
+  /**
+   * Injection seam for the bounded `update-branch` readback poll. Tests supply
+   * a no-op so the 202-async path costs no wall clock.
+   */
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+  readonly updateBranchReadback?: {
+    readonly attempts?: number;
+    readonly delayMs?: number;
+  };
+}
+
+/**
+ * Bounded poll for the documented 202 Accepted behaviour of
+ * `PUT /repos/{owner}/{repo}/pulls/{n}/update-branch`. Four reads spanning
+ * ~4.5s is enough for GitHub's queue in the overwhelming majority of cases and
+ * short enough that a genuinely stuck update still surfaces inside one cycle.
+ * Exceeding the budget is not an error — it yields `pending`, never `updated`.
+ */
+const UPDATE_BRANCH_READBACK_ATTEMPTS = 4;
+const UPDATE_BRANCH_READBACK_DELAY_MS = 1_500;
+
+/**
+ * `gh pr update-branch` compares before it mutates. When `behind_by == 0` it
+ * prints this to **stdout** and exits 0 without calling the API at all
+ * (`cli/cli` v2.78, `pkg/cmd/pr/update-branch/update_branch.go`). `defaultRunner`
+ * returns stdout, so this is directly observable — unlike gh's failure messages,
+ * which go to stderr.
+ */
+const ALREADY_UP_TO_DATE_PATTERN = /already\s+up[-\s]?to[-\s]?date/i;
+
+function errorText(error: unknown): string {
+  return error instanceof Error
+    ? `${error.message}\n${String((error as { stderr?: unknown }).stderr ?? '')}`
+    : String(error);
+}
+
+/**
+ * Map an `update-branch` failure onto the smallest set of classes that lead to
+ * different operator actions.
+ *
+ * Ordering is load-bearing. GitHub serves *secondary* rate limits as HTTP 403,
+ * so the rate-limit probe must run before the permission probe or every
+ * throttle would be misreported as a branch-protection refusal — which is
+ * exactly the class of false diagnosis this function exists to stop.
+ *
+ * Both transports are covered. `gh pr update-branch` drives the GraphQL
+ * `updatePullRequestBranch` mutation, whose conflict answer is the literal
+ * `GraphQL: merge conflict between base and head (updatePullRequestBranch)`,
+ * and gh's own pre-flight refusal is `Cannot update PR branch due to conflicts`
+ * — neither carries an HTTP status. The REST endpoint answers HTTP 422 for the
+ * same condition. Conflict prose and 422 are both matched so the classification
+ * does not depend on which transport produced the failure.
+ *
+ * Anything unrecognised is `unclassified`, never `conflict`: asserting a
+ * conflict we cannot see is the failure mode that misled the operator on
+ * PR #2130.
+ */
+export function classifyUpdateBranchFailure(text: string): UpdateBranchFailureClass {
+  if (/\b(429|rate limit|secondary rate|abuse detection|retry-after)\b/i.test(text)
+    || /HTTP 429/i.test(text)) {
+    return 'rate-limited';
+  }
+  if (/HTTP 422/i.test(text)
+    || /\bunprocessable\b/i.test(text)
+    || /merge conflict/i.test(text)
+    || /\bconflict/i.test(text)
+    || /not mergeable|cannot be merged/i.test(text)) {
+    return 'conflict';
+  }
+  if (/HTTP 40[134]/i.test(text)
+    || /bad credentials|requires authentication|not authorized|unauthorized/i.test(text)
+    || /resource not accessible|must have|permission|protected branch|forbidden/i.test(text)) {
+    return 'forbidden';
+  }
+  if (/HTTP 5\d\d/i.test(text)
+    || /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE/i.test(text)
+    || /timed out|timeout|connection reset|socket hang up|network is unreachable|TLS handshake|EOF/i
+      .test(text)) {
+    return 'unavailable';
+  }
+  return 'unclassified';
 }
 
 export type ProductionMergeActionPort = Pick<
@@ -87,6 +171,10 @@ export function makeProductionMergeActionPort(
 ): ProductionMergeActionPort {
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
+  const pause = options.sleep
+    ?? ((milliseconds: number) => new Promise<void>((resolve) => {
+      setTimeout(resolve, milliseconds);
+    }));
   const expectedBase = gitRefName(options.expectedBaseRefName ?? 'next');
   const repositorySlug = options.repositorySlug ?? REPO;
   const withCredential = <Value>(
@@ -122,11 +210,38 @@ export function makeProductionMergeActionPort(
       context: 'Merge',
       repositorySlug,
     });
-    const { baseOid, baseRefName: compareBaseRefName, files } = changedFiles;
+    const { baseRefName: compareBaseRefName, files } = changedFiles;
+    // CODEOWNERS is read at the base branch *tip*, not at the PR's pinned fork
+    // point (`baseOid`), because the tip is what GitHub enforces at merge time.
+    // This makes `codeownerSensitive` agree with the enforcing authority.
+    //
+    // The fork-point read could disagree in BOTH directions, and neither
+    // direction is safe to hand-wave:
+    //   - a rule ADDED to the base after the PR forked was absent from the
+    //     fork-point blob, so a change touching a newly-owned path
+    //     under-reported as not sensitive — the fail-open direction;
+    //   - a rule DELETED or NARROWED on the base after the PR forked was still
+    //     present in the fork-point blob, so a change over-reported as
+    //     sensitive and was routed to a human GitHub would not have asked for.
+    //
+    // Note explicitly that this fix is therefore NOT monotone: moving to the
+    // tip can turn `codeownerSensitive` from `true` to `false` whenever a rule
+    // was removed, and an ordinary commit is enough to do that. The
+    // justification is correctness — one authority, the one that actually
+    // gates the merge — not conservatism. Do not restate it as "can only add
+    // sensitivity"; that claim is false.
+    //
+    // `baseOid` stays the authority for the changed-files diff, which is
+    // genuinely computed against the fork point. The `heads/` prefix keeps a
+    // same-named tag from hijacking ref resolution, matching the compare call
+    // below; `compareBaseRefName` is a `gitRefName`, so no unsafe ref reaches
+    // the network.
     let codeownersResponse: string;
     try {
       codeownersResponse = await runner('gh', [
-        'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS?ref=${baseOid}`,
+        'api',
+        `repos/${repositorySlug}/contents/.github/CODEOWNERS`
+        + `?ref=heads/${compareBaseRefName}`,
       ]);
     } catch (error) {
       if (error instanceof Error && /HTTP 404/i.test(error.message)) {
@@ -141,11 +256,10 @@ export function makeProductionMergeActionPort(
     if (typeof codeownersRaw.content !== 'string') {
       throw new Error('Merge CODEOWNERS read was incomplete');
     }
-    // `baseOid` is the PR's pinned fork point: correct for the CODEOWNERS blob
-    // read above, wrong for staleness. It never advances with the base branch,
-    // so comparing against it can only ever yield `ahead`/`identical` and made
-    // the `behind` merge-gate reason unreachable. Compare against the base
-    // branch so GitHub resolves it to the current tip. The `heads/` prefix
+    // `baseOid` is the PR's pinned fork point. It never advances with the base
+    // branch, so comparing against it can only ever yield `ahead`/`identical`
+    // and made the `behind` merge-gate reason unreachable. Compare against the
+    // base branch so GitHub resolves it to the current tip. The `heads/` prefix
     // keeps a same-named tag from hijacking the resolution. See
     // `readExactCompareStatus` for the full race analysis.
     const compare = JSON.parse(await runner('gh', [
@@ -363,28 +477,89 @@ export function makeProductionMergeActionPort(
         }
       }),
 
-    updateBranch: ({ prNumber, expectedHead, credential }) =>
+    /**
+     * The old shape was `try { update } catch {} ; read head once ; unchanged
+     * => rejected`. That single readback conflated five distinguishable
+     * outcomes — 422 conflict, 401/403 refusal, 429/secondary throttle, network
+     * failure, and the endpoint's documented 202 Accepted queueing — into one
+     * verdict that reads as "merge conflict" to an operator. Observed live on
+     * PR #2130: reported `rejected`, then succeeded unchanged.
+     *
+     * Now: capture and classify the error text, and give an accepted-but-queued
+     * update a bounded readback window before deciding anything. A durable
+     * refusal (conflict/forbidden) skips the poll entirely, so the common
+     * conflict case costs no extra wall clock.
+     */
+    updateBranch: ({ prNumber, expectedHead, credential }): Promise<UpdateBranchOutcome> =>
       withCredential(credential, async ({ run }) => {
+        let failure: UpdateBranchFailureClass | undefined;
+        let alreadyUpToDate = false;
         try {
-          await run('gh', [
+          const output = await run('gh', [
             'pr', 'update-branch', String(prNumber),
             '--repo', repositorySlug,
           ]);
-        } catch {
-          // Exact readback below classifies the outcome.
+          alreadyUpToDate = ALREADY_UP_TO_DATE_PATTERN.test(output);
+        } catch (error) {
+          failure = classifyUpdateBranchFailure(errorText(error));
         }
-        const readback = JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', repositorySlug,
-          '--json', 'headRefOid',
-        ])) as { headRefOid?: unknown };
-        if (typeof readback.headRefOid !== 'string') {
-          return { status: 'rejected' as const, head: expectedHead };
+        // A non-zero exit is not proof the request failed to land, so even a
+        // durable-looking refusal gets one readback — it just gets no poll.
+        // Nothing is in flight when gh never called the API, so an
+        // already-up-to-date answer skips the poll for the same reason.
+        const durable = failure !== undefined
+          && DURABLE_UPDATE_BRANCH_FAILURES.has(failure);
+        const attempts = durable || alreadyUpToDate
+          ? 1
+          : Math.max(1, options.updateBranchReadback?.attempts
+            ?? UPDATE_BRANCH_READBACK_ATTEMPTS);
+        const delayMs = options.updateBranchReadback?.delayMs
+          ?? UPDATE_BRANCH_READBACK_DELAY_MS;
+        let readbackFailed = false;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          if (attempt > 0) await pause(delayMs);
+          let head: string | undefined;
+          try {
+            const readback = JSON.parse(await run('gh', [
+              'pr', 'view', String(prNumber), '--repo', repositorySlug,
+              '--json', 'headRefOid',
+            ])) as { headRefOid?: unknown };
+            if (typeof readback.headRefOid === 'string') head = readback.headRefOid;
+          } catch {
+            // Fall through: an unreadable head is undetermined, not a refusal.
+          }
+          if (head === undefined) {
+            readbackFailed = true;
+            continue;
+          }
+          readbackFailed = false;
+          const observed = gitOid(head);
+          if (observed !== expectedHead) {
+            return { status: 'updated' as const, head: observed };
+          }
         }
-        const head = gitOid(readback.headRefOid);
-        if (head === expectedHead) {
-          return { status: 'rejected' as const, head };
+        if (failure !== undefined) {
+          return {
+            status: durable ? ('rejected' as const) : ('pending' as const),
+            head: expectedHead,
+            failure,
+          };
         }
-        return { status: 'updated' as const, head };
+        if (alreadyUpToDate) {
+          // gh compared and found `behind_by == 0`. The head correctly did not
+          // move; that is success with nothing to do, not a refusal.
+          return { status: 'already-up-to-date' as const, head: expectedHead };
+        }
+        // The queue call itself succeeded. An unchanged head after the whole
+        // readback budget is the 202-async case (or a readback we could not
+        // complete) — undetermined, and explicitly not `updated`.
+        return {
+          status: 'pending' as const,
+          head: expectedHead,
+          failure: readbackFailed
+            ? ('unavailable' as const)
+            : ('queued' as const),
+        };
       }),
 
     fileReconcileChild: ({ prNumber, effort, credential }) =>

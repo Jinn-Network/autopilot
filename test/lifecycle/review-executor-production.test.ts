@@ -177,7 +177,7 @@ function projectFields(): string {
 }
 
 describe('production review acquisition port', () => {
-  it('reads CODEOWNERS from the exact current GitHub base commit', async () => {
+  it('reads CODEOWNERS from the base branch tip, not the pinned fork point', async () => {
     const calls: string[][] = [];
     const port = makeProductionReviewActionPort({
       repositoryPath: '/repo',
@@ -210,6 +210,9 @@ describe('production review acquisition port', () => {
     await expect(port.readCandidate(84)).resolves.toMatchObject({
       approvalPolicy: 'human-codeowner',
     });
+    // GitHub enforces the CODEOWNERS in effect at the base branch tip. The
+    // PR's pinned fork point ('4'.repeat(40)) predates any rule added since the
+    // fork, so reading it can only under-report ownership.
     expect(calls).toEqual([
       ['api', 'repos/Jinn-Network/mono/pulls/84'],
       [
@@ -218,9 +221,10 @@ describe('production review acquisition port', () => {
         '--method',
         'GET',
         '-f',
-        `ref=${'4'.repeat(40)}`,
+        'ref=heads/next',
       ],
     ]);
+    expect(calls[1]!.join(' ')).not.toContain('4'.repeat(40));
   });
 
   it('treats an absent CODEOWNERS file as an empty policy', async () => {
@@ -740,5 +744,91 @@ describe('production review acquisition port', () => {
 
     expect(sharedMutations).toEqual([]);
     expect(remoteReviewRef).toBe(REVIEW);
+  });
+});
+
+/**
+ * CODEOWNERS direction-of-error. `codeownerSensitive` / `approvalPolicy` decide
+ * whether the engine may approve a change itself or must route it to a human.
+ * Reading the policy at the PR's pinned fork point missed every rule added to
+ * the base since the fork, so a change touching a newly-owned path read as
+ * `approve-eligible` — a fail OPEN on a safety signal. Reading the tip is
+ * monotone the other way: it can only add ownership.
+ */
+describe('review CODEOWNERS is read at the base branch tip', () => {
+  const FORK_POINT = '4'.repeat(40);
+  const OWNED_FILE = 'client/src/dashboard/spa/src/pages/Home.tsx';
+
+  function port(input: { readonly atForkPoint: string; readonly atTip: string }) {
+    const refs: string[] = [];
+    return {
+      refs,
+      value: makeProductionReviewActionPort({
+        repositoryPath: '/repo',
+        worktreeBase: '/worktrees',
+        runnerId: 'runner-a',
+        readSnapshot: async () => snapshot(),
+        changedFiles: async () => [OWNED_FILE],
+        runner: async (command, args) => {
+          expect(command).toBe('gh');
+          if (args.some((arg) => arg.endsWith('/pulls/84'))) {
+            return JSON.stringify({
+              changed_files: 1,
+              head: { sha: HEAD },
+              base: { ref: 'next', sha: FORK_POINT },
+            });
+          }
+          if (args.some((arg) => arg.endsWith('/contents/.github/CODEOWNERS'))) {
+            const ref = args.find((arg) => arg.startsWith('ref='))!;
+            refs.push(ref);
+            return JSON.stringify({
+              encoding: 'base64',
+              content: Buffer.from(
+                ref === `ref=${FORK_POINT}` ? input.atForkPoint : input.atTip,
+              ).toString('base64'),
+            });
+          }
+          throw new Error(`unexpected ${args.join(' ')}`);
+        },
+      }),
+    };
+  }
+
+  it('routes to a human for a rule added to the base after the PR forked', async () => {
+    const harness = port({
+      atForkPoint: '# no owned paths\n',
+      atTip: '/client/src/dashboard/spa/src/pages/ @Jinn-Network/codeowners\n',
+    });
+
+    await expect(harness.value.readCandidate(84)).resolves.toMatchObject({
+      approvalPolicy: 'human-codeowner',
+    });
+    expect(harness.refs).toEqual(['ref=heads/next']);
+  });
+
+  /**
+   * The `true -> false` direction, stated explicitly. CODEOWNERS entries can be
+   * deleted or narrowed by an ordinary commit, so the tip policy is not a
+   * superset of the fork-point policy and this fix is not monotone. Routing to
+   * a human on the strength of a rule GitHub no longer enforces was the
+   * fork-point read's over-reporting failure, and dropping it here is correct.
+   */
+  it('stops routing to a human once the owning rule is deleted from the base', async () => {
+    const harness = port({
+      atForkPoint: '/client/src/dashboard/spa/src/pages/ @Jinn-Network/codeowners\n',
+      atTip: '# ownership withdrawn\n',
+    });
+
+    await expect(harness.value.readCandidate(84)).resolves.toMatchObject({
+      approvalPolicy: 'approve-eligible',
+    });
+    expect(harness.refs).toEqual(['ref=heads/next']);
+  });
+
+  it('pins the base through heads/ so a same-named tag cannot hijack the policy', async () => {
+    const harness = port({ atForkPoint: '', atTip: '' });
+
+    await harness.value.readCandidate(84);
+    expect(harness.refs[0]).toBe('ref=heads/next');
   });
 });

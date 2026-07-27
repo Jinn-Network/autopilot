@@ -43,6 +43,7 @@ import {
   gitOid,
   gitRefName,
   type GitOid,
+  type GitRefName,
 } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import { hasExternalHumanAuthority } from './human-authority.js';
@@ -146,10 +147,37 @@ export function makeProductionReviewActionPort(
     if (mutationError !== undefined) throw mutationError;
     throw new Error(ambiguityMessage);
   };
+  /**
+   * Read the CODEOWNERS policy GitHub will actually enforce.
+   *
+   * That policy lives at the base branch *tip*, not at `baseOid` — the PR's
+   * pinned fork point. Reading the tip makes `humanSurface` agree with the
+   * authority that actually gates the merge.
+   *
+   * The fork-point read could disagree in BOTH directions:
+   *   - a rule ADDED to the base after this PR forked is in force for the PR
+   *     but absent from the fork-point blob, so a change touching a
+   *     newly-owned path was classified `approve-eligible` and the engine
+   *     could self-approve it — a fail-OPEN on a safety-relevant signal;
+   *   - a rule DELETED or NARROWED after the fork is gone for the PR but still
+   *     present in the fork-point blob, so a change was routed to a human
+   *     GitHub would never have asked for.
+   *
+   * State plainly what this does NOT claim: the fix is not monotone. Because
+   * CODEOWNERS entries can be removed by an ordinary commit, reading the tip
+   * can turn `humanSurface` from `true` to `false`. That is correct — GitHub
+   * will not enforce a rule that no longer exists — but it is emphatically not
+   * a "can only add sensitivity" argument, and must not be restated as one.
+   *
+   * `heads/` pins resolution to the branch so a same-named tag cannot hijack
+   * it, matching `readExactCompareStatus`. `baseRefName` reaches here as a
+   * `gitRefName` from `ExactChangedFiles`, already verified equal to the PR's
+   * declared base and already rejected if it could alter URL meaning.
+   */
   const readCodeownersText = async (input: {
     readonly prNumber: number;
     readonly expectedHead: GitOid;
-    readonly baseRefName: string;
+    readonly baseRefName: GitRefName;
     readonly baseOid: GitOid;
   }): Promise<string> => {
     if (options.codeownersText !== undefined) {
@@ -160,7 +188,7 @@ export function makeProductionReviewActionPort(
       raw = await runner('gh', [
         'api', `repos/${repositorySlug}/contents/.github/CODEOWNERS`,
         '--method', 'GET',
-        '-f', `ref=${input.baseOid}`,
+        '-f', `ref=heads/${input.baseRefName}`,
       ]);
     } catch (error) {
       if (error instanceof Error && /HTTP 404/i.test(error.message)) return '';
@@ -275,7 +303,10 @@ export function makeProductionReviewActionPort(
       parseOwnedPrefixes(await readCodeownersText({
         prNumber,
         expectedHead: pr.headOid,
-        baseRefName: pr.baseRefName,
+        // `changedFiles.baseRefName`, not `pr.baseRefName`: the former was
+        // re-verified against a fresh REST read of the PR inside
+        // `readExactChangedFiles` and is already a validated `GitRefName`.
+        baseRefName: changedFiles.baseRefName,
         baseOid: changedFiles.baseOid,
       })),
     );
