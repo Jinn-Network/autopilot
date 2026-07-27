@@ -53,16 +53,18 @@ import {
 // This file is deliberately subprocess-heavy: almost every test builds one or more real
 // `git` repository fixtures and drives `createAttemptWorkspace` against them, so a single
 // test routinely spawns dozens of real `git` processes. Vitest's 5000 ms default leaves
-// too little headroom for that on a loaded runner — this file has already timed out twice
-// on `macos-latest`.
+// too little headroom for that on a loaded runner — this file is *reported* to have timed
+// out twice on `macos-latest`. That report is inherited rather than first-hand: those runs
+// have since aged out of GitHub's log retention, so the failures cannot be re-read here.
 //
-// The number below is derived from measurement, not picked:
-//   - Local worst case, unloaded dev Mac, 3 runs, slowest test in the file ('retains
-//     authentication failure, missing objects, malformed manifests, and escaped paths'):
-//     1474 / 1388 / 1466 ms.
-//   - Observed CI slowdown floor: a test measured here at 1893 / 1891 / 1812 ms still
-//     exceeded the 5000 ms default on `macos-latest`, so that runner is at least
-//     5000 / 1893 = 2.6x slower than this baseline.
+// The number below is derived from measurement wherever measurement was still possible:
+//   - Local worst case (measured here), unloaded dev Mac, 3 runs, slowest test in the file
+//     ('retains authentication failure, missing objects, malformed manifests, and escaped
+//     paths'): 1474 / 1388 / 1466 ms.
+//   - Inferred CI slowdown floor: the test named in that timeout report measures here at
+//     1893 / 1891 / 1812 ms. Taking the report at face value — it is the one input below
+//     resting on the expired logs rather than on a local measurement — puts that runner at
+//     no better than 5000 / 1893 = 2.6x slower than this baseline.
 //   - Extrapolated CI worst case: 1474 ms x 2.6 = ~3.9 s, i.e. only ~1.3x under the
 //     default — the next timeout would be a matter of runner variance, not of any one
 //     test. 15000 ms restores a ~3.8x margin over that extrapolated CI worst case
