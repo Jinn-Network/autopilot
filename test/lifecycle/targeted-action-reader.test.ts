@@ -1366,11 +1366,21 @@ describe('targeted action reader unrelated open PR churn', () => {
     readonly reads: ReadonlyMap<number, RawPullRequest | null>;
     readonly dependencies?: readonly number[];
     readonly blockedOn?: 'Nothing' | 'Another issue';
+    /** Records every rate-limit reservation, in the order the reader takes it. */
+    readonly onReserve?: () => void;
+    /** Records every live PR read, in the order the reader issues it. */
+    readonly onRead?: (number: number) => void;
   }) => makeTargetedActionReader({
     authorAllowlist: new Set(['oaksprout']),
     rateLimitFloor: 500,
-    readGraphQlRemaining: async () => 4_000,
-    readPullRequest: async (number) => input.reads.get(number) ?? null,
+    readGraphQlRemaining: async () => {
+      input.onReserve?.();
+      return 4_000;
+    },
+    readPullRequest: async (number) => {
+      input.onRead?.(number);
+      return input.reads.get(number) ?? null;
+    },
     readOpenPullRequestIndex: async () => input.index,
     readProjectItem: async () => ({
       id: 'item-42',
@@ -1961,9 +1971,13 @@ describe('targeted action reader unrelated open PR churn', () => {
   const offPatternReader = (input: {
     readonly stack: ReturnType<typeof offPatternStack>;
     readonly contenderIndexHeadOid?: string;
+    readonly onReserve?: () => void;
+    readonly onRead?: (number: number) => void;
   }) => {
     const { subject, parent, grandparent, contender } = input.stack;
     return vetoReader({
+      onReserve: input.onReserve,
+      onRead: input.onRead,
       index: [
         indexEntry(subject),
         indexEntry(parent),
@@ -2027,6 +2041,89 @@ describe('targeted action reader unrelated open PR churn', () => {
       stack.subject.number,
     );
 
+    expect(snapshotOf(read)).toBeNull();
+    expect(targetedAuthorityRefusalDetail(read)).toMatch(
+      /PR #401 maps to target base chain issue #9 and its headOid moved/,
+    );
+  });
+
+  /**
+   * The base chain walk and the refresh loop both want the same ancestor rows.
+   * An uncached off-pattern grandparent is wanted by both, so without the
+   * memo it is fetched — and billed — twice for one targeted action. This
+   * engine may not hammer the GitHub API, so one PR number costs one read.
+   */
+  it('reads each PR at most once across the walk and the refresh loop', async () => {
+    const stack = offPatternStack();
+    const reads: number[] = [];
+    const reader = offPatternReader({ stack, onRead: (number) => reads.push(number) });
+
+    const snapshot = snapshotOf(await reader.readPullRequest(
+      stackedCycle(stack.subject, stack.parent),
+      stack.subject.number,
+    ));
+
+    expect(snapshot?.pullRequests.map((pr) => pr.number)).toEqual([101, 201, 301, 401]);
+    // #301 is wanted by the walk and again by the refresh loop; #201 is cached
+    // fresh and wanted by neither.
+    expect(reads).toEqual([101, 301, 401]);
+  });
+
+  /**
+   * Every non-fresh PR read on this path — the walk's ancestors and the
+   * refresh loop's index rows alike — funnels through the one reserve call in
+   * `readLive`. That single call site is the whole of this path's reservation
+   * accounting, so an unreserved read here is an unbilled read.
+   */
+  it('reserves rate limit quota before every live PR read', async () => {
+    const stack = offPatternStack();
+    const events: string[] = [];
+    const reader = offPatternReader({
+      stack,
+      onReserve: () => events.push('reserve'),
+      onRead: (number) => events.push(`read:${number}`),
+    });
+
+    const snapshot = snapshotOf(await reader.readPullRequest(
+      stackedCycle(stack.subject, stack.parent),
+      stack.subject.number,
+    ));
+
+    expect(snapshot).not.toBeNull();
+    expect(events).toEqual([
+      'reserve', 'read:101',
+      'reserve', 'read:301',
+      'reserve', 'read:401',
+    ]);
+  });
+
+  /**
+   * A cached ancestor row is only as good as the index says it is. Here the
+   * grandparent picked up issue #9 after the cycle, so the cached row's
+   * closure is empty and its off-pattern branch name carries nothing. Trusting
+   * mere presence in the cache — rather than freshness against the index —
+   * composes an empty closure and hides the contender racing for #9.
+   */
+  it('re-reads a stale cached base chain ancestor before composing its closure', async () => {
+    const stack = offPatternStack();
+    const staleGrandparent: RawPullRequest = {
+      ...stack.grandparent,
+      updatedAt: '2026-07-22T08:00:00.000Z',
+      closingIssueNumbers: [],
+    };
+    const reads: number[] = [];
+    const reader = offPatternReader({
+      stack,
+      contenderIndexHeadOid: RACING_INDEX_HEAD,
+      onRead: (number) => reads.push(number),
+    });
+
+    const read = await reader.readPullRequest(
+      stackedCycle(stack.subject, stack.parent, staleGrandparent),
+      stack.subject.number,
+    );
+
+    expect(reads).toEqual([101, 301, 401]);
     expect(snapshotOf(read)).toBeNull();
     expect(targetedAuthorityRefusalDetail(read)).toMatch(
       /PR #401 maps to target base chain issue #9 and its headOid moved/,
