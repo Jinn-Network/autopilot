@@ -20,10 +20,12 @@ import { runLifecycleCycle } from '../../src/lifecycle/controller.js';
 import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
 import {
   marketplaceStatus,
+  installMarketplaceEvaluatorLeg,
   upgradeMarketplaceExecutionV2,
 } from '../../src/lifecycle/marketplace-adoption-state.js';
 import {
   readAttemptManifest,
+  decodeAttemptManifest,
   type AttemptManifest,
   type MarketplaceExecutionState,
 } from '../../src/lifecycle/attempt-workspace.js';
@@ -200,6 +202,86 @@ function installHarnessAtV2(
     },
   }, null, 2)}\n`);
   return manifestPath;
+}
+
+function installEvaluatorLegAtV2(
+  v2Base: string,
+  runnerId: string,
+  originManifestPath: string,
+  reviewAttemptId: string,
+): string {
+  const reviewDir = join(v2Base, runnerId, 'review', `pr-2101-${reviewAttemptId}`);
+  mkdirSync(join(reviewDir, 'worktree'), { recursive: true });
+  mkdirSync(join(reviewDir, 'gh-config'), { recursive: true });
+  const requestDigest = marketplacePreparedState(readAttemptManifest(originManifestPath)).requestDigest;
+  const origin = readAttemptManifest(originManifestPath);
+  const reviewManifestPath = join(reviewDir, 'manifest.json');
+  const manifest = decodeAttemptManifest({
+    version: 2,
+    attemptId: reviewAttemptId,
+    runnerId,
+    host: origin.host,
+    phase: 'review',
+    processState: 'preparing',
+    pid: null,
+    execution: {
+      backend: 'marketplace',
+      state: {
+        schemaVersion: 'marketplace-execution-v2',
+        status: 'prepared',
+        requestPath: join(reviewDir, 'marketplace-request.json'),
+        requestDigest,
+        solverNetSelectionPath: join(reviewDir, 'solvernet-selection.json'),
+        preparedAt: NOW.toISOString(),
+        agentSoftDeadline: '2026-07-27T13:00:00.000Z',
+        adoptionDeadline: '2026-07-27T14:00:00.000Z',
+      },
+    },
+    subject: 'pr-2101',
+    issueNumber: 2001,
+    prNumber: 2101,
+    branch: 'autopilot/2001',
+    targetBase: 'next',
+    expectedHead: gitOid('3'.repeat(40)),
+    claimOid: gitOid('3'.repeat(40)),
+    reviewGeneration: '33333333-3333-4333-8333-333333333333',
+    reviewRefOid: gitOid('3'.repeat(40)),
+    reviewApprovalPolicy: 'approve-eligible',
+    selectedLogin: 'review-bot',
+    repository: origin.repository,
+    paths: {
+      attemptDir: reviewDir,
+      manifest: reviewManifestPath,
+      worktree: join(reviewDir, 'worktree'),
+      log: join(reviewDir, 'session.log'),
+      ghConfigDir: join(reviewDir, 'gh-config'),
+      askpass: join(reviewDir, 'askpass'),
+      tokenFile: join(reviewDir, 'token'),
+    },
+    timestamps: {
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString(),
+    },
+  });
+  writeFileSync(reviewManifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  installMarketplaceEvaluatorLeg(
+    reviewManifestPath,
+    {
+      originManifestPath,
+      originV2AttemptId: ATTEMPT_ID,
+      originRequestDigest: requestDigest,
+      taskId: '501',
+      taskCid: 'bafybeigdyrzt5m6u2r3o4exampletaskcid',
+      taskCreationBlock: 501,
+      prNumber: 2101,
+      expectedHead: gitOid('3'.repeat(40)),
+      generation: '33333333-3333-4333-8333-333333333333',
+      reviewRefOid: gitOid('3'.repeat(40)),
+      reviewer: 'review-bot',
+    },
+    () => NOW,
+  );
+  return reviewManifestPath;
 }
 
 function writer(): ReconciliationWriter {
@@ -510,6 +592,33 @@ describe('marketplace solution recovery', () => {
     });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/does not match its v2 attempt path/i);
+  });
+
+  it('skips anchored evaluator-leg review manifests during adoption recovery', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const harness = new Harness('implement', 'submitted');
+    const manifestPath = installHarnessAtV2(harness, v2Base, 'runner-1', ATTEMPT_ID);
+    installEvaluatorLegAtV2(v2Base, 'runner-1', manifestPath, REVIEW_ATTEMPT);
+    expect(marketplaceStatus(readAttemptManifest(
+      join(v2Base, 'runner-1', 'review', `pr-2101-${REVIEW_ATTEMPT}`, 'manifest.json'),
+    ))).toBeNull();
+    const adopt = vi.fn(async () => ({
+      status: 'recoverable' as const,
+      stage: 'observation',
+      detail: 'pending',
+    }));
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base,
+      recoverPrepared: async () => [],
+      makeAdopter: () => ({ adopt }),
+      isPidAlive: () => true,
+      now: () => NOW,
+    });
+    expect(result).toEqual({ ok: true });
+    expect(adopt).toHaveBeenCalledTimes(1);
+    expect(adopt).toHaveBeenCalledWith(manifestPath);
   });
 
   it('fails closed when prepared attempts remain before adoption recovery', async () => {

@@ -3111,26 +3111,32 @@ function isRunnerLiveAttempt(
   manifest: AttemptManifest,
   isPidAlive: (pid: number) => boolean,
 ): boolean {
-  if (
-    manifest.execution.backend === 'marketplace'
-    && manifest.execution.state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION
-  ) {
-    return manifest.execution.state.status === 'anchored';
+  const processRunningWithLivePid = manifest.processState === 'running'
+    && manifest.pid !== null
+    && isPidAlive(manifest.pid);
+  if (manifest.execution.backend === 'marketplace') {
+    const state = manifest.execution.state;
+    if (state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) {
+      return state.status === 'anchored' && processRunningWithLivePid;
+    }
+    if (
+      state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      || state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    ) {
+      if (state.status === 'prepared' || state.status === 'submitted') {
+        return true;
+      }
+      if (
+        state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+        && state.status !== 'receipt-published'
+        && state.status !== 'cancelled'
+      ) {
+        return processRunningWithLivePid;
+      }
+      return false;
+    }
   }
-  if (
-    manifest.execution.backend === 'marketplace'
-    && (manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
-      || manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION)
-  ) {
-    return manifest.execution.state.status === 'prepared'
-      || manifest.execution.state.status === 'submitted';
-  }
-  return manifest.processState === 'preparing'
-    || (
-      manifest.processState === 'running'
-      && manifest.pid !== null
-      && isPidAlive(manifest.pid)
-    );
+  return manifest.processState === 'preparing' || processRunningWithLivePid;
 }
 
 export type CleanupReasonCode =

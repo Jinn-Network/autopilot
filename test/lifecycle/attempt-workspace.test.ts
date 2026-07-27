@@ -52,6 +52,7 @@ import {
 import {
   installMarketplaceEvaluatorLeg,
   transitionMarketplaceAdoption,
+  transitionMarketplaceEvaluatorLeg,
 } from '../../src/lifecycle/marketplace-adoption-state.js';
 
 // This file is deliberately subprocess-heavy: almost every test builds one or more real
@@ -3082,6 +3083,28 @@ describe('attempt workspace and manifest', () => {
     }
   });
 
+  function setManifestProcessState(
+    manifestPath: string,
+    processState: 'running' | 'exited',
+    pid: number | null,
+  ): void {
+    const raw = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    const existing = raw.timestamps as Record<string, unknown>;
+    const timestamps = {
+      ...existing,
+      updatedAt: NOW,
+      childStartedAt: existing.childStartedAt ?? NOW,
+      ...(processState === 'exited' ? { childExitedAt: NOW } : {}),
+    };
+    if (processState === 'running') {
+      delete timestamps.childExitedAt;
+    }
+    raw.processState = processState;
+    raw.pid = pid;
+    raw.timestamps = timestamps;
+    writeFileSync(manifestPath, `${JSON.stringify(raw, null, 2)}\n`);
+  }
+
   it('counts only this runner’s live manifests for local capacity', async () => {
     const fixture = repositoryFixture();
     const one = await createAttemptWorkspace(options(fixture, {
@@ -3158,6 +3181,171 @@ describe('attempt workspace and manifest', () => {
       runnerId,
       (pid) => pid === 300,
     ).map((attempt) => attempt.attemptId).sort()).toEqual([UUID_A, UUID_B]);
+  });
+
+  it('counts anchored evaluator legs only while their process is running', async () => {
+    const fixture = repositoryFixture();
+    const runnerId = 'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const common = {
+      schemaVersion: 'marketplace-execution-v2' as const,
+      requestPath: join(fixture.root, 'evaluator-request.json'),
+      requestDigest,
+      solverNetSelectionPath: join(fixture.root, 'evaluator-solvernet.json'),
+      preparedAt: NOW,
+      agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+      adoptionDeadline: '2026-07-20T01:30:00.000Z',
+    };
+    const origin = await createAttemptWorkspace(options(fixture, {
+      execution: { backend: 'marketplace', state: { ...common, status: 'cancelled', cancelledAt: NOW, reason: 'test' } },
+    }), defaultRunner);
+    const review = await createAttemptWorkspace(options(fixture, {
+      phase: 'review',
+      subject: 'pr-84',
+      prNumber: 84,
+      branch: 'autopilot/42',
+      reviewGeneration: UUID_C,
+      reviewRefOid: fixture.oid,
+      reviewApprovalPolicy: 'approve-eligible',
+      selectedLogin: 'review-bot',
+      credential: new SelectedCredential('review-bot', 'review', 'review-secret'),
+      attemptId: UUID_B,
+      execution: { backend: 'marketplace', state: { ...common, status: 'prepared' } },
+    }), defaultRunner);
+    const identity = {
+      originManifestPath: origin.paths.manifest,
+      originV2AttemptId: UUID_A,
+      originRequestDigest: requestDigest,
+      taskId: '501',
+      taskCid: 'bafybeigdyrzt5m6u2r3o4exampletaskcid',
+      taskCreationBlock: 501,
+      prNumber: 84,
+      expectedHead: fixture.oid,
+      generation: UUID_C,
+      reviewRefOid: fixture.oid,
+      reviewer: 'review-bot',
+    };
+    installMarketplaceEvaluatorLeg(
+      review.paths.manifest,
+      identity,
+      () => new Date(NOW),
+    );
+    setManifestProcessState(review.paths.manifest, 'running', 500);
+    expect(listRunnerLiveAttempts(
+      join(fixture.base, 'v2'),
+      runnerId,
+      (pid) => pid === 500,
+    ).map((attempt) => attempt.attemptId)).toEqual([UUID_B]);
+    setManifestProcessState(review.paths.manifest, 'exited', 500);
+    expect(listRunnerLiveAttempts(
+      join(fixture.base, 'v2'),
+      runnerId,
+      () => true,
+    ).map((attempt) => attempt.attemptId)).toEqual([]);
+    transitionMarketplaceEvaluatorLeg(
+      review.paths.manifest,
+      identity,
+      { status: 'released', releaseReason: 'receipt-published' },
+      () => new Date('2026-07-20T00:03:00.000Z'),
+    );
+    setManifestProcessState(review.paths.manifest, 'running', 501);
+    expect(listRunnerLiveAttempts(
+      join(fixture.base, 'v2'),
+      runnerId,
+      (pid) => pid === 501,
+    ).map((attempt) => attempt.attemptId)).toEqual([]);
+  });
+
+  it('counts mid-adoption marketplace v3 attempts while their process is running', async () => {
+    const fixture = repositoryFixture();
+    const runnerId = 'host-100-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const requestDigest = `sha256:${'a'.repeat(64)}`;
+    const attemptDir = join(
+      fixture.base,
+      'v2',
+      runnerId,
+      'implement',
+      `issue-42-${UUID_A}`,
+    );
+    const submission = {
+      ...SUBMISSION_RESULT,
+      generatedAt: NOW,
+      id: `autopilot:${UUID_A}`,
+      taskId: '501',
+    };
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: fixture.oid,
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v3',
+          status: 'submitted',
+          requestPath: join(attemptDir, 'marketplace-request.json'),
+          requestDigest,
+          solverNetSelectionPath: join(attemptDir, 'solvernet-selection.json'),
+          preparedAt: NOW,
+          agentSoftDeadline: '2026-07-20T01:00:00.000Z',
+          adoptionDeadline: '2026-07-20T01:30:00.000Z',
+          submission,
+          submittedAt: NOW,
+        },
+      },
+    }), defaultRunner);
+    const delivery = {
+      observationPath: join(attemptDir, 'delivery.json'),
+      observationDigest: `sha256:${'b'.repeat(64)}`,
+      taskId: '501',
+      taskCid: submission.taskCid,
+      taskCreationTransaction: submission.creationTx,
+      taskCreationBlock: submission.creationBlock,
+      solverNetManifestCid: submission.solverNetManifestCid,
+      attemptIndex: 0,
+      requestId: `0x${'c'.repeat(64)}`,
+      deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid',
+      deliveryEnvelopeDigest: `sha256:${'d'.repeat(64)}`,
+      deliveryTransaction: `0x${'e'.repeat(64)}`,
+      deliveryBlock: submission.creationBlock + 1,
+      solverSafe: `0x${'1'.repeat(40)}`,
+      solverAgentEoa: `0x${'2'.repeat(40)}`,
+      signer: `0x${'2'.repeat(40)}`,
+      publisherAgentId: '501',
+      correlation: {
+        taskId: '501',
+        attemptIndex: 0,
+        requestId: `0x${'c'.repeat(64)}`,
+        deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid',
+        v2AttemptId: UUID_A,
+        claimOid: fixture.oid,
+        prNumber: 84,
+        expectedHead: fixture.oid,
+      },
+      observedAt: NOW,
+    };
+    transitionMarketplaceAdoption(
+      manifest.paths.manifest,
+      requestDigest,
+      { status: 'solution-observed', delivery },
+      () => new Date(NOW),
+    );
+    expect(listRunnerLiveAttempts(
+      join(fixture.base, 'v2'),
+      runnerId,
+      () => true,
+    ).map((attempt) => attempt.attemptId)).toEqual([]);
+    setManifestProcessState(manifest.paths.manifest, 'running', 600);
+    expect(listRunnerLiveAttempts(
+      join(fixture.base, 'v2'),
+      runnerId,
+      (pid) => pid === 600,
+    ).map((attempt) => attempt.attemptId)).toEqual([UUID_A]);
+    setManifestProcessState(manifest.paths.manifest, 'exited', 600);
+    expect(listRunnerLiveAttempts(
+      join(fixture.base, 'v2'),
+      runnerId,
+      () => true,
+    ).map((attempt) => attempt.attemptId)).toEqual([]);
   });
 });
 

@@ -755,7 +755,11 @@ export async function recoverSubmittedMarketplaceAttempts(
               now,
             );
           }
-          switch (marketplaceStatus(manifest)) {
+          const recoveryStatus = marketplaceStatus(manifest);
+          if (recoveryStatus === null) {
+            continue;
+          }
+          switch (recoveryStatus) {
             case 'prepared':
               throw new Error('prepared recovery must finish before adoption recovery');
             case 'submitted':

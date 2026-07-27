@@ -27,11 +27,16 @@ export type MarketplaceRecoveryStatus =
   | 'prepared'
   | 'cancelled';
 
-export function marketplaceStatus(manifest: AttemptManifest): MarketplaceRecoveryStatus {
+export function marketplaceStatus(
+  manifest: AttemptManifest,
+): MarketplaceRecoveryStatus | null {
   if (manifest.execution.backend !== 'marketplace') {
     throw new Error('Only marketplace attempts expose marketplace status');
   }
   const state = manifest.execution.state;
+  if (state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) {
+    return null;
+  }
   if (state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) {
     return state.status;
   }
