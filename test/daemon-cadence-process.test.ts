@@ -11,7 +11,7 @@ const CHILD_ENTRY = fileURLToPath(
 
 function cacheState(lastFullReconciliationAt: string): unknown {
   return {
-    version: 1,
+    version: 2,
     evidence: {
       project: {
         items: [],

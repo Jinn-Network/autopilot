@@ -378,13 +378,23 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
   async changed(pr: PullRequestSnapshot): Promise<boolean> {
     if (pr.state !== 'OPEN') return false;
     if (pr.evidenceIncompleteReason !== undefined) return true;
-    if (
-      pr.mergeability === 'MERGEABLE'
-      && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus)
-      && pr.compareStatus === undefined
-    ) {
-      return true;
-    }
+    // `compareStatus` is the only cached field whose truth depends on a commit
+    // outside this PR: the base branch tip. Every conditional read below is
+    // keyed on PR detail, reviews, comments, events, check-runs and commit
+    // status, and *none* of those change when the base branch advances, so a
+    // cached `compareStatus` can never be invalidated by the ETag path. Left
+    // alone it livelocks: a PR that has fallen behind its base keeps its stale
+    // `ahead`, `mergeState` stays `clean`, the controller's ladder guard is
+    // never entered, `update-branch` is never scheduled, and the merge
+    // executor's own fresh compare refuses it every cycle, forever.
+    //
+    // Merge-path PRs are therefore forced to refresh. The decision is applied
+    // *after* the conditional evidence below rather than as an early return, so
+    // the schema and identity guards on that path keep running — an early
+    // return would silently retire them for exactly the PRs closest to merge.
+    const compareStatusIsExpired = pr.mergeability === 'MERGEABLE'
+      && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
+    if (compareStatusIsExpired && pr.compareStatus === undefined) return true;
     const detailResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/pulls/${pr.number}`,
     );
@@ -472,7 +482,8 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       mergeability: pr.mergeability,
       mergeStateStatus: pr.mergeStateStatus,
     };
-    return JSON.stringify({ ...detail, labels: [...detail.labels].sort() })
+    return compareStatusIsExpired
+      || JSON.stringify({ ...detail, labels: [...detail.labels].sort() })
         !== JSON.stringify({ ...cachedDetail, labels: [...cachedDetail.labels].sort() })
       || canonical(currentReviews) !== canonical(pr.reviews)
       || JSON.stringify(currentHuman) !== JSON.stringify(cachedHuman)

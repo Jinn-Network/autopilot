@@ -159,7 +159,11 @@ function candidateRunner(changedFiles: number, filenames: readonly string[]) {
       });
     }
     if (endpoint?.startsWith('repos/Jinn-Network/mono/compare/')) {
-      expect(endpoint).toBe(`repos/Jinn-Network/mono/compare/${BASE}...${HEAD}`);
+      // Compare resolves the base *branch* at request time. The pinned
+      // `base.sha` fork point (BASE) stays reserved for the CODEOWNERS blob
+      // read above; using it here can never report `behind`.
+      expect(endpoint).toBe(`repos/Jinn-Network/mono/compare/heads/stack/base...${HEAD}`);
+      expect(endpoint).not.toContain(BASE);
       return JSON.stringify({ status: 'ahead' });
     }
     throw new Error(`unexpected ${command} ${args.join(' ')}`);
