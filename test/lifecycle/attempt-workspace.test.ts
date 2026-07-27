@@ -50,6 +50,32 @@ import {
   verifyMarketplaceTaskRequest,
 } from '../../src/lifecycle/marketplace-task.js';
 
+// This file is deliberately subprocess-heavy: almost every test builds one or more real
+// `git` repository fixtures and drives `createAttemptWorkspace` against them, so a single
+// test routinely spawns dozens of real `git` processes. Vitest's 5000 ms default leaves
+// too little headroom for that on a loaded runner — this file is *reported* to have timed
+// out twice on `macos-latest`. That report is inherited rather than first-hand: those runs
+// have since aged out of GitHub's log retention, so the failures cannot be re-read here.
+//
+// The number below is derived from measurement wherever measurement was still possible:
+//   - Local worst case (measured here, post-fix), unloaded dev Mac, 3 runs, slowest test in
+//     the file ('retains authentication failure, missing objects, malformed manifests, and
+//     escaped paths'): 1474 / 1388 / 1466 ms.
+//   - Inferred CI slowdown floor: the test named in that timeout report measured here
+//     *before this PR's fixture fix* at 1893 / 1891 / 1812 ms — post-fix it measures
+//     1281 / 1259 ms here, which is why the bullet above names a different test as the
+//     file's slowest. Taking the report at face value — it is the one input below
+//     resting on the expired logs rather than on a local measurement — puts that runner at
+//     no better than 5000 / 1893 = 2.6x slower than this pre-fix baseline.
+//   - Extrapolated CI worst case: 1474 ms x 2.6 = ~3.9 s, i.e. only ~1.3x under the
+//     default — the next timeout would be a matter of runner variance, not of any one
+//     test. 15000 ms restores a ~3.8x margin over that extrapolated CI worst case
+//     (~10x over local) while still failing fast on a genuine hang.
+//
+// Scoped to this file on purpose. Raising `testTimeout` in vitest.config.ts would hide
+// slowness across the entire suite; this file's cost is a known, intended property of it.
+vi.setConfig({ testTimeout: 15_000 });
+
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
 const UUID_C = '33333333-3333-4333-8333-333333333333';
@@ -2150,18 +2176,27 @@ describe('attempt workspace and manifest', () => {
       Partial<CreateAttemptOptions>,
       (manifest: AttemptManifest) => unknown,
     ]> = [
-      ['updateAttemptManifest', {}, (manifest) => updateAttemptManifest(
+      ['updateAttemptManifest', {
+        attemptId: '44444444-4444-4444-8444-444444444444',
+      }, (manifest) => updateAttemptManifest(
         manifest.paths.manifest,
         (current) => current,
       )],
-      ['markAttemptRunning', {}, (manifest) => markAttemptRunning(manifest.paths.manifest, 4242)],
-      ['markAttemptExited', {}, (manifest) => markAttemptExited(manifest.paths.manifest)],
-      ['advanceAttemptExpectedHead', {}, (manifest) => advanceAttemptExpectedHead(
+      ['markAttemptRunning', {
+        attemptId: '55555555-5555-4555-8555-555555555555',
+      }, (manifest) => markAttemptRunning(manifest.paths.manifest, 4242)],
+      ['markAttemptExited', {
+        attemptId: '66666666-6666-4666-8666-666666666666',
+      }, (manifest) => markAttemptExited(manifest.paths.manifest)],
+      ['advanceAttemptExpectedHead', {
+        attemptId: '77777777-7777-4777-8777-777777777777',
+      }, (manifest) => advanceAttemptExpectedHead(
         manifest.paths.manifest,
         manifest.expectedHead,
         'a'.repeat(40),
       )],
       ['advanceAttemptReviewPair', {
+        attemptId: '88888888-8888-4888-8888-888888888888',
         phase: 'review',
         subject: 'pr-7',
         prNumber: 7,
@@ -2177,13 +2212,24 @@ describe('attempt workspace and manifest', () => {
       )],
     ];
 
-    for (const [name, overrides, writer] of writers) {
-      const fixture = repositoryFixture();
-      const manifest = await createAttemptWorkspace(options(fixture, {
+    // One repository fixture serves every writer: each case carries its own
+    // attemptId, so `createAttemptWorkspace` places it under a distinct
+    // `<base>/v2/<runnerId>/<phase>/<subject>-<attemptId>` directory
+    // (src/lifecycle/attempt-workspace.ts:2493-2503) and therefore its own
+    // manifest.json. The reservation the loop asserts is decided solely by the
+    // manifest bytes at that path (src/lifecycle/attempt-workspace.ts:797-804),
+    // so no case can observe or be rescued by another's state. The distinct-path
+    // assertion below fails loudly if a future edit reuses an attemptId.
+    const loopFixture = repositoryFixture();
+    const loopManifests = new Set<string>();
+    for (const [index, [name, overrides, writer]] of writers.entries()) {
+      const manifest = await createAttemptWorkspace(options(loopFixture, {
         ...overrides,
-        ...(name === 'advanceAttemptReviewPair' ? { reviewRefOid: fixture.oid } : {}),
-        execution: marketplaceExecution(fixture),
+        ...(name === 'advanceAttemptReviewPair' ? { reviewRefOid: loopFixture.oid } : {}),
+        execution: marketplaceExecution(loopFixture),
       }), defaultRunner);
+      expect(loopManifests.add(manifest.paths.manifest).size, `${name} must own a manifest`)
+        .toBe(index + 1);
       const original = readFileSync(manifest.paths.manifest, 'utf8');
       let error: unknown;
       try {
