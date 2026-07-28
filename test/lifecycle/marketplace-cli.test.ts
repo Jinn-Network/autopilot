@@ -2,6 +2,7 @@ import { afterEach, expect, describe, it, vi } from 'vitest';
 import {
   MarketplaceMachineCliFailure,
   MarketplaceMachineCliProtocolError,
+  MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES,
   MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES,
   MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS,
   marketplaceMachineEnvironment,
@@ -63,6 +64,29 @@ describe('marketplace machine CLI boundary', () => {
       process.execPath,
       ['-e', `process.stdout.write('x'.repeat(${overLimit}))`],
       { environment: process.env },
+    )).rejects.toThrow(/output limit/i);
+  });
+
+  it('uses a per-call Relay observation allowance at the exact byte boundary', async () => {
+    const limit = MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES;
+    const accepted = await runMarketplaceMachineSubprocess(
+      process.execPath,
+      ['-e', `process.stdout.write('x'.repeat(${limit}))`],
+      {
+        environment: process.env,
+        outputProfile: 'issue-relay-observation',
+      },
+    );
+    expect(accepted.exitCode).toBe(0);
+    expect(Buffer.byteLength(accepted.stdout)).toBe(limit);
+
+    await expect(runMarketplaceMachineSubprocess(
+      process.execPath,
+      ['-e', `process.stdout.write('x'.repeat(${limit + 1}))`],
+      {
+        environment: process.env,
+        outputProfile: 'issue-relay-observation',
+      },
     )).rejects.toThrow(/output limit/i);
   });
 

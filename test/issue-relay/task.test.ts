@@ -300,6 +300,7 @@ describe('Relay marketplace request persistence', () => {
     const request = buildRelayMarketplaceRequest({
       task: initialTask(),
       solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
       specPath,
       createdAt: '2026-07-28T10:03:00.000Z',
       submitBy: '2026-07-28T10:18:00.000Z',
@@ -338,6 +339,7 @@ describe('Relay marketplace request persistence', () => {
     const request = buildRelayMarketplaceRequest({
       task: initialTask(),
       solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
       specPath,
       createdAt: '2026-07-28T10:03:00.000Z',
       submitBy: '2026-07-28T10:18:00.000Z',
@@ -366,6 +368,7 @@ describe('Relay marketplace request persistence', () => {
     const request = buildRelayMarketplaceRequest({
       task: initialTask(),
       solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
       specPath,
       createdAt: '2026-07-28T10:03:00.000Z',
       submitBy: '2026-07-28T10:18:00.000Z',
@@ -393,6 +396,7 @@ describe('Relay marketplace request persistence', () => {
     const request = buildRelayMarketplaceRequest({
       task: initialTask(),
       solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
       specPath: join(directory, 'spec.json'),
       createdAt: '2026-07-28T10:03:00.000Z',
       submitBy: '2026-07-28T10:18:00.000Z',
@@ -405,5 +409,25 @@ describe('Relay marketplace request persistence', () => {
 
     expect(() => persistRelayMarketplaceRequest(requestPath, weakened))
       .toThrow(/argv.*canonical|immutable.*binding/i);
+  });
+
+  it('persists the approved maximum spend in the exact canonical submit argv', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-'));
+    temporaryDirectories.push(directory);
+    const request = buildRelayMarketplaceRequest({
+      task: initialTask(),
+      solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
+      specPath: join(directory, 'spec.json'),
+      createdAt: '2026-07-28T10:03:00.000Z',
+      submitBy: '2026-07-28T10:18:00.000Z',
+    });
+
+    expect(request.argv.slice(-4)).toEqual([
+      '--max-spend-wei',
+      '100',
+      '--yes',
+      '--json',
+    ]);
   });
 });

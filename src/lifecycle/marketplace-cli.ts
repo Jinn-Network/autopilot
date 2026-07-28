@@ -13,7 +13,10 @@ export interface MarketplaceMachineSubprocessResult {
 export type MarketplaceMachineSubprocess = (
   command: string,
   args: readonly string[],
-  options: { readonly environment: NodeJS.ProcessEnv },
+  options: {
+    readonly environment: NodeJS.ProcessEnv;
+    readonly outputProfile?: 'issue-relay-observation';
+  },
 ) => Promise<MarketplaceMachineSubprocessResult>;
 
 export type MarketplaceMachineCliFailureCode =
@@ -91,6 +94,12 @@ export function resolveInstalledJinnBinary(): string {
 
 export const MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS = 300_000;
 export const MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+const ISSUE_RELAY_MAX_PATCH_BYTES = 2 * 1024 * 1024;
+const JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION = 6;
+const ISSUE_RELAY_OBSERVATION_JSON_OVERHEAD_BYTES = 256 * 1024;
+export const MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES =
+  ISSUE_RELAY_MAX_PATCH_BYTES * JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION
+  + ISSUE_RELAY_OBSERVATION_JSON_OVERHEAD_BYTES;
 
 export class MarketplaceMachineSubprocessPolicyError extends Error {
   readonly reason: 'timeout' | 'output-limit';
@@ -107,6 +116,10 @@ export const runMarketplaceMachineSubprocess: MarketplaceMachineSubprocess = (
   args,
   options,
 ) => new Promise((resolve, reject) => {
+  const outputLimitBytes =
+    options.outputProfile === 'issue-relay-observation'
+      ? MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES
+      : MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES;
   const child = spawn(command, [...args], {
     env: options.environment,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -131,7 +144,7 @@ export const runMarketplaceMachineSubprocess: MarketplaceMachineSubprocess = (
   const collect = (target: Buffer[], chunk: Buffer): void => {
     if (settled) return;
     outputBytes += chunk.byteLength;
-    if (outputBytes > MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES) {
+    if (outputBytes > outputLimitBytes) {
       stop('output');
       return;
     }
