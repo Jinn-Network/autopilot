@@ -1,6 +1,7 @@
 import type { AutopilotCorrelation } from '@jinn-network/sdk/autopilot';
 import {
   anchorEvidenceFromEvaluatorManifest,
+  claimMarketplaceAttemptProcess,
   findMarketplaceEvaluatorLegReviews,
   findMarketplaceEvaluatorReviewByAttemptId,
   readAttemptManifest,
@@ -68,6 +69,8 @@ export interface MarketplaceReviewAnchorDependencies {
   }) => Promise<AttemptManifest>;
   readonly releasePort?: ReviewSessionPort;
   readonly releasePortFor?: (manifestPath: string) => ReviewSessionPort;
+  readonly processPid?: number;
+  readonly isPidAlive?: (pid: number) => boolean;
   readonly now?: () => Date;
 }
 
@@ -145,8 +148,10 @@ async function anchorFromPreparedManifest(
   manifest: AttemptManifest,
   origin: MarketplaceReviewAnchorOrigin,
   claim: AcquiredExactHeadReviewClaim,
+  deps: MarketplaceReviewAnchorDependencies,
   now: () => Date,
 ): Promise<MarketplaceReviewAnchorResult> {
+  let anchored: AttemptManifest;
   if (
     manifest.execution.backend === 'marketplace'
     && manifest.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1'
@@ -157,15 +162,29 @@ async function anchorFromPreparedManifest(
         detail: 'Linked evaluator-leg review manifest was already released.',
       };
     }
-    return {
-      status: 'anchored',
-      anchor: anchorEvidenceFromEvaluatorManifest(manifest),
-    };
+    anchored = manifest;
+  } else {
+    anchored = await installEvaluatorLeg(manifest.paths.manifest, origin, claim, now);
   }
-  const installed = await installEvaluatorLeg(manifest.paths.manifest, origin, claim, now);
+  let running: AttemptManifest;
+  try {
+    running = claimMarketplaceAttemptProcess(anchored.paths.manifest, {
+      pid: deps.processPid ?? process.pid,
+      ...(deps.isPidAlive === undefined ? {} : { isPidAlive: deps.isPidAlive }),
+      now,
+    });
+  } catch (error) {
+    if (
+      error instanceof Error
+      && error.message === 'Marketplace attempt process lease is held by a live PID'
+    ) {
+      return { status: 'recoverable', detail: error.message };
+    }
+    throw error;
+  }
   return {
     status: 'anchored',
-    anchor: anchorEvidenceFromEvaluatorManifest(installed),
+    anchor: anchorEvidenceFromEvaluatorManifest(running),
   };
 }
 
@@ -252,7 +271,13 @@ async function recoverPreparedEvaluatorReview(
     ) {
       return null;
     }
-    return anchorFromPreparedManifest(manifest, input.origin, claimFromManifest(manifest), now);
+    return anchorFromPreparedManifest(
+      manifest,
+      input.origin,
+      claimFromManifest(manifest),
+      deps,
+      now,
+    );
   }
   if (
     state.schemaVersion !== 'marketplace-execution-v2'
@@ -265,6 +290,7 @@ async function recoverPreparedEvaluatorReview(
     manifest,
     input.origin,
     claimFromManifest(manifest),
+    deps,
     now,
   );
 }
@@ -298,10 +324,13 @@ export async function anchorMarketplaceEvaluatorReview(
     };
   }
   if (linked.length === 1) {
-    return {
-      status: 'anchored',
-      anchor: anchorEvidenceFromEvaluatorManifest(linked[0]),
-    };
+    return anchorFromPreparedManifest(
+      linked[0],
+      input.origin,
+      claimFromManifest(linked[0]),
+      deps,
+      now,
+    );
   }
 
   const preClaimCandidate = await deps.claimAcquisition.readCandidate(input.prNumber);
@@ -357,7 +386,7 @@ export async function anchorMarketplaceEvaluatorReview(
       confirmed,
     });
   }
-  return anchorFromPreparedManifest(manifest, input.origin, claim, now);
+  return anchorFromPreparedManifest(manifest, input.origin, claim, deps, now);
 }
 
 async function publishStaleReviewClaim(

@@ -1,11 +1,18 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultRunner } from '../../src/dispatcher/issue-source.js';
 import { CredentialPool, SelectedCredential } from '../../src/lifecycle/credentials.js';
 import {
+  claimMarketplaceAttemptProcess,
   createAttemptWorkspace,
   readAttemptManifest,
 } from '../../src/lifecycle/attempt-workspace.js';
@@ -229,6 +236,30 @@ async function preparedReviewManifest(
   }, defaultRunner);
 }
 
+async function anchoredReviewManifest(
+  fixture: ReturnType<typeof repositoryFixture>,
+): Promise<Awaited<ReturnType<typeof createAttemptWorkspace>>> {
+  const manifest = await preparedReviewManifest(fixture);
+  installMarketplaceEvaluatorLeg(
+    manifest.paths.manifest,
+    {
+      originManifestPath: originManifestPath(fixture),
+      originV2AttemptId: ORIGIN_ATTEMPT,
+      originRequestDigest: DIGEST,
+      taskId: '501',
+      taskCid: TASK_CID,
+      taskCreationBlock: TASK_CREATION_BLOCK,
+      prNumber: 84,
+      expectedHead: gitOid(fixture.oid),
+      generation: GENERATION,
+      reviewRefOid: REVIEW_REF_OID,
+      reviewer: 'review-bot',
+    },
+    () => new Date(NOW),
+  );
+  return readAttemptManifest(manifest.paths.manifest);
+}
+
 function releasePortFor(fixture: ReturnType<typeof repositoryFixture>): ReviewSessionPort {
   return {
     readManifest: (path: string) => readAttemptManifest(path),
@@ -274,6 +305,112 @@ function releasePortFor(fixture: ReturnType<typeof repositoryFixture>): ReviewSe
 }
 
 describe('marketplace review anchor', () => {
+  it('acquires a marketplace process lease for a newly anchored evaluator', async () => {
+    const fixture = repositoryFixture();
+    let createdManifest: Awaited<ReturnType<typeof createAttemptWorkspace>>;
+    const result = await anchorMarketplaceEvaluatorReview({
+      origin: originInput(fixture),
+      prNumber: 84,
+      expectedHead: gitOid(fixture.oid),
+      v2Base: join(fixture.base, 'v2'),
+    }, {
+      claimAcquisition: claimAcquisition(fixture.oid),
+      createEvaluatorReviewWorkspace: async () => {
+        createdManifest = await preparedReviewManifest(fixture);
+        return createdManifest;
+      },
+      processPid: 730,
+      isPidAlive: () => false,
+      now: () => new Date(NOW),
+    });
+
+    expect(result.status).toBe('anchored');
+    expect(readAttemptManifest(createdManifest!.paths.manifest)).toMatchObject({
+      processState: 'running',
+      pid: 730,
+      execution: {
+        backend: 'marketplace',
+        state: { schemaVersion: 'marketplace-evaluator-leg-v1', status: 'anchored' },
+      },
+    });
+  });
+
+  it('rebinds a dead marketplace evaluator process lease during anchor recovery', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await anchoredReviewManifest(fixture);
+    claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 731,
+      now: () => new Date(NOW),
+    });
+
+    const result = await anchorMarketplaceEvaluatorReview({
+      origin: originInput(fixture),
+      prNumber: 84,
+      expectedHead: gitOid(fixture.oid),
+      v2Base: join(fixture.base, 'v2'),
+    }, {
+      claimAcquisition: {
+        readCandidate: async () => {
+          throw new Error('claim acquisition must not run during anchor recovery');
+        },
+      } as unknown as ReviewClaimAcquisitionDeps,
+      createEvaluatorReviewWorkspace: async () => {
+        throw new Error('workspace must not be recreated during anchor recovery');
+      },
+      processPid: 730,
+      isPidAlive: () => false,
+      now: () => new Date(NOW),
+    });
+
+    expect(result.status).toBe('anchored');
+    expect(readAttemptManifest(manifest.paths.manifest)).toMatchObject({
+      processState: 'running',
+      pid: 730,
+      execution: {
+        backend: 'marketplace',
+        state: { schemaVersion: 'marketplace-evaluator-leg-v1', status: 'anchored' },
+      },
+    });
+  });
+
+  it('keeps a live foreign marketplace evaluator process lease recoverable and byte-identical', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await anchoredReviewManifest(fixture);
+    claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 731,
+      now: () => new Date(NOW),
+    });
+    const before = readFileSync(manifest.paths.manifest);
+    const publishReviewClaim = vi.fn();
+    const createEvaluatorReviewWorkspace = vi.fn();
+
+    const result = await anchorMarketplaceEvaluatorReview({
+      origin: originInput(fixture),
+      prNumber: 84,
+      expectedHead: gitOid(fixture.oid),
+      v2Base: join(fixture.base, 'v2'),
+    }, {
+      claimAcquisition: {
+        readCandidate: vi.fn(async () => {
+          throw new Error('claim acquisition must not run during anchor recovery');
+        }),
+        publishReviewClaim,
+      } as unknown as ReviewClaimAcquisitionDeps,
+      createEvaluatorReviewWorkspace,
+      processPid: 730,
+      isPidAlive: (pid) => pid === 731,
+      now: () => new Date(NOW),
+    });
+
+    expect(result).toEqual({
+      status: 'recoverable',
+      detail: 'Marketplace attempt process lease is held by a live PID',
+    });
+    expect(readFileSync(manifest.paths.manifest)).toEqual(before);
+    expect(publishReviewClaim).not.toHaveBeenCalled();
+    expect(createEvaluatorReviewWorkspace).not.toHaveBeenCalled();
+  });
+
   it('recovers an exact existing anchored evaluator-leg review', async () => {
     const fixture = repositoryFixture();
     const credential = new SelectedCredential('review-bot', 'review', 'review-secret');
