@@ -889,7 +889,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       exactOpen.set(candidate.number, candidate);
     }
     const next: LifecycleDiscoveryState = {
-      version: 2,
+      version: 3,
       evidence: evidence(reconciled),
       terminalClaims: [...(reconciled.terminalClaims ?? [])],
       openPullRequestEvidence: [...exactOpen.values()]
@@ -920,6 +920,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     allowGraphQl = true,
   ): Promise<IncrementalComputation> {
     if (prior === null) throw new IncrementalSnapshotUnavailableError();
+    this.restDiscovery.resetBaseBranchTipMemo?.();
     const lastFull = prior.evidence.lastFullReconciliationAt;
     const cycleStartedAt = exactNow(this.now);
     let liveGraphQlRemaining = await this.requireGraphQlRemaining();
@@ -1129,7 +1130,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       githubUsage: usage,
     });
     const next: LifecycleDiscoveryState = {
-      version: 2,
+      version: 3,
       evidence: evidence(snapshot),
       terminalClaims: [...(snapshot.terminalClaims ?? [])],
       openPullRequestEvidence: [...openEvidence.values()]

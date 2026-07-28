@@ -10,6 +10,7 @@ import { gitOid } from '../../src/lifecycle/types.js';
 import { GitHubUsageMeter } from '../../src/lifecycle/github-usage.js';
 
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const BASE_TIP = 'cccccccccccccccccccccccccccccccccccccccc';
 
 function pr(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnapshot {
   return {
@@ -28,6 +29,7 @@ function pr(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnapshot {
     mergeability: 'MERGEABLE',
     mergeStateStatus: 'CLEAN',
     compareStatus: 'ahead',
+    compareBaseTipOid: gitOid(BASE_TIP),
     checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     reviews: [],
     ...overrides,
@@ -90,12 +92,18 @@ function equalBodies(): Record<string, unknown> {
 }
 
 /**
- * Merge-path PRs are force-refreshed so their `compareStatus` cannot go stale
- * against a moving base tip. Tests whose subject is the conditional-equality
- * path itself must therefore use a PR that is *not* on the merge path, in both
- * the live body and the cached snapshot.
+ * Merge-path PRs key `compareStatus` freshness on the recorded base branch tip.
+ * Tests whose subject is the conditional-equality path itself must therefore use
+ * a PR that is *not* on the merge path, in both the live body and the cached
+ * snapshot.
  */
 const OFF_MERGE_PATH = { mergeStateStatus: 'BLOCKED' } as const;
+
+function matchingBaseTipReader(tip: string = BASE_TIP) {
+  return {
+    readBaseBranchTipOid: async () => gitOid(tip),
+  };
+}
 
 function offMergePathBodies(): Record<string, unknown> {
   const bodies = equalBodies();
@@ -109,6 +117,7 @@ function offMergePathBodies(): Record<string, unknown> {
 function probeWith(
   bodies: Record<string, unknown>,
   later304 = false,
+  baseTip: string = BASE_TIP,
 ): {
   readonly probe: ConditionalPullRequestEvidenceProbe;
   readonly meter: GitHubUsageMeter;
@@ -138,6 +147,8 @@ function probeWith(
   return {
     probe: new ConditionalPullRequestEvidenceProbe(
       new ConditionalRestClient(run, { usageMeter: meter }),
+      'Jinn-Network/mono',
+      matchingBaseTipReader(baseTip),
     ),
     meter,
     calls,
@@ -182,25 +193,57 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
   });
 
   /**
-   * `compareStatus` is the only cached field whose truth depends on a commit
-   * outside the PR. None of the conditional reads observe the base branch tip,
-   * so a cached value must expire on its own or a PR that has fallen behind its
-   * base keeps a stale `ahead` forever: `mergeState` stays `clean`, the
-   * controller's ladder guard is never entered, `update-branch` is never
-   * scheduled, and the merge executor's own fresh compare refuses it every
-   * cycle. Livelock.
+   * `compareStatus` depends on the live base branch tip. When the recorded tip
+   * still matches, merge-path PRs may reuse cached compare evidence alongside
+   * the conditional ETag path.
    */
-  it('expires a cached compareStatus on every cycle even when PR detail is unchanged', async () => {
+  it('reuses cached compare evidence when the base branch tip is unchanged', async () => {
     const context = probeWith(equalBodies(), true);
 
-    // Byte-identical evidence on both cycles: every ETag returns 304, so the
-    // conditional path on its own would report "unchanged" forever.
-    await expect(context.probe.changed(pr({ compareStatus: 'ahead' }))).resolves.toBe(true);
-    await expect(context.probe.changed(pr({ compareStatus: 'ahead' }))).resolves.toBe(true);
-    // The conditional evidence is still read and still validated — the forced
-    // refresh is applied after it, not instead of it.
+    await expect(context.probe.changed(pr())).resolves.toBe(false);
+    await expect(context.probe.changed(pr())).resolves.toBe(false);
+
+    expect(context.calls).toHaveLength(12);
+    expect(context.meter.read()).toMatchObject({
+      restRequests: 12,
+      restNotModified: 6,
+      cacheHits: 6,
+    });
+  });
+
+  it('refreshes merge-path compare evidence when the base branch tip moves', async () => {
+    const movedTip = 'dddddddddddddddddddddddddddddddddddddddd';
+    const context = probeWith(equalBodies(), true, movedTip);
+
+    await expect(context.probe.changed(pr())).resolves.toBe(true);
+    await expect(context.probe.changed(pr())).resolves.toBe(true);
     expect(context.calls).toHaveLength(12);
     expect(context.meter.read()).toMatchObject({ restNotModified: 6 });
+  });
+
+  it('refreshes merge-path compare evidence when the live base tip is unavailable', async () => {
+    const meter = new GitHubUsageMeter();
+    const unavailableProbe = new ConditionalPullRequestEvidenceProbe(
+      new ConditionalRestClient(async (_command, args) => {
+        const bodies = equalBodies();
+        const kind = args[2] === 'repos/Jinn-Network/mono/pulls/101'
+          ? 'detail'
+          : args[2]!.includes('/reviews?')
+            ? 'reviews'
+            : args[2]!.includes('/comments?')
+              ? 'comments'
+              : args[2]!.includes('/events?')
+                ? 'events'
+                : args[2]!.includes('/check-runs?')
+                  ? 'checks'
+                  : 'statuses';
+        return included({ status: 200, body: bodies[kind] });
+      }, { usageMeter: meter }),
+      'Jinn-Network/mono',
+      { readBaseBranchTipOid: async () => 'unavailable' as const },
+    );
+
+    await expect(unavailableProbe.changed(pr())).resolves.toBe(true);
   });
 
   it('still fails closed on malformed evidence for a merge-path PR', async () => {
@@ -209,7 +252,10 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     const context = probeWith(bodies);
 
     // The forced refresh must not become a shortcut past the identity guard.
-    await expect(context.probe.changed(pr({ compareStatus: 'ahead' }))).rejects.toThrow(
+    await expect(context.probe.changed(pr({
+      compareStatus: 'ahead',
+      compareBaseTipOid: gitOid(BASE_TIP),
+    }))).rejects.toThrow(
       /does not match/i,
     );
   });
@@ -220,10 +266,24 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     ['behind' as const],
     ['diverged' as const],
     ['unknown' as const],
-  ])('expires a cached %s compareStatus for a mergeability-clean PR', async (compareStatus) => {
+  ])('refreshes merge-path PRs missing a recorded base tip for cached %s compareStatus', async (compareStatus) => {
     const context = probeWith(equalBodies(), true);
 
-    await expect(context.probe.changed(pr({ compareStatus }))).resolves.toBe(true);
+    await expect(context.probe.changed(pr({
+      compareStatus,
+      compareBaseTipOid: undefined,
+    }))).resolves.toBe(true);
+  });
+
+  it.each([
+    ['ahead' as const],
+    ['identical' as const],
+    ['behind' as const],
+    ['diverged' as const],
+  ])('reuses cached %s compareStatus when the base tip still matches', async (compareStatus) => {
+    const context = probeWith(equalBodies(), true);
+
+    await expect(context.probe.changed(pr({ compareStatus }))).resolves.toBe(false);
   });
 
   it('forces refresh when cached PR evidence is explicitly incomplete', async () => {

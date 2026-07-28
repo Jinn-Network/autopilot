@@ -157,6 +157,14 @@ export async function readExactCompareStatus(
 export interface ExactCompareEvidence {
   readonly status: CompareStatus;
   /**
+   * The base branch tip OID GitHub resolved when computing `status`. This is
+   * the live tip at compare time, not the PR's pinned fork point.
+   *
+   * Absent when the compare response did not carry a valid `base_commit.sha`.
+   * Consumers must treat absence as "compare evidence is not cacheable".
+   */
+  readonly compareBaseTipOid?: GitOid;
+  /**
    * Identity of the diff this head presents against its base branch tip, or
    * `undefined` when it could not be proven.
    *
@@ -189,6 +197,23 @@ export interface ReadExactCompareEvidenceOptions
   readonly proveReviewedDiff?: boolean;
 }
 
+function compareBaseTipOidFromCompare(compare: unknown): GitOid | undefined {
+  if (typeof compare !== 'object' || compare === null || Array.isArray(compare)) {
+    return undefined;
+  }
+  const baseCommit = (compare as { base_commit?: unknown }).base_commit;
+  if (typeof baseCommit !== 'object' || baseCommit === null || Array.isArray(baseCommit)) {
+    return undefined;
+  }
+  const sha = (baseCommit as { sha?: unknown }).sha;
+  if (typeof sha !== 'string') return undefined;
+  try {
+    return gitOid(sha);
+  } catch {
+    return undefined;
+  }
+}
+
 /** See `readExactCompareStatus` for the full head/base authority analysis. */
 export async function readExactCompareEvidence(
   options: ReadExactCompareEvidenceOptions,
@@ -218,7 +243,11 @@ export async function readExactCompareEvidence(
     `repos/${repositorySlug}/compare/heads/${compareBase}...${options.expectedHead}`,
   ])) as { status?: unknown; files?: unknown };
   const status = decodeCompareStatus(compare.status);
-  if (options.proveReviewedDiff !== true) return { status };
+  const compareBaseTipOid = compareBaseTipOidFromCompare(compare);
+  const baseTipEvidence = compareBaseTipOid === undefined
+    ? {}
+    : { compareBaseTipOid };
+  if (options.proveReviewedDiff !== true) return { status, ...baseTipEvidence };
   // Fail closed on the changed-file proof exactly as the merge gate does. A
   // read failure yields no digest, never a digest computed from weaker
   // evidence, so the view can never carry where the gate would refuse.
@@ -233,11 +262,12 @@ export async function readExactCompareEvidence(
       repositorySlug,
     });
   } catch {
-    return { status };
+    return { status, ...baseTipEvidence };
   }
   const digest = reviewedDiffDigestFromCompare(compare.files, changedFiles);
   return {
     status,
+    ...baseTipEvidence,
     ...(digest.status === 'digest' ? { reviewedDiffDigest: digest.digest } : {}),
   };
 }

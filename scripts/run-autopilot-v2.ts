@@ -535,6 +535,7 @@ export async function runAutopilotV2(
     evidenceProbe: new ConditionalPullRequestEvidenceProbe(
       conditionalRest,
       loaded.config.repository.slug,
+      restDiscovery,
     ),
     authorAllowlist: allowlist,
     machineAuthorLogins,

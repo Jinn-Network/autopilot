@@ -24,6 +24,7 @@ import {
   ConditionalRestClient,
   type ConditionalRestResponse,
 } from './github-rest.js';
+import { gitOid, gitRefName, type GitOid } from './types.js';
 
 const PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 100;
@@ -692,6 +693,7 @@ export class GitHubRestDiscoveryReader {
   private readonly repositoryRestDatabaseId: number;
   private readonly projectOwner: string;
   private readonly projectNumber: number;
+  private readonly baseBranchTipMemo = new Map<string, Promise<GitOid | 'unavailable'>>();
 
   constructor(
     private readonly rest: ConditionalRestClient,
@@ -705,6 +707,46 @@ export class GitHubRestDiscoveryReader {
     this.projectNumber = options.projectNumber ?? PROJECT_NUMBER;
     if (!Number.isSafeInteger(this.maxPages) || this.maxPages <= 0) {
       throw new Error('GitHub REST maxPages must be a positive integer');
+    }
+  }
+
+  /** Clears per-boundary memoization for live base branch tip reads. */
+  resetBaseBranchTipMemo(): void {
+    this.baseBranchTipMemo.clear();
+  }
+
+  /**
+   * Read the current tip of a base branch. Memoized for the lifetime of this
+   * reader until `resetBaseBranchTipMemo` — one network read per unique base
+   * ref per incremental boundary.
+   */
+  readBaseBranchTipOid(baseRefName: string): Promise<GitOid | 'unavailable'> {
+    let ref: ReturnType<typeof gitRefName>;
+    try {
+      ref = gitRefName(baseRefName);
+    } catch {
+      return Promise.resolve('unavailable');
+    }
+    const cached = this.baseBranchTipMemo.get(ref);
+    if (cached !== undefined) return cached;
+    const pending = this.readBaseBranchTipOidUncached(ref);
+    this.baseBranchTipMemo.set(ref, pending);
+    return pending;
+  }
+
+  private async readBaseBranchTipOidUncached(
+    ref: ReturnType<typeof gitRefName>,
+  ): Promise<GitOid | 'unavailable'> {
+    try {
+      const response = await this.rest.getJson(
+        `repos/${this.repositorySlug}/git/ref/heads/${encodeURIComponent(ref)}`,
+      );
+      const body = record(response.body, 'git ref');
+      const object = record(body.object, 'git ref object');
+      if (object.type !== 'commit') return 'unavailable';
+      return gitOid(nonEmptyString(object.sha, 'git ref object.sha'));
+    } catch {
+      return 'unavailable';
     }
   }
 

@@ -33,7 +33,7 @@ function state(): LifecycleDiscoveryState {
     reviews: [],
   };
   return {
-    version: 2,
+    version: 3,
     evidence: {
       project: {
         items: [{
@@ -257,6 +257,19 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await writeFile(
       join(directory, 'lifecycle-cache.json'),
       JSON.stringify({ ...state(), version: 1 }),
+      { mode: 0o600 },
+    );
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+
+    await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
+  });
+
+  it('rejects a version 2 envelope so compareStatus without base-tip keys cannot survive', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    await chmod(directory, 0o700);
+    await writeFile(
+      join(directory, 'lifecycle-cache.json'),
+      JSON.stringify({ ...state(), version: 2 }),
       { mode: 0o600 },
     );
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
@@ -491,11 +504,13 @@ describe('LifecycleDiscoveryCacheStore', () => {
         pullRequests: [{
           ...base.evidence.pullRequests[0]!,
           compareStatus: 'behind',
+          compareBaseTipOid: gitOid('cccccccccccccccccccccccccccccccccccccccc'),
         }],
       },
       openPullRequestEvidence: [{
         ...base.openPullRequestEvidence[0]!,
         compareStatus: 'behind',
+        compareBaseTipOid: gitOid('cccccccccccccccccccccccccccccccccccccccc'),
       }],
     };
 
