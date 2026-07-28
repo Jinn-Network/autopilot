@@ -1,5 +1,15 @@
+import { isDeepStrictEqual } from 'node:util';
 import type { IssueRelaySnapshotV1 } from './snapshot.js';
 import { relayTaskKey } from './identity.js';
+import type { AcceptedRelayAdoption } from './adoption.js';
+import type { IssueRelayEvaluationAnchorV1 } from './contracts.js';
+import type { VerifiedIssueRelayVerdictObservation } from './marketplace-cli.js';
+import {
+  relayAdoptionReceiptDigest,
+  relayRequiredCheckStatus,
+  verifyRelayCheckSummary,
+  type RelayCheckSummary,
+} from './checks.js';
 
 export type RelayPhase =
   | 'awaiting-clarification'
@@ -94,11 +104,54 @@ export interface RelayAuthoritativeFacts {
   readonly currentBaseOid: string;
   readonly currentPr?: {
     readonly number: number;
+    readonly branch: string;
     readonly head: string;
+    readonly base: string;
     readonly draft: boolean;
+    readonly generation: string;
   };
+  readonly readiness?: RelayReadyEvidence;
   readonly now: string;
 }
+
+export interface RelayReadyEvidence {
+  readonly adoption: AcceptedRelayAdoption;
+  readonly checks: RelayCheckSummary;
+  readonly evaluationAnchor?: IssueRelayEvaluationAnchorV1;
+  readonly verdict?: VerifiedIssueRelayVerdictObservation;
+}
+
+export interface RelayReadyInput extends RelayReadyEvidence {
+  readonly currentHead: string;
+  readonly currentBaseOid: string;
+  readonly targetBase: string;
+  readonly draft?: {
+    readonly number: number;
+    readonly branch: string;
+    readonly head: string;
+    readonly base: string;
+    readonly draft: boolean;
+    readonly generation: string;
+  };
+  readonly cancelled: boolean;
+  readonly exhausted: boolean;
+}
+
+export type RelayReadyDecision =
+  | { readonly ready: true; readonly head: string }
+  | {
+      readonly ready: false;
+      readonly reason:
+        | 'draft-missing'
+        | 'checks-pending'
+        | 'checks-failed'
+        | 'verdict-pending'
+        | 'verdict-failed'
+        | 'stale-head'
+        | 'stale-base'
+        | 'cancelled'
+        | 'exhausted';
+    };
 
 export interface RelayDerivationPolicy {
   readonly maxRoundsPerGeneration: number;
@@ -234,8 +287,11 @@ function livePrMatchesDurable(facts: RelayAuthoritativeFacts): boolean {
   return durablePr !== undefined
     && livePr !== undefined
     && durablePr.number === livePr.number
+    && durablePr.branch === livePr.branch
     && durablePr.head === livePr.head
     && durablePr.draft === livePr.draft
+    && livePr.base === facts.durable?.snapshot.repository.defaultBranch
+    && livePr.generation === facts.durable?.generation
     && durablePr.draft;
 }
 
@@ -255,6 +311,151 @@ function acceptedExactHead(
   }
   return round.adoption.resultingHead === round.checks.head
     && round.checks.head === facts.durable.pr.head;
+}
+
+function notReady(reason: Exclude<RelayReadyDecision, { readonly ready: true }>['reason']):
+RelayReadyDecision {
+  return { ready: false, reason };
+}
+
+/**
+ * Makes no mutations. It accepts only the exact live draft/base facts and the
+ * authenticated evidence installed for the same adopted head.
+ */
+export function deriveRelayReady(input: RelayReadyInput): RelayReadyDecision {
+  if (input.cancelled) return notReady('cancelled');
+  if (input.exhausted) return notReady('exhausted');
+  if (
+    input.draft === undefined
+    || !input.draft.draft
+    || input.draft.number !== input.adoption.prNumber
+  ) {
+    return notReady('draft-missing');
+  }
+
+  const { receipt } = input.adoption;
+  const anchor = input.evaluationAnchor;
+  const verdict = input.verdict;
+  const heads = [
+    input.currentHead,
+    input.draft.head,
+    input.adoption.resultingHead,
+    receipt.resultingHead,
+    input.checks.head,
+    ...(anchor === undefined ? [] : [anchor.evaluatedHead]),
+    ...(verdict === undefined ? [] : [verdict.payload.evaluatedHead]),
+  ];
+  if (
+    !heads.every((head) => GIT_OID_PATTERN.test(head))
+    || heads.some((head) => head !== input.currentHead)
+    || input.adoption.status !== 'accepted'
+    || input.adoption.branch !== receipt.headRef
+    || input.adoption.prNumber !== receipt.prNumber
+    || input.draft.branch !== receipt.headRef
+    || input.draft.generation !== receipt.correlation.generation
+  ) {
+    return notReady('stale-head');
+  }
+  if (
+    input.targetBase.length === 0
+    || input.draft.base !== input.targetBase
+    || !GIT_OID_PATTERN.test(input.currentBaseOid)
+  ) {
+    return notReady('stale-base');
+  }
+
+  try {
+    verifyRelayCheckSummary(input.checks);
+  } catch {
+    return notReady('checks-failed');
+  }
+  const checkStatus = relayRequiredCheckStatus(input.checks);
+  if (checkStatus === 'failed') return notReady('checks-failed');
+  if (checkStatus === 'pending') return notReady('checks-pending');
+  if (anchor === undefined) return notReady('verdict-pending');
+  if (
+    anchor.targetBase !== input.targetBase
+    || !GIT_OID_PATTERN.test(anchor.baseOid)
+    || input.currentBaseOid !== anchor.baseOid
+  ) {
+    return notReady('stale-base');
+  }
+  if (anchor.checksDigest !== input.checks.digest) {
+    return notReady('checks-failed');
+  }
+  if (
+    anchor.adoptionReceiptDigest !== relayAdoptionReceiptDigest(input.adoption)
+    || !isDeepStrictEqual(anchor.correlation, receipt.correlation)
+    || anchor.targetRepository !== receipt.targetRepository
+    || anchor.workspaceRepository !== receipt.workspaceRepository
+    || anchor.prNumber !== receipt.prNumber
+    || anchor.headRef !== receipt.headRef
+  ) {
+    return notReady('verdict-failed');
+  }
+  if (verdict === undefined) return notReady('verdict-pending');
+  if (
+    verdict.payload.outcome !== 'pass'
+    || verdict.attempt.operator.toLocaleLowerCase('en-US')
+      === receipt.solutionSafe.toLocaleLowerCase('en-US')
+    || verdict.task.taskId !== receipt.correlation.taskId
+    || verdict.attempt.attemptIndex !== receipt.correlation.attemptIndex
+    || verdict.attempt.requestId !== receipt.correlation.requestId
+    || !isDeepStrictEqual(verdict.payload.correlation, receipt.correlation)
+    || verdict.round.generation !== receipt.correlation.generation
+    || verdict.round.round !== receipt.correlation.round
+    || verdict.round.snapshotDigest !== receipt.correlation.snapshotDigest
+    || verdict.round.targetRepository !== receipt.targetRepository
+    || verdict.round.workspaceRepository !== receipt.workspaceRepository
+    || verdict.round.inputHead !== receipt.inputHead
+  ) {
+    return notReady('verdict-failed');
+  }
+  return { ready: true, head: input.currentHead };
+}
+
+function readinessMatchesRound(
+  facts: RelayAuthoritativeFacts,
+  round: RelayRoundRecordV1,
+): boolean {
+  const evidence = facts.readiness;
+  const durableVerdict = round.verdict;
+  if (
+    evidence === undefined
+    || durableVerdict === undefined
+    || facts.currentPr === undefined
+  ) {
+    return false;
+  }
+  const decision = deriveRelayReady({
+    currentHead: facts.currentPr.head,
+    currentBaseOid: facts.currentBaseOid,
+    targetBase: facts.durable?.snapshot.repository.defaultBranch ?? '',
+    draft: facts.currentPr,
+    adoption: evidence.adoption,
+    checks: evidence.checks,
+    evaluationAnchor: evidence.evaluationAnchor,
+    verdict: evidence.verdict,
+    cancelled: facts.durable?.cancellation !== undefined,
+    exhausted: facts.durable?.phase === 'exhausted',
+  });
+  return decision.ready
+    && evidence.adoption.receipt.correlation.generation
+      === facts.durable?.generation
+    && facts.currentPr.generation === facts.durable?.generation
+    && facts.currentPr.base === facts.durable?.snapshot.repository.defaultBranch
+    && facts.currentPr.branch === facts.durable?.pr?.branch
+    && evidence.adoption.receipt.correlation.round === round.round
+    && evidence.adoption.receipt.correlation.taskId === round.task?.taskId
+    && evidence.verdict?.task.taskCid === round.task?.taskCid
+    && evidence.adoption.receipt.correlation.deliveryEnvelopeCid
+      === round.solution?.envelopeCid
+    && evidence.adoption.receipt.solutionSafe.toLocaleLowerCase('en-US')
+      === round.solution?.operatorSafe.toLocaleLowerCase('en-US')
+    && evidence.evaluationAnchor?.adoptionReceiptDigest
+      === round.adoption?.receiptDigest
+    && evidence.evaluationAnchor?.checksDigest === round.checks?.digest
+    && evidence.verdict?.delivery.envelopeCid === durableVerdict.envelopeCid;
 }
 
 function deriveDraftOpenAction(
@@ -298,7 +499,9 @@ function deriveEvaluatingAction(
   }
   switch (round.verdict.outcome) {
     case 'pass':
-      return { kind: 'mark-ready' };
+      return readinessMatchesRound(facts, round)
+        ? { kind: 'mark-ready' }
+        : none('Authenticated exact-head readiness evidence is missing');
     case 'request-changes':
       return none('Request-changes verdict must enter repair-needed');
     case 'human':

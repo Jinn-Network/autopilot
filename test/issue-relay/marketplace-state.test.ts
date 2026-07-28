@@ -11,15 +11,29 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { relayGeneration, relayTaskKey } from '../../src/issue-relay/identity.js';
 import {
+  buildRelayVerdictExpectation,
   buildRelaySolutionExpectation,
+  observeAndInstallRelayVerdict,
+  persistRelayVerdictExpectation,
   installVerifiedRelayObservation,
   persistRelaySolutionExpectation,
   persistRelaySubmissionEvidence,
+  readVerifiedRelayVerdictObservation,
   readVerifiedRelayObservation,
+  verifyRelayVerdictExpectation,
   verifyRelaySolutionExpectation,
 } from '../../src/issue-relay/marketplace-state.js';
+import {
+  aggregateRelayChecks,
+  relayAdoptionReceiptDigest,
+} from '../../src/issue-relay/checks.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
 import { buildRelayTaskSpec } from '../../src/issue-relay/task.js';
+import type { AcceptedRelayAdoption } from '../../src/issue-relay/adoption.js';
+import type {
+  IssueRelayEvaluationAnchorV1,
+  IssueRelayVerdictV1,
+} from '../../src/issue-relay/contracts.js';
 import type {
   IssueRelayDeliveryObservation,
   RelaySubmissionEvidence,
@@ -99,6 +113,81 @@ const observation: Extract<
     patch: 'diff --git a/a.ts b/a.ts\n',
   },
 };
+const resultingHead = '2'.repeat(40);
+const adoption: AcceptedRelayAdoption = {
+  status: 'accepted',
+  branch: 'jinn/issue-relay/example',
+  resultingHead,
+  prNumber: 68,
+  receipt: {
+    schemaVersion: 'jinn-issue-relay-adoption.v1',
+    disposition: 'accepted',
+    correlation: {
+      generation: round.generation,
+      round: round.round,
+      snapshotDigest: round.snapshotDigest,
+      taskId: observation.task.taskId,
+      attemptIndex: observation.attempt.attemptIndex,
+      requestId: observation.attempt.requestId,
+      deliveryEnvelopeCid: observation.delivery.envelopeCid,
+    },
+    targetRepository: round.targetRepository,
+    workspaceRepository: round.workspaceRepository,
+    issueNumber: 42,
+    prNumber: 68,
+    headRef: 'jinn/issue-relay/example',
+    inputHead: round.inputHead,
+    resultingHead,
+    patchDigest: `sha256:${'a'.repeat(64)}`,
+    solutionSafe: observation.attempt.operator,
+    adoptedAt: '2026-07-28T12:00:00.000Z',
+  },
+};
+const checks = aggregateRelayChecks({
+  head: resultingHead,
+  branchRequiredChecks: [],
+  profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+  checks: [],
+});
+const anchor: IssueRelayEvaluationAnchorV1 = {
+  schemaVersion: 'jinn-issue-relay-evaluation-anchor.v1',
+  correlation: adoption.receipt.correlation,
+  targetRepository: adoption.receipt.targetRepository,
+  workspaceRepository: adoption.receipt.workspaceRepository,
+  prNumber: adoption.receipt.prNumber,
+  targetBase: 'main',
+  baseOid: base,
+  headRef: adoption.receipt.headRef,
+  evaluatedHead: adoption.receipt.resultingHead,
+  adoptionReceiptDigest: relayAdoptionReceiptDigest(adoption),
+  checksDigest: checks.digest,
+  anchoredAt: '2026-07-28T12:10:00.000Z',
+};
+const verdict: IssueRelayVerdictV1 = {
+  schemaVersion: 'jinn-issue-relay-verdict.v1',
+  outcome: 'pass',
+  correlation: adoption.receipt.correlation,
+  evaluatedHead: resultingHead,
+  summary: 'The complete adopted head satisfies the frozen issue.',
+  findings: [],
+};
+const verdictObservation: IssueRelayDeliveryObservation = {
+  status: 'verified',
+  role: 'verdict',
+  task: observation.task,
+  attempt: {
+    attemptIndex: observation.attempt.attemptIndex,
+    requestId: observation.attempt.requestId,
+    operator: `0x${'f'.repeat(40)}`,
+  },
+  delivery: {
+    envelopeCid: `f01551220${'e'.repeat(64)}`,
+    transactionHash: `0x${'1'.repeat(64)}`,
+    blockNumber: 130,
+  },
+  round,
+  payload: verdict,
+};
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -113,6 +202,8 @@ function statePaths() {
     submissionPath: join(directory, 'submission.json'),
     expectationPath: join(directory, 'expectation.json'),
     observationPath: join(directory, 'observation.json'),
+    verdictExpectationPath: join(directory, 'verdict-expectation.json'),
+    verdictObservationPath: join(directory, 'verdict-observation.json'),
   };
 }
 
@@ -266,5 +357,166 @@ describe('Relay verified observation state', () => {
       expectationDigest: artifact.digest,
       observation,
     })).toThrow(/digest mismatch/i);
+  });
+});
+
+describe('Relay authenticated verdict state', () => {
+  it('persists a role-verdict expectation pinned to exact solution adoption and anchor facts', () => {
+    const paths = statePaths();
+    const expectation = buildRelayVerdictExpectation({
+      solutionExpectation: buildRelaySolutionExpectation({ submission, round }),
+      adoption,
+      evaluationAnchor: anchor,
+      checks,
+    });
+
+    expect(expectation).toEqual({
+      schemaVersion: 'jinn-issue-relay-delivery-expectation.v1',
+      role: 'verdict',
+      taskId: submission.taskId,
+      taskCid: submission.taskCid,
+      creationBlockNumber: submission.creationBlock,
+      round,
+      attemptIndex: observation.attempt.attemptIndex,
+      requestId: observation.attempt.requestId,
+      deliveryEnvelopeCid: observation.delivery.envelopeCid,
+      solutionOperatorSafe: observation.attempt.operator,
+    });
+    const artifact = persistRelayVerdictExpectation(
+      paths.verdictExpectationPath,
+      expectation,
+    );
+    expect(statSync(paths.verdictExpectationPath).mode & 0o777).toBe(0o600);
+    expect(verifyRelayVerdictExpectation(
+      paths.verdictExpectationPath,
+      artifact.digest,
+    )).toEqual(expectation);
+  });
+
+  it('uses the Task 7 observation port and installs only the exact authenticated verdict', async () => {
+    const paths = statePaths();
+    const calls: Array<{ path: string; digest: string }> = [];
+    const result = await observeAndInstallRelayVerdict({
+      marketplace: {
+        async observe(path, digest) {
+          calls.push({ path, digest });
+          return verdictObservation;
+        },
+      },
+      expectationPath: paths.verdictExpectationPath,
+      observationPath: paths.verdictObservationPath,
+      solutionExpectation: buildRelaySolutionExpectation({ submission, round }),
+      adoption,
+      evaluationAnchor: anchor,
+      checks,
+    });
+
+    expect(calls).toEqual([{
+      path: paths.verdictExpectationPath,
+      digest: result.expectation.digest,
+    }]);
+    expect(readVerifiedRelayVerdictObservation(
+      paths.verdictObservationPath,
+      result.observation.digest,
+    )).toEqual(verdictObservation);
+  });
+
+  it.each([
+    [
+      'evaluated head',
+      {
+        ...verdictObservation,
+        payload: { ...verdict, evaluatedHead: '3'.repeat(40) },
+      },
+    ],
+    [
+      'full correlation',
+      {
+        ...verdictObservation,
+        payload: {
+          ...verdict,
+          correlation: { ...verdict.correlation, requestId: `0x${'9'.repeat(64)}` },
+        },
+      },
+    ],
+    [
+      'evaluator Safe distinctness',
+      {
+        ...verdictObservation,
+        attempt: {
+          ...verdictObservation.attempt,
+          operator: `0x${'E'.repeat(40)}`,
+        },
+      },
+    ],
+    [
+      'request facts',
+      {
+        ...verdictObservation,
+        attempt: {
+          ...verdictObservation.attempt,
+          requestId: `0x${'8'.repeat(64)}`,
+        },
+      },
+    ],
+    [
+      'delivery facts',
+      {
+        ...verdictObservation,
+        task: { ...observation.task, taskId: '502' },
+      },
+    ],
+  ])('rejects a verdict whose %s do not match the anchor', async (
+    _label,
+    candidate,
+  ) => {
+    const paths = statePaths();
+    await expect(observeAndInstallRelayVerdict({
+      marketplace: {
+        async observe() {
+          return candidate as IssueRelayDeliveryObservation;
+        },
+      },
+      expectationPath: paths.verdictExpectationPath,
+      observationPath: paths.verdictObservationPath,
+      solutionExpectation: buildRelaySolutionExpectation({ submission, round }),
+      adoption,
+      evaluationAnchor: anchor,
+      checks,
+    })).rejects.toThrow(/verdict|correlation|operator|expectation|pin/i);
+  });
+
+  it('rejects replaced check and receipt digest bindings before invoking the CLI', async () => {
+    const paths = statePaths();
+    let calls = 0;
+    const marketplace = {
+      async observe(): Promise<IssueRelayDeliveryObservation> {
+        calls += 1;
+        return verdictObservation;
+      },
+    };
+
+    await expect(observeAndInstallRelayVerdict({
+      marketplace,
+      expectationPath: paths.verdictExpectationPath,
+      observationPath: paths.verdictObservationPath,
+      solutionExpectation: buildRelaySolutionExpectation({ submission, round }),
+      adoption,
+      evaluationAnchor: { ...anchor, checksDigest: `sha256:${'8'.repeat(64)}` },
+      checks,
+    })).rejects.toThrow(/check/i);
+    await expect(observeAndInstallRelayVerdict({
+      marketplace,
+      expectationPath: paths.verdictExpectationPath,
+      observationPath: paths.verdictObservationPath,
+      solutionExpectation: buildRelaySolutionExpectation({ submission, round }),
+      adoption,
+      evaluationAnchor: {
+        ...anchor,
+        adoptionReceiptDigest: `sha256:${'7'.repeat(64)}`,
+      },
+      checks,
+    })).rejects.toThrow(/receipt/i);
+    expect(calls).toBe(0);
   });
 });

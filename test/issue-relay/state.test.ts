@@ -4,11 +4,19 @@ import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
 import type { RelayIssueInput } from '../../src/issue-relay/snapshot.js';
 import {
   deriveRelayAction,
+  deriveRelayReady,
   type RelayAuthoritativeFacts,
   type RelayGenerationRecordV1,
   type RelayPhase,
+  type RelayReadyInput,
   type RelayRoundRecordV1,
 } from '../../src/issue-relay/state.js';
+import {
+  aggregateRelayChecks,
+  relayAdoptionReceiptDigest,
+} from '../../src/issue-relay/checks.js';
+import type { AcceptedRelayAdoption } from '../../src/issue-relay/adoption.js';
+import type { VerifiedIssueRelayVerdictObservation } from '../../src/issue-relay/marketplace-cli.js';
 
 const BASE = '1111111111111111111111111111111111111111';
 const HEAD = '2222222222222222222222222222222222222222';
@@ -50,29 +58,115 @@ const generation = relayGeneration(snapshot);
 
 const task = {
   taskKey: relayTaskKey(generation, 0),
-  taskId: 'task-0',
-  taskCid: 'bafy-task-0',
+  taskId: '501',
+  taskCid: `f01551220${'4'.repeat(64)}`,
   fundedAt: '2026-07-28T12:05:00.000Z',
 };
 const solution = {
-  envelopeCid: 'bafy-solution-0',
-  operatorSafe: '0x1111111111111111111111111111111111111111',
+  envelopeCid: `f01551220${'c'.repeat(64)}`,
+  operatorSafe: `0x${'a'.repeat(40)}`,
   observedAt: '2026-07-28T12:10:00.000Z',
+};
+const acceptedAdoption: AcceptedRelayAdoption = {
+  status: 'accepted',
+  branch: 'jinn/issue-relay/example',
+  resultingHead: HEAD,
+  prNumber: 68,
+  receipt: {
+    schemaVersion: 'jinn-issue-relay-adoption.v1',
+    disposition: 'accepted',
+    correlation: {
+      generation,
+      round: 0,
+      snapshotDigest: snapshot.snapshotDigest,
+      taskId: task.taskId,
+      attemptIndex: 0,
+      requestId: `0x${'b'.repeat(64)}`,
+      deliveryEnvelopeCid: solution.envelopeCid,
+    },
+    targetRepository: 'Jinn-Network/mono',
+    workspaceRepository: 'Jinn-Network/mono',
+    issueNumber: 42,
+    prNumber: 68,
+    headRef: 'jinn/issue-relay/example',
+    inputHead: BASE,
+    resultingHead: HEAD,
+    patchDigest: `sha256:${'d'.repeat(64)}`,
+    solutionSafe: solution.operatorSafe,
+    adoptedAt: '2026-07-28T12:15:00.000Z',
+  },
+};
+const readyChecks = aggregateRelayChecks({
+  head: HEAD,
+  branchRequiredChecks: [],
+  profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+  checks: [],
+});
+const evaluationAnchor = {
+  schemaVersion: 'jinn-issue-relay-evaluation-anchor.v1' as const,
+  correlation: acceptedAdoption.receipt.correlation,
+  targetRepository: 'Jinn-Network/mono',
+  workspaceRepository: 'Jinn-Network/mono',
+  prNumber: 68,
+  targetBase: 'main',
+  baseOid: BASE,
+  headRef: acceptedAdoption.branch,
+  evaluatedHead: HEAD,
+  adoptionReceiptDigest: relayAdoptionReceiptDigest(acceptedAdoption),
+  checksDigest: readyChecks.digest,
+  anchoredAt: '2026-07-28T12:20:00.000Z',
+};
+const authenticatedVerdict: VerifiedIssueRelayVerdictObservation = {
+  status: 'verified',
+  role: 'verdict',
+  task: {
+    taskId: task.taskId,
+    taskCid: task.taskCid,
+  },
+  attempt: {
+    attemptIndex: 0,
+    requestId: acceptedAdoption.receipt.correlation.requestId,
+    operator: `0x${'e'.repeat(40)}`,
+  },
+  delivery: {
+    envelopeCid: `f01551220${'f'.repeat(64)}`,
+    transactionHash: `0x${'6'.repeat(64)}`,
+    blockNumber: 130,
+  },
+  round: {
+    schemaVersion: 'jinn-issue-relay-round.v1',
+    generation,
+    round: 0,
+    snapshotDigest: snapshot.snapshotDigest,
+    targetRepository: 'Jinn-Network/mono',
+    workspaceRepository: 'Jinn-Network/mono',
+    inputHead: BASE,
+    purpose: 'initial',
+    findings: [],
+  },
+  payload: {
+    schemaVersion: 'jinn-issue-relay-verdict.v1',
+    outcome: 'pass',
+    correlation: acceptedAdoption.receipt.correlation,
+    evaluatedHead: HEAD,
+    summary: 'The complete head passes independent evaluation.',
+    findings: [],
+  },
 };
 const adoption = {
   disposition: 'accepted' as const,
   resultingHead: HEAD,
-  receiptDigest: DIGEST,
+  receiptDigest: evaluationAnchor.adoptionReceiptDigest,
 };
 const passedChecks = {
   head: HEAD,
   status: 'passed' as const,
-  digest: DIGEST,
+  digest: readyChecks.digest,
 };
 const passingVerdict = {
   outcome: 'pass' as const,
   evaluatedHead: HEAD,
-  envelopeCid: 'bafy-verdict-pass',
+  envelopeCid: authenticatedVerdict.delivery.envelopeCid,
 };
 const repairVerdict = {
   outcome: 'request-changes' as const,
@@ -154,6 +248,156 @@ const policy = {
   generationDeadlineMs: 60 * 60 * 1_000,
 };
 
+function readyInput(
+  overrides: Partial<RelayReadyInput> = {},
+): RelayReadyInput {
+  return {
+    currentHead: HEAD,
+    currentBaseOid: BASE,
+    targetBase: 'main',
+    draft: {
+      number: 68,
+      branch: acceptedAdoption.branch,
+      head: HEAD,
+      base: 'main',
+      draft: true,
+      generation,
+    },
+    adoption: acceptedAdoption,
+    checks: readyChecks,
+    evaluationAnchor,
+    verdict: authenticatedVerdict,
+    cancelled: false,
+    exhausted: false,
+    ...overrides,
+  };
+}
+
+function livePr(head = HEAD) {
+  return {
+    number: 68,
+    branch: acceptedAdoption.branch,
+    head,
+    base: 'main',
+    draft: true,
+    generation,
+  };
+}
+
+describe('pure exact-head Relay readiness', () => {
+  it('returns draft-missing when the exact draft PR fact is absent', () => {
+    expect(deriveRelayReady(readyInput({ draft: undefined })))
+      .toEqual({ ready: false, reason: 'draft-missing' });
+  });
+
+  it('returns checks-pending when a required check is pending', () => {
+    const checks = aggregateRelayChecks({
+      head: HEAD,
+      branchRequiredChecks: ['build'],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+      checks: [{
+        kind: 'check-run',
+        name: 'build',
+        head: HEAD,
+        status: 'queued',
+        conclusion: null,
+      }],
+    });
+    expect(deriveRelayReady(readyInput({
+      checks,
+      evaluationAnchor: undefined,
+    }))).toEqual({ ready: false, reason: 'checks-pending' });
+  });
+
+  it('returns checks-failed when a required check failed', () => {
+    const checks = aggregateRelayChecks({
+      head: HEAD,
+      branchRequiredChecks: ['build'],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+      checks: [{
+        kind: 'check-run',
+        name: 'build',
+        head: HEAD,
+        status: 'completed',
+        conclusion: 'failure',
+      }],
+    });
+    expect(deriveRelayReady(readyInput({
+      checks,
+      evaluationAnchor: undefined,
+    }))).toEqual({ ready: false, reason: 'checks-failed' });
+  });
+
+  it('returns verdict-pending when no authenticated verdict has arrived', () => {
+    expect(deriveRelayReady(readyInput({ verdict: undefined })))
+      .toEqual({ ready: false, reason: 'verdict-pending' });
+  });
+
+  it('returns verdict-failed when the evaluator is not distinct', () => {
+    expect(deriveRelayReady(readyInput({
+      verdict: {
+        ...authenticatedVerdict,
+        attempt: {
+          ...authenticatedVerdict.attempt,
+          operator: acceptedAdoption.receipt.solutionSafe.toUpperCase()
+            .replace('0X', '0x'),
+        },
+      },
+    }))).toEqual({ ready: false, reason: 'verdict-failed' });
+  });
+
+  it('returns stale-head when any approval belongs to another current head', () => {
+    expect(deriveRelayReady(readyInput({ currentHead: STALE })))
+      .toEqual({ ready: false, reason: 'stale-head' });
+  });
+
+  it('returns stale-base when the evaluation anchor names another base', () => {
+    expect(deriveRelayReady(readyInput({ currentBaseOid: STALE })))
+      .toEqual({ ready: false, reason: 'stale-base' });
+  });
+
+  it('returns stale-base when the live PR was retargeted without a head change', () => {
+    expect(deriveRelayReady(readyInput({
+      draft: {
+        ...readyInput().draft!,
+        base: 'release',
+      },
+    }))).toEqual({ ready: false, reason: 'stale-base' });
+  });
+
+  it('returns stale-head when the live PR marker belongs to another generation', () => {
+    expect(deriveRelayReady(readyInput({
+      draft: {
+        ...readyInput().draft!,
+        generation: 'other-generation',
+      },
+    }))).toEqual({ ready: false, reason: 'stale-head' });
+  });
+
+  it('returns stale-head when the live PR branch differs from the adoption', () => {
+    expect(deriveRelayReady(readyInput({
+      draft: {
+        ...readyInput().draft!,
+        branch: 'jinn/issue-relay/other',
+      },
+    }))).toEqual({ ready: false, reason: 'stale-head' });
+  });
+
+  it('returns cancelled even if every exact-head approval passed', () => {
+    expect(deriveRelayReady(readyInput({ cancelled: true })))
+      .toEqual({ ready: false, reason: 'cancelled' });
+  });
+
+  it('returns exhausted even if every exact-head approval passed', () => {
+    expect(deriveRelayReady(readyInput({ exhausted: true })))
+      .toEqual({ ready: false, reason: 'exhausted' });
+  });
+
+  it('returns ready only for an exact draft, base, checks, and distinct evaluator pass', () => {
+    expect(deriveRelayReady(readyInput())).toEqual({ ready: true, head: HEAD });
+  });
+});
+
 describe('Relay state/action transition table', () => {
   it('missing durable snapshot -> publish-snapshot', () => {
     expect(deriveRelayAction(facts(undefined), policy))
@@ -215,21 +459,21 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: STALE, draft: true },
+      currentPr: livePr(STALE),
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
   it.each([
-    ['missing durable PR', undefined, { number: 68, head: HEAD, draft: true }],
+    ['missing durable PR', undefined, livePr()],
     [
       'different live PR number',
       { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
-      { number: 69, head: HEAD, draft: true },
+      { ...livePr(), number: 69 },
     ],
     [
       'non-draft live PR',
       { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
-      { number: 68, head: HEAD, draft: false },
+      { ...livePr(), draft: false },
     ],
   ] as const)('repair delivery with %s cannot be adopted', (_label, pr, currentPr) => {
     const record = durable('solution-delivered', {
@@ -248,8 +492,24 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), policy)).toEqual({ kind: 'publish-evaluation-anchor', round: 0 });
+  });
+
+  it('draft-open with a retargeted live PR cannot publish an evaluation anchor', () => {
+    const record = durable('draft-open', {
+      rounds: [round({ task, solution, adoption, checks: passedChecks })],
+      pr: {
+        number: 68,
+        branch: acceptedAdoption.branch,
+        head: HEAD,
+        draft: true,
+      },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: { ...livePr(), base: 'release' },
+    }), policy)).toMatchObject({ kind: 'none' });
   });
 
   it.each([
@@ -280,7 +540,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
@@ -291,7 +551,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
@@ -302,7 +562,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: STALE, draft: true },
+      currentPr: livePr(STALE),
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
@@ -313,7 +573,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), policy)).toEqual({ kind: 'observe-verdict', round: 0 });
   });
 
@@ -330,8 +590,60 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
+      readiness: {
+        adoption: acceptedAdoption,
+        checks: readyChecks,
+        evaluationAnchor,
+        verdict: authenticatedVerdict,
+      },
     }), policy)).toEqual({ kind: 'mark-ready' });
+  });
+
+  it('evaluating cannot promote minimal marker evidence without authenticated readiness facts', () => {
+    const record = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(),
+    }), policy)).toMatchObject({ kind: 'none' });
+  });
+
+  it('evaluating does not carry readiness across contradictory Task delivery facts', () => {
+    const record = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(),
+      readiness: {
+        adoption: acceptedAdoption,
+        checks: readyChecks,
+        evaluationAnchor,
+        verdict: {
+          ...authenticatedVerdict,
+          task: {
+            ...authenticatedVerdict.task,
+            taskCid: `f01551220${'9'.repeat(64)}`,
+          },
+        },
+      },
+    }), policy)).toMatchObject({ kind: 'none' });
   });
 
   it('evaluating with pass on a stale live head -> none', () => {
@@ -347,7 +659,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: STALE, draft: true },
+      currentPr: livePr(STALE),
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
@@ -365,7 +677,7 @@ describe('Relay state/action transition table', () => {
 
     expect(deriveRelayAction(facts(record, {
       currentBaseOid: STALE,
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
@@ -382,7 +694,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), policy)).toEqual({ kind: 'submit-repair', round: 1 });
   });
 
@@ -399,7 +711,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), { ...policy, maxRoundsPerGeneration: 1 }))
       .toEqual({ kind: 'close-exhausted' });
   });
@@ -417,7 +729,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
       now: '2026-07-28T13:00:02.000Z',
     }), policy)).toEqual({ kind: 'close-exhausted' });
   });
@@ -436,7 +748,7 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record, {
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), { ...policy, generationDeadlineMs: 1 }))
       .toEqual({ kind: 'submit-repair', round: 1 });
     expect(record.deadlineAt).toBe('2026-07-28T13:00:02.000Z');
@@ -462,7 +774,7 @@ describe('Relay state/action transition table', () => {
 
     expect(deriveRelayAction(facts(record, {
       issue,
-      currentPr: { number: 68, head: HEAD, draft: true },
+      currentPr: livePr(),
     }), policy)).toEqual({ kind: 'finish-cancellation' });
   });
 
