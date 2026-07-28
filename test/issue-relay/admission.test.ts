@@ -69,6 +69,50 @@ const baseInput = {
   now: new Date('2026-07-28T12:00:00.000Z'),
 };
 
+describe('Relay admission policy validation', () => {
+  it.each([
+    ['repository', { repository: 'example/other' }],
+    ['label', { label: 'engine:other' }],
+  ])('rejects a type-erased non-V0 %s policy value', (_name, override) => {
+    const invalidPolicy = {
+      ...policy,
+      ...override,
+    } as unknown as RelayAdmissionPolicy;
+
+    expect(() => admitRelayIssue({ ...baseInput, policy: invalidPolicy }))
+      .toThrow(/admission policy/i);
+  });
+
+  it.each([
+    ['maxIssueBytes', Number.NaN],
+    ['maxIssueBytes', Number.POSITIVE_INFINITY],
+    ['maxIssueBytes', 0],
+    ['maxIssueBytes', 1.5],
+    ['maxAcceptanceItems', Number.NaN],
+    ['maxAcceptanceItems', Number.POSITIVE_INFINITY],
+    ['maxAcceptanceItems', 0],
+    ['maxAcceptanceItems', 1.5],
+  ] as const)('rejects an invalid %s bound of %s', (field, value) => {
+    const invalidPolicy = {
+      ...policy,
+      [field]: value,
+    };
+
+    expect(() => admitRelayIssue({ ...baseInput, policy: invalidPolicy }))
+      .toThrow(/admission policy/i);
+  });
+
+  it('rejects a type-erased forbidden pattern that is not a RegExp', () => {
+    const invalidPolicy = {
+      ...policy,
+      forbiddenRequestPatterns: ['private key'],
+    } as unknown as RelayAdmissionPolicy;
+
+    expect(() => admitRelayIssue({ ...baseInput, policy: invalidPolicy }))
+      .toThrow(/admission policy/i);
+  });
+});
+
 describe('Relay issue admission authority', () => {
   it('admits a current WRITE author who applied the effective opt-in label', () => {
     const decision = admitRelayIssue(baseInput);
@@ -398,6 +442,29 @@ describe('Relay label history admission', () => {
     });
   });
 
+  it.each([
+    ['numeric shorthand', '0'],
+    ['an impossible date', '2026-02-30T11:00:00.000Z'],
+    ['a non-UTC offset', '2026-07-28T12:00:00.000+01:00'],
+    ['a future time', '2026-07-28T12:00:00.001Z'],
+  ])('fails closed when the relevant label event uses %s', (_name, createdAt) => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      labelEvents: [
+        labelEvents[0]!,
+        {
+          ...labelEvents[1]!,
+          createdAt,
+        },
+      ],
+    });
+
+    expect(decision).toMatchObject({
+      status: 'refused',
+      code: 'not-self-labelled',
+    });
+  });
+
   it('fails closed when the issue label set and event timeline disagree', () => {
     const decision = admitRelayIssue({
       ...baseInput,
@@ -537,6 +604,118 @@ describe('Relay acceptance clarity', () => {
     expect(decision).toMatchObject({
       status: 'awaiting-clarification',
       code: 'missing-acceptance-evidence',
+    });
+  });
+
+  it.each([
+    [
+      'four-space',
+      [
+        'This is an example, not acceptance evidence:',
+        '',
+        '    - [ ] Hidden in an indented code block.',
+      ].join('\n'),
+    ],
+    [
+      'tab',
+      [
+        'This is an example, not acceptance evidence:',
+        '',
+        '\t- [ ] Hidden in a tab-indented code block.',
+      ].join('\n'),
+    ],
+  ])('ignores checklist examples inside a %s-indented code block', (_name, body) => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      issue: {
+        ...issue,
+        issue: { ...issue.issue, body },
+      },
+    });
+
+    expect(decision).toMatchObject({
+      status: 'awaiting-clarification',
+      code: 'missing-acceptance-evidence',
+    });
+  });
+
+  it.each([
+    [
+      'Acceptance',
+      '=',
+      'The relay preserves the funded task key.',
+    ],
+    [
+      'Expected behavior',
+      '-',
+      'The relay returns duplicate after a retry.',
+    ],
+  ])('extracts a plain criterion under a Setext %s heading', (heading, marker, criterion) => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      issue: {
+        ...issue,
+        issue: {
+          ...issue.issue,
+          body: [
+            heading,
+            marker.repeat(heading.length),
+            criterion,
+          ].join('\n'),
+        },
+      },
+    });
+
+    expect(decision).toMatchObject({
+      status: 'admitted',
+      input: {
+        acceptanceEvidence: [criterion],
+      },
+    });
+  });
+
+  it('does not count a peer Setext heading as acceptance evidence', () => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      issue: {
+        ...issue,
+        issue: {
+          ...issue.issue,
+          body: [
+            '## Acceptance',
+            'Notes',
+            '-----',
+          ].join('\n'),
+        },
+      },
+    });
+
+    expect(decision).toMatchObject({
+      status: 'awaiting-clarification',
+      code: 'missing-acceptance-evidence',
+    });
+  });
+
+  it('extracts a valid nested GFM task-list criterion', () => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      issue: {
+        ...issue,
+        issue: {
+          ...issue.issue,
+          body: [
+            '- Platform',
+            '    - [ ] The command exits zero.',
+          ].join('\n'),
+        },
+      },
+    });
+
+    expect(decision).toMatchObject({
+      status: 'admitted',
+      input: {
+        acceptanceEvidence: ['The command exits zero.'],
+      },
     });
   });
 
