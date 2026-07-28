@@ -665,8 +665,10 @@ export async function runAutopilotV2(
     makeMarketplaceRecoveryReadSnapshot({
       manifestPath,
       readCycleSnapshot,
-      readTargetedPullRequestSnapshot: (cycleSnapshot, prNumber) =>
-        targeted.readPullRequest(cycleSnapshot, prNumber),
+      readTargetedPullRequestSnapshot: async (cycleSnapshot, prNumber) =>
+        targetedAuthoritySnapshot(
+          await targeted.readPullRequest(cycleSnapshot, prNumber),
+        ),
     });
   const recoverSubmittedMarketplaceAdoptions =
     marketplaceExecutionBackend === undefined
