@@ -20,6 +20,11 @@ const INPUT = '1'.repeat(40);
 const TREE = '2'.repeat(40);
 const RESULT = '3'.repeat(40);
 const PATCH_DIGEST = `sha256:${'4'.repeat(64)}` as const;
+const REPOSITORY_AUTHORITY = {
+  targetRepositoryId: 'R_target',
+  forkRepositoryId: 'R_fork',
+  forkParentRepositoryId: 'R_target',
+} as const;
 
 function acceptedReceipt(): Extract<
 IssueRelayAdoptionReceiptV1,
@@ -61,6 +66,7 @@ function pullRequest(
     open: true,
     draft: true,
     generation: GENERATION,
+    ...REPOSITORY_AUTHORITY,
     ...overrides,
   };
 }
@@ -80,12 +86,15 @@ function publisherFixture(input: {
     assuranceBody === undefined ? undefined : 900;
   let prOpen = prs[0]?.open ?? true;
   let pullRequestReads = 0;
+  const gitCommands: RelayGitCommand[] = [];
+  const githubCommands: RelayGitHubCommand[] = [];
   const gitMutations: RelayGitCommand[] = [];
   const githubMutations: RelayGitHubCommand[] = [];
   const commitMessage: { value?: string } = {};
 
   const publisher = createRelayGitPublisher({
     git: async (command) => {
+      gitCommands.push(command);
       switch (command.kind) {
         case 'read-applied-tree':
           return { kind: 'applied-tree', head: localHead, tree: TREE, exact: true };
@@ -118,6 +127,7 @@ function publisherFixture(input: {
       }
     },
     github: async (command) => {
+      githubCommands.push(command);
       switch (command.kind) {
         case 'list-pull-requests':
           return { kind: 'pull-requests', pullRequests: prs };
@@ -173,6 +183,8 @@ function publisherFixture(input: {
 
   return {
     publisher,
+    gitCommands,
+    githubCommands,
     gitMutations,
     githubMutations,
     commitMessage,
@@ -190,10 +202,8 @@ const commitInput = {
   round: 0,
   branch: BRANCH,
   targetRepository: 'Jinn-Network/mono' as const,
-  targetRepositoryId: 'R_target',
+  ...REPOSITORY_AUTHORITY,
   forkRepository: 'Jinn-Network/mono-relay',
-  forkRepositoryId: 'R_fork',
-  forkParentRepositoryId: 'R_target',
   worktreePath: '/relay/worktree',
   inputHead: INPUT,
   expectedTree: TREE,
@@ -324,6 +334,50 @@ describe('managed-fork Relay Git publisher', () => {
     ].join('\n'));
   });
 
+  it('carries immutable repository authority through every fork and GitHub command', async () => {
+    const fixture = publisherFixture();
+    await fixture.publisher.commitAndPush(commitInput);
+    const pr = await fixture.publisher.ensureDraftPullRequest({
+      generation: GENERATION,
+      targetRepository: 'Jinn-Network/mono',
+      targetRepositoryId: 'R_target',
+      forkRepository: 'Jinn-Network/mono-relay',
+      forkRepositoryId: 'R_fork',
+      forkParentRepositoryId: 'R_target',
+      branch: BRANCH,
+      resultingHead: RESULT,
+      defaultBranch: 'main',
+      issueNumber: 42,
+    });
+    await fixture.publisher.publishAdoptionReceipt({
+      targetRepository: 'Jinn-Network/mono',
+      targetRepositoryId: 'R_target',
+      forkRepositoryId: 'R_fork',
+      forkParentRepositoryId: 'R_target',
+      pr,
+      serviceLogin: 'jinn-relay[bot]',
+      receipt: acceptedReceipt(),
+    });
+
+    for (const command of fixture.gitCommands.filter(({ kind }) =>
+      kind === 'read-fork-ref'
+      || kind === 'read-fork-commit'
+      || kind === 'push-fork')) {
+      expect(command).toMatchObject({
+        targetRepositoryId: 'R_target',
+        forkRepositoryId: 'R_fork',
+        forkParentRepositoryId: 'R_target',
+      });
+    }
+    for (const command of fixture.githubCommands) {
+      expect(command).toMatchObject({
+        targetRepositoryId: 'R_target',
+        forkRepositoryId: 'R_fork',
+        forkParentRepositoryId: 'R_target',
+      });
+    }
+  });
+
   it('refuses a stale fork head before commit or push', async () => {
     const fixture = publisherFixture({ forkHead: 'a'.repeat(40) });
 
@@ -341,6 +395,7 @@ describe('managed-fork Relay Git publisher', () => {
     const fixture = publisherFixture({ forkHead: RESULT, createPrThrows: true });
 
     const created = await fixture.publisher.ensureDraftPullRequest({
+      ...REPOSITORY_AUTHORITY,
       generation: GENERATION,
       targetRepository: 'Jinn-Network/mono',
       forkRepository: 'Jinn-Network/mono-relay',
@@ -350,6 +405,7 @@ describe('managed-fork Relay Git publisher', () => {
       issueNumber: 42,
     });
     const replay = await fixture.publisher.ensureDraftPullRequest({
+      ...REPOSITORY_AUTHORITY,
       generation: GENERATION,
       targetRepository: 'Jinn-Network/mono',
       forkRepository: 'Jinn-Network/mono-relay',
@@ -380,6 +436,7 @@ describe('managed-fork Relay Git publisher', () => {
     });
 
     await expect(fixture.publisher.ensureDraftPullRequest({
+      ...REPOSITORY_AUTHORITY,
       generation: GENERATION,
       targetRepository: 'Jinn-Network/mono',
       forkRepository: 'Jinn-Network/mono-relay',
@@ -404,6 +461,7 @@ describe('managed-fork Relay Git publisher', () => {
     });
 
     await expect(fixture.publisher.ensureDraftPullRequest({
+      ...REPOSITORY_AUTHORITY,
       generation: GENERATION,
       targetRepository: 'Jinn-Network/mono',
       forkRepository: 'Jinn-Network/mono-relay',
@@ -423,19 +481,25 @@ describe('managed-fork Relay Git publisher', () => {
     });
 
     await fixture.publisher.closeDraftPullRequest({
+      ...REPOSITORY_AUTHORITY,
       targetRepository: 'Jinn-Network/mono',
       pr: pullRequest(),
       expectedHead: RESULT,
       reason: 'Relay generation was cancelled',
     });
 
-    expect(fixture.githubMutations).toContainEqual({
+    expect(fixture.githubMutations).toContainEqual(expect.objectContaining({
       kind: 'close-pull-request',
       repository: 'Jinn-Network/mono',
       prNumber: 68,
+      expectedGeneration: GENERATION,
+      expectedBranch: BRANCH,
       expectedHead: RESULT,
+      expectedBase: 'main',
+      expectedDraft: true,
+      expectedOpen: true,
       reason: 'Relay generation was cancelled',
-    });
+    }));
   });
 
   it('recovers an already-closed cancelled draft without another mutation', async () => {
@@ -446,6 +510,7 @@ describe('managed-fork Relay Git publisher', () => {
     });
 
     await fixture.publisher.closeDraftPullRequest({
+      ...REPOSITORY_AUTHORITY,
       targetRepository: 'Jinn-Network/mono',
       pr: closed,
       expectedHead: RESULT,
@@ -464,12 +529,14 @@ describe('managed-fork Relay Git publisher', () => {
     const receipt = acceptedReceipt();
 
     const published = await fixture.publisher.publishAdoptionReceipt({
+      ...REPOSITORY_AUTHORITY,
       targetRepository: 'Jinn-Network/mono',
       pr: pullRequest(),
       serviceLogin: 'jinn-relay[bot]',
       receipt,
     });
     const replay = await fixture.publisher.publishAdoptionReceipt({
+      ...REPOSITORY_AUTHORITY,
       targetRepository: 'Jinn-Network/mono',
       pr: pullRequest(),
       serviceLogin: 'jinn-relay[bot]',
@@ -501,6 +568,7 @@ describe('managed-fork Relay Git publisher', () => {
     });
 
     await expect(fixture.publisher.publishAdoptionReceipt({
+      ...REPOSITORY_AUTHORITY,
       targetRepository: 'Jinn-Network/mono',
       pr: pullRequest(),
       serviceLogin: 'jinn-relay[bot]',
@@ -528,6 +596,7 @@ describe('managed-fork Relay Git publisher', () => {
     });
 
     await expect(fixture.publisher.publishAdoptionReceipt({
+      ...REPOSITORY_AUTHORITY,
       targetRepository: 'Jinn-Network/mono',
       pr: pullRequest(),
       serviceLogin: 'jinn-relay[bot]',
@@ -552,6 +621,7 @@ describe('managed-fork Relay Git publisher', () => {
     });
 
     await expect(fixture.publisher.recoverAccepted({
+      ...REPOSITORY_AUTHORITY,
       generation: GENERATION,
       targetRepository: 'Jinn-Network/mono',
       forkRepository: 'Jinn-Network/mono-relay',
