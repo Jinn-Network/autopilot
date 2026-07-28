@@ -250,8 +250,7 @@ function phaseEvidenceIsConsistent(record: RelayGenerationRecordV1): boolean {
       return round?.verdict?.outcome === 'pass'
         && record.pr?.head === round.verdict.evaluatedHead;
     case 'cancelling':
-      return record.cancellation !== undefined
-        && record.rounds.some(({ task }) => task !== undefined);
+      return record.cancellation !== undefined;
     case 'closed':
     case 'exhausted':
       return true;

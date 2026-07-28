@@ -80,6 +80,19 @@ describe('Relay issue generation markers', () => {
     expect(parse(marker)?.deadlineAt).toBe('2026-07-28T13:00:02.000Z');
   });
 
+  it('round-trips persisted pre-funding cancellation intent', () => {
+    const record = generationRecord({
+      phase: 'cancelling',
+      cancellation: {
+        requestedAt: '2026-07-28T12:01:00.000Z',
+        reason: 'label-removed',
+      },
+      updatedAt: '2026-07-28T12:01:00.000Z',
+    });
+
+    expect(parse(formatRelayIssueMarker(record))).toEqual(record);
+  });
+
   it('round-trips untrusted snapshot prose that contains the marker prefix', () => {
     const embeddedSnapshot = buildRelaySnapshot({
       ...issueInput,
