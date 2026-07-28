@@ -28,7 +28,13 @@ export class RelayGitPublisherError extends Error {
   }
 }
 
-export interface RelayPullRequest {
+export interface RelayRepositoryAuthority {
+  readonly targetRepositoryId: string;
+  readonly forkRepositoryId: string;
+  readonly forkParentRepositoryId: string;
+}
+
+export interface RelayPullRequest extends RelayRepositoryAuthority {
   readonly number: number;
   readonly branch: string;
   readonly head: string;
@@ -67,25 +73,25 @@ export type RelayGitCommand =
       readonly head: string;
       readonly expectedMessage: string;
     }
-  | {
+  | (RelayRepositoryAuthority & {
       readonly kind: 'read-fork-commit';
       readonly repository: string;
       readonly branch: string;
       readonly head: string;
       readonly expectedMessage: string;
-    }
-  | {
+    })
+  | (RelayRepositoryAuthority & {
       readonly kind: 'read-fork-ref';
       readonly repository: string;
       readonly branch: string;
-    }
-  | {
+    })
+  | (RelayRepositoryAuthority & {
       readonly kind: 'push-fork';
       readonly repository: string;
       readonly branch: string;
       readonly expectedOldHead?: string;
       readonly newHead: string;
-    };
+    });
 
 export type RelayGitCommandResult =
   | {
@@ -109,7 +115,7 @@ export type RelayGitCommandRunner = (
   command: RelayGitCommand,
 ) => Promise<RelayGitCommandResult>;
 
-export type RelayGitHubCommand =
+export type RelayGitHubCommand = RelayRepositoryAuthority & (
   | {
       readonly kind: 'list-pull-requests';
       readonly repository: string;
@@ -134,7 +140,12 @@ export type RelayGitHubCommand =
       readonly kind: 'close-pull-request';
       readonly repository: string;
       readonly prNumber: number;
+      readonly expectedGeneration: string;
+      readonly expectedBranch: string;
       readonly expectedHead: string;
+      readonly expectedBase: string;
+      readonly expectedDraft: true;
+      readonly expectedOpen: true;
       readonly reason: string;
     }
   | {
@@ -156,7 +167,8 @@ export type RelayGitHubCommand =
       readonly commentId: number;
       readonly expectedHead: string;
       readonly body: string;
-    };
+    }
+);
 
 export type RelayGitHubCommandResult =
   | {
@@ -174,15 +186,12 @@ export type RelayGitHubCommandRunner = (
   command: RelayGitHubCommand,
 ) => Promise<RelayGitHubCommandResult>;
 
-export interface RelayCommitAndPushInput {
+export interface RelayCommitAndPushInput extends RelayRepositoryAuthority {
   readonly generation: string;
   readonly round: number;
   readonly branch: string;
   readonly targetRepository: string;
-  readonly targetRepositoryId: string;
   readonly forkRepository: string;
-  readonly forkRepositoryId: string;
-  readonly forkParentRepositoryId: string;
   readonly worktreePath: string;
   readonly inputHead: string;
   readonly expectedTree: string;
@@ -198,7 +207,7 @@ RelayCommitAndPushInput,
 'expectedTree' | 'expectedForkHead'
 >;
 
-export interface RelayDraftPullRequestInput {
+export interface RelayDraftPullRequestInput extends RelayRepositoryAuthority {
   readonly generation: string;
   readonly targetRepository: string;
   readonly forkRepository: string;
@@ -210,7 +219,7 @@ export interface RelayDraftPullRequestInput {
 }
 
 export interface RelayAdoptionPublisher {
-  recoverAccepted(input: {
+  recoverAccepted(input: RelayRepositoryAuthority & {
     readonly generation: string;
     readonly targetRepository: string;
     readonly forkRepository: string;
@@ -238,13 +247,13 @@ export interface RelayAdoptionPublisher {
     readonly resultingHead: string;
   }>;
   ensureDraftPullRequest(input: RelayDraftPullRequestInput): Promise<RelayPullRequest>;
-  closeDraftPullRequest(input: {
+  closeDraftPullRequest(input: RelayRepositoryAuthority & {
     readonly targetRepository: string;
     readonly pr: RelayPullRequest;
     readonly expectedHead: string;
     readonly reason: string;
   }): Promise<void>;
-  publishAdoptionReceipt(input: {
+  publishAdoptionReceipt(input: RelayRepositoryAuthority & {
     readonly targetRepository: string;
     readonly pr: RelayPullRequest;
     readonly serviceLogin: string;
@@ -397,6 +406,9 @@ function exactPr(
   input: RelayDraftPullRequestInput,
 ): boolean {
   return candidate.generation === input.generation
+    && candidate.targetRepositoryId === input.targetRepositoryId
+    && candidate.forkRepositoryId === input.forkRepositoryId
+    && candidate.forkParentRepositoryId === input.forkParentRepositoryId
     && candidate.branch === input.branch
     && candidate.head === input.resultingHead
     && candidate.base === input.defaultBranch
@@ -413,6 +425,9 @@ function sameExactPrIdentity(
   right: RelayPullRequest,
 ): boolean {
   return left.number === right.number
+    && left.targetRepositoryId === right.targetRepositoryId
+    && left.forkRepositoryId === right.forkRepositoryId
+    && left.forkParentRepositoryId === right.forkParentRepositoryId
     && left.generation === right.generation
     && left.branch === right.branch
     && left.head === right.head
@@ -451,13 +466,21 @@ export function createRelayGitPublisher(options: {
   const listPrs = async (
     input: Pick<
     RelayDraftPullRequestInput,
-    'targetRepository' | 'forkRepository' | 'branch'
+    | 'targetRepository'
+    | 'targetRepositoryId'
+    | 'forkRepository'
+    | 'forkRepositoryId'
+    | 'forkParentRepositoryId'
+    | 'branch'
     >,
   ): Promise<readonly RelayPullRequest[]> => {
     const result = await github({
       kind: 'list-pull-requests',
       repository: input.targetRepository,
+      targetRepositoryId: input.targetRepositoryId,
       forkRepository: input.forkRepository,
+      forkRepositoryId: input.forkRepositoryId,
+      forkParentRepositoryId: input.forkParentRepositoryId,
       branch: input.branch,
     });
     if (result.kind !== 'pull-requests') {
@@ -470,12 +493,14 @@ export function createRelayGitPublisher(options: {
   };
 
   const readPr = async (
+    authority: RelayRepositoryAuthority,
     repository: string,
     number: number,
   ): Promise<RelayPullRequest> => {
     const result = await github({
       kind: 'read-pull-request',
       repository,
+      ...authority,
       prNumber: number,
     });
     if (result.kind !== 'pull-request') {
@@ -488,12 +513,14 @@ export function createRelayGitPublisher(options: {
   };
 
   const listAssurance = async (
+    authority: RelayRepositoryAuthority,
     repository: string,
     prNumber: number,
   ): Promise<readonly RelayAssuranceComment[]> => {
     const result = await github({
       kind: 'list-assurance-comments',
       repository,
+      ...authority,
       prNumber,
     });
     if (result.kind !== 'assurance-comments') {
@@ -506,11 +533,12 @@ export function createRelayGitPublisher(options: {
   };
 
   const ownedAssurance = async (
+    authority: RelayRepositoryAuthority,
     repository: string,
     prNumber: number,
     serviceLogin: string,
   ): Promise<RelayAssuranceComment | undefined> => {
-    const owned = (await listAssurance(repository, prNumber)).filter(
+    const owned = (await listAssurance(authority, repository, prNumber)).filter(
       (comment) =>
         sameLogin(comment.authorLogin, serviceLogin)
         && comment.body.includes(ASSURANCE_MARKER),
@@ -536,9 +564,12 @@ export function createRelayGitPublisher(options: {
           'Relay replay found contradictory pull requests for the generation branch',
         );
       }
-      const pr = await readPr(input.targetRepository, input.prNumber);
+      const pr = await readPr(input, input.targetRepository, input.prNumber);
       if (
         pr.generation !== input.generation
+        || pr.targetRepositoryId !== input.targetRepositoryId
+        || pr.forkRepositoryId !== input.forkRepositoryId
+        || pr.forkParentRepositoryId !== input.forkParentRepositoryId
         || pr.branch !== input.branch
         || pr.base !== input.defaultBranch
         || (!pr.open && input.allowClosed !== true)
@@ -550,6 +581,7 @@ export function createRelayGitPublisher(options: {
         );
       }
       const comment = await ownedAssurance(
+        input,
         input.targetRepository,
         input.prNumber,
         input.serviceLogin,
@@ -583,6 +615,9 @@ export function createRelayGitPublisher(options: {
       });
       const fork = await git({
         kind: 'read-fork-ref',
+        targetRepositoryId: input.targetRepositoryId,
+        forkRepositoryId: input.forkRepositoryId,
+        forkParentRepositoryId: input.forkParentRepositoryId,
         repository: input.forkRepository,
         branch: input.branch,
       });
@@ -598,6 +633,9 @@ export function createRelayGitPublisher(options: {
       requireOid(fork.head, 'Relay recovery fork head');
       const commit = await git({
         kind: 'read-fork-commit',
+        targetRepositoryId: input.targetRepositoryId,
+        forkRepositoryId: input.forkRepositoryId,
+        forkParentRepositoryId: input.forkParentRepositoryId,
         repository: input.forkRepository,
         branch: input.branch,
         head: fork.head,
@@ -671,6 +709,9 @@ export function createRelayGitPublisher(options: {
       }
       const forkBeforeResult = await git({
         kind: 'read-fork-ref',
+        targetRepositoryId: input.targetRepositoryId,
+        forkRepositoryId: input.forkRepositoryId,
+        forkParentRepositoryId: input.forkParentRepositoryId,
         repository: input.forkRepository,
         branch: input.branch,
       });
@@ -749,6 +790,9 @@ export function createRelayGitPublisher(options: {
         try {
           await git({
             kind: 'push-fork',
+            targetRepositoryId: input.targetRepositoryId,
+            forkRepositoryId: input.forkRepositoryId,
+            forkParentRepositoryId: input.forkParentRepositoryId,
             repository: input.forkRepository,
             branch: input.branch,
             expectedOldHead: input.expectedForkHead,
@@ -761,6 +805,9 @@ export function createRelayGitPublisher(options: {
       }
       const forkAfter = await git({
         kind: 'read-fork-ref',
+        targetRepositoryId: input.targetRepositoryId,
+        forkRepositoryId: input.forkRepositoryId,
+        forkParentRepositoryId: input.forkParentRepositoryId,
         repository: input.forkRepository,
         branch: input.branch,
       });
@@ -787,6 +834,9 @@ export function createRelayGitPublisher(options: {
         try {
           await github({
             kind: 'create-draft-pull-request',
+            targetRepositoryId: input.targetRepositoryId,
+            forkRepositoryId: input.forkRepositoryId,
+            forkParentRepositoryId: input.forkParentRepositoryId,
             repository: input.targetRepository,
             title: `Jinn Issue Relay: #${input.issueNumber}`,
             body: formatRelayPullRequestMarker(input.generation),
@@ -807,13 +857,16 @@ export function createRelayGitPublisher(options: {
         );
       }
       const listed = assertExactPr(candidates[0]!, input);
-      const readback = await readPr(input.targetRepository, listed.number);
+      const readback = await readPr(input, input.targetRepository, listed.number);
       return assertExactPr(readback, input);
     },
 
     async closeDraftPullRequest(input) {
       if (
-        input.pr.head !== input.expectedHead
+        input.pr.targetRepositoryId !== input.targetRepositoryId
+        || input.pr.forkRepositoryId !== input.forkRepositoryId
+        || input.pr.forkParentRepositoryId !== input.forkParentRepositoryId
+        || input.pr.head !== input.expectedHead
         || !input.pr.draft
       ) {
         throw new RelayGitPublisherError(
@@ -823,6 +876,7 @@ export function createRelayGitPublisher(options: {
       }
       if (!input.pr.open) {
         const alreadyClosed = await readPr(
+          input,
           input.targetRepository,
           input.pr.number,
         );
@@ -837,15 +891,23 @@ export function createRelayGitPublisher(options: {
       try {
         await github({
           kind: 'close-pull-request',
+          targetRepositoryId: input.targetRepositoryId,
+          forkRepositoryId: input.forkRepositoryId,
+          forkParentRepositoryId: input.forkParentRepositoryId,
           repository: input.targetRepository,
           prNumber: input.pr.number,
+          expectedGeneration: input.pr.generation,
+          expectedBranch: input.pr.branch,
           expectedHead: input.expectedHead,
+          expectedBase: input.pr.base,
+          expectedDraft: true,
+          expectedOpen: true,
           reason: input.reason,
         });
       } catch {
         // Close may commit before transport failure; exact readback follows.
       }
-      const readback = await readPr(input.targetRepository, input.pr.number);
+      const readback = await readPr(input, input.targetRepository, input.pr.number);
       if (!sameExactPrIdentity(readback, { ...input.pr, open: false })) {
         throw new RelayGitPublisherError(
           'pr-contradiction',
@@ -855,10 +917,21 @@ export function createRelayGitPublisher(options: {
     },
 
     async publishAdoptionReceipt(input) {
+      if (
+        input.pr.targetRepositoryId !== input.targetRepositoryId
+        || input.pr.forkRepositoryId !== input.forkRepositoryId
+        || input.pr.forkParentRepositoryId !== input.forkParentRepositoryId
+      ) {
+        throw new RelayGitPublisherError(
+          'receipt-contradiction',
+          'Relay receipt target repository identity is contradictory',
+        );
+      }
       const canonical = IssueRelayAdoptionReceiptV1Schema.parse(
         input.receipt,
       ) as IssueRelayAdoptionReceiptV1;
       const prBefore = await readPr(
+        input,
         input.targetRepository,
         input.pr.number,
       );
@@ -869,6 +942,7 @@ export function createRelayGitPublisher(options: {
         );
       }
       const existing = await ownedAssurance(
+        input,
         input.targetRepository,
         input.pr.number,
         input.serviceLogin,
@@ -898,6 +972,9 @@ export function createRelayGitPublisher(options: {
           await github(existing === undefined
             ? {
               kind: 'create-assurance-comment',
+              targetRepositoryId: input.targetRepositoryId,
+              forkRepositoryId: input.forkRepositoryId,
+              forkParentRepositoryId: input.forkParentRepositoryId,
               repository: input.targetRepository,
               prNumber: input.pr.number,
               expectedHead: input.pr.head,
@@ -905,6 +982,9 @@ export function createRelayGitPublisher(options: {
             }
             : {
               kind: 'edit-assurance-comment',
+              targetRepositoryId: input.targetRepositoryId,
+              forkRepositoryId: input.forkRepositoryId,
+              forkParentRepositoryId: input.forkParentRepositoryId,
               repository: input.targetRepository,
               prNumber: input.pr.number,
               commentId: existing.id,
@@ -916,7 +996,7 @@ export function createRelayGitPublisher(options: {
           // one-comment exact body and receipt readback below is authoritative.
         }
       }
-      const prAfter = await readPr(input.targetRepository, input.pr.number);
+      const prAfter = await readPr(input, input.targetRepository, input.pr.number);
       if (!sameExactPrIdentity(prAfter, input.pr)) {
         throw new RelayGitPublisherError(
           'receipt-contradiction',
@@ -924,6 +1004,7 @@ export function createRelayGitPublisher(options: {
         );
       }
       const readback = await ownedAssurance(
+        input,
         input.targetRepository,
         input.pr.number,
         input.serviceLogin,

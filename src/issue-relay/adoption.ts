@@ -22,6 +22,7 @@ import { gitOid } from '../lifecycle/types.js';
 import type {
   RelayAdoptionPublisher,
   RelayPullRequest,
+  RelayRepositoryAuthority,
 } from './git-publisher.js';
 
 export interface RelayAdoptionAuthority {
@@ -235,6 +236,52 @@ function liveStaticCorrelationMatches(input: {
     && live.worktree.path.length > 0;
 }
 
+function repositoryAuthority(
+  live: RelayAdoptionExactAuthority,
+): RelayRepositoryAuthority {
+  return {
+    targetRepositoryId: live.targetRepositoryId,
+    forkRepositoryId: live.forkRepositoryId,
+    forkParentRepositoryId: live.forkParentRepositoryId,
+  };
+}
+
+function repositoryAuthorityMatches(
+  initial: RelayAdoptionExactAuthority,
+  current: RelayAdoptionExactAuthority,
+): boolean {
+  return isDeepStrictEqual(
+    repositoryAuthority(current),
+    repositoryAuthority(initial),
+  );
+}
+
+function authorityRereadMatches(input: {
+  readonly requested: RelayAdoptionAuthority;
+  readonly observation: VerifiedRelaySolutionObservation;
+  readonly snapshot: IssueRelaySnapshotV1;
+  readonly initial: RelayAdoptionExactAuthority;
+  readonly current: RelayAdoptionExactAuthority;
+}): boolean {
+  return liveStaticCorrelationMatches({
+    requested: input.requested,
+    observation: input.observation,
+    snapshot: input.snapshot,
+    live: input.current,
+  })
+    && repositoryAuthorityMatches(input.initial, input.current)
+    && input.current.serviceLogin === input.initial.serviceLogin;
+}
+
+function pullRequestRepositoryMatches(
+  pr: RelayPullRequest,
+  authority: RelayAdoptionExactAuthority,
+): boolean {
+  return pr.targetRepositoryId === authority.targetRepositoryId
+    && pr.forkRepositoryId === authority.forkRepositoryId
+    && pr.forkParentRepositoryId === authority.forkParentRepositoryId;
+}
+
 function expectedPreAdoptionForkHead(
   observation: VerifiedRelaySolutionObservation,
 ): string | undefined {
@@ -254,6 +301,7 @@ function prMatchesPreAdoption(input: {
   }
   const pr = live.pr;
   return pr !== undefined
+    && pullRequestRepositoryMatches(pr, live)
     && authority.existingPrNumber === pr.number
     && observation.round.prNumber === pr.number
     && pr.generation === authority.generation
@@ -268,6 +316,7 @@ function matchesRecoveredPublicationBoundary(input: {
   readonly authority: RelayAdoptionAuthority;
   readonly observation: VerifiedRelaySolutionObservation;
   readonly live: RelayAdoptionExactAuthority;
+  readonly expectedPrNumber?: number;
 }): boolean {
   const { authority, observation, live } = input;
   const forkHead = live.expectedForkHead;
@@ -277,14 +326,18 @@ function matchesRecoveredPublicationBoundary(input: {
   const pr = live.pr;
   if (pr === undefined) {
     return observation.round.purpose === 'initial'
-      && authority.existingPrNumber === undefined;
+      && authority.existingPrNumber === undefined
+      && input.expectedPrNumber === undefined;
   }
   return pr.generation === authority.generation
+    && pullRequestRepositoryMatches(pr, live)
     && pr.branch === authority.branch
     && pr.head === forkHead
     && pr.base === live.defaultBranch
     && pr.open
     && pr.draft
+    && input.expectedPrNumber !== undefined
+    && pr.number === input.expectedPrNumber
     && (
       authority.existingPrNumber === undefined
       || authority.existingPrNumber === pr.number
@@ -322,15 +375,28 @@ function exactPublishedPr(input: {
   readonly authority: RelayAdoptionAuthority;
   readonly defaultBranch: string;
   readonly resultingHead: string;
+  readonly repository: RelayAdoptionExactAuthority;
+  readonly expectedPrNumber?: number;
   readonly allowClosed?: boolean;
 }): boolean {
-  const { pr, authority, defaultBranch, resultingHead } = input;
+  const {
+    pr,
+    authority,
+    defaultBranch,
+    resultingHead,
+    repository,
+  } = input;
   return pr.generation === authority.generation
+    && pullRequestRepositoryMatches(pr, repository)
     && pr.branch === authority.branch
     && pr.head === resultingHead
     && pr.base === defaultBranch
     && (pr.open || input.allowClosed === true)
-    && pr.draft;
+    && pr.draft
+    && (
+      input.expectedPrNumber === undefined
+      || pr.number === input.expectedPrNumber
+    );
 }
 
 function acceptedReceipt(input: {
@@ -407,6 +473,9 @@ export function makeRelayAdoptionCoordinator(
           now,
         );
       }
+      const pinnedRepository = repositoryAuthority(live);
+      const expectedPrNumber =
+        input.authority.existingPrNumber ?? live.pr?.number;
 
       const artifact = new TextEncoder().encode(observation.payload.patch);
       let patch: ValidatedMarketplacePatch;
@@ -425,6 +494,7 @@ export function makeRelayAdoptionCoordinator(
       }
 
       const replay = await dependencies.publisher.recoverAccepted({
+        ...pinnedRepository,
         generation: input.authority.generation,
         targetRepository: input.authority.targetRepository,
         forkRepository: input.authority.forkRepository,
@@ -449,29 +519,49 @@ export function makeRelayAdoptionCoordinator(
         })) {
           throw new Error('Relay accepted replay contradicts the exact adoption identity');
         }
-        if (
+        const afterReplay = await dependencies.authority.readExact({
+          ...input,
+          observation,
+        });
+        const cancellationRequested =
           live.cancellationRequested
-          || input.authority.cancellationRequested
+          || afterReplay.cancellationRequested
+          || input.authority.cancellationRequested;
+        if (
+          !authorityRereadMatches({
+            requested: input.authority,
+            observation,
+            snapshot: input.snapshot,
+            initial: live,
+            current: afterReplay,
+          })
+          || afterReplay.expectedForkHead !== replay.resultingHead
+          || afterReplay.pr === undefined
+          || !exactPublishedPr({
+            pr: afterReplay.pr,
+            authority: input.authority,
+            defaultBranch: afterReplay.defaultBranch,
+            resultingHead: replay.resultingHead,
+            repository: live,
+            expectedPrNumber: replay.prNumber,
+            allowClosed: cancellationRequested,
+          })
         ) {
-          if (
-            live.pr === undefined
-            || !exactPublishedPr({
-              pr: live.pr,
-              authority: input.authority,
-              defaultBranch: live.defaultBranch,
-              resultingHead: replay.resultingHead,
-              allowClosed: true,
-            })
-            || live.pr.number !== replay.prNumber
-          ) {
-            throw new Error(
-              'Relay accepted replay lost exact draft authority during cancellation',
-            );
-          }
-          if (live.pr.open) {
+          return rejection(
+            observation,
+            'authority-changed',
+            'Relay exact authority changed during accepted receipt recovery',
+            now,
+          );
+        }
+        if (
+          cancellationRequested
+        ) {
+          if (afterReplay.pr.open) {
             await dependencies.publisher.closeDraftPullRequest({
+              ...pinnedRepository,
               targetRepository: input.authority.targetRepository,
-              pr: live.pr,
+              pr: afterReplay.pr,
               expectedHead: replay.resultingHead,
               reason: 'Relay generation was cancelled',
             });
@@ -508,10 +598,8 @@ export function makeRelayAdoptionCoordinator(
           round: input.authority.round,
           branch: input.authority.branch,
           targetRepository: input.authority.targetRepository,
-          targetRepositoryId: live.targetRepositoryId,
+          ...pinnedRepository,
           forkRepository: input.authority.forkRepository,
-          forkRepositoryId: live.forkRepositoryId,
-          forkParentRepositoryId: live.forkParentRepositoryId,
           worktreePath: live.worktree.path,
           inputHead: input.authority.inputHead,
           summary: input.snapshot.issue.title,
@@ -536,6 +624,7 @@ export function makeRelayAdoptionCoordinator(
             authority: input.authority,
             observation,
             live,
+            expectedPrNumber,
           })
         )
       ) {
@@ -547,59 +636,68 @@ export function makeRelayAdoptionCoordinator(
         );
       }
 
-      let applied = patch;
-      let expectedTree: ReturnType<typeof gitOid>;
-      if (recoveredPublication === undefined) {
-        const worktree = await dependencies.worktrees.prepareExact({
-          generation: input.authority.generation,
-          round: input.authority.round,
-          workspaceRepository: input.authority.workspaceRepository,
-          expectedHead: input.authority.inputHead,
-          manifestPath: live.worktree.manifestPath,
-          worktreePath: live.worktree.path,
-        });
-        if (
-          worktree.manifestPath !== live.worktree.manifestPath
-          || worktree.path !== live.worktree.path
-          || worktree.expectedHead !== input.authority.inputHead
-        ) {
-          throw new Error(
-            'Relay worktree preparation did not read back exact input authority',
-          );
-        }
+      const inputWorktree = await dependencies.worktrees.prepareExact({
+        generation: input.authority.generation,
+        round: input.authority.round,
+        workspaceRepository: input.authority.workspaceRepository,
+        expectedHead: input.authority.inputHead,
+        manifestPath: live.worktree.manifestPath,
+        worktreePath: live.worktree.path,
+      });
+      if (
+        inputWorktree.manifestPath !== live.worktree.manifestPath
+        || inputWorktree.path !== live.worktree.path
+        || inputWorktree.expectedHead !== input.authority.inputHead
+      ) {
+        throw new Error(
+          'Relay worktree preparation did not read back exact input authority',
+        );
+      }
 
-        try {
-          applied = await dependencies.applyPatch({
-            artifact: Uint8Array.from(patch.artifact),
-            manifestPath: worktree.manifestPath,
-            worktreePath: worktree.path,
-            expectedHead: gitOid(input.authority.inputHead),
-          });
-        } catch (error) {
-          if (error instanceof MarketplacePatchPolicyError) {
-            return rejection(
-              observation,
-              'unsafe-patch',
-              `Relay patch application rejected the artifact: ${error.reason}`,
-              now,
-            );
-          }
-          throw error;
-        }
-        if (
-          applied.artifactDigest !== patch.artifactDigest
-          || !isDeepStrictEqual(applied.touchedPaths, patch.touchedPaths)
-        ) {
-          throw new Error(
-            'Relay patch application readback differs from policy validation',
+      let applied: ValidatedMarketplacePatch;
+      try {
+        applied = await dependencies.applyPatch({
+          artifact: Uint8Array.from(patch.artifact),
+          manifestPath: inputWorktree.manifestPath,
+          worktreePath: inputWorktree.path,
+          expectedHead: gitOid(input.authority.inputHead),
+        });
+      } catch (error) {
+        if (error instanceof MarketplacePatchPolicyError) {
+          return rejection(
+            observation,
+            'unsafe-patch',
+            `Relay patch application rejected the artifact: ${error.reason}`,
+            now,
           );
         }
-        expectedTree = gitOid(await dependencies.publisher.readAppliedTree({
-          worktreePath: worktree.path,
+        throw error;
+      }
+      if (
+        applied.artifactDigest !== patch.artifactDigest
+        || !isDeepStrictEqual(applied.touchedPaths, patch.touchedPaths)
+      ) {
+        throw new Error(
+          'Relay patch application readback differs from policy validation',
+        );
+      }
+      const expectedTree = gitOid(
+        await dependencies.publisher.readAppliedTree({
+          worktreePath: inputWorktree.path,
           inputHead: input.authority.inputHead,
-        }));
-      } else {
-        const worktree = await dependencies.worktrees.prepareExact({
+        }),
+      );
+
+      if (recoveredPublication !== undefined) {
+        if (recoveredPublication.tree !== expectedTree) {
+          return rejection(
+            observation,
+            'stale-input',
+            'Relay recovered commit tree differs from the authenticated patch tree',
+            now,
+          );
+        }
+        const recoveredWorktree = await dependencies.worktrees.prepareExact({
           generation: input.authority.generation,
           round: input.authority.round,
           workspaceRepository: input.authority.forkRepository,
@@ -608,15 +706,15 @@ export function makeRelayAdoptionCoordinator(
           worktreePath: live.worktree.path,
         });
         if (
-          worktree.manifestPath !== live.worktree.manifestPath
-          || worktree.path !== live.worktree.path
-          || worktree.expectedHead !== recoveredPublication.resultingHead
+          recoveredWorktree.manifestPath !== live.worktree.manifestPath
+          || recoveredWorktree.path !== live.worktree.path
+          || recoveredWorktree.expectedHead
+            !== recoveredPublication.resultingHead
         ) {
           throw new Error(
             'Relay recovered worktree did not read back exact fork authority',
           );
         }
-        expectedTree = gitOid(recoveredPublication.tree);
       }
       try {
         await dependencies.verification.verify({
@@ -642,15 +740,70 @@ export function makeRelayAdoptionCoordinator(
         throw error;
       }
 
+      const beforePush = await dependencies.authority.readExact({
+        ...input,
+        observation,
+      });
+      const beforePushBoundaryMatches = recoveredPublication === undefined
+        ? (
+          beforePush.expectedForkHead === expectedForkHead
+          && prMatchesPreAdoption({
+            authority: input.authority,
+            observation,
+            live: beforePush,
+          })
+        )
+        : (
+          beforePush.expectedForkHead === recoveredPublication.resultingHead
+          && matchesRecoveredPublicationBoundary({
+            authority: input.authority,
+            observation,
+            live: beforePush,
+            expectedPrNumber,
+          })
+        );
+      if (
+        !authorityRereadMatches({
+          requested: input.authority,
+          observation,
+          snapshot: input.snapshot,
+          initial: live,
+          current: beforePush,
+        })
+        || !beforePushBoundaryMatches
+      ) {
+        return rejection(
+          observation,
+          'authority-changed',
+          'Relay exact repository authority changed before expected-old push',
+          now,
+        );
+      }
+      if (beforePush.cancellationRequested) {
+        if (beforePush.pr !== undefined) {
+          await dependencies.publisher.closeDraftPullRequest({
+            ...pinnedRepository,
+            targetRepository: input.authority.targetRepository,
+            pr: beforePush.pr,
+            expectedHead: beforePush.pr.head,
+            reason: 'Relay generation was cancelled',
+          });
+        }
+        return rejection(
+          observation,
+          'cancelled',
+          'Relay generation was cancelled before expected-old push',
+          now,
+        );
+      }
+
       const published = await dependencies.publisher.commitAndPush({
         generation: input.authority.generation,
         round: input.authority.round,
         branch: input.authority.branch,
         targetRepository: input.authority.targetRepository,
-        targetRepositoryId: live.targetRepositoryId,
+        ...pinnedRepository,
         forkRepository: input.authority.forkRepository,
-        forkRepositoryId: live.forkRepositoryId,
-        forkParentRepositoryId: live.forkParentRepositoryId,
         worktreePath: live.worktree.path,
         inputHead: input.authority.inputHead,
         expectedTree,
@@ -665,17 +818,41 @@ export function makeRelayAdoptionCoordinator(
         ...input,
         observation,
       });
-      if (!liveStaticCorrelationMatches({
-        requested: input.authority,
-        observation,
-        snapshot: input.snapshot,
-        live: afterPush,
-      }) || afterPush.expectedForkHead !== published.resultingHead) {
-        throw new Error('Relay exact authority changed after expected-old fork push');
+      const afterPushPrMatches = afterPush.pr === undefined
+        ? expectedPrNumber === undefined
+        : (
+          expectedPrNumber !== undefined
+          && exactPublishedPr({
+            pr: afterPush.pr,
+            authority: input.authority,
+            defaultBranch: afterPush.defaultBranch,
+            resultingHead: published.resultingHead,
+            repository: live,
+            expectedPrNumber,
+          })
+        );
+      if (
+        !authorityRereadMatches({
+          requested: input.authority,
+          observation,
+          snapshot: input.snapshot,
+          initial: live,
+          current: afterPush,
+        })
+        || afterPush.expectedForkHead !== published.resultingHead
+        || !afterPushPrMatches
+      ) {
+        return rejection(
+          observation,
+          'authority-changed',
+          'Relay exact authority changed after expected-old fork push',
+          now,
+        );
       }
       if (afterPush.cancellationRequested) {
         if (afterPush.pr !== undefined) {
           await dependencies.publisher.closeDraftPullRequest({
+            ...pinnedRepository,
             targetRepository: input.authority.targetRepository,
             pr: afterPush.pr,
             expectedHead: published.resultingHead,
@@ -691,6 +868,7 @@ export function makeRelayAdoptionCoordinator(
       }
 
       const pr = await dependencies.publisher.ensureDraftPullRequest({
+        ...pinnedRepository,
         generation: input.authority.generation,
         targetRepository: input.authority.targetRepository,
         forkRepository: input.authority.forkRepository,
@@ -698,14 +876,15 @@ export function makeRelayAdoptionCoordinator(
         resultingHead: published.resultingHead,
         defaultBranch: afterPush.defaultBranch,
         issueNumber: input.snapshot.issue.number,
-        existingPrNumber:
-          input.authority.existingPrNumber ?? afterPush.pr?.number,
+        existingPrNumber: expectedPrNumber,
       });
       if (!exactPublishedPr({
         pr,
         authority: input.authority,
         defaultBranch: afterPush.defaultBranch,
         resultingHead: published.resultingHead,
+        repository: live,
+        expectedPrNumber,
       })) {
         throw new Error('Relay draft pull request failed exact adoption readback');
       }
@@ -715,11 +894,12 @@ export function makeRelayAdoptionCoordinator(
         observation,
       });
       if (
-        !liveStaticCorrelationMatches({
+        !authorityRereadMatches({
           requested: input.authority,
           observation,
           snapshot: input.snapshot,
-          live: afterPr,
+          initial: live,
+          current: afterPr,
         })
         || afterPr.expectedForkHead !== published.resultingHead
         || afterPr.serviceLogin !== live.serviceLogin
@@ -730,6 +910,8 @@ export function makeRelayAdoptionCoordinator(
           authority: input.authority,
           defaultBranch: afterPr.defaultBranch,
           resultingHead: published.resultingHead,
+          repository: live,
+          expectedPrNumber: pr.number,
         })
       ) {
         return rejection(
@@ -741,6 +923,7 @@ export function makeRelayAdoptionCoordinator(
       }
       if (afterPr.cancellationRequested) {
         await dependencies.publisher.closeDraftPullRequest({
+          ...pinnedRepository,
           targetRepository: input.authority.targetRepository,
           pr,
           expectedHead: published.resultingHead,
@@ -764,6 +947,7 @@ export function makeRelayAdoptionCoordinator(
         now,
       });
       const readback = await dependencies.publisher.publishAdoptionReceipt({
+        ...pinnedRepository,
         targetRepository: input.authority.targetRepository,
         pr,
         serviceLogin: afterPr.serviceLogin,
@@ -774,6 +958,51 @@ export function makeRelayAdoptionCoordinator(
         || !isDeepStrictEqual(readback, receipt)
       ) {
         throw new Error('Relay adoption receipt did not read back exactly');
+      }
+      const afterReceipt = await dependencies.authority.readExact({
+        ...input,
+        observation,
+      });
+      if (
+        !authorityRereadMatches({
+          requested: input.authority,
+          observation,
+          snapshot: input.snapshot,
+          initial: live,
+          current: afterReceipt,
+        })
+        || afterReceipt.expectedForkHead !== published.resultingHead
+        || afterReceipt.pr === undefined
+        || !exactPublishedPr({
+          pr: afterReceipt.pr,
+          authority: input.authority,
+          defaultBranch: afterReceipt.defaultBranch,
+          resultingHead: published.resultingHead,
+          repository: live,
+          expectedPrNumber: pr.number,
+        })
+      ) {
+        return rejection(
+          observation,
+          'authority-changed',
+          'Relay exact authority changed after adoption receipt publication',
+          now,
+        );
+      }
+      if (afterReceipt.cancellationRequested) {
+        await dependencies.publisher.closeDraftPullRequest({
+          ...pinnedRepository,
+          targetRepository: input.authority.targetRepository,
+          pr: afterReceipt.pr,
+          expectedHead: published.resultingHead,
+          reason: 'Relay generation was cancelled',
+        });
+        return rejection(
+          observation,
+          'cancelled',
+          'Relay generation was cancelled during adoption receipt publication',
+          now,
+        );
       }
       return {
         status: 'accepted',
