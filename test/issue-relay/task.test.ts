@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdtempSync,
   readFileSync,
@@ -291,7 +292,124 @@ function initialTask(): RelayTaskSpec {
   });
 }
 
+function taskAtCanonicalSpecBytes(targetBytes: number): RelayTaskSpec {
+  const task = initialTask();
+  const empty = {
+    ...task,
+    spec: {
+      ...task.spec,
+      problem_statement: '',
+    },
+  };
+  const fixedBytes = Buffer.byteLength(
+    `${JSON.stringify(empty.spec, null, 2)}\n`,
+  );
+  if (targetBytes < fixedBytes) {
+    throw new RangeError('Target Relay spec size is smaller than its fixed fields');
+  }
+  const sized = {
+    ...empty,
+    spec: {
+      ...empty.spec,
+      problem_statement: 'x'.repeat(targetBytes - fixedBytes),
+    },
+  };
+  if (
+    Buffer.byteLength(`${JSON.stringify(sized.spec, null, 2)}\n`)
+    !== targetBytes
+  ) {
+    throw new Error('Failed to synthesize an exact-size Relay spec');
+  }
+  return sized;
+}
+
 describe('Relay marketplace request persistence', () => {
+  it('accepts an exact 2 MiB canonical Relay spec and rejects one additional byte', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-'));
+    temporaryDirectories.push(directory);
+    const request = {
+      solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
+      specPath: join(directory, 'spec.json'),
+      createdAt: '2026-07-28T10:03:00.000Z',
+      submitBy: '2026-07-28T10:18:00.000Z',
+    };
+
+    expect(Buffer.byteLength(buildRelayMarketplaceRequest({
+      ...request,
+      task: taskAtCanonicalSpecBytes(2 * 1024 * 1024),
+    }).specBytes)).toBe(2 * 1024 * 1024);
+    expect(() => buildRelayMarketplaceRequest({
+      ...request,
+      task: taskAtCanonicalSpecBytes(2 * 1024 * 1024 + 1),
+    })).toThrow(/spec.*2 MiB|spec.*byte limit/i);
+  });
+
+  it('rejects an oversized Relay spec before persistence writes either artifact', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-'));
+    temporaryDirectories.push(directory);
+    const requestPath = join(directory, 'request.json');
+    const specPath = join(directory, 'spec.json');
+    const exact = buildRelayMarketplaceRequest({
+      task: taskAtCanonicalSpecBytes(2 * 1024 * 1024),
+      solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
+      specPath,
+      createdAt: '2026-07-28T10:03:00.000Z',
+      submitBy: '2026-07-28T10:18:00.000Z',
+    });
+    const spec = JSON.parse(exact.specBytes) as RelayTaskSpec['spec'];
+    const specBytes = `${JSON.stringify({
+      ...spec,
+      problem_statement: `${spec.problem_statement}x`,
+    }, null, 2)}\n`;
+    const oversized = {
+      ...exact,
+      specBytes,
+      specDigest:
+        `sha256:${createHash('sha256').update(specBytes).digest('hex')}` as const,
+    };
+
+    expect(() => persistRelayMarketplaceRequest(requestPath, oversized))
+      .toThrow(/spec.*2 MiB|spec.*byte limit/i);
+    expect(existsSync(requestPath)).toBe(false);
+    expect(existsSync(specPath)).toBe(false);
+  });
+
+  it('rejects an oversized canonical Relay spec during replay verification', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-'));
+    temporaryDirectories.push(directory);
+    const requestPath = join(directory, 'request.json');
+    const specPath = join(directory, 'spec.json');
+    const exact = buildRelayMarketplaceRequest({
+      task: taskAtCanonicalSpecBytes(2 * 1024 * 1024),
+      solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
+      specPath,
+      createdAt: '2026-07-28T10:03:00.000Z',
+      submitBy: '2026-07-28T10:18:00.000Z',
+    });
+    const spec = JSON.parse(exact.specBytes) as RelayTaskSpec['spec'];
+    const specBytes = `${JSON.stringify({
+      ...spec,
+      problem_statement: `${spec.problem_statement}x`,
+    }, null, 2)}\n`;
+    const oversized = {
+      ...exact,
+      specBytes,
+      specDigest:
+        `sha256:${createHash('sha256').update(specBytes).digest('hex')}` as const,
+    };
+    const requestBytes = Buffer.from(`${JSON.stringify(oversized, null, 2)}\n`);
+    writeFileSync(specPath, specBytes, { mode: 0o600 });
+    writeFileSync(requestPath, requestBytes, { mode: 0o600 });
+
+    expect(() => verifyRelayMarketplaceRequest(
+      requestPath,
+      `sha256:${createHash('sha256').update(requestBytes).digest('hex')}`,
+    )).toThrow(/spec.*2 MiB|spec.*byte limit/i);
+  });
+
   it('persists canonical request and exact spec bytes as fsynced private regular absolute files', () => {
     const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-'));
     temporaryDirectories.push(directory);

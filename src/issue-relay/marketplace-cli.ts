@@ -19,6 +19,13 @@ import {
   type IssueRelayRoundV1,
   type IssueRelayVerdictV1,
 } from './contracts.js';
+import {
+  ISSUE_RELAY_MAX_ENVELOPE_CID_BYTES,
+  ISSUE_RELAY_MAX_OBSERVATION_DETAIL_BYTES,
+  ISSUE_RELAY_MAX_OBSERVATION_REASON_BYTES,
+  ISSUE_RELAY_MAX_PATCH_BYTES,
+  ISSUE_RELAY_MAX_TASK_ID_DECIMAL_DIGITS,
+} from './limits.js';
 import { verifyRelayMarketplaceRequest } from './task.js';
 
 export type IssueRelayMarketplaceSubprocess = MarketplaceMachineSubprocess;
@@ -114,9 +121,11 @@ const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const HEX_32_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const TASK_ID_PATTERN = /^(0|[1-9][0-9]*)$/;
 const TASK_CID_PATTERN = /^f01551220[0-9a-f]{64}$/;
-const ISSUE_RELAY_MAX_PATCH_BYTES = 2 * 1024 * 1024;
 const CANONICAL_UTC_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const UINT256_MAX = (1n << 256n) - 1n;
+const ENVELOPE_CID_PATTERN =
+  /^(?:f01551220[0-9a-f]{64}|b[a-z2-7]{57}[aeimquy6])$/;
 
 function exactKeys(
   record: Readonly<Record<string, unknown>>,
@@ -377,10 +386,31 @@ function parseSubmission(
 }
 
 const nonEmpty = z.string().min(1);
+const boundedText = (maxBytes: number, label: string) =>
+  nonEmpty
+    .refine((value) => !value.includes('\u0000'), `${label} must not contain NUL`)
+    .refine(
+      (value) => new TextEncoder().encode(value).byteLength <= maxBytes,
+      `${label} exceeds its UTF-8 byte limit`,
+    );
 const address = z.string().regex(ADDRESS_PATTERN);
 const hex32 = z.string().regex(HEX_32_PATTERN);
-const taskId = z.string().regex(TASK_ID_PATTERN);
+const taskId = z.string()
+  .regex(TASK_ID_PATTERN)
+  .max(ISSUE_RELAY_MAX_TASK_ID_DECIMAL_DIGITS)
+  .refine((value) => BigInt(value) <= UINT256_MAX, 'Task ID exceeds uint256');
 const taskCid = z.string().regex(TASK_CID_PATTERN);
+const envelopeCid = z.string()
+  .max(ISSUE_RELAY_MAX_ENVELOPE_CID_BYTES)
+  .regex(ENVELOPE_CID_PATTERN);
+const observationReason = boundedText(
+  ISSUE_RELAY_MAX_OBSERVATION_REASON_BYTES,
+  'Issue Relay observation reason',
+);
+const observationDetail = boundedText(
+  ISSUE_RELAY_MAX_OBSERVATION_DETAIL_BYTES,
+  'Issue Relay observation detail',
+);
 const nonNegativeInteger = z.number().int().safe().nonnegative();
 const observationCommon = {
   status: z.literal('verified'),
@@ -391,7 +421,7 @@ const observationCommon = {
     operator: address,
   }).strict(),
   delivery: z.object({
-    envelopeCid: nonEmpty,
+    envelopeCid,
     transactionHash: hex32,
     blockNumber: nonNegativeInteger,
   }).strict(),
@@ -400,13 +430,13 @@ const observationCommon = {
 const observationSchema = z.union([
   z.object({
     status: z.literal('pending'),
-    reason: nonEmpty,
-    detail: nonEmpty.optional(),
+    reason: observationReason,
+    detail: observationDetail.optional(),
   }).strict(),
   z.object({
     status: z.literal('contradiction'),
-    reason: nonEmpty,
-    detail: nonEmpty,
+    reason: observationReason,
+    detail: observationDetail,
   }).strict(),
   z.object({
     ...observationCommon,

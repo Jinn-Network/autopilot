@@ -89,7 +89,7 @@ const observation: Extract<
     operator: `0x${'e'.repeat(40)}`,
   },
   delivery: {
-    envelopeCid: 'bafy-delivery',
+    envelopeCid: `f01551220${'d'.repeat(64)}`,
     transactionHash: `0x${'f'.repeat(64)}`,
     blockNumber: 120,
   },

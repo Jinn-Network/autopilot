@@ -71,6 +71,7 @@ const task = buildRelayTaskSpec({
 const creatorSafe = `0x${'a'.repeat(40)}`;
 const creationTx = `0x${'b'.repeat(64)}`;
 const taskCid = `f01551220${'c'.repeat(64)}`;
+const envelopeCid = `f01551220${'d'.repeat(64)}`;
 const manifestCid = 'bafy-solver-net';
 const submitted = {
   schemaVersion: 1,
@@ -528,7 +529,7 @@ describe('Issue Relay marketplace CLI observation', () => {
         operator: `0x${'e'.repeat(40)}`,
       },
       delivery: {
-        envelopeCid: 'bafy-delivery',
+        envelopeCid,
         transactionHash: `0x${'f'.repeat(64)}`,
         blockNumber: 120,
       },
@@ -552,6 +553,66 @@ describe('Issue Relay marketplace CLI observation', () => {
     })).toThrow();
   });
 
+  it('bounds canonical Task IDs, envelope CIDs, and pending diagnostics', () => {
+    const maximumTaskId = ((1n << 256n) - 1n).toString();
+    const maximumPending = {
+      status: 'pending' as const,
+      reason: 'r'.repeat(240),
+      detail: 'd'.repeat(8 * 1024),
+    };
+    const verified = {
+      status: 'verified' as const,
+      role: 'solution' as const,
+      task: { taskId: maximumTaskId, taskCid },
+      attempt: {
+        attemptIndex: 0,
+        requestId: `0x${'d'.repeat(64)}`,
+        operator: `0x${'e'.repeat(40)}`,
+      },
+      delivery: {
+        envelopeCid,
+        transactionHash: `0x${'f'.repeat(64)}`,
+        blockNumber: 120,
+      },
+      round: task.spec.relay,
+      payload: {
+        schemaVersion: 'jinn-repo-solution.v1' as const,
+        patch: 'diff --git a/a.ts b/a.ts\n',
+      },
+    };
+
+    expect(parseIssueRelayDeliveryObservation(verified))
+      .toMatchObject({ task: { taskId: maximumTaskId } });
+    expect(parseIssueRelayDeliveryObservation(maximumPending))
+      .toEqual(maximumPending);
+
+    for (const invalid of [
+      {
+        ...verified,
+        task: { ...verified.task, taskId: (1n << 256n).toString() },
+      },
+      {
+        ...verified,
+        task: { ...verified.task, taskId: '01' },
+      },
+      {
+        ...verified,
+        delivery: { ...verified.delivery, envelopeCid: `${envelopeCid}0` },
+      },
+      {
+        status: 'pending',
+        reason: 'r'.repeat(241),
+      },
+      {
+        status: 'contradiction',
+        reason: 'task-mismatch',
+        detail: 'd'.repeat(8 * 1024 + 1),
+      },
+    ]) {
+      expect(() => parseIssueRelayDeliveryObservation(invalid)).toThrow();
+    }
+  });
+
   it('uses the exact read-only observation argv and accepts one strict verified envelope', async () => {
     const fixture = persistedRequest();
     const observation = {
@@ -564,7 +625,7 @@ describe('Issue Relay marketplace CLI observation', () => {
         operator: `0x${'e'.repeat(40)}`,
       },
       delivery: {
-        envelopeCid: 'bafy-delivery',
+        envelopeCid,
         transactionHash: `0x${'f'.repeat(64)}`,
         blockNumber: 120,
       },
