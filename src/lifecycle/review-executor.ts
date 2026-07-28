@@ -156,6 +156,7 @@ export type ReviewClaimAcquisitionResult =
       readonly status: 'acquired';
       readonly claim: AcquiredExactHeadReviewClaim;
       readonly confirmed: ReviewActionCandidate;
+      readonly credential: SelectedCredential;
     }
   | {
       readonly status: 'already-approved';
@@ -540,6 +541,7 @@ export async function acquireExactHeadReviewClaim(
       paths: attempt.paths,
     },
     confirmed,
+    credential: selection.credential,
   };
 }
 
@@ -571,18 +573,11 @@ export async function executeReviewAction(
         return { status: 'ambiguous', prNumber };
     }
   }
-  const { claim, confirmed } = acquired;
+  const { claim, confirmed, credential } = acquired;
   const manifestPaths = claim.paths;
-  const selection = selectCredential(deps.credentials, {
-    phase: 'review',
-    prAuthor: confirmed.author,
-  });
-  if (selection.status !== 'selected') {
-    throw new Error('Review claim acquisition credential is unavailable');
-  }
   const environment = buildSanitizedChildEnv(
     deps.ambientEnvironment,
-    selection.credential,
+    credential,
     {
       ghConfigDir: manifestPaths.ghConfigDir,
       askpassPath: manifestPaths.askpass,

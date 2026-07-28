@@ -402,6 +402,42 @@ describe('review action executor', () => {
     expect(h.records[0]?.reviewer).toBe('one-bot');
   });
 
+  it('spawns with the acquisition credential when confirmed author diverges from candidate', async () => {
+    const h = harness({
+      credentials: pool([
+        {
+          login: 'review-bot',
+          normalizedLogin: 'review-bot',
+          reviewToken: 'review-secret',
+        },
+        {
+          login: 'impl-bot',
+          normalizedLogin: 'impl-bot',
+          implementationToken: 'impl-secret',
+        },
+      ]),
+      readCandidate: async () => candidate({ author: 'someone-else' }),
+      confirmAcquisition: async ({ expectedHead, expectedReviewRefOid }) => candidate({
+        author: 'review-bot',
+        head: expectedHead,
+        reviewRef: {
+          oid: expectedReviewRefOid,
+          record: claim({ reviewer: 'review-bot' }),
+        },
+      }),
+      startSession: async (request) => {
+        const input = request.local.spawnInput;
+        expect(request.reviewerLogin).toBe('review-bot');
+        expect(input.environment.GH_TOKEN).toBe('review-secret');
+        return { status: 'started', backend: 'local', pid: 42 };
+      },
+    });
+
+    await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned', reviewer: 'review-bot' });
+    expect(h.records[0]?.reviewer).toBe('review-bot');
+  });
+
   it('fails canonical ambiguity, Human evidence, self-review, and wrong draft policy closed', async () => {
     const cases: ReviewActionCandidate[] = [
       candidate({ mappingProblem: 'Canonical mapping changed to issue #43.' }),
