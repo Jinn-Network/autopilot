@@ -117,6 +117,15 @@ describe('Relay jinn-repo task construction', () => {
     });
   });
 
+  it('enforces the exact 2 MiB canonical spec bound during task construction', () => {
+    const exact = constructedTaskAtCanonicalSpecBytes(2 * 1024 * 1024);
+
+    expect(Buffer.byteLength(`${JSON.stringify(exact.spec, null, 2)}\n`))
+      .toBe(2 * 1024 * 1024);
+    expect(() => constructedTaskAtCanonicalSpecBytes(2 * 1024 * 1024 + 1))
+      .toThrow(/spec.*2 MiB|spec.*byte limit/i);
+  });
+
   it('binds repairs to the public managed fork and exact current PR head while quoting bounded findings', () => {
     const finding = {
       code: 'review-command',
@@ -292,6 +301,50 @@ function initialTask(): RelayTaskSpec {
   });
 }
 
+function constructedTaskAtCanonicalSpecBytes(targetBytes: number): RelayTaskSpec {
+  const {
+    schemaVersion: _schemaVersion,
+    snapshotDigest: _snapshotDigest,
+    ...snapshotInput
+  } = snapshot;
+  const emptySnapshot = buildRelaySnapshot({
+    ...snapshotInput,
+    issue: {
+      ...snapshotInput.issue,
+      body: '',
+    },
+  });
+  const emptyTask = buildRelayTaskSpec({
+    snapshot: emptySnapshot,
+    round: 0,
+    purpose: 'initial',
+    workspaceRepository: 'Jinn-Network/mono',
+    inputHead: base,
+    findings: [],
+  });
+  const fixedBytes = Buffer.byteLength(
+    `${JSON.stringify(emptyTask.spec, null, 2)}\n`,
+  );
+  if (targetBytes < fixedBytes) {
+    throw new RangeError('Target Relay spec size is smaller than its fixed fields');
+  }
+  const sizedSnapshot = buildRelaySnapshot({
+    ...snapshotInput,
+    issue: {
+      ...snapshotInput.issue,
+      body: 'x'.repeat(targetBytes - fixedBytes),
+    },
+  });
+  return buildRelayTaskSpec({
+    snapshot: sizedSnapshot,
+    round: 0,
+    purpose: 'initial',
+    workspaceRepository: 'Jinn-Network/mono',
+    inputHead: base,
+    findings: [],
+  });
+}
+
 function taskAtCanonicalSpecBytes(targetBytes: number): RelayTaskSpec {
   const task = initialTask();
   const empty = {
@@ -334,11 +387,17 @@ describe('Relay marketplace request persistence', () => {
       createdAt: '2026-07-28T10:03:00.000Z',
       submitBy: '2026-07-28T10:18:00.000Z',
     };
-
-    expect(Buffer.byteLength(buildRelayMarketplaceRequest({
+    const exact = buildRelayMarketplaceRequest({
       ...request,
       task: taskAtCanonicalSpecBytes(2 * 1024 * 1024),
-    }).specBytes)).toBe(2 * 1024 * 1024);
+    });
+
+    expect(Buffer.byteLength(exact.specBytes)).toBe(2 * 1024 * 1024);
+    expect(persistRelayMarketplaceRequest(
+      join(directory, 'request.json'),
+      exact,
+    )).toMatchObject({ reused: false });
+    expect(readFileSync(request.specPath).byteLength).toBe(2 * 1024 * 1024);
     expect(() => buildRelayMarketplaceRequest({
       ...request,
       task: taskAtCanonicalSpecBytes(2 * 1024 * 1024 + 1),
@@ -372,6 +431,41 @@ describe('Relay marketplace request persistence', () => {
 
     expect(() => persistRelayMarketplaceRequest(requestPath, oversized))
       .toThrow(/spec.*2 MiB|spec.*byte limit/i);
+    expect(existsSync(requestPath)).toBe(false);
+    expect(existsSync(specPath)).toBe(false);
+  });
+
+  it('rejects compact input whose canonical spec is limit plus one before installing either artifact', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-'));
+    temporaryDirectories.push(directory);
+    const requestPath = join(directory, 'request.json');
+    const specPath = join(directory, 'spec.json');
+    const exact = buildRelayMarketplaceRequest({
+      task: taskAtCanonicalSpecBytes(2 * 1024 * 1024),
+      solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
+      specPath,
+      createdAt: '2026-07-28T10:03:00.000Z',
+      submitBy: '2026-07-28T10:18:00.000Z',
+    });
+    const oversizedSpec = taskAtCanonicalSpecBytes(
+      2 * 1024 * 1024 + 1,
+    ).spec;
+    const compactSpecBytes = JSON.stringify(oversizedSpec);
+    const canonicalSpecBytes = `${JSON.stringify(oversizedSpec, null, 2)}\n`;
+    const forged = {
+      ...exact,
+      specBytes: compactSpecBytes,
+      specDigest:
+        `sha256:${createHash('sha256').update(compactSpecBytes).digest('hex')}` as const,
+    };
+
+    expect(Buffer.byteLength(compactSpecBytes))
+      .toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(Buffer.byteLength(canonicalSpecBytes))
+      .toBe(2 * 1024 * 1024 + 1);
+    expect(() => persistRelayMarketplaceRequest(requestPath, forged))
+      .toThrow(/canonical|spec.*2 MiB|spec.*byte limit/i);
     expect(existsSync(requestPath)).toBe(false);
     expect(existsSync(specPath)).toBe(false);
   });
