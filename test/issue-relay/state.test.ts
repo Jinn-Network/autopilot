@@ -260,6 +260,7 @@ function readyInput(
       branch: acceptedAdoption.branch,
       head: HEAD,
       base: 'main',
+      open: true,
       draft: true,
       generation,
     },
@@ -279,6 +280,7 @@ function livePr(head = HEAD) {
     branch: acceptedAdoption.branch,
     head,
     base: 'main',
+    open: true,
     draft: true,
     generation,
   };
@@ -290,14 +292,25 @@ describe('pure exact-head Relay readiness', () => {
       .toEqual({ ready: false, reason: 'draft-missing' });
   });
 
+  it('returns draft-missing when the live draft PR is closed', () => {
+    expect(deriveRelayReady(readyInput({
+      draft: {
+        ...readyInput().draft!,
+        open: false,
+      },
+    } as unknown as Partial<RelayReadyInput>)))
+      .toEqual({ ready: false, reason: 'draft-missing' });
+  });
+
   it('returns checks-pending when a required check is pending', () => {
     const checks = aggregateRelayChecks({
       head: HEAD,
-      branchRequiredChecks: ['build'],
+      branchRequiredChecks: [{ name: 'build', appId: 101 }],
       profile: { name: 'jinn-mono.v1', requiredChecks: [] },
       checks: [{
         kind: 'check-run',
         name: 'build',
+        appId: 101,
         head: HEAD,
         status: 'queued',
         conclusion: null,
@@ -312,11 +325,12 @@ describe('pure exact-head Relay readiness', () => {
   it('returns checks-failed when a required check failed', () => {
     const checks = aggregateRelayChecks({
       head: HEAD,
-      branchRequiredChecks: ['build'],
+      branchRequiredChecks: [{ name: 'build', appId: 101 }],
       profile: { name: 'jinn-mono.v1', requiredChecks: [] },
       checks: [{
         kind: 'check-run',
         name: 'build',
+        appId: 101,
         head: HEAD,
         status: 'completed',
         conclusion: 'failure',
@@ -344,6 +358,90 @@ describe('pure exact-head Relay readiness', () => {
         },
       },
     }))).toEqual({ ready: false, reason: 'verdict-failed' });
+  });
+
+  it.each([
+    [
+      'a noncanonical accepted adoption receipt',
+      {
+        adoption: {
+          ...acceptedAdoption,
+          receipt: {
+            ...acceptedAdoption.receipt,
+            untrusted: true,
+          },
+        },
+      },
+      'verdict-failed',
+    ],
+    [
+      'a noncanonical evaluation anchor',
+      {
+        evaluationAnchor: {
+          ...evaluationAnchor,
+          untrusted: true,
+        },
+      },
+      'verdict-failed',
+    ],
+    [
+      'a pending marketplace observation',
+      {
+        verdict: {
+          status: 'pending',
+          reason: 'verdict-not-delivered',
+        },
+      },
+      'verdict-pending',
+    ],
+    [
+      'a solution-shaped marketplace observation',
+      {
+        verdict: {
+          ...authenticatedVerdict,
+          role: 'solution',
+          payload: {
+            schemaVersion: 'jinn-repo-solution.v1',
+            patch: 'diff --git a/a b/a\n',
+          },
+        },
+      },
+      'verdict-failed',
+    ],
+    [
+      'a verdict payload missing correlation',
+      {
+        verdict: {
+          ...authenticatedVerdict,
+          payload: {
+            schemaVersion: 'jinn-issue-relay-verdict.v1',
+            outcome: 'pass',
+            evaluatedHead: HEAD,
+            summary: 'Forged without correlation.',
+            findings: [],
+          },
+        },
+      },
+      'verdict-failed',
+    ],
+    [
+      'a noncanonical verified verdict observation',
+      {
+        verdict: {
+          ...authenticatedVerdict,
+          untrusted: true,
+        },
+      },
+      'verdict-failed',
+    ],
+  ] as const)('fails closed without throwing for %s', (
+    _label,
+    overrides,
+    reason,
+  ) => {
+    expect(deriveRelayReady(readyInput(
+      overrides as unknown as Partial<RelayReadyInput>,
+    ))).toEqual({ ready: false, reason });
   });
 
   it('returns stale-head when any approval belongs to another current head', () => {
@@ -614,6 +712,68 @@ describe('Relay state/action transition table', () => {
 
     expect(deriveRelayAction(facts(record, {
       currentPr: livePr(),
+    }), policy)).toMatchObject({ kind: 'none' });
+  });
+
+  it('evaluating never promotes a TypeScript-shaped forged anchor', () => {
+    const record = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: {
+        number: 68,
+        branch: acceptedAdoption.branch,
+        head: HEAD,
+        draft: true,
+      },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(),
+      readiness: {
+        adoption: acceptedAdoption,
+        checks: readyChecks,
+        evaluationAnchor: {
+          ...evaluationAnchor,
+          untrusted: true,
+        } as unknown as typeof evaluationAnchor,
+        verdict: authenticatedVerdict,
+      },
+    }), policy)).toMatchObject({ kind: 'none' });
+  });
+
+  it('evaluating never marks a closed draft PR ready', () => {
+    const record = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: {
+        number: 68,
+        branch: acceptedAdoption.branch,
+        head: HEAD,
+        draft: true,
+      },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: {
+        ...livePr(),
+        open: false,
+      } as unknown as RelayAuthoritativeFacts['currentPr'],
+      readiness: {
+        adoption: acceptedAdoption,
+        checks: readyChecks,
+        evaluationAnchor,
+        verdict: authenticatedVerdict,
+      },
     }), policy)).toMatchObject({ kind: 'none' });
   });
 

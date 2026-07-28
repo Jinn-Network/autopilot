@@ -2,8 +2,15 @@ import { isDeepStrictEqual } from 'node:util';
 import type { IssueRelaySnapshotV1 } from './snapshot.js';
 import { relayTaskKey } from './identity.js';
 import type { AcceptedRelayAdoption } from './adoption.js';
-import type { IssueRelayEvaluationAnchorV1 } from './contracts.js';
-import type { VerifiedIssueRelayVerdictObservation } from './marketplace-cli.js';
+import {
+  IssueRelayAdoptionReceiptV1Schema,
+  IssueRelayEvaluationAnchorV1Schema,
+  type IssueRelayEvaluationAnchorV1,
+} from './contracts.js';
+import {
+  parseIssueRelayDeliveryObservation,
+  type VerifiedIssueRelayVerdictObservation,
+} from './marketplace-cli.js';
 import {
   relayAdoptionReceiptDigest,
   relayRequiredCheckStatus,
@@ -107,6 +114,7 @@ export interface RelayAuthoritativeFacts {
     readonly branch: string;
     readonly head: string;
     readonly base: string;
+    readonly open: boolean;
     readonly draft: boolean;
     readonly generation: string;
   };
@@ -130,6 +138,7 @@ export interface RelayReadyInput extends RelayReadyEvidence {
     readonly branch: string;
     readonly head: string;
     readonly base: string;
+    readonly open: boolean;
     readonly draft: boolean;
     readonly generation: string;
   };
@@ -290,6 +299,7 @@ function livePrMatchesDurable(facts: RelayAuthoritativeFacts): boolean {
     && durablePr.branch === livePr.branch
     && durablePr.head === livePr.head
     && durablePr.draft === livePr.draft
+    && livePr.open
     && livePr.base === facts.durable?.snapshot.repository.defaultBranch
     && livePr.generation === facts.durable?.generation
     && durablePr.draft;
@@ -325,21 +335,74 @@ RelayReadyDecision {
 export function deriveRelayReady(input: RelayReadyInput): RelayReadyDecision {
   if (input.cancelled) return notReady('cancelled');
   if (input.exhausted) return notReady('exhausted');
+
+  const adoptionRecord = input.adoption as unknown;
+  if (
+    adoptionRecord === null
+    || typeof adoptionRecord !== 'object'
+    || Array.isArray(adoptionRecord)
+  ) {
+    return notReady('verdict-failed');
+  }
+  const adoptionCandidate = adoptionRecord as Partial<AcceptedRelayAdoption>;
+  const receiptResult = IssueRelayAdoptionReceiptV1Schema.safeParse(
+    adoptionCandidate.receipt,
+  );
+  if (
+    adoptionCandidate.status !== 'accepted'
+    || typeof adoptionCandidate.branch !== 'string'
+    || typeof adoptionCandidate.resultingHead !== 'string'
+    || !Number.isSafeInteger(adoptionCandidate.prNumber)
+    || receiptResult.success === false
+    || receiptResult.data.disposition !== 'accepted'
+  ) {
+    return notReady('verdict-failed');
+  }
+  const adoption = adoptionCandidate as AcceptedRelayAdoption;
+  const receipt = receiptResult.data as AcceptedRelayAdoption['receipt'];
+
+  let anchor: IssueRelayEvaluationAnchorV1 | undefined;
+  if (input.evaluationAnchor !== undefined) {
+    const anchorResult = IssueRelayEvaluationAnchorV1Schema.safeParse(
+      input.evaluationAnchor,
+    );
+    if (anchorResult.success === false) return notReady('verdict-failed');
+    anchor = anchorResult.data as IssueRelayEvaluationAnchorV1;
+  }
+
+  let verdict: VerifiedIssueRelayVerdictObservation | undefined;
+  let verdictState: 'missing' | 'pending' | 'failed' | 'verified' =
+    input.verdict === undefined ? 'missing' : 'failed';
+  if (input.verdict !== undefined) {
+    try {
+      const observation = parseIssueRelayDeliveryObservation(input.verdict);
+      if (observation.status === 'pending') {
+        verdictState = 'pending';
+      } else if (
+        observation.status === 'verified'
+        && observation.role === 'verdict'
+      ) {
+        verdict = observation;
+        verdictState = 'verified';
+      }
+    } catch {
+      verdictState = 'failed';
+    }
+  }
+
   if (
     input.draft === undefined
+    || !input.draft.open
     || !input.draft.draft
-    || input.draft.number !== input.adoption.prNumber
+    || input.draft.number !== adoption.prNumber
   ) {
     return notReady('draft-missing');
   }
 
-  const { receipt } = input.adoption;
-  const anchor = input.evaluationAnchor;
-  const verdict = input.verdict;
   const heads = [
     input.currentHead,
     input.draft.head,
-    input.adoption.resultingHead,
+    adoption.resultingHead,
     receipt.resultingHead,
     input.checks.head,
     ...(anchor === undefined ? [] : [anchor.evaluatedHead]),
@@ -348,9 +411,8 @@ export function deriveRelayReady(input: RelayReadyInput): RelayReadyDecision {
   if (
     !heads.every((head) => GIT_OID_PATTERN.test(head))
     || heads.some((head) => head !== input.currentHead)
-    || input.adoption.status !== 'accepted'
-    || input.adoption.branch !== receipt.headRef
-    || input.adoption.prNumber !== receipt.prNumber
+    || adoption.branch !== receipt.headRef
+    || adoption.prNumber !== receipt.prNumber
     || input.draft.branch !== receipt.headRef
     || input.draft.generation !== receipt.correlation.generation
   ) {
@@ -384,7 +446,10 @@ export function deriveRelayReady(input: RelayReadyInput): RelayReadyDecision {
     return notReady('checks-failed');
   }
   if (
-    anchor.adoptionReceiptDigest !== relayAdoptionReceiptDigest(input.adoption)
+    anchor.adoptionReceiptDigest !== relayAdoptionReceiptDigest({
+      ...adoption,
+      receipt,
+    })
     || !isDeepStrictEqual(anchor.correlation, receipt.correlation)
     || anchor.targetRepository !== receipt.targetRepository
     || anchor.workspaceRepository !== receipt.workspaceRepository
@@ -393,7 +458,12 @@ export function deriveRelayReady(input: RelayReadyInput): RelayReadyDecision {
   ) {
     return notReady('verdict-failed');
   }
-  if (verdict === undefined) return notReady('verdict-pending');
+  if (verdictState === 'missing' || verdictState === 'pending') {
+    return notReady('verdict-pending');
+  }
+  if (verdictState === 'failed' || verdict === undefined) {
+    return notReady('verdict-failed');
+  }
   if (
     verdict.payload.outcome !== 'pass'
     || verdict.attempt.operator.toLocaleLowerCase('en-US')

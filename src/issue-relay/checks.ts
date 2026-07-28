@@ -18,6 +18,7 @@ const EVALUATION_ANCHOR_MARKER =
   '<!-- jinn-issue-relay:evaluation-anchor:v1 -->';
 
 export interface RelayCheck {
+  readonly kind: 'check-run' | 'status-context' | 'any';
   readonly name: string;
   /** GitHub App id for the producer, when the check came from an App. */
   readonly appId?: number;
@@ -47,7 +48,7 @@ export type RelayGitHubCheckFact =
   | {
       readonly kind: 'check-run';
       readonly name: string;
-      readonly appId?: number | null;
+      readonly appId: number;
       readonly head: string;
       readonly status:
         | 'queued'
@@ -99,6 +100,17 @@ function order(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function checkOrder(left: RelayCheck, right: RelayCheck): number {
+  const kindRank = {
+    'check-run': 0,
+    'status-context': 1,
+    any: 2,
+  } as const;
+  return order(left.name, right.name)
+    || kindRank[left.kind] - kindRank[right.kind]
+    || (left.appId ?? -1) - (right.appId ?? -1);
+}
+
 function validName(name: unknown, label: string): asserts name is string {
   if (
     typeof name !== 'string'
@@ -123,13 +135,20 @@ function validUrl(url: unknown, label: string): asserts url is string | undefine
   }
 }
 
-function normalizedAppId(
+function branchRequirementAppId(
   appId: unknown,
   label: string,
 ): number | undefined {
-  if (appId === undefined || appId === null || appId === -1) return undefined;
+  if (appId === null || appId === -1) return undefined;
   if (!Number.isSafeInteger(appId) || (appId as number) <= 0) {
     throw new Error(`${label} App id is invalid`);
+  }
+  return appId as number;
+}
+
+function observedAppId(appId: unknown, label: string): number {
+  if (!Number.isSafeInteger(appId) || (appId as number) <= 0) {
+    throw new Error(`${label} App id is incomplete or invalid`);
   }
   return appId as number;
 }
@@ -143,12 +162,12 @@ function normalizeCheck(fact: RelayGitHubCheckFact, head: string): RelayCheck {
   if (fact.kind === 'status-context') {
     switch (fact.state) {
       case 'success':
-        return { name: fact.name, status: 'passed', ...(fact.url === undefined ? {} : { url: fact.url }) };
+        return { kind: fact.kind, name: fact.name, status: 'passed', ...(fact.url === undefined ? {} : { url: fact.url }) };
       case 'failure':
       case 'error':
-        return { name: fact.name, status: 'failed', ...(fact.url === undefined ? {} : { url: fact.url }) };
+        return { kind: fact.kind, name: fact.name, status: 'failed', ...(fact.url === undefined ? {} : { url: fact.url }) };
       case 'pending':
-        return { name: fact.name, status: 'pending', ...(fact.url === undefined ? {} : { url: fact.url }) };
+        return { kind: fact.kind, name: fact.name, status: 'pending', ...(fact.url === undefined ? {} : { url: fact.url }) };
       default:
         throw new Error(`GitHub status context ${fact.name} has an incomplete state`);
     }
@@ -156,7 +175,7 @@ function normalizeCheck(fact: RelayGitHubCheckFact, head: string): RelayCheck {
   if (fact.kind !== 'check-run') {
     throw new Error('GitHub check has an invalid kind');
   }
-  const appId = normalizedAppId(fact.appId, `GitHub check ${fact.name}`);
+  const appId = observedAppId(fact.appId, `GitHub check ${fact.name}`);
   if (![
     'queued',
     'in_progress',
@@ -172,8 +191,9 @@ function normalizeCheck(fact: RelayGitHubCheckFact, head: string): RelayCheck {
       throw new Error(`GitHub check ${fact.name} has a conclusion before completion`);
     }
     return {
+      kind: fact.kind,
       name: fact.name,
-      ...(appId === undefined ? {} : { appId }),
+      appId,
       status: 'pending',
       ...(fact.url === undefined ? {} : { url: fact.url }),
     };
@@ -200,8 +220,9 @@ function normalizeCheck(fact: RelayGitHubCheckFact, head: string): RelayCheck {
     ? 'passed'
     : 'failed';
   return {
+    kind: fact.kind,
     name: fact.name,
-    ...(appId === undefined ? {} : { appId }),
+    appId,
     status,
     ...(fact.url === undefined ? {} : { url: fact.url }),
   };
@@ -218,9 +239,7 @@ function canonicalSummary(input: Omit<RelayCheckSummary, 'digest'>) {
 
 export function aggregateRelayChecks(input: {
   readonly head: string;
-  readonly branchRequiredChecks: readonly (
-    string | RelayBranchRequiredCheck
-  )[];
+  readonly branchRequiredChecks: readonly RelayBranchRequiredCheck[];
   readonly profile: RelayCheckProfile;
   readonly checks: readonly RelayGitHubCheckFact[];
 }): RelayCheckSummary {
@@ -228,47 +247,60 @@ export function aggregateRelayChecks(input: {
   if (input.profile.name !== 'jinn-mono.v1') {
     throw new Error('Relay check profile is unsupported');
   }
-  const requiredNames = new Map<
-    string,
-    { readonly name: string; readonly appId?: number }
-  >();
-  for (const requirement of input.branchRequiredChecks) {
-    const name = typeof requirement === 'string'
-      ? requirement
-      : requirement.name;
-    validName(name, 'Branch-required check');
-    const appId = typeof requirement === 'string'
-      ? undefined
-      : normalizedAppId(requirement.appId, `Branch-required check ${name}`);
-    const key = name.toLocaleLowerCase('en-US');
-    const existing = requiredNames.get(key);
-    if (
-      existing !== undefined
-      && existing.appId !== undefined
-      && appId !== undefined
-      && existing.appId !== appId
-    ) {
-      throw new Error(`Branch-required check ${name} has contradictory App ids`);
+  const requirements: Array<{
+    readonly kind: 'check-run' | 'any';
+    readonly name: string;
+    readonly appId?: number;
+  }> = [];
+  const requirementKeys = new Set<string>();
+  const branchRequirementNames = new Set<string>();
+  const addRequirement = (
+    requirement: {
+      readonly kind: 'check-run' | 'any';
+      readonly name: string;
+      readonly appId?: number;
+    },
+  ) => {
+    const key =
+      `${requirement.kind}\u0000${requirement.name}\u0000${requirement.appId ?? '*'}`;
+    if (requirementKeys.has(key)) {
+      throw new Error(`Relay contains a duplicate required check requirement ${requirement.name}`);
     }
-    requiredNames.set(key, {
-      name: existing?.name ?? name,
-      ...(existing?.appId === undefined && appId === undefined
-        ? {}
-        : { appId: existing?.appId ?? appId }),
+    requirementKeys.add(key);
+    requirements.push(requirement);
+  };
+  for (const requirement of input.branchRequiredChecks) {
+    const name = requirement.name;
+    validName(name, 'Branch-required check');
+    branchRequirementNames.add(name);
+    const appId = branchRequirementAppId(
+      requirement.appId,
+      `Branch-required check ${name}`,
+    );
+    addRequirement({
+      kind: appId === undefined ? 'any' : 'check-run',
+      name,
+      ...(appId === undefined ? {} : { appId }),
     });
   }
+  const profileRequirementNames = new Set<string>();
   for (const name of input.profile.requiredChecks) {
     validName(name, 'Profile-required check');
-    const key = name.toLocaleLowerCase('en-US');
-    if (!requiredNames.has(key)) requiredNames.set(key, { name });
+    if (profileRequirementNames.has(name)) {
+      throw new Error(`Relay contains a duplicate required check requirement ${name}`);
+    }
+    profileRequirementNames.add(name);
+    if (branchRequirementNames.has(name)) continue;
+    addRequirement({ kind: 'any', name });
   }
 
   const observed = new Map<string, RelayCheck>();
   for (const fact of input.checks) {
     const check = normalizeCheck(fact, input.head);
-    const key = check.name.toLocaleLowerCase('en-US');
+    const key =
+      `${check.kind}\u0000${check.name}\u0000${check.appId ?? '*'}`;
     if (observed.has(key)) {
-      throw new Error(`GitHub check facts contain duplicate name ${check.name}`);
+      throw new Error(`GitHub check facts contain duplicate identity ${check.name}`);
     }
     observed.set(key, check);
   }
@@ -277,19 +309,31 @@ export function aggregateRelayChecks(input: {
   const optional: RelayCheck[] = [];
   if (observed.size > 0) {
     const consumed = new Set<string>();
-    for (const [key, requirement] of requiredNames) {
-      const check = observed.get(key);
-      if (
-        check !== undefined
-        && (
-          requirement.appId === undefined
-          || check.appId === requirement.appId
-        )
-      ) {
+    const candidates = [...observed.entries()];
+    const statusRank = { passed: 0, pending: 1, failed: 2 } as const;
+    const orderedRequirements = [...requirements].sort((left, right) =>
+      (left.kind === right.kind ? 0 : left.kind === 'check-run' ? -1 : 1)
+      || order(left.name, right.name)
+      || (left.appId ?? -1) - (right.appId ?? -1));
+    for (const requirement of orderedRequirements) {
+      const exactKey = requirement.kind === 'check-run'
+        ? `check-run\u0000${requirement.name}\u0000${requirement.appId}`
+        : undefined;
+      const match = exactKey === undefined
+        ? candidates
+          .filter(([key, check]) =>
+            !consumed.has(key) && check.name === requirement.name)
+          .sort((left, right) =>
+            statusRank[left[1].status] - statusRank[right[1].status]
+            || checkOrder(left[1], right[1]))[0]
+        : candidates.find(([key]) => key === exactKey && !consumed.has(key));
+      if (match !== undefined) {
+        const [key, check] = match;
         required.push(check);
         consumed.add(key);
       } else {
         required.push({
+          kind: requirement.kind,
           name: requirement.name,
           ...(requirement.appId === undefined
             ? {}
@@ -302,9 +346,6 @@ export function aggregateRelayChecks(input: {
       if (!consumed.has(key)) optional.push(check);
     }
   }
-  const checkOrder = (left: RelayCheck, right: RelayCheck) =>
-    order(left.name, right.name)
-    || (left.appId ?? -1) - (right.appId ?? -1);
   required.sort(checkOrder);
   optional.sort(checkOrder);
   const summary = { head: input.head, required, optional };
@@ -318,24 +359,35 @@ export function verifyRelayCheckSummary(summary: RelayCheckSummary): void {
     ['required', summary.required],
     ['optional', summary.optional],
   ] as const) {
-    let prior: string | undefined;
+    let prior: RelayCheck | undefined;
     for (const check of checks) {
       validName(check.name, `Relay ${label} check name`);
       validUrl(check.url, `Relay ${label} check ${check.name}`);
-      normalizedAppId(check.appId, `Relay ${label} check ${check.name}`);
       if (!['passed', 'failed', 'pending'].includes(check.status)) {
         throw new Error(`Relay ${label} check has an invalid status`);
       }
+      if (!['check-run', 'status-context', 'any'].includes(check.kind)) {
+        throw new Error(`Relay ${label} check has an invalid kind`);
+      }
+      if (check.kind === 'check-run') {
+        observedAppId(check.appId, `Relay ${label} check ${check.name}`);
+      } else if (check.appId !== undefined) {
+        throw new Error(`Relay ${label} check ${check.name} has a contradictory App id`);
+      }
+      if (
+        check.kind === 'any'
+        && (label !== 'required' || check.status !== 'pending' || check.url !== undefined)
+      ) {
+        throw new Error(`Relay ${label} wildcard check ${check.name} is contradictory`);
+      }
       const key =
-        `${check.name.toLocaleLowerCase('en-US')}\u0000${check.appId ?? '*'}`;
+        `${check.kind}\u0000${check.name}\u0000${check.appId ?? '*'}`;
       if (names.has(key)) throw new Error(`Relay check summary duplicates ${check.name}`);
       names.add(key);
-      const sortKey =
-        `${check.name}\u0000${String(check.appId ?? -1).padStart(16, '0')}`;
-      if (prior !== undefined && order(prior, sortKey) >= 0) {
+      if (prior !== undefined && checkOrder(prior, check) >= 0) {
         throw new Error(`Relay ${label} checks are not canonically ordered`);
       }
-      prior = sortKey;
+      prior = check;
     }
   }
   const expected = sha256(canonicalSummary({
@@ -594,6 +646,10 @@ export function createRelayEvaluationAnchorPublisher(options: {
       const parsed = parseRelayEvaluationAnchorBlock(readback[0].body);
       if (parsed === null || !isDeepStrictEqual(parsed, anchor)) {
         throw new Error('Relay evaluation anchor did not parse after publication');
+      }
+      const finalPr = await options.port.readPullRequest(readInput);
+      if (!exactPr(finalPr, input.pr)) {
+        throw new Error('Relay draft PR changed during evaluation anchoring');
       }
       return parsed;
     },
