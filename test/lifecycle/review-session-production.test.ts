@@ -13,6 +13,7 @@ import {
   type ProductionReviewSessionPortOptions,
 } from '../../src/lifecycle/review-session-production.js';
 import { makeReviewSessionProtocol } from '../../src/lifecycle/review-session.js';
+import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 import {
   gitOid,
   type ReviewClaimRecord,
@@ -1696,5 +1697,251 @@ describe('production review session port', () => {
     await expect(port.hasHumanComment(
       84, HEAD, REVIEW, GENERATION, 'human', canonicalBody,
     )).resolves.toBe(false);
+  });
+});
+
+/**
+ * End-to-end over the *production* review-session path.
+ *
+ * The unit tests for this feature all injected a `readReviewedDiffDigest` into
+ * a hand-built port, so every one of them passed while the feature recorded
+ * nothing at all in production — measured on the canary as twelve open-PR
+ * review claims and zero digests. These drive the real
+ * `makeProductionReviewSessionPort` against faked `gh` responses, all the way
+ * to the bytes `createReviewRecord` writes into the claim blob, and assert on
+ * that payload rather than on an in-memory record.
+ */
+describe('production review session reviewed-diff digest', () => {
+  const COMPARE_FILES = [
+    {
+      filename: 'src/b.ts',
+      status: 'added',
+      patch: '@@ -0,0 +1 @@\n+added\n',
+    },
+    {
+      filename: 'src/a.ts',
+      status: 'modified',
+      previous_filename: undefined,
+      patch: '@@ -1,3 +1,3 @@\n-old\n+new\n context\n',
+    },
+  ];
+
+  function digestHarness(options: {
+    readonly compareFiles?: unknown;
+    readonly failPullRequestRead?: boolean;
+    readonly changedFiles?: readonly string[];
+  } = {}) {
+    const bound = manifest();
+    const payloads: string[] = [];
+    let authority = { reviewRefOid: REVIEW, record: claim() as ReviewClaimRecord };
+    let labels = ['engine:review'];
+    let submittedBody: string | undefined;
+    const compareFiles = options.compareFiles ?? COMPARE_FILES;
+    const changedFiles = options.changedFiles
+      ?? COMPARE_FILES.map((file) => file.filename);
+
+    const production = makeRawProductionReviewSessionPort({
+      environment: {
+        GH_TOKEN: 'selected-secret',
+        JINN_AUTOPILOT_SESSION_MANIFEST: '/attempt/manifest.json',
+      },
+      readManifest: () => bound,
+      writeMetadataFile: (payload: string) => {
+        payloads.push(payload);
+        return '/attempt/metadata.json';
+      },
+      removeMetadataFile: () => undefined,
+      readProjectHumanAuthority: async () => false,
+      readNativeIssueHumanAuthority: async () => false,
+      readMappingAuthority: async () => ({
+        defaultBranch: 'next',
+        issues: [{ number: 42, blockedOn: null, blockedByIssues: [] }],
+        stableBranches: [],
+      }),
+      runner: async (cmd: string, args: readonly string[]) => {
+        const endpoint = String(args[1] ?? '');
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({
+            number: 84,
+            state: 'OPEN',
+            headRefOid: HEAD,
+            headRefName: 'autopilot/42',
+            baseRefName: 'next',
+            baseRefOid: BASE,
+            isDraft: false,
+            body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+            author: { login: 'implementation-bot' },
+            labels: labels.map((name) => ({ name })),
+            closingIssuesReferences: [{ number: 42 }],
+            files: [],
+          });
+        }
+        if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+          return JSON.stringify([{
+            number: 84,
+            headRefOid: HEAD,
+            headRefName: 'autopilot/42',
+            baseRefName: 'next',
+            body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+            closingIssuesReferences: [{ number: 42 }],
+          }]);
+        }
+        if (cmd === 'gh' && args.join(' ') === 'api user --jq .login') {
+          return 'review-bot\n';
+        }
+        // --- the three reads the digest rides on -------------------------
+        if (cmd === 'gh' && endpoint === 'repos/Jinn-Network/mono/pulls/84') {
+          if (options.failPullRequestRead === true) {
+            throw new Error('HTTP 502: Bad Gateway');
+          }
+          return JSON.stringify({
+            changed_files: changedFiles.length,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: BASE },
+          });
+        }
+        if (
+          cmd === 'gh'
+          && endpoint.startsWith('repos/Jinn-Network/mono/pulls/84/files')
+        ) {
+          // `gh api --paginate --slurp` returns one array per page.
+          return JSON.stringify([changedFiles.map((filename) => ({ filename }))]);
+        }
+        if (
+          cmd === 'gh'
+          && endpoint.startsWith('repos/Jinn-Network/mono/compare/')
+        ) {
+          expect(endpoint).toBe(
+            `repos/Jinn-Network/mono/compare/heads/next...${HEAD}`,
+          );
+          return JSON.stringify({ status: 'ahead', files: compareFiles });
+        }
+        // -----------------------------------------------------------------
+        if (
+          cmd === 'gh'
+          && args.includes('repos/Jinn-Network/mono/pulls/84/reviews')
+        ) {
+          if (args.includes('--method')) {
+            submittedBody = String(args[args.length - 1]).replace(/^body=/, '');
+            return '{}';
+          }
+          return JSON.stringify([submittedBody === undefined ? [] : [{
+            user: { login: 'review-bot' },
+            state: 'APPROVED',
+            commit_id: HEAD,
+            submitted_at: '2026-07-20T12:05:00.000Z',
+            body: submittedBody,
+          }]]);
+        }
+        if (cmd === 'gh' && endpoint.includes('issues/84/comments')) return '[[]]';
+        if (cmd === 'git' && args.includes('ls-tree')) return '';
+        if (cmd === 'git' && args.includes('hash-object')) return `${BLOB}\n`;
+        if (cmd === 'git' && args.includes('write-tree')) return `${TREE}\n`;
+        if (cmd === 'git' && args.includes('commit-tree')) return `${RECORD}\n`;
+        if (cmd === 'git') return '';
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+
+    const protocol = makeReviewSessionProtocol({
+      ...production,
+      readAuthority: async () => authority,
+      publishReviewClaim: async ({ record }) => {
+        authority = { reviewRefOid: REVIEW, record };
+        return { status: 'won', published: RECORD, observed: RECORD };
+      },
+      setPullRequestLabel: async (_pr, _head, label, on) => {
+        labels = on
+          ? [...new Set([...labels, label])]
+          : labels.filter((entry) => entry !== label);
+      },
+      setPullRequestDraft: async () => undefined,
+    });
+
+    return { bound, protocol, payloads };
+  }
+
+  /** The claim payloads actually handed to `git hash-object`, decoded. */
+  function recordedClaims(payloads: readonly string[]) {
+    return payloads.map((payload) => JSON.parse(payload));
+  }
+
+  it('records a reviewed-diff digest on the published review claim', async () => {
+    const h = digestHarness();
+
+    const outcome = await h.protocol.reviewVerdict(h.bound, 'APPROVE', 'Clean.');
+
+    expect(outcome).toMatchObject({ status: 'approved', head: HEAD });
+    expect(outcome).not.toHaveProperty('reviewedDiffDigestRefusal');
+
+    const claims = recordedClaims(h.payloads);
+    expect(claims.map((record) => record.state))
+      .toEqual(['verdict-intent', 'terminal-approved']);
+    // The digest is the same one the merge gate recomputes from the compare it
+    // fetches anyway, so the carry can actually fire.
+    const expected = reviewedDiffDigestFromCompare(COMPARE_FILES, {
+      baseOid: BASE,
+      baseRefName: 'next',
+      files: COMPARE_FILES.map((file) => file.filename),
+      complete: true,
+    });
+    expect(expected.status).toBe('digest');
+    for (const record of claims) {
+      expect(record.reviewedDiffDigest).toBe(expected.digest);
+    }
+  });
+
+  it.each([
+    {
+      name: 'the changed-file authority read fails',
+      options: { failPullRequestRead: true },
+      refusal: 'changed-files-unreadable',
+    },
+    {
+      name: 'a compare entry carries no patch',
+      options: {
+        compareFiles: [
+          { filename: 'src/a.ts', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b\n' },
+          { filename: 'assets/logo.png', status: 'added' },
+        ],
+        changedFiles: ['src/a.ts', 'assets/logo.png'],
+      },
+      refusal: 'unrepresented-patch',
+    },
+    {
+      name: 'the compare file list is at the documented cap',
+      options: {
+        compareFiles: Array.from({ length: 300 }, (_unused, index) => ({
+          filename: `src/f${index}.ts`,
+          status: 'modified',
+          patch: '@@ -1 +1 @@\n-a\n+b\n',
+        })),
+        changedFiles: Array.from({ length: 300 }, (_unused, index) => `src/f${index}.ts`),
+      },
+      refusal: 'compare-files-truncated',
+    },
+    {
+      name: 'compare and the proven changed-file list disagree',
+      options: { changedFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'] },
+      refusal: 'file-set-mismatch',
+    },
+  ])('approves fail-closed and names the cause when $name', async ({
+    options,
+    refusal,
+  }) => {
+    const h = digestHarness(options);
+
+    const outcome = await h.protocol.reviewVerdict(h.bound, 'APPROVE', 'Clean.');
+
+    // Still approved, still no digest — the merge gate keeps requiring exact
+    // head identity. The only thing that changed is that the cause has a name.
+    expect(outcome).toMatchObject({
+      status: 'approved',
+      head: HEAD,
+      reviewedDiffDigestRefusal: refusal,
+    });
+    for (const record of recordedClaims(h.payloads)) {
+      expect(record).not.toHaveProperty('reviewedDiffDigest');
+    }
   });
 });

@@ -12,6 +12,11 @@ import type {
   ReviewFollowUpEntry,
 } from './review-follow-ups.js';
 import type { ReviewNativeReview } from './review-executor.js';
+import { isReviewedDiffDigest } from './reviewed-diff-digest.js';
+import type {
+  ReviewedDiffDigestResult,
+  ReviewedDiffDigestUnavailableReason,
+} from './reviewed-diff-digest.js';
 import type {
   GitOid,
   HumanReason,
@@ -110,15 +115,22 @@ export interface ReviewSessionPort {
    * Identity of the diff the reviewer is being asked to approve, recorded on
    * the claim so a later head can be proven to present the same diff.
    *
-   * Optional port method returning an optional value: a port that does not
-   * implement it, and any read that cannot prove the digest, both leave the
-   * claim without one, and a claim without one is exactly today's behaviour —
-   * the merge gate keeps requiring exact head identity.
+   * Required, and returning an *attributed* result rather than an optional
+   * string. Both properties are the fix for the way this feature shipped dead:
+   * as an optional method returning `string | undefined`, a port that simply
+   * did not implement it produced the same bare `undefined` as a read that
+   * genuinely could not prove the digest, and nothing anywhere named the
+   * difference. Measured on the canary, that is exactly what happened — the
+   * session build that publishes the claim had no such method at all, so every
+   * claim was written without a digest and the carry could never fire.
+   *
+   * Unavailability is still fail-closed: no digest on the claim means the merge
+   * gate keeps requiring exact head identity. It is no longer silent.
    */
-  readReviewedDiffDigest?(
+  readReviewedDiffDigest(
     prNumber: number,
     expectedHead: GitOid,
-  ): Promise<string | undefined>;
+  ): Promise<ReviewedDiffDigestResult>;
   fileFindingChild?(input: {
     readonly parentPr: number;
     readonly title: string;
@@ -137,12 +149,60 @@ export interface ReviewSessionPort {
   now(): Date;
 }
 
+/**
+ * Why an approval was recorded without a reviewed-diff digest.
+ *
+ * Attribution, in the shape of `issueRefusal` in `implementation-executor.ts`
+ * and `TargetedAuthorityRefusal` in `targeted-action-reader.ts`: a withheld
+ * value alone is unattributable, so the site that withholds it names the cause
+ * and every caller repeats that name verbatim. It exists so an operator can
+ * tell "the carry is off because X" from "the carry is silently broken" — the
+ * distinction this feature shipped without, and the reason it ran dead on the
+ * canary for twelve review claims before anyone could see it.
+ *
+ * It never relaxes anything. A refusal is exactly a missing digest, and a
+ * missing digest is exactly today's fail-closed behaviour: the merge gate keeps
+ * requiring exact head identity.
+ */
+export type ReviewedDiffDigestRefusal =
+  /**
+   * The session build's port has no `readReviewedDiffDigest` at all. Not
+   * hypothetical: this is the measured canary cause. The engine that publishes
+   * the review claim is resolved separately from the engine that runs the
+   * lifecycle daemon, so it can be an older build in which the method does not
+   * exist, and the optional-method contract used to make that indistinguishable
+   * from a proven-unprovable digest.
+   */
+  | 'port-unavailable'
+  /** The port threw. The message is appended after a colon. */
+  | `port-threw: ${string}`
+  /** The port resolved to something that is not a digest result. */
+  | 'port-malformed'
+  /** The port's own attributed reason, repeated verbatim. */
+  | ReviewedDiffDigestUnavailableReason
+  /**
+   * A durable `verdict-intent`/`terminal-approved` record from an earlier
+   * attempt is being reused and holds no digest. The original cause was not
+   * recorded, and the digest is deliberately not recomputed here: it must
+   * describe the diff the reviewer read, not a later one.
+   */
+  | 'recorded-without-digest';
+
+type ReviewedDiffDigestReading =
+  | { readonly status: 'digest'; readonly digest: string }
+  | { readonly status: 'unavailable'; readonly refusal: ReviewedDiffDigestRefusal };
+
 export type ReviewVerdictResult =
   | { readonly status: 'requested-changes'; readonly head: GitOid }
   | {
       readonly status: 'approved';
       readonly head: GitOid;
       readonly followUpNumbers?: readonly number[];
+      /**
+       * Present exactly when the approval carries no reviewed-diff digest, and
+       * absent when it carries one. Reported, never acted on.
+       */
+      readonly reviewedDiffDigestRefusal?: ReviewedDiffDigestRefusal;
     }
   | { readonly status: 'human'; readonly head: GitOid }
   | { readonly status: 'mapping-pending'; readonly head: GitOid }
@@ -320,24 +380,49 @@ function nextRecord(
   return { ...common, state };
 }
 
+function refusalDetail(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  // Bounded and single-line: this string is reported to an operator, not
+  // parsed, and a port failure can carry an arbitrarily large message.
+  return detail.replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
 /**
  * Never throws and never propagates a port failure: an unreadable digest must
  * leave the claim without one, which is byte-for-byte the pre-existing
  * behaviour, and must not fail an otherwise valid approval.
+ *
+ * What it no longer does is stay quiet about it. Every way this can fail to
+ * produce a digest returns a named cause, including the one the type system
+ * now also rules out in-tree — a port build that has no such method. The method
+ * is required, but the runtime guard stays: the failure this fix exists for was
+ * a *build* whose port predates the method, which no compile of this file can
+ * observe.
  */
 async function readReviewedDiffDigest(
   manifest: AttemptManifest,
   port: ReviewSessionPort,
-): Promise<string | undefined> {
-  if (port.readReviewedDiffDigest === undefined) return undefined;
+): Promise<ReviewedDiffDigestReading> {
+  if (typeof port.readReviewedDiffDigest !== 'function') {
+    return { status: 'unavailable', refusal: 'port-unavailable' };
+  }
+  let result: ReviewedDiffDigestResult;
   try {
-    return await port.readReviewedDiffDigest(
+    result = await port.readReviewedDiffDigest(
       manifest.prNumber!,
       manifest.expectedHead as GitOid,
     );
-  } catch {
-    return undefined;
+  } catch (error) {
+    return { status: 'unavailable', refusal: `port-threw: ${refusalDetail(error)}` };
   }
+  if (result?.status === 'digest' && isReviewedDiffDigest(result.digest)) {
+    return { status: 'digest', digest: result.digest };
+  }
+  // A malformed port result is not a digest and must not be reported as one of
+  // the reader's own proven reasons either.
+  return result?.status === 'unavailable' && typeof result.reason === 'string'
+    ? { status: 'unavailable', refusal: result.reason }
+    : { status: 'unavailable', refusal: 'port-malformed' };
 }
 
 async function publishRecord(
@@ -635,6 +720,7 @@ async function reviewVerdict(
       : `${body.trim()}\n\nFollow-up issues: ${followUpNumbers.map((n) => `#${n}`).join(', ')}`;
 
   let intent: Extract<ReviewClaimRecord, { readonly state: 'verdict-intent' }>;
+  let digestRefusal: ReviewedDiffDigestRefusal | undefined;
   if (authority.record.state === 'verdict-intent') {
     if (authority.record.verdict.state !== state) {
       throw new Error('Review verdict retry contradicts the current intent');
@@ -658,14 +744,16 @@ async function reviewVerdict(
     // later head: the whole point is that this value describes *what was
     // reviewed*. Retries reuse the durable `verdict-intent` record above rather
     // than re-reading, so the recorded digest cannot drift under a retry.
+    const reading = state === 'APPROVE'
+      ? await readReviewedDiffDigest(manifest, port)
+      : undefined;
+    if (reading?.status === 'unavailable') digestRefusal = reading.refusal;
     intent = nextRecord(
       manifest,
       'verdict-intent',
       port.now(),
       { state, marker: port.nextMarker() },
-      state === 'APPROVE'
-        ? await readReviewedDiffDigest(manifest, port)
-        : undefined,
+      reading?.status === 'digest' ? reading.digest : undefined,
     ) as Extract<ReviewClaimRecord, { readonly state: 'verdict-intent' }>;
     const published = await publishRecord(manifest, authority, intent, port);
     if (published.status !== 'published') return { status: published.status, head };
@@ -749,9 +837,20 @@ async function reviewVerdict(
   if (pullRequest.draft) {
     await port.setPullRequestDraft(manifest.prNumber!, head, false);
   }
-  return followUpNumbers === undefined || followUpNumbers.length === 0
-    ? { status: 'approved', head }
-    : { status: 'approved', head, followUpNumbers };
+  // Reported off the durable record, not off the reading: a retry that reused
+  // an existing intent never re-read a digest, and the claim is what the merge
+  // gate will actually consult.
+  const refusal = intent.reviewedDiffDigest !== undefined
+    ? undefined
+    : digestRefusal ?? 'recorded-without-digest';
+  return {
+    status: 'approved',
+    head,
+    ...(followUpNumbers === undefined || followUpNumbers.length === 0
+      ? {}
+      : { followUpNumbers }),
+    ...(refusal === undefined ? {} : { reviewedDiffDigestRefusal: refusal }),
+  };
 }
 
 /**

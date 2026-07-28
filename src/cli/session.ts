@@ -71,6 +71,12 @@ export interface SessionCliDeps {
     candidate: string,
   ) => string;
   readonly writeOutput?: (output: string) => void;
+  /**
+   * Operator-facing diagnostics. Separate from `writeOutput` because that
+   * stream carries exactly one machine-readable JSON line per command and
+   * callers parse it. Defaults to stderr.
+   */
+  readonly writeDiagnostic?: (output: string) => void;
   readonly setExitCode?: (exitCode: number) => void;
 }
 
@@ -339,6 +345,28 @@ function operationNotWired(operation: string): never {
   throw new Error(`session ${operation}: operation not wired`);
 }
 
+/**
+ * Operator-facing line for an approval that carries no reviewed-diff digest.
+ *
+ * The refusal already rides the machine-readable outcome, but a JSON field
+ * nobody prints is how the carry came to be dead on the canary for twelve
+ * review claims. This states the consequence in words, on the session's
+ * diagnostic stream, at the moment the approval is published. It changes no
+ * outcome and no exit code: a missing digest is fail-closed, exactly as before.
+ */
+function reviewedDiffDigestDiagnostic(
+  outcome: SessionOperationOutcome,
+): string | undefined {
+  if (outcome.status !== 'approved') return undefined;
+  const refusal = (outcome as ReviewVerdictResult & { status: 'approved' })
+    .reviewedDiffDigestRefusal;
+  return refusal === undefined
+    ? undefined
+    : '[autopilot] review approved without a reviewed-diff digest '
+      + `(${refusal}). The approval will NOT carry to a new head: any `
+      + 'update-branch costs a fresh review. This is fail-closed, not unsafe.\n';
+}
+
 function finishSessionCommand(
   operation: ParsedSessionCommand['operation'],
   outcome: SessionOperationOutcome,
@@ -350,6 +378,12 @@ function finishSessionCommand(
     outcome,
     exitCode: succeeded ? 0 : 2,
   };
+  const diagnostic = reviewedDiffDigestDiagnostic(outcome);
+  if (diagnostic !== undefined) {
+    const writeDiagnostic = deps.writeDiagnostic
+      ?? ((output: string): void => { process.stderr.write(output); });
+    writeDiagnostic(diagnostic);
+  }
   const writeOutput = deps.writeOutput
     ?? ((output: string): void => { process.stdout.write(output); });
   writeOutput(`${JSON.stringify(execution)}\n`);

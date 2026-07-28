@@ -932,11 +932,14 @@ describe('review session protocol', () => {
     h.port.readReviewedDiffDigest = async (prNumber, expectedHead) => {
       expect(prNumber).toBe(84);
       heads.push(expectedHead);
-      return DIGEST;
+      return { status: 'digest', digest: DIGEST };
     };
 
-    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
-      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+    const outcome = await h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.');
+    expect(outcome).toMatchObject({ status: 'approved', head: HEAD });
+    // A recorded digest is reported by the absence of an attribution, so the
+    // field is never ambiguous about which of the two states it describes.
+    expect(outcome).not.toHaveProperty('reviewedDiffDigestRefusal');
 
     // Digested once, at the head the reviewer read.
     expect(heads).toEqual([HEAD]);
@@ -952,7 +955,7 @@ describe('review session protocol', () => {
     let calls = 0;
     h.port.readReviewedDiffDigest = async () => {
       calls += 1;
-      return DIGEST;
+      return { status: 'digest', digest: DIGEST };
     };
 
     await h.protocol.reviewVerdict(h.manifest, 'REQUEST_CHANGES', 'Not yet.');
@@ -961,18 +964,68 @@ describe('review session protocol', () => {
   });
 
   it.each([
-    ['the port does not implement it', undefined],
-    ['the port cannot prove a digest', async () => undefined],
-    ['the port throws', async () => { throw new Error('HTTP 500'); }],
-  ])('approves without a digest when %s', async (_name, reader) => {
+    // The measured canary cause: a session build whose port predates the
+    // method. It is required by the type now, so only a foreign build can
+    // present this shape — and it must be named, never silent.
+    ['the port does not implement it', undefined, 'port-unavailable'],
+    [
+      'the port cannot prove a digest',
+      async () => ({ status: 'unavailable', reason: 'unrepresented-patch' }),
+      'unrepresented-patch',
+    ],
+    [
+      'the compare file list is at the cap',
+      async () => ({ status: 'unavailable', reason: 'compare-files-truncated' }),
+      'compare-files-truncated',
+    ],
+    [
+      'the port throws',
+      async () => { throw new Error('HTTP 500'); },
+      'port-threw: HTTP 500',
+    ],
+    ['the port resolves to nothing', async () => undefined, 'port-malformed'],
+    [
+      'the port resolves to a malformed digest',
+      async () => ({ status: 'digest', digest: 'not-a-digest' }),
+      'port-malformed',
+    ],
+  ])('approves without a digest and names the cause when %s', async (
+    _name,
+    reader,
+    refusal,
+  ) => {
     const h = harness();
-    if (reader !== undefined) h.port.readReviewedDiffDigest = reader;
+    if (reader === undefined) delete h.port.readReviewedDiffDigest;
+    else h.port.readReviewedDiffDigest = reader;
 
     await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
-      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+      .resolves.toMatchObject({
+        status: 'approved',
+        head: HEAD,
+        reviewedDiffDigestRefusal: refusal,
+      });
     // No digest recorded means the merge gate keeps requiring exact head
     // identity: today's behaviour, never a silent carry.
     expect(h.authority.record).toMatchObject({ state: 'terminal-approved' });
+    expect(h.authority.record).not.toHaveProperty('reviewedDiffDigest');
+  });
+
+  it('names a reused digest-less intent rather than re-reading a digest for it', async () => {
+    const h = harness({ state: 'verdict-intent', verdictState: 'APPROVE' });
+    let calls = 0;
+    h.port.readReviewedDiffDigest = async () => {
+      calls += 1;
+      return { status: 'digest', digest: DIGEST };
+    };
+
+    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
+      .resolves.toMatchObject({
+        status: 'approved',
+        reviewedDiffDigestRefusal: 'recorded-without-digest',
+      });
+    // The digest must describe the diff the reviewer read, so a retry never
+    // recomputes one for the durable intent it is resuming.
+    expect(calls).toBe(0);
     expect(h.authority.record).not.toHaveProperty('reviewedDiffDigest');
   });
 
@@ -988,11 +1041,12 @@ describe('review session protocol', () => {
     let calls = 0;
     h.port.readReviewedDiffDigest = async () => {
       calls += 1;
-      return `v1:${'e'.repeat(64)}`;
+      return { status: 'digest', digest: `v1:${'e'.repeat(64)}` };
     };
 
-    await expect(h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.'))
-      .resolves.toMatchObject({ status: 'approved', head: HEAD });
+    const outcome = await h.protocol.reviewVerdict(h.manifest, 'APPROVE', 'Clean.');
+    expect(outcome).toMatchObject({ status: 'approved', head: HEAD });
+    expect(outcome).not.toHaveProperty('reviewedDiffDigestRefusal');
     expect(calls).toBe(0);
     expect(h.authority.record).toMatchObject({
       state: 'terminal-approved',
