@@ -5,6 +5,7 @@ import type { RelayIssueInput } from '../../src/issue-relay/snapshot.js';
 import {
   deriveRelayAction,
   deriveRelayReady,
+  persistRelayCancellation,
   type RelayAuthoritativeFacts,
   type RelayGenerationRecordV1,
   type RelayPhase,
@@ -915,11 +916,12 @@ describe('Relay state/action transition table', () => {
   });
 
   it.each([
-    ['closed issue', { open: false, optedIn: true }],
-    ['removed label', { open: true, optedIn: false }],
-  ])('%s after funding dominates a passing verdict -> finish-cancellation', (
+    ['closed issue', { open: false, optedIn: true }, 'issue-closed'],
+    ['removed label', { open: true, optedIn: false }, 'label-removed'],
+  ] as const)('%s after funding persists cancellation before settling', (
     _label,
     issue,
+    reason,
   ) => {
     const record = durable('evaluating', {
       rounds: [round({
@@ -935,10 +937,97 @@ describe('Relay state/action transition table', () => {
     expect(deriveRelayAction(facts(record, {
       issue,
       currentPr: livePr(),
+    }), policy)).toEqual({ kind: 'record-cancellation', reason });
+  });
+
+  it('an operator request persists cancellation before any other action', () => {
+    const record = durable('repair-needed', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: repairVerdict,
+      })],
+      pr: { number: 68, branch: acceptedAdoption.branch, head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      operatorCancellationRequested: true,
+      currentPr: livePr(),
+    }), policy)).toEqual({
+      kind: 'record-cancellation',
+      reason: 'operator',
+    });
+  });
+
+  it('persists pre-funding withdrawal so an admitted generation cannot submit later', () => {
+    const admitted = durable('admitted');
+
+    expect(deriveRelayAction(facts(admitted, {
+      issue: { open: false, optedIn: true },
+    }), policy)).toEqual({
+      kind: 'record-cancellation',
+      reason: 'issue-closed',
+    });
+
+    const cancelling = persistRelayCancellation(admitted, {
+      requestedAt: '2026-07-28T12:30:00.000Z',
+      reason: 'issue-closed',
+    });
+    expect(deriveRelayAction(facts(cancelling, {
+      issue: { open: false, optedIn: true },
     }), policy)).toEqual({ kind: 'finish-cancellation' });
   });
 
-  it('cancelling with funded work -> finish-cancellation', () => {
+  it('persists cancellation without mutating frozen round or PR evidence', () => {
+    const current = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: { number: 68, branch: acceptedAdoption.branch, head: HEAD, draft: true },
+    });
+
+    const cancelled = persistRelayCancellation(current, {
+      requestedAt: '2026-07-28T12:30:00.000Z',
+      reason: 'issue-closed',
+    });
+
+    expect(cancelled).toEqual({
+      ...current,
+      phase: 'cancelling',
+      cancellation: {
+        requestedAt: '2026-07-28T12:30:00.000Z',
+        reason: 'issue-closed',
+      },
+      updatedAt: '2026-07-28T12:30:00.000Z',
+    });
+    expect(current.cancellation).toBeUndefined();
+    expect(cancelled.rounds).toEqual(current.rounds);
+    expect(cancelled.pr).toEqual(current.pr);
+  });
+
+  it('replays the same persisted cancellation intent idempotently', () => {
+    const cancelled = durable('cancelling', {
+      rounds: [round({ task })],
+      cancellation: {
+        requestedAt: '2026-07-28T12:25:00.000Z',
+        reason: 'operator',
+      },
+      updatedAt: '2026-07-28T12:25:00.000Z',
+    });
+
+    expect(persistRelayCancellation(cancelled, {
+      requestedAt: '2026-07-28T12:25:00.000Z',
+      reason: 'operator',
+    })).toBe(cancelled);
+  });
+
+  it('a persisted cancellation observes only the already-funded current round', () => {
     const record = durable('cancelling', {
       rounds: [round({ task })],
       cancellation: {
@@ -948,7 +1037,77 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record), policy))
+      .toEqual({ kind: 'observe-solution', round: 0 });
+  });
+
+  it('a persisted cancellation settles an already-delivered current round', () => {
+    const record = durable('cancelling', {
+      rounds: [round({ task, solution })],
+      cancellation: {
+        requestedAt: '2026-07-28T12:25:00.000Z',
+        reason: 'operator',
+      },
+    });
+
+    expect(deriveRelayAction(facts(record), policy))
+      .toEqual({ kind: 'adopt-solution', round: 0 });
+  });
+
+  it('a persisted cancellation finishes only after current adoption or rejection settles', () => {
+    const record = durable('cancelling', {
+      rounds: [round({ task, solution, adoption })],
+      cancellation: {
+        requestedAt: '2026-07-28T12:25:00.000Z',
+        reason: 'operator',
+      },
+    });
+
+    expect(deriveRelayAction(facts(record), policy))
       .toEqual({ kind: 'finish-cancellation' });
+  });
+
+  it('cancellation dominance never submits a repair or marks a passing head ready', () => {
+    const repair = durable('repair-needed', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: repairVerdict,
+      })],
+      pr: { number: 68, branch: acceptedAdoption.branch, head: HEAD, draft: true },
+    });
+    const passing = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: { number: 68, branch: acceptedAdoption.branch, head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(repair, {
+      issue: { open: true, optedIn: false },
+      currentPr: livePr(),
+    }), policy)).toEqual({
+      kind: 'record-cancellation',
+      reason: 'label-removed',
+    });
+    expect(deriveRelayAction(facts(passing, {
+      issue: { open: false, optedIn: true },
+      currentPr: livePr(),
+      readiness: {
+        adoption: acceptedAdoption,
+        checks: readyChecks,
+        evaluationAnchor,
+        verdict: authenticatedVerdict,
+      },
+    }), policy)).toEqual({
+      kind: 'record-cancellation',
+      reason: 'issue-closed',
+    });
   });
 
   it.each([

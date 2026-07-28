@@ -89,8 +89,17 @@ export interface RelayGenerationRecordV1 {
   readonly updatedAt: string;
 }
 
+export type RelayCancellationReason =
+  | 'issue-closed'
+  | 'label-removed'
+  | 'operator';
+
 export type RelayAction =
   | { readonly kind: 'publish-snapshot' }
+  | {
+      readonly kind: 'record-cancellation';
+      readonly reason: RelayCancellationReason;
+    }
   | { readonly kind: 'submit-round'; readonly round: number }
   | { readonly kind: 'observe-solution'; readonly round: number }
   | { readonly kind: 'adopt-solution'; readonly round: number }
@@ -119,6 +128,7 @@ export interface RelayAuthoritativeFacts {
     readonly generation: string;
   };
   readonly readiness?: RelayReadyEvidence;
+  readonly operatorCancellationRequested?: boolean;
   readonly now: string;
 }
 
@@ -270,8 +280,45 @@ function latestRound(
   return record.rounds.at(-1);
 }
 
-function hasFundedWork(record: RelayGenerationRecordV1): boolean {
-  return record.rounds.some(({ task }) => task !== undefined);
+export function persistRelayCancellation(
+  record: RelayGenerationRecordV1,
+  input: {
+    readonly requestedAt: string;
+    readonly reason: RelayCancellationReason;
+  },
+): RelayGenerationRecordV1 {
+  const requestedAt = canonicalUtcTimestamp(input.requestedAt);
+  const updatedAt = canonicalUtcTimestamp(record.updatedAt);
+  if (requestedAt === undefined || updatedAt === undefined) {
+    throw new TypeError('Relay cancellation intent is stale or not persistable');
+  }
+  if (record.cancellation !== undefined) {
+    if (
+      record.phase === 'cancelling'
+      && record.updatedAt === input.requestedAt
+      && record.cancellation.requestedAt === input.requestedAt
+      && record.cancellation.reason === input.reason
+    ) {
+      return record;
+    }
+    throw new TypeError('Relay cancellation intent is contradictory');
+  }
+  if (
+    requestedAt <= updatedAt
+    || ['awaiting-clarification', 'refused', 'ready', 'closed', 'exhausted']
+      .includes(record.phase)
+  ) {
+    throw new TypeError('Relay cancellation intent is stale or not persistable');
+  }
+  return {
+    ...record,
+    phase: 'cancelling',
+    cancellation: {
+      requestedAt: input.requestedAt,
+      reason: input.reason,
+    },
+    updatedAt: input.requestedAt,
+  };
 }
 
 function roundInputIsCurrent(
@@ -605,6 +652,23 @@ function deriveRepairAction(
   return { kind: 'submit-repair', round: nextRound };
 }
 
+function deriveCancellationSettlement(
+  record: RelayGenerationRecordV1,
+): RelayAction {
+  const fundedRound = [...record.rounds].reverse()
+    .find(({ task }) => task !== undefined);
+  if (fundedRound?.task === undefined) {
+    return { kind: 'finish-cancellation' };
+  }
+  if (fundedRound.solution === undefined) {
+    return { kind: 'observe-solution', round: fundedRound.round };
+  }
+  if (fundedRound.adoption === undefined) {
+    return { kind: 'adopt-solution', round: fundedRound.round };
+  }
+  return { kind: 'finish-cancellation' };
+}
+
 /**
  * Derives at most one next action from durable GitHub-authored evidence.
  * The function is intentionally I/O-free; callers must reread facts after
@@ -652,15 +716,22 @@ export function deriveRelayAction(
       return exhaustiveNone(record.phase);
   }
 
-  const funded = hasFundedWork(record);
+  const cancellationReason: RelayCancellationReason | undefined =
+    facts.operatorCancellationRequested === true
+      ? 'operator'
+      : !facts.issue.open
+        ? 'issue-closed'
+        : !facts.issue.optedIn
+          ? 'label-removed'
+          : undefined;
   if (
-    record.phase === 'cancelling'
-    || record.cancellation !== undefined
-    || ((!facts.issue.open || !facts.issue.optedIn) && funded)
+    cancellationReason !== undefined
+    && record.cancellation === undefined
   ) {
-    return funded
-      ? { kind: 'finish-cancellation' }
-      : none('Cancellation has no funded settlement path');
+    return { kind: 'record-cancellation', reason: cancellationReason };
+  }
+  if (record.phase === 'cancelling' || record.cancellation !== undefined) {
+    return deriveCancellationSettlement(record);
   }
   if (!facts.issue.open || !facts.issue.optedIn) {
     return none('Issue authority ended before funding');
