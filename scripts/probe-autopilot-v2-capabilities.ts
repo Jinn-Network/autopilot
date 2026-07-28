@@ -1,8 +1,12 @@
 import { argv, env } from 'node:process';
-import { isAbsolute } from 'node:path';
+import { basename, isAbsolute } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   defaultRunner,
 } from '../src/dispatcher/issue-source.js';
+import {
+  loadAutopilotConfig,
+} from '../src/config/config.js';
 import {
   AUTOPILOT_V2_REMOTE,
 } from '../src/lifecycle/active-runtime-production.js';
@@ -30,6 +34,20 @@ function outputPath(args: readonly string[]): string {
   return args[1];
 }
 
+export async function resolveCapabilityProbeRepository(
+  repositoryPath: string,
+  environment: NodeJS.ProcessEnv = env,
+): Promise<{
+  readonly repositoryPath: string;
+  readonly repositoryUrl: string;
+}> {
+  const loaded = await loadAutopilotConfig(repositoryPath, environment);
+  return {
+    repositoryPath,
+    repositoryUrl: loaded.config.repository.remote.url,
+  };
+}
+
 async function main(): Promise<void> {
   const output = outputPath(argv.slice(2));
   const repositoryPath = (await defaultRunner('git', [
@@ -37,6 +55,10 @@ async function main(): Promise<void> {
     '--path-format=absolute',
     '--show-toplevel',
   ])).trim();
+  const repository = await resolveCapabilityProbeRepository(
+    repositoryPath,
+    env,
+  );
   const credentials = await resolveCredentialPool({
     JINN_IMPL_GH_TOKEN: env.JINN_IMPL_GH_TOKEN,
     JINN_REVIEW_GH_TOKEN: env.JINN_REVIEW_GH_TOKEN,
@@ -53,7 +75,7 @@ async function main(): Promise<void> {
         ...args,
       ]);
       return runCapabilityProbe({
-        repositoryPath,
+        ...repository,
         remoteName: AUTOPILOT_V2_REMOTE,
         implementerLogin: selection.login,
         runGit,
@@ -70,11 +92,24 @@ async function main(): Promise<void> {
   })}\n`);
 }
 
-main().catch((error: unknown) => {
-  console.error(
-    `[autopilot:v2:capability-probe] ${
-      error instanceof Error ? error.message : String(error)
-    }`,
-  );
-  process.exitCode = 1;
-});
+export function isDirectCapabilityProbeEntrypoint(
+  entryPath: string | undefined,
+  moduleUrl = import.meta.url,
+): boolean {
+  return entryPath != null
+    && /^probe-autopilot-v2-capabilities\.(?:[cm]?[jt]s)$/.test(
+      basename(entryPath),
+    )
+    && moduleUrl === pathToFileURL(entryPath).href;
+}
+
+if (isDirectCapabilityProbeEntrypoint(argv[1])) {
+  main().catch((error: unknown) => {
+    console.error(
+      `[autopilot:v2:capability-probe] ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    process.exitCode = 1;
+  });
+}
