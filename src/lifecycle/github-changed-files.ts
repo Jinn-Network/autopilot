@@ -1,6 +1,10 @@
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
 import {
+  reviewedDiffDigestFromCompare,
+  type ReviewedDiffDigestResult,
+} from './reviewed-diff-digest.js';
+import {
   decodeCompareStatus,
   gitOid,
   gitRefName,
@@ -10,6 +14,11 @@ import {
 } from './types.js';
 
 export const GITHUB_CHANGED_FILES_MAX = 3_000;
+
+export type {
+  ReviewedDiffDigestResult,
+  ReviewedDiffDigestUnavailableReason,
+} from './reviewed-diff-digest.js';
 
 export type { CompareStatus } from './types.js';
 
@@ -142,6 +151,48 @@ export async function readExactChangedFiles(
 export async function readExactCompareStatus(
   options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
 ): Promise<CompareStatus> {
+  return (await readExactCompareEvidence(options)).status;
+}
+
+export interface ExactCompareEvidence {
+  readonly status: CompareStatus;
+  /**
+   * Identity of the diff this head presents against its base branch tip, or
+   * `undefined` when it could not be proven.
+   *
+   * `undefined` is not "no change": every consumer must fall back to requiring
+   * exact head identity when it is absent.
+   */
+  readonly reviewedDiffDigest?: string;
+}
+
+export interface ReadExactCompareEvidenceOptions
+  extends Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'> {
+  /**
+   * Read and require the exact changed-file proof before emitting a digest.
+   *
+   * Off by default, and off means **no digest at all** rather than a cheaper,
+   * weaker one. That is not squeamishness: the lifecycle view and the merge gate
+   * both decide whether an approval carries, and if the view could carry on
+   * evidence the gate would reject, the PR reaches `merge-ready`, the gate
+   * refuses with `terminal-approval`, and `reviewEnrollmentEligible` no longer
+   * dispatches a review — a permanent strand with no safety breach and no
+   * recovery. The gate always has an `ExactChangedFiles` reading (it needs one
+   * for CODEOWNERS), so the only way the two sides can evaluate identical
+   * evidence is for this side to read one too.
+   *
+   * The caller turns it on only when a carry is actually in question — a
+   * terminal-approved claim that recorded a digest at a head that is no longer
+   * the PR head — so the extra `pulls/{n}/files` pagination is paid by the
+   * handful of PRs that were just update-branched, not by every open PR.
+   */
+  readonly proveReviewedDiff?: boolean;
+}
+
+/** See `readExactCompareStatus` for the full head/base authority analysis. */
+export async function readExactCompareEvidence(
+  options: ReadExactCompareEvidenceOptions,
+): Promise<ExactCompareEvidence> {
   const repositorySlug = options.repositorySlug ?? REPO;
   const metadata = JSON.parse(await options.run('gh', [
     'api', `repos/${repositorySlug}/pulls/${options.prNumber}`,
@@ -165,6 +216,86 @@ export async function readExactCompareStatus(
   const compare = JSON.parse(await options.run('gh', [
     'api',
     `repos/${repositorySlug}/compare/heads/${compareBase}...${options.expectedHead}`,
-  ])) as { status?: unknown };
-  return decodeCompareStatus(compare.status);
+  ])) as { status?: unknown; files?: unknown };
+  const status = decodeCompareStatus(compare.status);
+  if (options.proveReviewedDiff !== true) return { status };
+  // Fail closed on the changed-file proof exactly as the merge gate does. A
+  // read failure yields no digest, never a digest computed from weaker
+  // evidence, so the view can never carry where the gate would refuse.
+  let changedFiles: ExactChangedFiles;
+  try {
+    changedFiles = await readExactChangedFiles({
+      run: options.run,
+      prNumber: options.prNumber,
+      expectedHead: options.expectedHead,
+      expectedBaseRefName: options.expectedBaseRefName,
+      context: 'Compare',
+      repositorySlug,
+    });
+  } catch {
+    return { status };
+  }
+  const digest = reviewedDiffDigestFromCompare(compare.files, changedFiles);
+  return {
+    status,
+    ...(digest.status === 'digest' ? { reviewedDiffDigest: digest.digest } : {}),
+  };
+}
+
+export interface ReadReviewedDiffDigestOptions {
+  readonly run: CommandRunner;
+  readonly prNumber: number;
+  readonly expectedHead: GitOid;
+  readonly expectedBaseRefName: string;
+  readonly context: string;
+  readonly repositorySlug?: string;
+}
+
+/**
+ * Read both completeness authorities and digest the PR's diff against its base
+ * branch tip.
+ *
+ * Never throws: every failure is an `unavailable` result, because the only
+ * correct response to a failure here is to leave the merge gate's head-identity
+ * requirement in place. A thrown error would instead have to be caught by every
+ * caller and mapped to the same thing, which is exactly how a fail-open slips
+ * in.
+ */
+export async function readReviewedDiffDigest(
+  options: ReadReviewedDiffDigestOptions,
+): Promise<ReviewedDiffDigestResult> {
+  const repositorySlug = options.repositorySlug ?? REPO;
+  let changedFiles: ExactChangedFiles;
+  try {
+    changedFiles = await readExactChangedFiles({
+      run: options.run,
+      prNumber: options.prNumber,
+      expectedHead: options.expectedHead,
+      expectedBaseRefName: options.expectedBaseRefName,
+      context: options.context,
+      repositorySlug,
+    });
+  } catch {
+    return { status: 'unavailable', reason: 'changed-files-unreadable' };
+  }
+  let compare: unknown;
+  try {
+    // `heads/` and `gitRefName` are load-bearing for the same reasons as in
+    // `readExactCompareStatus`: a same-named tag must not hijack resolution and
+    // a base name containing `..` must not inject a second separator.
+    compare = JSON.parse(await options.run('gh', [
+      'api',
+      `repos/${repositorySlug}/compare/`
+      + `heads/${gitRefName(changedFiles.baseRefName)}...${options.expectedHead}`,
+    ]));
+  } catch {
+    return { status: 'unavailable', reason: 'compare-unreadable' };
+  }
+  if (typeof compare !== 'object' || compare === null || Array.isArray(compare)) {
+    return { status: 'unavailable', reason: 'compare-malformed' };
+  }
+  return reviewedDiffDigestFromCompare(
+    (compare as { files?: unknown }).files,
+    changedFiles,
+  );
 }

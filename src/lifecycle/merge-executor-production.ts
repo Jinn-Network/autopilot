@@ -17,6 +17,7 @@ import type {
 } from './merge-executor.js';
 import { DURABLE_UPDATE_BRANCH_FAILURES } from './merge-executor.js';
 import { readExactChangedFiles } from './github-changed-files.js';
+import { reviewedDiffDigestFromCompare } from './reviewed-diff-digest.js';
 import { withSelectedCredential } from './production-auth.js';
 import type {
   GitHubLifecycleSnapshot,
@@ -265,10 +266,40 @@ export function makeProductionMergeActionPort(
     const compare = JSON.parse(await runner('gh', [
       'api',
       `repos/${repositorySlug}/compare/heads/${compareBaseRefName}...${pr.headOid}`,
-    ])) as { status?: unknown };
+    ])) as { status?: unknown; files?: unknown };
     const compareStatus = decodeCompareStatus(compare.status);
     const effectiveReviews = effectiveCurrentHeadReviews(pr);
     const reviewClaim = lifecycle.reviewClaim;
+    // The approval is anchored to the head the reviewer read, which is the head
+    // the claim, the terminal verdict, the native review's `commitId` and the
+    // signed marker all name. When that is still the PR head this is exactly
+    // `pr.headOid` and nothing below differs from the previous behaviour.
+    const approvalHead = reviewClaim?.head;
+    // Only relevant when the head has moved. `update-branch` mints a new head
+    // commit without changing what was reviewed; a worker push changes it. The
+    // digest is the evidence that separates the two, and it is consulted only
+    // to relax the *head-identity* conjunct of the approval — never any other
+    // gate reason.
+    //
+    // Recomputed here from the compare response `readCandidate` already fetches
+    // and the exact changed-file list it already proved complete, so carrying
+    // costs no additional API call.
+    const reviewedDiffCarry = reviewClaim?.state === 'terminal-approved'
+      && approvalHead !== pr.headOid
+      && reviewClaim.reviewedDiffDigest !== undefined
+      ? reviewedDiffDigestFromCompare(compare.files, changedFiles)
+      : undefined;
+    const carriedApproval = reviewedDiffCarry?.status === 'digest'
+      && reviewClaim?.state === 'terminal-approved'
+      && reviewedDiffCarry.digest === reviewClaim.reviewedDiffDigest;
+    // Unchanged: still the reviewer's effective review at the *current* head.
+    // Measured on Jinn-Network/mono, GitHub re-points an existing review's
+    // `commit_id` onto the merge commit that `update-branch` creates (PR #2130
+    // carries three reviews whose signed markers name three different heads and
+    // whose `commit_id` all read as the final head), while an ordinary worker
+    // push leaves `commit_id` alone (PR #2232). So the carried review is found
+    // here, and the dismissal/supersession semantics of "effective at the
+    // current head" are preserved exactly.
     const terminalReview = reviewClaim === undefined
       ? undefined
       : effectiveReviews.find((review) =>
@@ -283,9 +314,25 @@ export function makeProductionMergeActionPort(
           verdict: reviewClaim.verdict.state,
         })
       : undefined;
+    // The marker encodes `head=<reviewClaim.head>`, so it is *not* re-signed for
+    // a carried head and must not be: re-signing would mint a claim of review at
+    // a commit nobody reviewed. It stays the reviewer-authored, head-bound proof
+    // for the head that was actually read, verified here against the recorded
+    // head — and it is the *only* head binding on the native review that GitHub
+    // does not rewrite, which is precisely why it is the one that is kept.
+    //
+    // Read the `terminalVerdict.head` conjunct below for what it actually is.
+    // `snapshot.ts` derives `terminalVerdict.head` as `claim.head` by
+    // definition, so `terminalVerdict.head === reviewClaim.head` is a *tautology*
+    // for any snapshot-derived item: it degenerates to "a verdict exists" and
+    // binds no head. It is retained only because it is free and still rejects a
+    // foreign lifecycle projection whose verdict metadata contradicts its own
+    // claim — not because it proves anything about which commit was reviewed.
+    // The head binding that does the work is the signed-marker check on the
+    // native review, on the last line of this conjunction.
     const terminalApprovalMatches = reviewClaim?.state === 'terminal-approved'
-      && reviewClaim.head === pr.headOid
-      && lifecycle.terminalVerdict?.head === pr.headOid
+      && (approvalHead === pr.headOid || carriedApproval)
+      && lifecycle.terminalVerdict?.head === reviewClaim.head
       && lifecycle.terminalVerdict.state === 'APPROVE'
       && lifecycle.terminalVerdict.marker === reviewClaim.verdict.marker
       && signedMarker !== undefined

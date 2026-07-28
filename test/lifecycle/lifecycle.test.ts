@@ -950,6 +950,106 @@ describe('engine approval must be head-bound to reach merge-ready', () => {
     })).toBe(false);
   });
 
+  // Same carried-approval shape, plus proof that the new head presents exactly
+  // the diff that was approved. `update-branch` mints a commit; it does not
+  // change what the reviewer read.
+  const DIGEST = `v1:${'a'.repeat(64)}`;
+  const OTHER_DIGEST = `v1:${'b'.repeat(64)}`;
+
+  function provenCarry(overrides = {}) {
+    return carriedApproval({
+      reviewClaim: claim({ reviewedDiffDigest: DIGEST }),
+      terminalVerdict: {
+        head: HEAD_A,
+        state: 'APPROVE',
+        marker: MARKER,
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
+      reviewedDiffDigest: DIGEST,
+      // The merge gate's `terminalReview` conjunct, projected. Without it the
+      // view would carry on `approved` alone and could outrun the gate.
+      reviewerApprovedAtHead: true,
+      ...overrides,
+    });
+  }
+
+  it('reaches merge-ready at an update-branch head that presents the reviewed diff', () => {
+    const item = provenCarry();
+    expect(engineApprovedAtHead(item)).toBe(true);
+    expect(engineApprovalLapsed(item)).toBe(false);
+    expect(deriveLifecycle(snapshot(item), NOW, STALE_AFTER).items[0].phase)
+      .toBe('merge-ready');
+  });
+
+  it.each([
+    ['the current head presents a different diff', { reviewedDiffDigest: OTHER_DIGEST }],
+    ['the current head digest could not be proven', { reviewedDiffDigest: undefined }],
+    [
+      'the claim predates diff digests',
+      { reviewClaim: claim({ reviewedDiffDigest: undefined }) },
+    ],
+    [
+      'the verdict is not anchored to the reviewed head',
+      {
+        terminalVerdict: {
+          head: HEAD_B,
+          state: 'APPROVE',
+          marker: MARKER,
+          recordedAt: '2026-07-20T11:00:00.000Z',
+        },
+      },
+    ],
+    [
+      'the verdict marker is not the claim\'s',
+      {
+        terminalVerdict: {
+          head: HEAD_A,
+          state: 'APPROVE',
+          marker: 'other',
+          recordedAt: '2026-07-20T11:00:00.000Z',
+        },
+      },
+    ],
+    ['there is no reconstructed verdict at all', { terminalVerdict: undefined }],
+    [
+      'the claim reviewer has no marker-bearing APPROVED review at the head',
+      { reviewerApprovedAtHead: undefined },
+    ],
+    [
+      'the claim never reached terminal-approved',
+      {
+        reviewClaim: claim({
+          state: 'stale',
+          verdict: undefined,
+          reviewedDiffDigest: undefined,
+        }),
+      },
+    ],
+  ])('re-reviews when %s', (_name, overrides) => {
+    const item = provenCarry(overrides);
+    expect(engineApprovedAtHead(item)).toBe(false);
+    expect(engineApprovalLapsed(item)).toBe(true);
+    expect(deriveLifecycle(snapshot(item), NOW, STALE_AFTER).items[0].phase)
+      .toBe('awaiting-review');
+  });
+
+  it('never lets a matching digest substitute for CI on the new head', () => {
+    const item = provenCarry({
+      checks: [{ name: 'ci', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    });
+    // The approval carries; CI does not.
+    expect(engineApprovedAtHead(item)).toBe(true);
+    expect(deriveLifecycle(snapshot(item), NOW, STALE_AFTER).items[0].phase)
+      .toBe('ci-blocked');
+  });
+
+  it('never lets a matching digest substitute for a head that is behind its base', () => {
+    const item = provenCarry({ mergeState: 'behind' });
+    expect(engineApprovedAtHead(item)).toBe(true);
+    expect(deriveLifecycle(snapshot(item), NOW, STALE_AFTER).items[0].phase)
+      .toBe('awaiting-review');
+  });
+
   it('plans claim-review, not merge, for carried approvals', () => {
     const capacity = {
       implementationSlots: 1,

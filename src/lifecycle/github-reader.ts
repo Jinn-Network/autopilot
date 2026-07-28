@@ -26,13 +26,14 @@ import type {
 } from './snapshot.js';
 import {
   decodeBranchClaimTrailers,
+  decodeReviewClaimPayload,
   extractImplementationCompletionSummary,
   parseHumanCommentEvidence,
   reviewClaimRef,
   terminalBranchClaimTrailers,
 } from './codecs.js';
 import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
-import { readExactCompareStatus } from './github-changed-files.js';
+import { readExactCompareEvidence } from './github-changed-files.js';
 import { gitOid, gitRefName, type GitOid, type GitRefName } from './types.js';
 import {
   GitHubUsageMeter,
@@ -705,6 +706,32 @@ function inconsistentPullRequest(
   };
 }
 
+/**
+ * Is an approval carry in question for this PR right now?
+ *
+ * True only for a terminal-approved claim that recorded a reviewed-diff digest
+ * at a head that is no longer the PR head — exactly the shape `update-branch`
+ * produces. Everything else answers false, so the extra changed-file read that
+ * proving a digest costs is confined to the PRs that can actually use it.
+ *
+ * An undecodable payload answers false: an unreadable claim is not evidence
+ * that a carry is available.
+ */
+function reviewedDiffCarryInQuestion(
+  reviewClaim: { readonly oid: string; readonly payload: string } | null,
+  headOid: string,
+): boolean {
+  if (reviewClaim === null) return false;
+  try {
+    const record = decodeReviewClaimPayload(reviewClaim.payload);
+    return record.state === 'terminal-approved'
+      && record.reviewedDiffDigest !== undefined
+      && record.head !== headOid;
+  } catch {
+    return false;
+  }
+}
+
 function looksFalseCleanMergeState(
   mergeability: RawPullRequest['mergeability'],
   mergeStateStatus: string,
@@ -1354,6 +1381,9 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       && latestDraftEvent?.__typename === 'ConvertToDraftEvent'
       ? latestDraftEvent.actor?.login
       : undefined;
+    const reviewClaim = includeReviewClaim
+      ? await this.reviewClaim(pr.number, reviewClaimListing)
+      : null;
     return {
       number: pr.number,
       title: pr.title,
@@ -1374,9 +1404,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       reviews,
       branchClaimTrailers: claimEvidence?.claimTrailers ?? null,
       implementationCompletionSummary: claimEvidence?.completionSummary ?? null,
-      reviewClaim: includeReviewClaim
-        ? await this.reviewClaim(pr.number, reviewClaimListing)
-        : null,
+      reviewClaim,
       humanIssueNumber: humanEvidence?.issueNumber ?? null,
       humanAuthor: humanEvidence?.author ?? null,
       humanHead: humanEvidence?.head ?? null,
@@ -1390,16 +1418,26 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       humanReason: humanEvidence?.reason ?? null,
       mergedAt: pr.mergedAt,
       mergeCommitOid: pr.mergeCommit?.oid ?? null,
+      // The compare request answers whether the head is behind its base, and its
+      // `files[]` answers what diff the head presents against it. The second
+      // answer additionally needs the exact changed-file proof so that this
+      // reading is identical to the merge gate's — see `proveReviewedDiff` — and
+      // that proof is only paid for when a carry is actually in question, i.e.
+      // for a PR that was just update-branched under a recorded approval.
       ...(pr.state === 'OPEN' && looksFalseCleanMergeState(pr.mergeable, pr.mergeStateStatus)
-        ? {
-            compareStatus: await readExactCompareStatus({
-              run: this.run,
-              prNumber: pr.number,
-              expectedHead: gitOid(pr.headRefOid),
-              expectedBaseRefName: pr.baseRefName,
-              repositorySlug: this.repositorySlug,
-            }),
-          }
+        ? await readExactCompareEvidence({
+            run: this.run,
+            prNumber: pr.number,
+            expectedHead: gitOid(pr.headRefOid),
+            expectedBaseRefName: pr.baseRefName,
+            repositorySlug: this.repositorySlug,
+            proveReviewedDiff: reviewedDiffCarryInQuestion(reviewClaim, pr.headRefOid),
+          }).then((evidence) => ({
+            compareStatus: evidence.status,
+            ...(evidence.reviewedDiffDigest === undefined
+              ? {}
+              : { reviewedDiffDigest: evidence.reviewedDiffDigest }),
+          }))
         : {}),
     };
   }

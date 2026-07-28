@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isReviewedDiffDigest } from './reviewed-diff-digest.js';
 import {
   gitOid,
   gitRefName,
@@ -341,6 +342,7 @@ function reviewRecordFromUnknown(
     'verdict',
     'mappingRequest',
     'mappingDiagnostic',
+    'reviewedDiffDigest',
   ]);
   if (
     (requireRuntimeDiscriminator && record.kind !== 'review-claim')
@@ -394,6 +396,23 @@ function reviewRecordFromUnknown(
   ) {
     throw new Error(`${state} has contradictory mapping diagnostic metadata`);
   }
+  // A malformed digest is rejected rather than dropped: silently discarding it
+  // would turn "this claim asserts a diff identity we cannot parse" into "this
+  // claim asserts nothing", and the two must stay distinguishable.
+  if (
+    record.reviewedDiffDigest !== undefined
+    && !isReviewedDiffDigest(record.reviewedDiffDigest)
+  ) {
+    throw new Error('Invalid reviewed diff digest');
+  }
+  const reviewedDiffDigest = record.reviewedDiffDigest as string | undefined;
+  if (
+    reviewedDiffDigest !== undefined
+    && state !== 'verdict-intent'
+    && state !== 'terminal-approved'
+  ) {
+    throw new Error(`${state} has contradictory reviewed diff digest metadata`);
+  }
   const common = {
     kind: 'review-claim' as const,
     protocolVersion: 2 as const,
@@ -403,6 +422,7 @@ function reviewRecordFromUnknown(
     reviewer: safeText(record.reviewer, 'reviewer'),
     head: gitOid(safeText(record.head, 'head')),
     recordedAt: isoTimestamp(safeText(record.recordedAt, 'recorded-at')),
+    ...(reviewedDiffDigest === undefined ? {} : { reviewedDiffDigest }),
   };
   if (state === 'verdict-intent') {
     return { ...common, state, verdict: verdict! };
@@ -437,6 +457,9 @@ export function encodeReviewClaimPayload(record: ReviewClaimRecord): string {
     head: valid.head,
     state: valid.state,
     recordedAt: valid.recordedAt,
+    ...(valid.reviewedDiffDigest === undefined
+      ? {}
+      : { reviewedDiffDigest: valid.reviewedDiffDigest }),
     ...(valid.verdict === undefined ? {} : { verdict: valid.verdict }),
     ...('mappingRequest' in valid ? { mappingRequest: valid.mappingRequest } : {}),
     ...('mappingDiagnostic' in valid && valid.mappingDiagnostic !== undefined

@@ -31,6 +31,10 @@ import {
 } from '../../src/lifecycle/codecs.js';
 import { makeProductionReconciliationWriter } from '../../src/lifecycle/reconciliation-writer-production.js';
 import { makeProductionReviewActionPort } from '../../src/lifecycle/review-executor-production.js';
+import { makeProductionMergeActionPort } from '../../src/lifecycle/merge-executor-production.js';
+import { evaluateMergeGate } from '../../src/lifecycle/merge-executor.js';
+import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
+import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 import { makeReviewSessionProtocol } from '../../src/lifecycle/review-session.js';
 import { makeProductionReviewSessionPort } from '../../src/lifecycle/review-session-production.js';
 import { readAttemptManifest } from '../../src/lifecycle/attempt-workspace.js';
@@ -152,6 +156,350 @@ function reader(overrides: Partial<GitHubLifecycleReader> = {}): GitHubLifecycle
     ...overrides,
   };
 }
+
+/**
+ * The lifecycle view and the merge gate both decide whether an approval carries
+ * across an `update-branch` head. If the view can carry where the gate refuses,
+ * the PR reaches `merge-ready`, the merge returns `ineligible(terminal-approval)`,
+ * and `reviewEnrollmentEligible` stops dispatching reviews because
+ * `engineApprovalLapsed` is false — no unsafe merge, and no way out. This suite
+ * drives BOTH sides from one snapshot object and pins the implication
+ *
+ *     view says merge-ready  =>  the gate does not refuse for terminal-approval
+ *
+ * across the review shapes where the two used to disagree.
+ */
+describe('view and merge gate agree on a carried approval', () => {
+  const OLD_HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const MERGED_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
+  const FORK_POINT = 'dddddddddddddddddddddddddddddddddddddddd';
+  const MARKER = '<!-- jinn-autopilot-review:v2 '
+    + 'generation=22222222-2222-4222-8222-222222222222 '
+    + 'attempt=33333333-3333-4333-8333-333333333333 '
+    + 'intent=44444444-4444-4444-8444-444444444444 '
+    + 'reviewer=reviewer '
+    + `head=${OLD_HEAD} `
+    + 'verdict=APPROVE -->';
+  const COMPARE_FILES = [{
+    filename: 'src/a.ts',
+    status: 'modified',
+    sha: 'e'.repeat(40),
+    additions: 1,
+    deletions: 1,
+    patch: '@@ -1,1 +1,1 @@\n-old\n+new',
+  }];
+
+  // Both sides are driven from ONE source of truth — the compare payload — the
+  // way production does it: the reader digests that payload onto the PR
+  // snapshot, and the merge gate re-digests the same payload live. Handing the
+  // two different digests would exercise a state that cannot occur.
+  function digestOf(compareFiles) {
+    const result = reviewedDiffDigestFromCompare(compareFiles, {
+      baseOid: gitOid(FORK_POINT),
+      baseRefName: gitRefName('next'),
+      files: compareFiles.map((file) => file.filename),
+      complete: true,
+    });
+    return result.status === 'digest' ? result.digest : undefined;
+  }
+
+  const APPROVED_DIGEST = digestOf(COMPARE_FILES);
+
+  function engineReview(overrides = {}) {
+    return {
+      reviewer: 'reviewer',
+      state: 'APPROVED',
+      // update-branch re-points the review onto the merge commit.
+      commitId: MERGED_HEAD,
+      body: `Looks good.\n\n${MARKER}`,
+      submittedAt: '2026-07-20T10:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  async function snapshotFor(reviews, compareFiles) {
+    const base = page('page-2').nodes[0];
+    const digest = digestOf(compareFiles);
+    return buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...base,
+          headOid: MERGED_HEAD,
+          mergeStateStatus: 'CLEAN',
+          compareStatus: 'ahead',
+          ...(digest === undefined ? {} : { reviewedDiffDigest: digest }),
+          reviews,
+          reviewClaim: {
+            oid: REVIEW_REF,
+            payload: JSON.stringify({
+              protocolVersion: 2,
+              prNumber: 101,
+              generation: '22222222-2222-4222-8222-222222222222',
+              attempt: '33333333-3333-4333-8333-333333333333',
+              reviewer: 'reviewer',
+              head: OLD_HEAD,
+              state: 'terminal-approved',
+              recordedAt: '2026-07-20T09:00:00.000Z',
+              reviewedDiffDigest: APPROVED_DIGEST,
+              verdict: {
+                marker: '44444444-4444-4444-8444-444444444444',
+                state: 'APPROVE',
+              },
+            }),
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readBranchClaims: async () => [],
+    }), { authorAllowlist: new Set(['trusted']), defaultBranch: 'next' });
+  }
+
+  function mergePort(snapshot, compareFiles) {
+    return makeProductionMergeActionPort({
+      readSnapshot: async () => snapshot,
+      authorAllowlist: new Set(['trusted']),
+      expectedBaseRefName: 'next',
+      runner: async (_command, args) => {
+        const endpoint = args.find((arg) => arg.startsWith('repos/'));
+        if (endpoint === 'repos/Jinn-Network/mono/pulls/101') {
+          return JSON.stringify({
+            changed_files: compareFiles.length,
+            head: { sha: MERGED_HEAD },
+            base: { ref: 'next', sha: FORK_POINT },
+          });
+        }
+        if (endpoint.startsWith('repos/Jinn-Network/mono/pulls/101/files?')) {
+          return JSON.stringify([
+            compareFiles.map((file) => ({ filename: file.filename })),
+          ]);
+        }
+        if (endpoint.startsWith('repos/Jinn-Network/mono/contents/')) {
+          return JSON.stringify({ content: Buffer.from('').toString('base64') });
+        }
+        return JSON.stringify({ status: 'ahead', files: compareFiles });
+      },
+    });
+  }
+
+  async function bothSides(reviews, compareFiles) {
+    const snapshot = await snapshotFor(reviews, compareFiles);
+    const view = deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60 * 1000,
+    ).items[0];
+    const candidate = await mergePort(snapshot, compareFiles).readCandidate(101);
+    const gate = candidate === null
+      ? { pass: false, reasons: ['pull-request-missing'] }
+      : evaluateMergeGate(candidate);
+    return { view, gate, candidate };
+  }
+
+  it('carries on both sides when the engine review rode onto the merge commit', async () => {
+    const { view, gate, candidate } = await bothSides([engineReview()], COMPARE_FILES);
+    expect(view.phase).toBe('merge-ready');
+    expect(candidate.terminalApprovalMatches).toBe(true);
+    expect(gate.reasons).not.toContain('terminal-approval');
+  });
+
+  it.each([
+    [
+      'a human approved the new head while the engine review stayed on the old one',
+      [
+        engineReview({ commitId: OLD_HEAD }),
+        {
+          reviewer: 'a-human',
+          state: 'APPROVED',
+          commitId: MERGED_HEAD,
+          body: 'LGTM',
+          submittedAt: '2026-07-20T11:00:00.000Z',
+        },
+      ],
+      COMPARE_FILES,
+    ],
+    [
+      "the claim reviewer's latest review at the head is COMMENTED",
+      [
+        engineReview(),
+        {
+          reviewer: 'reviewer',
+          state: 'COMMENTED',
+          commitId: MERGED_HEAD,
+          body: 'One more thought.',
+          submittedAt: '2026-07-20T11:00:00.000Z',
+        },
+      ],
+      COMPARE_FILES,
+    ],
+    [
+      'the engine review at the head carries no signed marker',
+      [engineReview({ body: 'Approved.' })],
+      COMPARE_FILES,
+    ],
+    [
+      'the current head diff cannot be represented at all',
+      [engineReview()],
+      [{ filename: 'src/a.ts', status: 'modified', sha: 'e'.repeat(40) }],
+    ],
+    [
+      'the current head presents a different diff',
+      [engineReview()],
+      [{ ...COMPARE_FILES[0], patch: '@@ -1,1 +1,1 @@\n-old\n+different' }],
+    ],
+    [
+      'a worker added a file after the approval',
+      [engineReview()],
+      [
+        COMPARE_FILES[0],
+        {
+          filename: 'src/backdoor.ts',
+          status: 'added',
+          sha: 'f'.repeat(40),
+          patch: '@@ -0,0 +1 @@\n+exfiltrate();',
+        },
+      ],
+    ],
+  ])('neither side carries when %s', async (_name, reviews, compareFiles) => {
+    const { view, gate } = await bothSides(reviews, compareFiles);
+    // The implication that matters: had the view said merge-ready here, the
+    // gate's terminal-approval refusal would have had no recovery path.
+    expect(view.phase).not.toBe('merge-ready');
+    expect(gate.reasons).toContain('terminal-approval');
+  });
+});
+
+describe('head-bound review evidence on the lifecycle item', () => {
+  const OTHER_COMMIT = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+
+  async function item(overrides) {
+    const base = page('page-2').nodes[0];
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => ({
+        nodes: [{ ...base, ...overrides }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readBranchClaims: async () => [],
+    }), { authorAllowlist: new Set(['trusted']), defaultBranch: 'next' });
+    return {
+      lifecycle: snapshot.lifecycle.items.find((entry) => entry.kind === 'pull-request'),
+      pullRequest: snapshot.pullRequests[0],
+    };
+  }
+
+  // Mutant guard: `latestDecisiveReview` must stay pinned to the current head.
+  // Without that filter an approval left behind on an older commit would keep
+  // reporting `approved`, which is the flag every carry decision starts from.
+  it('does not report approved from a review left behind on an older commit', async () => {
+    const base = page('page-2').nodes[0];
+    const { lifecycle } = await item({
+      reviews: [{ ...base.reviews[0], commitId: OTHER_COMMIT }],
+    });
+    expect(lifecycle.approved).toBe(false);
+    expect(lifecycle.needsReview).toBe(true);
+  });
+
+  // Mutant guard: the digest must be validated, not merely typed. A `string`
+  // check would let arbitrary text reach the carry comparison, where equality
+  // with a recorded value is the whole authority.
+  it.each([
+    ['a malformed digest', 'not-a-digest'],
+    ['a bare hex digest with no version', 'c'.repeat(64)],
+    ['a future version', `v2:${'c'.repeat(64)}`],
+    ['a non-string digest', 7],
+  ])('drops %s from the PR snapshot', async (_name, digest) => {
+    const { pullRequest } = await item({ reviewedDiffDigest: digest });
+    expect(pullRequest).not.toHaveProperty('reviewedDiffDigest');
+  });
+
+  it('keeps a well-formed digest', async () => {
+    const digest = `v1:${'c'.repeat(64)}`;
+    const { pullRequest } = await item({ reviewedDiffDigest: digest });
+    expect(pullRequest.reviewedDiffDigest).toBe(digest);
+  });
+});
+
+describe('terminal verdict head binding', () => {
+  const MERGED_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
+
+  async function build(overrides) {
+    const base = page('page-2').nodes[0];
+    const pr = {
+      ...base,
+      reviewClaim: {
+        oid: REVIEW_REF,
+        payload: JSON.stringify({
+          protocolVersion: 2,
+          prNumber: 101,
+          generation: '22222222-2222-4222-8222-222222222222',
+          attempt: '33333333-3333-4333-8333-333333333333',
+          reviewer: 'reviewer',
+          head: HEAD,
+          state: 'terminal-approved',
+          recordedAt: '2026-07-20T09:00:00.000Z',
+          verdict: {
+            marker: '44444444-4444-4444-8444-444444444444',
+            state: 'APPROVE',
+          },
+        }),
+      },
+      ...overrides,
+    };
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => ({
+        nodes: [pr],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+      readBranchClaims: async () => [],
+    }), { authorAllowlist: new Set(['trusted']), defaultBranch: 'next' });
+    return snapshot.lifecycle.items.find((item) => item.kind === 'pull-request');
+  }
+
+  // Measured on Jinn-Network/mono: `update-branch` re-points every existing
+  // review's `commit_id` onto the new merge commit (PR #2130 ends with three
+  // reviews naming three different marker heads and one shared `commit_id`),
+  // while an ordinary push leaves `commit_id` alone (PR #2232). The signed
+  // marker is the binding GitHub does not rewrite.
+  it('reports the head the marker names, not the commit_id GitHub rewrote', async () => {
+    const item = await build({
+      headOid: MERGED_HEAD,
+      reviews: [{
+        ...page('page-2').nodes[0].reviews[0],
+        commitId: MERGED_HEAD,
+      }],
+    });
+    expect(item.head).toBe(MERGED_HEAD);
+    expect(item.terminalVerdict).toMatchObject({ head: HEAD, state: 'APPROVE' });
+  });
+
+  it('still reports the reviewed head when nothing moved', async () => {
+    const item = await build({});
+    expect(item.terminalVerdict).toMatchObject({ head: HEAD, state: 'APPROVE' });
+  });
+
+  it('produces no verdict for a review body that does not carry the signed marker', async () => {
+    const item = await build({
+      headOid: MERGED_HEAD,
+      reviews: [{
+        ...page('page-2').nodes[0].reviews[0],
+        commitId: MERGED_HEAD,
+        body: 'Looks good to me.',
+      }],
+    });
+    expect(item.terminalVerdict).toBeUndefined();
+  });
+
+  it('produces no verdict for a marker signed by a different reviewer identity', async () => {
+    const item = await build({
+      headOid: MERGED_HEAD,
+      reviews: [{
+        ...page('page-2').nodes[0].reviews[0],
+        reviewer: 'marker-copying-bot',
+        commitId: MERGED_HEAD,
+      }],
+    });
+    expect(item.terminalVerdict).toBeUndefined();
+  });
+});
 
 describe('buildGitHubLifecycleSnapshot', () => {
   it('uses the canonical resolver to enroll the complete #2084 stacked mapping once', async () => {

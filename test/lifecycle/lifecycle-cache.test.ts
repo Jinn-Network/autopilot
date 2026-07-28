@@ -853,4 +853,67 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await expect(store.save(skewed)).resolves.toBeUndefined();
     await expect(store.load()).resolves.toEqual(skewed);
   });
+
+  it('persists reviewed-diff digests and refuses malformed ones', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const digest = `v1:${'c'.repeat(64)}`;
+    const pullRequest: PullRequestSnapshot = {
+      ...base.evidence.pullRequests[0]!,
+      reviewedDiffDigest: digest,
+      reviewClaim: {
+        oid: gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+        record: {
+          kind: 'review-claim',
+          protocolVersion: 2,
+          prNumber: 101,
+          generation: '22222222-2222-4222-8222-222222222222',
+          attempt: '33333333-3333-4333-8333-333333333333',
+          reviewer: 'reviewer',
+          head: gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+          recordedAt: '2026-07-22T14:00:00.000Z',
+          state: 'terminal-approved',
+          verdict: { marker: '44444444-4444-4444-8444-444444444444', state: 'APPROVE' },
+          reviewedDiffDigest: digest,
+        },
+      },
+    };
+    const withDigest: LifecycleDiscoveryState = {
+      ...base,
+      evidence: { ...base.evidence, pullRequests: [pullRequest] },
+      openPullRequestEvidence: [pullRequest],
+    };
+
+    await expect(store.save(withDigest)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(withDigest);
+
+    // A cache written before the field existed still loads, and still loads
+    // without a digest — which is what keeps the merge gate on exact heads.
+    const legacyPr = { ...withDigest.evidence.pullRequests[0]! };
+    delete (legacyPr as Record<string, unknown>).reviewedDiffDigest;
+    delete (legacyPr.reviewClaim!.record as unknown as Record<string, unknown>).reviewedDiffDigest;
+    const legacy: LifecycleDiscoveryState = {
+      ...withDigest,
+      evidence: { ...withDigest.evidence, pullRequests: [legacyPr] },
+      openPullRequestEvidence: [legacyPr],
+    };
+    await expect(store.save(legacy)).resolves.toBeUndefined();
+    const loaded = await store.load();
+    expect(loaded!.evidence.pullRequests[0]).not.toHaveProperty('reviewedDiffDigest');
+    expect(loaded!.evidence.pullRequests[0]!.reviewClaim!.record)
+      .not.toHaveProperty('reviewedDiffDigest');
+
+    await writeFile(
+      join(directory, 'lifecycle-cache.json'),
+      JSON.stringify({
+        ...legacy,
+        evidence: {
+          ...legacy.evidence,
+          pullRequests: [{ ...legacyPr, reviewedDiffDigest: 'not-a-digest' }],
+        },
+      }),
+    );
+    await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
+  });
 });

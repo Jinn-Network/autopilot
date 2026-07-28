@@ -157,6 +157,17 @@ interface ReviewClaimBase {
   readonly reviewer: string;
   readonly head: GitOid;
   readonly recordedAt: string;
+  /**
+   * Identity of the diff this claim's head presented against its base at the
+   * moment the reviewer read it — see `reviewed-diff-digest.ts` for the exact
+   * construction and its `v1:<sha256>` shape.
+   *
+   * Optional, and its absence is load-bearing: claims written before this field
+   * existed, and claims whose digest could not be proven, carry no digest, and
+   * the merge gate must then keep requiring exact head identity. Never treat a
+   * missing digest as "the diff did not change".
+   */
+  readonly reviewedDiffDigest?: string;
 }
 
 export type ReviewClaimRecord =
@@ -291,6 +302,24 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   readonly implementationSummary?: string;
   readonly reviewClaim?: ReviewClaimRecord;
   readonly terminalVerdict?: TerminalVerdictEvidence;
+  /**
+   * The claim reviewer's effective native review at `head` is APPROVED and
+   * carries the signed marker naming the reviewed head — the merge gate's
+   * `terminalReview` conjunct, projected so the lifecycle view can require the
+   * same thing the gate will. Absent means false; absence must never let an
+   * approval carry.
+   */
+  readonly reviewerApprovedAtHead?: boolean;
+  /**
+   * Identity of the diff `head` presents against its base branch tip — the same
+   * construction as `ReviewClaimRecord.reviewedDiffDigest`, computed for the
+   * head that exists now. Equality of the two is the only evidence that an
+   * approval recorded at an older head still describes this one.
+   *
+   * Absent whenever it could not be proven. Absent is *unknown*, never
+   * "unchanged".
+   */
+  readonly reviewedDiffDigest?: string;
 }
 
 export type LifecycleItem = IssueLifecycleItem | PullRequestLifecycleItem;

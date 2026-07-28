@@ -293,6 +293,12 @@ function nextReviewRecord(
     }
     return {
       ...common,
+      // Carried, never recomputed. The intent recorded the diff the reviewer
+      // read; recomputing here would silently re-anchor the claim to whatever
+      // the diff happens to be at recovery time.
+      ...(current.reviewedDiffDigest === undefined
+        ? {}
+        : { reviewedDiffDigest: current.reviewedDiffDigest }),
       state,
       verdict: {
         marker: current.verdict.marker,
