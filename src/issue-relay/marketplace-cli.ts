@@ -513,7 +513,10 @@ export class IssueRelayMarketplaceCli {
       '--dry-run',
       '--yes',
       '--json',
-    ], { environment: this.environment });
+    ], {
+      environment: this.environment,
+      outputProfile: 'issue-relay-dry-run',
+    });
     verifyRelayMarketplaceRequest(requestPath, requestDigestPin);
     if (result.exitCode !== 0) {
       throwMarketplaceMachineFailure(result, 'jinn tasks submit --dry-run');

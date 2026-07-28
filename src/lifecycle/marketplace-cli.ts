@@ -15,7 +15,9 @@ export type MarketplaceMachineSubprocess = (
   args: readonly string[],
   options: {
     readonly environment: NodeJS.ProcessEnv;
-    readonly outputProfile?: 'issue-relay-observation';
+    readonly outputProfile?:
+      | 'issue-relay-dry-run'
+      | 'issue-relay-observation';
   },
 ) => Promise<MarketplaceMachineSubprocessResult>;
 
@@ -95,11 +97,29 @@ export function resolveInstalledJinnBinary(): string {
 export const MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS = 300_000;
 export const MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES = 1024 * 1024;
 const ISSUE_RELAY_MAX_PATCH_BYTES = 2 * 1024 * 1024;
+const ISSUE_RELAY_MAX_DRY_RUN_SPEC_BYTES = 2 * 1024 * 1024;
+const ISSUE_RELAY_MAX_FINDINGS = 50;
+const ISSUE_RELAY_MAX_FINDING_LABEL_BYTES = 240;
+const ISSUE_RELAY_MAX_FINDING_BODY_BYTES = 8 * 1024;
+const ISSUE_RELAY_MAX_GENERATION_BYTES = 8 * 1024;
+const ISSUE_RELAY_MAX_REPOSITORY_BYTES = 200;
 const JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION = 6;
-const ISSUE_RELAY_OBSERVATION_JSON_OVERHEAD_BYTES = 256 * 1024;
+const ISSUE_RELAY_MACHINE_ENVELOPE_OVERHEAD_BYTES = 256 * 1024;
+const ISSUE_RELAY_MAX_ROUND_TEXT_BYTES =
+  ISSUE_RELAY_MAX_GENERATION_BYTES
+  + 2 * ISSUE_RELAY_MAX_REPOSITORY_BYTES
+  + ISSUE_RELAY_MAX_FINDINGS * (
+    2 * ISSUE_RELAY_MAX_FINDING_LABEL_BYTES
+    + 2 * ISSUE_RELAY_MAX_FINDING_BODY_BYTES
+  );
 export const MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES =
-  ISSUE_RELAY_MAX_PATCH_BYTES * JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION
-  + ISSUE_RELAY_OBSERVATION_JSON_OVERHEAD_BYTES;
+  (ISSUE_RELAY_MAX_PATCH_BYTES + ISSUE_RELAY_MAX_ROUND_TEXT_BYTES)
+  * JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION
+  + ISSUE_RELAY_MACHINE_ENVELOPE_OVERHEAD_BYTES;
+const MARKETPLACE_MACHINE_RELAY_DRY_RUN_OUTPUT_LIMIT_BYTES =
+  ISSUE_RELAY_MAX_DRY_RUN_SPEC_BYTES
+  * JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION
+  + ISSUE_RELAY_MACHINE_ENVELOPE_OVERHEAD_BYTES;
 
 export class MarketplaceMachineSubprocessPolicyError extends Error {
   readonly reason: 'timeout' | 'output-limit';
@@ -116,9 +136,10 @@ export const runMarketplaceMachineSubprocess: MarketplaceMachineSubprocess = (
   args,
   options,
 ) => new Promise((resolve, reject) => {
-  const outputLimitBytes =
-    options.outputProfile === 'issue-relay-observation'
-      ? MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES
+  const outputLimitBytes = options.outputProfile === 'issue-relay-observation'
+    ? MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES
+    : options.outputProfile === 'issue-relay-dry-run'
+      ? MARKETPLACE_MACHINE_RELAY_DRY_RUN_OUTPUT_LIMIT_BYTES
       : MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES;
   const child = spawn(command, [...args], {
     env: options.environment,
