@@ -292,6 +292,16 @@ function branchClaim(workflow: MutationWorkflow): BranchClaim {
   };
 }
 
+function withoutPrNumber(
+  claim: BranchClaim,
+): Extract<BranchClaim, { readonly phase: 'implement' }> {
+  if (claim.phase !== 'implement') {
+    throw new Error('Only an initial implement claim may omit its PR number');
+  }
+  const { prNumber: _prNumber, ...initial } = claim;
+  return initial;
+}
+
 function verificationEvidence(expectedTree: GitOid): MarketplaceVerificationEvidence {
   const patch = validateMarketplacePatch(new TextEncoder().encode(PATCH));
   const plan = buildJinnMonoV1VerificationPlan({
@@ -620,9 +630,19 @@ export class Harness implements
     },
     implementationComplete: async (_manifest, summary) => {
       expect(summary).toBe('Implemented the requested contract.');
+      if (
+        this.currentClaim.phase !== 'implement'
+        || this.currentManifest.prNumber === undefined
+      ) {
+        throw new Error('Implementation completion requires an exact PR claim');
+      }
       if (this.currentClaim.phaseComplete !== true) {
         this.completionMutations += 1;
-        this.currentClaim = { ...this.currentClaim, phaseComplete: true };
+        this.currentClaim = {
+          ...this.currentClaim,
+          prNumber: this.currentManifest.prNumber,
+          phaseComplete: true,
+        };
         this.currentClaimOid = this.phaseCompleteHead;
         this.remoteHead = this.phaseCompleteHead;
         this.prHead = this.phaseCompleteHead;
@@ -768,6 +788,54 @@ function writeObservationFile(
 }
 
 describe('marketplace mutation adoption validation', () => {
+  it.each([
+    [
+      'an explicit wrong PR on the origin claim',
+      (harness: Harness) => {
+        harness.currentClaim = { ...harness.currentClaim, prNumber: 2102 };
+      },
+    ],
+    [
+      'an omitted PR after a newer claim',
+      (harness: Harness) => {
+        harness.currentClaim = withoutPrNumber(harness.currentClaim);
+        harness.currentClaimOid = STALE;
+      },
+    ],
+    [
+      'a phase-complete claim with an omitted PR',
+      (harness: Harness) => {
+        harness.currentClaim = {
+          ...withoutPrNumber(harness.currentClaim),
+          phaseComplete: true,
+        };
+      },
+    ],
+    [
+      'a phase-complete claim below the remote head',
+      (harness: Harness) => {
+        harness.currentClaim = {
+          ...harness.currentClaim,
+          phaseComplete: true,
+        };
+      },
+    ],
+  ])('rejects %s before effects', async (_name, arrange) => {
+    const harness = new Harness();
+    arrange(harness);
+
+    await expect(adopt(harness)).resolves.toMatchObject({
+      status: 'rejected',
+      reason: 'stale-claim',
+      receipt: {
+        disposition: 'rejected',
+        detail: 'Implementation attempt no longer owns the exact claim',
+      },
+    });
+    expect(harness.applyMutations).toBe(0);
+    expect(harness.comments).toHaveLength(1);
+  });
+
   it('rejects untrusted receipt authors before effects', async () => {
     const harness = new Harness();
     harness.receiptAuthors = ['evil-bot'];
@@ -891,6 +959,24 @@ describe('marketplace mutation adoption validation', () => {
 });
 
 describe('marketplace mutation adoption success', () => {
+  it('accepts a fresh implement claim published before the PR existed', async () => {
+    const harness = new Harness();
+    harness.currentClaim = withoutPrNumber(harness.currentClaim);
+
+    const result = await adopt(harness);
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      receipt: { disposition: 'accepted' },
+    });
+    expect(harness.applyMutations).toBe(1);
+    expect(harness.currentClaim).toMatchObject({
+      prNumber: 2101,
+      phaseComplete: true,
+    });
+    expect(harness.comments).toHaveLength(1);
+  });
+
   it('adopts through verify, commit, completion, anchor, and receipt', async () => {
     const harness = new Harness();
     const result = await adopt(harness);

@@ -15,6 +15,8 @@ import {
   type AutopilotWorkflow,
 } from '@jinn-network/sdk/autopilot';
 import { readAttemptManifest, type AttemptManifest } from './attempt-workspace.js';
+import { branchClaimPrAuthorityMatches } from './implementation-claim-authority.js';
+import type { ImplementationSessionProtocol } from './implementation-session.js';
 import {
   publishAdoptionReceipt,
   type AdoptionReceiptExactFacts,
@@ -52,7 +54,6 @@ import type {
   MarketplaceReviewAnchorOrigin,
   MarketplaceReviewAnchorPort,
 } from './marketplace-review-anchor.js';
-import type { ImplementationSessionProtocol } from './implementation-session.js';
 import { gitOid, type BranchClaim, type GitOid } from './types.js';
 
 export type MarketplaceMutationAdoptionResult =
@@ -464,15 +465,16 @@ function authorityFailure(
   if (
     claim.phase !== workflowClaimPhase(session.workflow)
     || claim.issueNumber !== manifest.issueNumber
-    || claim.prNumber !== session.prNumber
     || claim.attempt !== session.v2AttemptId
     || claim.runner !== session.runnerId
     || claim.targetBase !== session.targetBase
-    || (
-      claim.phaseComplete === true
-        ? authority.latestClaimOid !== authority.remoteHead
-        : authority.latestClaimOid !== manifest.claimOid
-    )
+    || !branchClaimPrAuthorityMatches({
+      claim,
+      expectedPrNumber: session.prNumber,
+      originClaimOid: gitOid(manifest.claimOid),
+      latestClaimOid: authority.latestClaimOid,
+      remoteHead: authority.remoteHead,
+    })
   ) {
     return {
       reason: 'stale-claim',
