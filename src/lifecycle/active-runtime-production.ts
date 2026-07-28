@@ -159,6 +159,7 @@ export interface ProductionActiveRuntimeOptions {
   readonly readImplementationSnapshot: (
     cycleSnapshot: GitHubLifecycleSnapshot,
     action: Extract<NewWorkAction, { kind: 'claim-implementation' }>,
+    selfClaim?: import('./self-claim-transition.js').SelfClaimHeadTransition,
   ) => Promise<GitHubLifecycleSnapshot>;
   /** One aggregate quota reservation before any review cohort begins. */
   readonly reserveReviewCohort: (size: number) => Promise<void>;
@@ -876,8 +877,8 @@ export function makeProductionActiveRuntime(
           remoteName,
           credentials,
           authorAllowlist: options.authorAllowlist,
-          readSnapshot: () =>
-            options.readImplementationSnapshot(cycleSnapshot, action),
+          readSnapshot: (selfClaim) =>
+            options.readImplementationSnapshot(cycleSnapshot, action, selfClaim),
           runner,
           environment: ambient,
           repositorySlug: options.repositorySlug,

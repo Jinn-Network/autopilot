@@ -19,6 +19,10 @@ import {
   hasReviewFollowUpMarkerTag,
   parseReviewFollowUpMarker,
 } from './review-follow-ups.js';
+import {
+  selfClaimHeadTransition,
+  type SelfClaimHeadTransition,
+} from './self-claim-transition.js';
 import type { HumanReason, ImplementationClaimAction } from './types.js';
 import type {
   LocalImplementationSessionExecutionRequest,
@@ -171,7 +175,10 @@ export interface ImplementationExecutorDeps {
     readonly language: string;
     readonly verificationProfile: string;
   };
-  readIssue(issueNumber: number): Promise<ImplementationIssue | null>;
+  readIssue(
+    issueNumber: number,
+    selfClaim?: SelfClaimHeadTransition,
+  ): Promise<ImplementationIssue | null>;
   readStaleRecovery(
     issueNumber: number,
     prNumber: number,
@@ -195,6 +202,7 @@ export interface ImplementationExecutorDeps {
     issueNumber: number,
     expectedHead: GitOid,
     credential: SelectedCredential,
+    selfClaim?: SelfClaimHeadTransition,
   ): Promise<void>;
   createAttempt(input: CreateAttemptInput): Promise<ImplementationAttemptBinding>;
   startSession(
@@ -749,7 +757,16 @@ export async function executeImplementationAction(
     return { status: 'ambiguous', issueNumber };
   }
 
-  const currentIssue = await deps.readIssue(issueNumber);
+  let selfClaim: SelfClaimHeadTransition | undefined = adopted === undefined
+    ? undefined
+    : selfClaimHeadTransition({
+        prNumber: adopted.number,
+        previousHead: expectedRemoteHead,
+        candidateParent,
+        claimedHead: claimOid,
+      });
+
+  const currentIssue = await deps.readIssue(issueNumber, selfClaim);
   if (
     currentIssue === null
     || currentIssue.number !== issueNumber
@@ -784,7 +801,20 @@ export async function executeImplementationAction(
       claimOid,
     };
   }
-  await deps.setProjectInProgress(issueNumber, claimOid, selection.credential);
+  if (selfClaim === undefined) {
+    selfClaim = selfClaimHeadTransition({
+      prNumber: pullRequest.number,
+      previousHead: expectedRemoteHead,
+      candidateParent,
+      claimedHead: claimOid,
+    });
+  }
+  await deps.setProjectInProgress(
+    issueNumber,
+    claimOid,
+    selection.credential,
+    selfClaim,
+  );
 
   const preparation = executionBackend === 'marketplace'
     ? marketplacePreparation({
