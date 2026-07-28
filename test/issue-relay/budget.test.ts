@@ -168,6 +168,28 @@ describe('Relay spend idempotency and concurrency', () => {
 });
 
 describe('Relay generation exhaustion', () => {
+  it('rejects a funded continuation without its durable active deadline record', () => {
+    const ledger: RelaySpendLedger = {
+      activeGenerations: [],
+      fundedRounds: [{
+        taskKey: 'issue-relay:R_kgDOCandidate:42:sha256:candidate:round:0',
+        generation: candidate.generation,
+        repository: candidate.repository,
+        authorLogin: candidate.authorLogin,
+        round: 0,
+        spendWei: 40n,
+        fundedAt: '2026-07-28T11:00:00.000Z',
+      }],
+    };
+
+    expect(() => admitRelaySpend({
+      policy,
+      ledger,
+      candidate: { ...candidate, round: 1 },
+      now,
+    })).toThrow(/continuation.*active generation/i);
+  });
+
   it('admits the last zero-based round and exhausts the configured round count', () => {
     const activeLedger: RelaySpendLedger = {
       activeGenerations: [{
@@ -340,5 +362,101 @@ describe('Relay spend ledger validation', () => {
       candidate: { ...candidate, proposedSpendWei: -1n },
       now,
     })).toThrow(/proposed spend/i);
+  });
+
+  it.each([
+    ['numeric shorthand', '0'],
+    ['an impossible date', '2026-02-30T13:00:00.000Z'],
+    ['a non-UTC offset', '2026-07-28T14:00:00.000+01:00'],
+  ])('rejects a generation deadline using %s', (_name, deadlineAt) => {
+    expect(() => admitRelaySpend({
+      policy,
+      ledger: {
+        activeGenerations: [{
+          generation: candidate.generation,
+          repository: candidate.repository,
+          authorLogin: candidate.authorLogin,
+          deadlineAt,
+        }],
+        fundedRounds: [],
+      },
+      candidate,
+      now,
+    })).toThrow(/generation deadline.*canonical UTC/i);
+  });
+
+  it.each([
+    ['numeric shorthand', '0'],
+    ['an impossible date', '2026-02-30T11:00:00.000Z'],
+    ['a non-UTC offset', '2026-07-28T12:00:00.000+01:00'],
+    ['a future time', '2026-07-28T12:00:00.001Z'],
+  ])('rejects a funding time using %s', (_name, fundedAt) => {
+    expect(() => admitRelaySpend({
+      policy,
+      ledger: {
+        activeGenerations: [],
+        fundedRounds: [{
+          taskKey: 'issue-relay:other-generation:round:0',
+          generation: 'other-generation',
+          repository: 'other/repository',
+          authorLogin: 'Bob',
+          round: 0,
+          spendWei: 1n,
+          fundedAt,
+        }],
+      },
+      candidate,
+      now,
+    })).toThrow(/funded time/i);
+  });
+
+  it('fails closed on contradictory metadata for an unrelated generation', () => {
+    expect(() => admitRelaySpend({
+      policy,
+      ledger: {
+        activeGenerations: [{
+          generation: 'unrelated-generation',
+          repository: 'other/repository',
+          authorLogin: 'Bob',
+          deadlineAt: '2026-07-28T13:00:00.000Z',
+        }],
+        fundedRounds: [{
+          taskKey: 'issue-relay:unrelated-generation:round:0',
+          generation: 'unrelated-generation',
+          repository: 'different/repository',
+          authorLogin: 'Carol',
+          round: 0,
+          spendWei: 1n,
+          fundedAt: '2026-07-28T11:00:00.000Z',
+        }],
+      },
+      candidate,
+      now,
+    })).toThrow(/conflicting generation metadata/i);
+  });
+
+  it('fails closed on duplicate active records for an unrelated generation', () => {
+    expect(() => admitRelaySpend({
+      policy,
+      ledger: {
+        activeGenerations: [
+          {
+            generation: 'unrelated-generation',
+            repository: 'other/repository',
+            authorLogin: 'Bob',
+            deadlineAt: '2026-07-28T13:00:00.000Z',
+          },
+          {
+            generation: 'unrelated-generation',
+            repository: 'other/repository',
+            authorLogin: 'Bob',
+            deadlineAt: '2026-07-28T13:00:00.000Z',
+          },
+        ],
+        fundedRounds: [],
+      },
+      candidate,
+      now,
+    })).toThrow(/ambiguous active generation/i);
   });
 });

@@ -60,10 +60,13 @@ function requireNonNegativeWei(value: bigint, label: string): void {
   }
 }
 
-function parsedTimestamp(value: string, label: string): number {
+function canonicalUtcTimestamp(value: string, label: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+    throw new TypeError(`${label} must be a canonical UTC timestamp`);
+  }
   const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) {
-    throw new TypeError(`${label} must be a valid timestamp`);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+    throw new TypeError(`${label} must be a canonical UTC timestamp`);
   }
   return timestamp;
 }
@@ -112,21 +115,48 @@ export function admitRelaySpend(input: {
 
   const active = input.ledger.activeGenerations.map((generation) => ({
     ...generation,
-    deadlineMs: parsedTimestamp(generation.deadlineAt, 'Generation deadline'),
+    deadlineMs: canonicalUtcTimestamp(generation.deadlineAt, 'Generation deadline'),
   }));
   const activeGenerationNames = new Set<string>();
+  const generationMetadata = new Map<
+    string,
+    { readonly repository: string; readonly authorLogin: string }
+  >();
+  const recordGenerationMetadata = (
+    generation: string,
+    repository: string,
+    authorLogin: string,
+  ): void => {
+    const existing = generationMetadata.get(generation);
+    if (
+      existing !== undefined
+      && (
+        !sameGitHubName(existing.repository, repository)
+        || !sameGitHubName(existing.authorLogin, authorLogin)
+      )
+    ) {
+      throw new TypeError('Conflicting generation metadata in spend ledger');
+    }
+    generationMetadata.set(generation, { repository, authorLogin });
+  };
   for (const generation of active) {
     if (activeGenerationNames.has(generation.generation)) {
       throw new TypeError('Ambiguous active generation ledger entries');
     }
     activeGenerationNames.add(generation.generation);
+    recordGenerationMetadata(
+      generation.generation,
+      generation.repository,
+      generation.authorLogin,
+    );
   }
 
   const fundedTaskKeys = new Set<string>();
+  const fundedAtByTaskKey = new Map<string, number>();
   for (const funded of input.ledger.fundedRounds) {
     requireNonNegativeInteger(funded.round, 'Funded round');
     requireNonNegativeWei(funded.spendWei, 'Funded spend');
-    const fundedAtMs = parsedTimestamp(funded.fundedAt, 'Funded time');
+    const fundedAtMs = canonicalUtcTimestamp(funded.fundedAt, 'Funded time');
     if (fundedAtMs > nowMs) {
       throw new TypeError('Funded time cannot be later than the supplied clock');
     }
@@ -137,20 +167,28 @@ export function admitRelaySpend(input: {
       throw new TypeError('Ambiguous duplicate funded task key');
     }
     fundedTaskKeys.add(funded.taskKey);
+    fundedAtByTaskKey.set(funded.taskKey, fundedAtMs);
+    recordGenerationMetadata(
+      funded.generation,
+      funded.repository,
+      funded.authorLogin,
+    );
   }
 
   const taskKey = relayTaskKey(input.candidate.generation, input.candidate.round);
+  const candidateActive = active.find(
+    ({ generation }) => generation === input.candidate.generation,
+  );
+  if (input.candidate.round > 0 && candidateActive === undefined) {
+    throw new TypeError('Relay continuation requires one active generation deadline record');
+  }
   if (fundedTaskKeys.has(taskKey)) {
     return { status: 'duplicate', taskKey };
   }
-
   if (input.candidate.round >= input.policy.maxRoundsPerGeneration) {
     return { status: 'exhausted', code: 'round-limit' };
   }
 
-  const candidateActive = active.find(
-    ({ generation }) => generation === input.candidate.generation,
-  );
   if (
     candidateActive !== undefined
     && (
@@ -213,7 +251,7 @@ export function admitRelaySpend(input: {
   const nextDayStartMs = dayStartMs + 24 * 60 * 60 * 1_000;
   let dailySpendWei = 0n;
   for (const funded of input.ledger.fundedRounds) {
-    const fundedAtMs = Date.parse(funded.fundedAt);
+    const fundedAtMs = fundedAtByTaskKey.get(funded.taskKey)!;
     if (fundedAtMs >= dayStartMs && fundedAtMs < nextDayStartMs) {
       dailySpendWei += funded.spendWei;
     }

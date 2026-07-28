@@ -31,6 +31,32 @@ function sameGitHubName(left: string, right: string): boolean {
   return left.toLocaleLowerCase('en-US') === right.toLocaleLowerCase('en-US');
 }
 
+function canonicalUtcTimestamp(value: string): number | undefined {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+    return undefined;
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+    return undefined;
+  }
+  return timestamp;
+}
+
+function validateAdmissionPolicy(policy: RelayAdmissionPolicy): void {
+  if (
+    policy.repository !== 'Jinn-Network/mono'
+    || policy.label !== 'engine:marketplace'
+    || !Number.isSafeInteger(policy.maxIssueBytes)
+    || policy.maxIssueBytes <= 0
+    || !Number.isSafeInteger(policy.maxAcceptanceItems)
+    || policy.maxAcceptanceItems <= 0
+    || !Array.isArray(policy.forbiddenRequestPatterns)
+    || !policy.forbiddenRequestPatterns.every((pattern) => pattern instanceof RegExp)
+  ) {
+    throw new TypeError('Invalid Relay admission policy');
+  }
+}
+
 function refusal(
   code: Extract<RelayAdmissionDecision, { status: 'refused' }>['code'],
   message: string,
@@ -45,16 +71,16 @@ function relevantEffectiveLabelEvent(input: {
 }): RelayLabelEvent | undefined {
   const relevant = input.events
     .filter((event) => sameGitHubName(event.label, input.label))
-    .map((event) => ({ event, timestamp: Date.parse(event.createdAt) }));
+    .map((event) => ({ event, timestamp: canonicalUtcTimestamp(event.createdAt) }));
 
   if (
     relevant.length === 0
-    || relevant.some(({ timestamp }) => !Number.isFinite(timestamp) || timestamp > input.nowMs)
+    || relevant.some(({ timestamp }) => timestamp === undefined || timestamp > input.nowMs)
   ) {
     return undefined;
   }
 
-  const latestTimestamp = Math.max(...relevant.map(({ timestamp }) => timestamp));
+  const latestTimestamp = Math.max(...relevant.map(({ timestamp }) => timestamp!));
   const latest = relevant.filter(({ timestamp }) => timestamp === latestTimestamp);
 
   if (latest.length !== 1 || latest[0]!.event.action !== 'labeled') {
@@ -74,6 +100,19 @@ function acceptanceEvidence(body: string): readonly string[] {
   let recognizedSectionDepth: number | undefined;
   let fence: { readonly character: string; readonly length: number } | undefined;
   let inHtmlComment = false;
+  let inListContext = false;
+  let pendingPlainLine:
+    | { readonly text: string; readonly inRecognizedSection: boolean }
+    | undefined;
+
+  const flushPendingPlainLine = (): void => {
+    if (pendingPlainLine?.inRecognizedSection === true) {
+      evidence.push(
+        stripBoundedItem(pendingPlainLine.text) ?? pendingPlainLine.text.trim(),
+      );
+    }
+    pendingPlainLine = undefined;
+  };
 
   for (const rawLine of body.replace(/\r\n?/g, '\n').split('\n')) {
     if (fence !== undefined) {
@@ -112,17 +151,43 @@ function acceptanceEvidence(body: string): readonly string[] {
       cursor = commentStart + 4;
     }
 
+    const nestedTaskListItem = inListContext
+      && /^(?: {4}|\t)[-*+]\s+\[[ xX]\]\s+/.test(line);
+    if (/^(?: {4}|\t)/.test(line) && !nestedTaskListItem) {
+      flushPendingPlainLine();
+      continue;
+    }
+
     const openingMarker = line.match(/^\s{0,3}(`{3,}|~{3,})/)?.[1];
     if (openingMarker !== undefined) {
+      flushPendingPlainLine();
       fence = {
         character: openingMarker[0]!,
         length: openingMarker.length,
       };
+      inListContext = false;
+      continue;
+    }
+
+    const setextUnderline = line.match(/^\s{0,3}(=+|-+)\s*$/)?.[1];
+    if (setextUnderline !== undefined && pendingPlainLine !== undefined) {
+      const headingDepth = setextUnderline[0] === '=' ? 1 : 2;
+      if (/\b(?:acceptance|expected|done when)\b/i.test(pendingPlainLine.text)) {
+        recognizedSectionDepth = headingDepth;
+      } else if (
+        recognizedSectionDepth !== undefined
+        && headingDepth <= recognizedSectionDepth
+      ) {
+        recognizedSectionDepth = undefined;
+      }
+      pendingPlainLine = undefined;
+      inListContext = false;
       continue;
     }
 
     const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
     if (heading !== null) {
+      flushPendingPlainLine();
       const headingDepth = line.trimStart().match(/^#+/)![0].length;
       if (/\b(?:acceptance|expected|done when)\b/i.test(heading[1]!)) {
         recognizedSectionDepth = headingDepth;
@@ -132,22 +197,32 @@ function acceptanceEvidence(body: string): readonly string[] {
       ) {
         recognizedSectionDepth = undefined;
       }
+      inListContext = false;
       continue;
     }
 
     const checklist = line.match(/^\s*[-*+]\s+\[[ xX]\]\s+(.+?)\s*$/)?.[1]?.trim();
     if (checklist !== undefined && checklist.length > 0) {
+      flushPendingPlainLine();
       evidence.push(checklist);
+      inListContext = true;
       continue;
     }
 
-    if (recognizedSectionDepth === undefined || line.trim().length === 0) {
+    if (line.trim().length === 0) {
+      flushPendingPlainLine();
       continue;
     }
 
-    evidence.push(stripBoundedItem(line) ?? line.trim());
+    flushPendingPlainLine();
+    pendingPlainLine = {
+      text: line,
+      inRecognizedSection: recognizedSectionDepth !== undefined,
+    };
+    inListContext = /^\s{0,3}[-*+]\s+/.test(line);
   }
 
+  flushPendingPlainLine();
   return evidence;
 }
 
@@ -166,9 +241,18 @@ export function admitRelayIssue(input: {
   readonly policy: RelayAdmissionPolicy;
   readonly now: Date;
 }): RelayAdmissionDecision {
+  validateAdmissionPolicy(input.policy);
+
   const nowMs = input.now.getTime();
   if (!Number.isFinite(nowMs)) {
     return refusal('unsupported-capability', 'Admission requires a valid capture time.');
+  }
+  const issueUpdatedAt = canonicalUtcTimestamp(input.issue.issue.updatedAt);
+  if (issueUpdatedAt === undefined || issueUpdatedAt > nowMs) {
+    return refusal(
+      'unsupported-capability',
+      'Issue facts require a canonical UTC update timestamp.',
+    );
   }
 
   if (input.issue.repository.visibility !== 'PUBLIC') {
