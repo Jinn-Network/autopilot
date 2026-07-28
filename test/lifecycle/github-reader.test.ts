@@ -174,6 +174,26 @@ describe('GhLifecycleReader', () => {
     });
   });
 
+  it('rejects opaque gh subcommands on the full lifecycle reader runner path', async () => {
+    const reader = new GhLifecycleReader(async (command, args) => {
+      if (command === 'gh' && args[0] !== 'api') {
+        throw new Error(`opaque gh command blocked: ${args[0]}`);
+      }
+      return JSON.stringify({
+        resources: {
+          graphql: {
+            limit: 5_000,
+            used: 0,
+            remaining: 5_000,
+            reset: 1_784_725_200,
+          },
+        },
+      });
+    });
+
+    await expect(reader.readGraphQlRemaining()).resolves.toBe(5_000);
+  });
+
   it.each([
     ['missing resources', {}],
     ['missing graphql resource', { resources: {} }],

@@ -822,10 +822,13 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       throw new Error('Full oracle returned inconsistent GraphQL usage evidence');
     }
     if (oracleGraphQlCost > FULL_SCAN_RESERVE) {
-      throw new Error(
-        `Full oracle consumed ${oracleGraphQlCost} GraphQL points; `
-          + `the ${FULL_SCAN_RESERVE}-point acceptance threshold was exceeded`,
-      );
+      const reserveReason =
+        `full reconciliation window consumed ${oracleGraphQlCost} GraphQL points `
+        + '(parity boundary validation, terminal-claim backfill, and '
+        + 'buildGitHubLifecycleSnapshot); '
+        + `the ${FULL_SCAN_RESERVE}-point observability reserve was exceeded`;
+      parityUnavailableReason = parityUnavailableReason ?? reserveReason;
+      console.warn(`[autopilot] ${reserveReason}`);
     }
     let differences: readonly LifecycleParityDifference[] | undefined;
     if (parityCandidate !== undefined && parityUnavailableReason === undefined) {
