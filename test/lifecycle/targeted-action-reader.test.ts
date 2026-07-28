@@ -15,6 +15,7 @@ import {
 import { encodeBranchClaimTrailers } from '../../src/lifecycle/codecs.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
+import { selfClaimHeadTransition } from '../../src/lifecycle/self-claim-transition.js';
 import type {
   GitHubLifecycleSnapshot,
   RawPullRequest,
@@ -553,6 +554,60 @@ describe('targeted action reader', () => {
       'project:42',
       'dependencies:42',
     ]);
+  });
+
+  it('allows only the engine exact self-claim head transition during stale recovery', async () => {
+    const fixture = staleRecoveryCycle();
+    const claimedHead = 'b'.repeat(40);
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => 510,
+      readOpenPullRequestIndex: async () => [
+        indexEntry(fixture.implementation, { headOid: HEAD }),
+        indexEntry(fixture.blocker),
+      ],
+      readPullRequest: async (number) => {
+        if (number === fixture.implementation.number) {
+          return { ...fixture.implementation, headOid: claimedHead };
+        }
+        if (number === fixture.blocker.number) return fixture.blocker;
+        return null;
+      },
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'In Progress',
+        priority: 'P1',
+        effort: 'Medium',
+        blockedOn: 'Another issue',
+        issueType: 'fix',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Target issue',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [7],
+      readPullRequestOutcomeNumbersClosingIssues: async () =>
+        new Set([fixture.blocker.number]),
+    });
+
+    const refused = await reader.readStaleRecoveryPullRequest(fixture.cycle, 101);
+    expect(targetedAuthorityRefusalDetail(refused)).toContain('headOid moved');
+
+    const allowed = await reader.readStaleRecoveryPullRequest(
+      fixture.cycle,
+      101,
+      selfClaimHeadTransition({
+        prNumber: 101,
+        previousHead: gitOid(HEAD),
+        candidateParent: gitOid(HEAD),
+        claimedHead: gitOid(claimedHead),
+      }),
+    );
+    expect(snapshotOf(allowed)).not.toBeNull();
   });
 
   it('withholds stale-recovery authority when a blocker closes unmerged after the cycle', async () => {

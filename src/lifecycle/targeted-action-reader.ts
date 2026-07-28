@@ -20,6 +20,10 @@ import {
 } from './snapshot.js';
 import type { PullRequestIndexEntry } from './github-rest-discovery.js';
 import { evidencedIssueNumbers } from './pr-mapping.js';
+import {
+  allowsSelfClaimHeadMismatch,
+  type SelfClaimHeadTransition,
+} from './self-claim-transition.js';
 
 export interface TargetedNativeIssue {
   readonly number: number;
@@ -138,6 +142,7 @@ export interface TargetedActionReader {
   readStaleRecoveryPullRequest(
     cycleSnapshot: GitHubLifecycleSnapshot,
     prNumber: number,
+    selfClaim?: SelfClaimHeadTransition,
   ): Promise<TargetedPullRequestRead>;
   /** Uses quota already reserved once for the enclosing review cohort. */
   readReservedPullRequest(
@@ -185,6 +190,7 @@ function describeExactMismatch(
   entry: PullRequestIndexEntry,
   live: RawPullRequest | null,
   requireOpenIdentity: boolean,
+  selfClaim?: SelfClaimHeadTransition,
 ): string | null {
   if (live === null) return 'the live re-read returned no PR';
   if (requireOpenIdentity) {
@@ -194,7 +200,14 @@ function describeExactMismatch(
     if (live.state !== 'OPEN') return `its live state is ${live.state}`;
   }
   if (live.headOid !== entry.headOid) {
-    return `its headOid moved from ${entry.headOid} to ${live.headOid}`;
+    if (
+      selfClaim !== undefined
+      && allowsSelfClaimHeadMismatch(entry, live, selfClaim)
+    ) {
+      // The engine's own confirmed claim push may trail the frozen index row.
+    } else {
+      return `its headOid moved from ${entry.headOid} to ${live.headOid}`;
+    }
   }
   if (live.headRefName !== entry.headRefName) {
     return `its headRefName moved from ${entry.headRefName} to ${live.headRefName}`;
@@ -365,6 +378,7 @@ export function makeTargetedActionReader(
     prNumber: number,
     reserveQuota: boolean,
     hydrateRecoveryBlockers: boolean,
+    selfClaim?: SelfClaimHeadTransition,
   ): Promise<TargetedPullRequestRead> => {
     positiveNumber(prNumber, 'Target PR number');
     completeCycle(cycleSnapshot);
@@ -434,7 +448,12 @@ export function makeTargetedActionReader(
           `Target PR #${prNumber} is absent from the complete open PR index`,
         );
       }
-      const targetMismatch = describeExactMismatch(targetIndex, raw, false);
+      const targetMismatch = describeExactMismatch(
+        targetIndex,
+        raw,
+        false,
+        selfClaim,
+      );
       if (targetMismatch !== null) {
         return refusal(
           `Target PR #${prNumber} live read disagrees with its open PR index row: ${targetMismatch}`,
@@ -580,7 +599,12 @@ export function makeTargetedActionReader(
           continue;
         }
         const live = await readLive(entry.number);
-        const mismatch = describeExactMismatch(entry, live, true);
+        const mismatch = describeExactMismatch(
+          entry,
+          live,
+          true,
+          entry.number === prNumber ? selfClaim : undefined,
+        );
         if (live === null || mismatch !== null) {
           // Only PRs the subject's authority actually rests on may veto the
           // read; every other churning PR is dropped, the same way a blocker
@@ -685,8 +709,8 @@ export function makeTargetedActionReader(
     readPullRequest: (cycleSnapshot, prNumber) =>
       readPullRequest(cycleSnapshot, prNumber, true, false),
 
-    readStaleRecoveryPullRequest: (cycleSnapshot, prNumber) =>
-      readPullRequest(cycleSnapshot, prNumber, true, true),
+    readStaleRecoveryPullRequest: (cycleSnapshot, prNumber, selfClaim) =>
+      readPullRequest(cycleSnapshot, prNumber, true, true, selfClaim),
 
     readReservedPullRequest: (cycleSnapshot, prNumber) =>
       readPullRequest(cycleSnapshot, prNumber, false, false),
