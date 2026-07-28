@@ -1784,32 +1784,28 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     expect(denied.reader.hydrationCalls).toEqual([]);
   });
 
-  it('marks parity unavailable without GraphQL spend when a changed PR needs hydration', async () => {
+  it('hydrates changed PRs when building the parity boundary candidate', async () => {
     const context = harness({ probeChanged: (call) => call === 2 });
     await context.source.read({ mode: 'full', rateLimitFloor: 500 });
     context.setNow('2026-07-22T10:10:00.000Z');
     await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
     context.reader.events = [];
     context.rest.events = context.reader.events;
-    const savesBeforeFull = context.store.saves;
-    context.reader.quotaResponses = [960, 960];
+    context.reader.hydrationCalls = [];
     context.setNow('2026-07-22T11:00:00.000Z');
 
     const reconciled = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
 
-    expect(context.reader.hydrationCalls).toEqual([]);
-    expect(context.reader.events).not.toContain('graphql:hydrate:101');
-    expect(reconciled.parityUnavailableReason).toMatch(
-      /fresh incremental boundary candidate failed.*requires GraphQL/i,
-    );
-    expect(reconciled.githubUsage?.graphqlCost).toBeLessThanOrEqual(450);
-    expect(context.store.saves).toBe(savesBeforeFull + 1);
-    expect(context.store.state?.evidence.snapshotMode).toBe('full');
+    expect(context.reader.hydrationCalls).toEqual([101]);
+    expect(context.reader.events).toContain('graphql:hydrate:101');
+    expect(reconciled).not.toHaveProperty('parityUnavailableReason');
+    expect(reconciled.parityDifferences).toEqual([]);
   });
 
-  it('abandons a multi-PR parity candidate with zero GraphQL spend and refreshes the full cache', async () => {
-    let changed = false;
-    const context = harness({ probeChanged: () => changed });
+  it('hydrates every changed PR when building a multi-PR parity candidate', async () => {
+    const context = harness({
+      probeChanged: (call) => call === 3 || call === 4,
+    });
     const second = rawPr({
       number: 102,
       title: 'second changed PR',
@@ -1831,27 +1827,21 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     await context.source.read({ mode: 'full', rateLimitFloor: 500 });
     context.setNow('2026-07-22T10:10:00.000Z');
     await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
-    changed = true;
     context.reader.events = [];
     context.rest.events = context.reader.events;
-    const savesBeforeFull = context.store.saves;
-    context.reader.quotaResponses = [4_000, 4_000];
+    context.reader.hydrationCalls = [];
     context.setNow('2026-07-22T11:00:00.000Z');
 
     const reconciled = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
 
-    expect(context.reader.hydrationCalls).toEqual([]);
-    expect(context.reader.events).not.toContain('graphql:hydrate:101');
-    expect(context.reader.events).not.toContain('graphql:hydrate:102');
-    expect(reconciled.parityUnavailableReason).toMatch(
-      /fresh incremental boundary candidate failed.*requires GraphQL/i,
-    );
-    expect(reconciled.githubUsage?.graphqlCost).toBeLessThanOrEqual(450);
-    expect(context.store.saves).toBe(savesBeforeFull + 1);
-    expect(context.store.state?.evidence.snapshotMode).toBe('full');
+    expect(context.reader.hydrationCalls).toEqual([101, 102]);
+    expect(context.reader.events).toContain('graphql:hydrate:101');
+    expect(context.reader.events).toContain('graphql:hydrate:102');
+    expect(reconciled).not.toHaveProperty('parityUnavailableReason');
+    expect(reconciled.parityDifferences).toEqual([]);
   });
 
-  it('stops a parity candidate before targeted closing-relation discovery', async () => {
+  it('hydrates closing-PR candidates when a Project transition activates an omitted issue during parity', async () => {
     const context = harness();
     const linked = rawPr({
       number: 102,
@@ -1870,6 +1860,7 @@ describe('IncrementalLifecycleSnapshotSource', () => {
         headRefName: linked.headRefName,
       }),
     ];
+    context.reader.targeted.set(102, linked);
     await context.source.read({ mode: 'full', rateLimitFloor: 500 });
     context.setNow('2026-07-22T10:10:00.000Z');
     await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
@@ -1889,19 +1880,79 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     context.reader.fullPrs = [rawPr(), linked];
     context.reader.closingPullRequestNumbers.set(43, [102]);
     context.reader.closingRelationCalls = [];
-    const savesBeforeFull = context.store.saves;
+    context.reader.hydrationCalls = [];
     context.setNow('2026-07-22T11:00:00.000Z');
 
     const reconciled = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
 
-    expect(context.reader.closingRelationCalls).toEqual([]);
+    expect(context.reader.closingRelationCalls).toEqual([[43]]);
+    expect(context.reader.hydrationCalls).toEqual([102]);
+    expect(reconciled).not.toHaveProperty('parityUnavailableReason');
+    expect(reconciled.parityDifferences).toEqual([]);
+  });
+
+  it('marks parity unavailable when parity hydration exhausts the GraphQL reserve', async () => {
+    const context = harness({ probeChanged: true });
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    context.setNow('2026-07-22T10:10:00.000Z');
+    await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
+    context.reader.hydrationCalls = [];
+    context.reader.quotaResponses = [4_000, 509];
+    context.setNow('2026-07-22T11:00:00.000Z');
+
+    const reconciled = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+
     expect(context.reader.hydrationCalls).toEqual([]);
     expect(reconciled.parityUnavailableReason).toMatch(
-      /requires GraphQL closing-PR relation discovery.*#43/i,
+      /fresh incremental boundary candidate failed.*509/i,
     );
-    expect(context.store.saves).toBe(savesBeforeFull + 1);
     expect(context.store.state?.evidence.snapshotMode).toBe('full');
-    expect(reconciled.githubUsage?.graphqlCost).toBeLessThanOrEqual(450);
+  });
+
+  it('completes parity across a mono-shaped backlog of 21 open PRs when quota allows hydration', async () => {
+    const openPrCount = 21;
+    const context = harness({
+      probeChanged: (call) => call > openPrCount && call <= openPrCount * 2,
+    });
+    const unrelated = Array.from({ length: openPrCount - 1 }, (_, offset) => {
+      const number = 200 + offset;
+      const headOid = offset % 2 === 0 ? HEAD_C : HEAD_D;
+      return rawPr({
+        number,
+        title: `unrelated ${offset}`,
+        labels: ['engine:review'],
+        closingIssueNumbers: [300 + offset],
+        headOid,
+        headRefName: `feature/unrelated-${offset}`,
+      });
+    });
+    context.reader.fullPrs = [rawPr(), ...unrelated];
+    context.rest.openPrs = [
+      openIndex(),
+      ...unrelated.map((pr) => openIndex({
+        number: pr.number,
+        title: pr.title,
+        headOid: pr.headOid,
+        headRefName: pr.headRefName,
+      })),
+    ];
+    for (const pr of unrelated) {
+      context.reader.targeted.set(pr.number, pr);
+    }
+    await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+    context.setNow('2026-07-22T10:10:00.000Z');
+    await context.source.read({ mode: 'incremental', rateLimitFloor: 500 });
+    context.reader.hydrationCalls = [];
+    context.reader.quotaResponses = Array.from({ length: 50 }, () => 4_000);
+    context.setNow('2026-07-22T11:00:00.000Z');
+
+    const reconciled = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(context.reader.hydrationCalls).toEqual(
+      [101, ...unrelated.map((pr) => pr.number)].sort((left, right) => left - right),
+    );
+    expect(reconciled).not.toHaveProperty('parityUnavailableReason');
+    expect(reconciled.parityDifferences).toEqual([]);
   });
 
   it('saves the full snapshot with parity unavailable when the reconciliation window exceeds the observability reserve', async () => {
