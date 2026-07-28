@@ -1434,6 +1434,9 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
             proveReviewedDiff: reviewedDiffCarryInQuestion(reviewClaim, pr.headRefOid),
           }).then((evidence) => ({
             compareStatus: evidence.status,
+            ...(evidence.compareBaseTipOid === undefined
+              ? {}
+              : { compareBaseTipOid: evidence.compareBaseTipOid }),
             ...(evidence.reviewedDiffDigest === undefined
               ? {}
               : { reviewedDiffDigest: evidence.reviewedDiffDigest }),

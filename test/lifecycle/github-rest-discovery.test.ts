@@ -998,4 +998,37 @@ describe('GitHubRestDiscoveryReader issue and PR indexes', () => {
     await expect(reader.readOpenIssueIndex()).rejects.toThrow(/issue/i);
     await expect(reader.readOpenPullRequestIndex()).rejects.toThrow(/pull request|PR/i);
   });
+
+  it('reads and memoizes live base branch tips for one incremental boundary', async () => {
+    const tip = 'c'.repeat(40);
+    const endpoint = 'repos/Jinn-Network/mono/git/ref/heads/next';
+    const calls: string[] = [];
+    const client = new ConditionalRestClient(async (_command, args) => {
+      calls.push(args[2]!);
+      return included({
+        ref: 'refs/heads/next',
+        object: { type: 'commit', sha: tip },
+      });
+    });
+    const reader = new GitHubRestDiscoveryReader(client);
+
+    await expect(reader.readBaseBranchTipOid('next')).resolves.toBe(tip);
+    await expect(reader.readBaseBranchTipOid('next')).resolves.toBe(tip);
+    expect(calls).toEqual([endpoint]);
+
+    reader.resetBaseBranchTipMemo();
+    await expect(reader.readBaseBranchTipOid('next')).resolves.toBe(tip);
+    expect(calls).toEqual([endpoint, endpoint]);
+  });
+
+  it('treats malformed base branch tip reads as unavailable', async () => {
+    const reader = new GitHubRestDiscoveryReader(new ConditionalRestClient(mapRunner(new Map([
+      ['repos/Jinn-Network/mono/git/ref/heads/next', included({
+        ref: 'refs/heads/next',
+        object: { type: 'tag', sha: 'c'.repeat(40) },
+      })],
+    ]))));
+
+    await expect(reader.readBaseBranchTipOid('next')).resolves.toBe('unavailable');
+  });
 });

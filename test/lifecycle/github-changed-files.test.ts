@@ -11,6 +11,7 @@ import { gitOid, gitRefName, type CompareStatus } from '../../src/lifecycle/type
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
 const BASE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const BASE_TIP = 'cccccccccccccccccccccccccccccccccccccccc';
 
 describe('readExactCompareEvidence', () => {
   const COMPARE_FILE = {
@@ -58,10 +59,17 @@ describe('readExactCompareEvidence', () => {
   }
 
   it('emits no digest at all unless the changed-file proof was requested', async () => {
-    const { result, calls } = await evidence({ status: 'ahead', files: [COMPARE_FILE] });
+    const { result, calls } = await evidence({
+      status: 'ahead',
+      base_commit: { sha: BASE_TIP },
+      files: [COMPARE_FILE],
+    });
     // A cheaper, weaker digest is worse than none: the merge gate always proves
     // the changed-file set, so a view that carried on less would strand the PR.
-    expect(result).toEqual({ status: 'ahead' });
+    expect(result).toEqual({
+      status: 'ahead',
+      compareBaseTipOid: gitOid(BASE_TIP),
+    });
     expect(calls).toEqual([
       'repos/Jinn-Network/mono/pulls/101',
       `repos/Jinn-Network/mono/compare/heads/next...${HEAD}`,
@@ -70,7 +78,7 @@ describe('readExactCompareEvidence', () => {
 
   it('derives status and a fully proven digest when the proof is requested', async () => {
     const { result, calls } = await evidence(
-      { status: 'ahead', files: [COMPARE_FILE] },
+      { status: 'ahead', base_commit: { sha: BASE_TIP }, files: [COMPARE_FILE] },
       { proveReviewedDiff: true },
     );
     const expected = reviewedDiffDigestFromCompare([COMPARE_FILE], {
@@ -82,9 +90,16 @@ describe('readExactCompareEvidence', () => {
     expect(expected.status).toBe('digest');
     expect(result).toEqual({
       status: 'ahead',
+      compareBaseTipOid: gitOid(BASE_TIP),
       reviewedDiffDigest: expected.status === 'digest' ? expected.digest : undefined,
     });
     expect(calls).toContain(`repos/Jinn-Network/mono/pulls/101/files?per_page=100`);
+  });
+
+  it('omits compareBaseTipOid when the compare response has no base_commit.sha', async () => {
+    const { result } = await evidence({ status: 'ahead', files: [COMPARE_FILE] });
+    expect(result).toEqual({ status: 'ahead' });
+    expect(result).not.toHaveProperty('compareBaseTipOid');
   });
 
   it.each([

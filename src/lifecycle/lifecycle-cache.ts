@@ -52,13 +52,13 @@ export interface LifecycleSnapshotEvidence {
 
 export interface LifecycleDiscoveryState {
   /**
-   * Bumped to 2: every `compareStatus` written by version 1 was computed
-   * against the PR's pinned fork point and is therefore `ahead` by
-   * construction. Those values must not survive the deploy, so the version
-   * bump discards them — a version mismatch fails `stateSchema`, which the
-   * incremental source quarantines and reseeds from a full read.
+   * Bumped to 3: version-2 caches may carry `compareStatus` without the base
+   * branch tip OID that determined it. Those values cannot be keyed for
+   * freshness, so the version bump discards them — a version mismatch fails
+   * `stateSchema`, which the incremental source quarantines and reseeds from a
+   * full read.
    */
-  readonly version: 2;
+  readonly version: 3;
   readonly evidence: LifecycleSnapshotEvidence;
   /** Exact terminal proof retained only for the currently surviving implementation claim. */
   readonly terminalClaims: readonly TerminalClaimEvidence[];
@@ -338,6 +338,7 @@ const pullRequestSchema = z.object({
   mergeability: z.enum(['MERGEABLE', 'CONFLICTING', 'UNKNOWN']),
   mergeStateStatus: z.string(),
   compareStatus: z.enum(COMPARE_STATUSES).optional(),
+  compareBaseTipOid: oid.optional(),
   reviewedDiffDigest: reviewedDiffDigestSchema.optional(),
   checks: z.array(z.object({
     name: z.string(),
@@ -494,7 +495,7 @@ const restCacheSchema = z.object({
 }).strict();
 
 const stateSchema = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   evidence: evidenceSchema,
   terminalClaims: z.array(terminalClaimSchema).default([]),
   openPullRequestEvidence: z.array(pullRequestSchema),

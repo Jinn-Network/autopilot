@@ -9,7 +9,29 @@ import type {
   NativeReviewState,
   PullRequestSnapshot,
 } from './snapshot.js';
-import { gitOid } from './types.js';
+import { gitOid, type GitOid } from './types.js';
+
+export interface BaseBranchTipReader {
+  readBaseBranchTipOid(baseRefName: string): Promise<GitOid | 'unavailable'>;
+}
+
+function mergePathPullRequest(pr: PullRequestSnapshot): boolean {
+  return pr.mergeability === 'MERGEABLE'
+    && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
+}
+
+async function compareEvidenceNeedsRefresh(
+  pr: PullRequestSnapshot,
+  baseBranchTipReader: BaseBranchTipReader | undefined,
+): Promise<boolean> {
+  if (!mergePathPullRequest(pr)) return false;
+  if (pr.compareStatus === undefined || pr.compareStatus === 'unknown') return true;
+  if (pr.compareBaseTipOid === undefined) return true;
+  if (baseBranchTipReader === undefined) return true;
+  const liveTip = await baseBranchTipReader.readBaseBranchTipOid(pr.baseRefName);
+  if (liveTip === 'unavailable') return true;
+  return liveTip !== pr.compareBaseTipOid;
+}
 
 function record(value: unknown, subject: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -373,28 +395,25 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
   constructor(
     private readonly rest: ConditionalRestClient,
     private readonly repositorySlug: string = REPO,
+    private readonly baseBranchTipReader?: BaseBranchTipReader,
   ) {}
 
   async changed(pr: PullRequestSnapshot): Promise<boolean> {
     if (pr.state !== 'OPEN') return false;
     if (pr.evidenceIncompleteReason !== undefined) return true;
-    // `compareStatus` is the only cached field whose truth depends on a commit
-    // outside this PR: the base branch tip. Every conditional read below is
-    // keyed on PR detail, reviews, comments, events, check-runs and commit
-    // status, and *none* of those change when the base branch advances, so a
-    // cached `compareStatus` can never be invalidated by the ETag path. Left
-    // alone it livelocks: a PR that has fallen behind its base keeps its stale
-    // `ahead`, `mergeState` stays `clean`, the controller's ladder guard is
-    // never entered, `update-branch` is never scheduled, and the merge
-    // executor's own fresh compare refuses it every cycle, forever.
-    //
-    // Merge-path PRs are therefore forced to refresh. The decision is applied
-    // *after* the conditional evidence below rather than as an early return, so
-    // the schema and identity guards on that path keep running — an early
-    // return would silently retire them for exactly the PRs closest to merge.
-    const compareStatusIsExpired = pr.mergeability === 'MERGEABLE'
-      && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
-    if (compareStatusIsExpired && pr.compareStatus === undefined) return true;
+    // Merge-path PRs without proven compare evidence must refresh before any
+    // conditional reuse. The live base-tip read is deferred until after the
+    // conditional evidence below so schema and identity guards keep running.
+    if (
+      mergePathPullRequest(pr)
+      && (
+        pr.compareStatus === undefined
+        || pr.compareStatus === 'unknown'
+        || pr.compareBaseTipOid === undefined
+      )
+    ) {
+      return true;
+    }
     const detailResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/pulls/${pr.number}`,
     );
@@ -482,7 +501,7 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       mergeability: pr.mergeability,
       mergeStateStatus: pr.mergeStateStatus,
     };
-    return compareStatusIsExpired
+    return (await compareEvidenceNeedsRefresh(pr, this.baseBranchTipReader))
       || JSON.stringify({ ...detail, labels: [...detail.labels].sort() })
         !== JSON.stringify({ ...cachedDetail, labels: [...cachedDetail.labels].sort() })
       || canonical(currentReviews) !== canonical(pr.reviews)

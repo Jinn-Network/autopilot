@@ -133,6 +133,12 @@ export interface PullRequestSnapshot {
   readonly mergeStateStatus: string;
   readonly compareStatus?: CompareStatus;
   /**
+   * Base branch tip OID that `compareStatus` was computed against. Absent when
+   * compare evidence could not be proven cacheable — never read absence as
+   * "the base has not moved".
+   */
+  readonly compareBaseTipOid?: GitOid;
+  /**
    * Identity of the diff this head presents against its base branch tip, read
    * from the same compare response as `compareStatus`. Absent whenever it could
    * not be proven — see `reviewed-diff-digest.ts`. Absence must never be read
@@ -192,6 +198,7 @@ export interface RawPullRequest {
   readonly mergeability: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
   readonly compareStatus?: CompareStatus;
+  readonly compareBaseTipOid?: string;
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
@@ -449,6 +456,9 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       mergeability: raw.mergeability,
       mergeStateStatus: raw.mergeStateStatus,
       ...(raw.compareStatus === undefined ? {} : { compareStatus: raw.compareStatus }),
+      ...(raw.compareBaseTipOid === undefined
+        ? {}
+        : { compareBaseTipOid: gitOid(raw.compareBaseTipOid) }),
       ...(isReviewedDiffDigest(raw.reviewedDiffDigest)
         ? { reviewedDiffDigest: raw.reviewedDiffDigest }
         : {}),
