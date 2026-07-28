@@ -7,6 +7,7 @@ const {
   isDirectLifecycleEntrypoint,
   makeMarketplaceRecoveryCallback,
   makeMarketplaceRecoveryCredentialResolver,
+  makeMarketplaceReviewAnchorRelease,
 } = lifecycleEntrypoint;
 
 describe('lifecycle script entrypoint', () => {
@@ -140,6 +141,46 @@ describe('lifecycle script entrypoint', () => {
       replay,
     })).toBeUndefined();
     expect(replay).not.toHaveBeenCalled();
+  });
+
+  it('constructs the recovery review port lazily with the evaluator-leg manifest', async () => {
+    const reviewPort = {} as never;
+    const makeReviewPort = vi.fn(() => reviewPort);
+    const release = vi.fn(async () => {});
+    const runner = vi.fn(async () => '');
+    const manifestPath = '/attempts/evaluator-leg/manifest.json';
+    const callback = makeMarketplaceReviewAnchorRelease({
+      runner,
+      environment: { KEEP_ME: 'yes' },
+      makeReviewPort,
+      release,
+      now: () => new Date('2026-07-28T10:30:00.000Z'),
+    });
+    const anchor = {
+      attemptId: '22222222-2222-4222-8222-222222222222',
+      manifestPath,
+      head: 'a'.repeat(40),
+      generation: '33333333-3333-4333-8333-333333333333',
+      refOid: 'b'.repeat(40),
+      reviewer: 'review-bot',
+      anchoredAt: '2026-07-28T10:29:00.000Z',
+    } as never;
+
+    expect(makeReviewPort).not.toHaveBeenCalled();
+    await callback(anchor);
+
+    expect(makeReviewPort).toHaveBeenCalledWith({
+      runner,
+      environment: {
+        KEEP_ME: 'yes',
+        JINN_AUTOPILOT_SESSION_MANIFEST: manifestPath,
+      },
+    });
+    expect(release).toHaveBeenCalledWith(
+      anchor,
+      reviewPort,
+      expect.any(Function),
+    );
   });
 
   it('allows attempt cleanup only for successful complete local active cycles', () => {

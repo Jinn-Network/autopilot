@@ -38,6 +38,8 @@ import {
   makeProductionMarketplaceAdoptionRecoveryCoordinator,
 } from '../src/lifecycle/active-runtime-production.js';
 import { releaseMarketplaceReviewAnchor } from '../src/lifecycle/marketplace-review-anchor.js';
+import type { MarketplaceReviewAnchorEvidence } from '../src/lifecycle/marketplace-execution-state.js';
+import type { ReviewSessionPort } from '../src/lifecycle/review-session.js';
 import { makeProductionReviewSessionPort } from '../src/lifecycle/review-session-production.js';
 import type { GitHubLifecycleSnapshot } from '../src/lifecycle/snapshot.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
@@ -280,6 +282,36 @@ export function makeMarketplaceRecoveryCredentialResolver(
       );
     }
     return selection.credential;
+  };
+}
+
+export function makeMarketplaceReviewAnchorRelease(input: {
+  readonly runner: CommandRunner;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly now?: () => Date;
+  readonly makeReviewPort?: (options: {
+    readonly runner: CommandRunner;
+    readonly environment: NodeJS.ProcessEnv;
+  }) => ReviewSessionPort;
+  readonly release?: (
+    anchor: MarketplaceReviewAnchorEvidence,
+    port: ReviewSessionPort,
+    now: () => Date,
+  ) => Promise<void>;
+}): (anchor: MarketplaceReviewAnchorEvidence) => Promise<void> {
+  const makeReviewPort =
+    input.makeReviewPort ?? makeProductionReviewSessionPort;
+  const release = input.release ?? releaseMarketplaceReviewAnchor;
+  const now = input.now ?? (() => new Date());
+  return async (anchor): Promise<void> => {
+    const reviewPort = makeReviewPort({
+      runner: input.runner,
+      environment: {
+        ...input.environment,
+        JINN_AUTOPILOT_SESSION_MANIFEST: anchor.manifestPath,
+      },
+    });
+    await release(anchor, reviewPort, now);
   };
 }
 
@@ -679,7 +711,7 @@ export async function runAutopilotV2(
             language: MARKETPLACE_LANGUAGE,
             verificationProfile: MARKETPLACE_VERIFICATION_PROFILE,
           });
-          const reviewReleasePort = makeProductionReviewSessionPort({
+          const releaseReviewAnchor = makeMarketplaceReviewAnchorRelease({
             runner,
             environment: runtimeEnvironment,
           });
@@ -698,13 +730,7 @@ export async function runAutopilotV2(
                 environment: runtimeEnvironment,
                 readRecoverySnapshot: makeRecoveryReadSnapshot(manifestPath),
               }),
-            releaseReviewAnchor: async (anchor) => {
-              await releaseMarketplaceReviewAnchor(
-                anchor,
-                reviewReleasePort,
-                () => new Date(),
-              );
-            },
+            releaseReviewAnchor,
             isPidAlive: childIsAlive,
           });
           if (!result.ok) {
