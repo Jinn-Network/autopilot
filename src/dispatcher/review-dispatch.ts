@@ -12,6 +12,7 @@ import {
   type ReviewCleanupOptions,
 } from './review-cleanup.js';
 import { sessionSpawnEnv } from './identity.js';
+import { reviewSessionLogPath } from './session-log.js';
 import { parseOwnedPrefixes, touchesCodeOwnedPath } from './code-owned.js';
 const SAFE_HEAD_REF = /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/;
 
@@ -139,6 +140,7 @@ async function dispatchReviewLocked(
   // GH_TOKEN overlay and named reviewer inputs: review-pr binds the named token
   // at each shell command so a tool subprocess cannot fall back to ambient auth.
   const sessionEnv = sessionSpawnEnv(cfg.reviewGhToken).env;
+  const logPath = reviewSessionLogPath(pr.number);
   const startedAt = Date.now();
   let expectedLease: ReviewLease | null = null;
   const result = spawnCoordinatorSession(
@@ -157,7 +159,8 @@ async function dispatchReviewLocked(
       },
       spawnOptions: {
         detached: true,
-        stdio: 'ignore',
+        stdio: ['ignore', 'inherit', 'inherit'],
+        logPath,
         onExit: (_code, _signal) => {
           void Promise.resolve()
             .then(() => {

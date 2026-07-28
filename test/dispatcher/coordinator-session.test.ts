@@ -8,6 +8,7 @@ import {
 } from '../../src/dispatcher/coordinator-session.js';
 import { HERMES_STATELESS_LAUNCHER } from '../../src/dispatcher/hermes-runtime.js';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
+import { AUTOPILOT_PACKAGE_DIR } from '../../src/dispatcher/runtime-path.js';
 import type { AutopilotRuntime } from '../../src/autopilot-runtime.js';
 
 type SpawnCall = {
@@ -84,11 +85,10 @@ describe.each(['claude', 'hermes', 'cursor'] as const)(
         expect(call.opts.env).toMatchObject({
           GH_TOKEN: `${session.kind}-token`,
           JINN_AUTOPILOT_RUNTIME: runtime,
+          JINN_AUTOPILOT_PACKAGE_DIR: AUTOPILOT_PACKAGE_DIR,
         });
-        // The installed `autopilot` executable owns session verbs. The target
-        // worktree must not select a repository-local engine checkout.
         expect((call.opts.env as Record<string, string>)
-          .JINN_AUTOPILOT_PACKAGE_DIR).toBeUndefined();
+          .JINN_AUTOPILOT_PACKAGE_DIR).toBe(AUTOPILOT_PACKAGE_DIR);
 
         if (runtime === 'claude') {
           expect(call.cmd).toBe('claude');
@@ -149,5 +149,61 @@ describe.each(['claude', 'hermes', 'cursor'] as const)(
         expect(logs[0]).not.toContain(`${session.kind}-token`);
       },
     );
+
+    it('overrides ambient JINN_AUTOPILOT_PACKAGE_DIR for $kind', (session) => {
+      const { call } = exercise(runtime, session);
+      expect((call.opts.env as Record<string, string>).JINN_AUTOPILOT_PACKAGE_DIR)
+        .toBe(AUTOPILOT_PACKAGE_DIR);
+    });
+
+    it('composes exit diagnostics with caller onExit for $kind', (session) => {
+      const calls: SpawnCall[] = [];
+      const logs: string[] = [];
+      const callerExits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+      const spawn: SpawnFn = (cmd, args, opts) => {
+        calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+        return { pid: 5151 };
+      };
+
+      spawnCoordinatorSession(
+        {
+          kind: session.kind,
+          number: 42,
+          skill: session.skill,
+          scenario: `SCENARIO-${session.kind}`,
+          worktreePath: `/tmp/worktrees/${session.kind}-42`,
+          effort: session.effort,
+          env: {
+            GH_TOKEN: `${session.kind}-token`,
+            JINN_AUTOPILOT_PACKAGE_DIR: '/wrong/package',
+          },
+          spawnOptions: {
+            detached: true,
+            stdio: ['ignore', 'inherit', 'inherit'],
+            logPath: `/tmp/${session.kind}-42.log`,
+            onExit: (code, signal) => {
+              callerExits.push({ code, signal });
+            },
+          },
+        },
+        { ...DEFAULT_CONFIG, runtime },
+        { spawn, log: (message) => logs.push(message) },
+      );
+
+      const onExit = calls[0].opts.onExit as
+        | ((code: number | null, signal: NodeJS.Signals | null) => void)
+        | undefined;
+      onExit?.(1, 'SIGTERM');
+
+      expect(callerExits).toEqual([{ code: 1, signal: 'SIGTERM' }]);
+      expect(logs).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining(`session=${session.kind}-42 runtime=${runtime}`),
+          expect.stringContaining(
+            `coordinator exit session=${session.kind}-42 pid=5151 code=1 signal=SIGTERM log=/tmp/${session.kind}-42.log`,
+          ),
+        ]),
+      );
+    });
   },
 );
