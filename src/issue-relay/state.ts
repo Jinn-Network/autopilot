@@ -193,7 +193,12 @@ function durableShapeIsConsistent(record: RelayGenerationRecordV1): boolean {
       return false;
     }
     return index === 0
-      || record.rounds[index - 1]?.verdict?.outcome === 'request-changes';
+      || (
+        record.rounds[index - 1]?.verdict?.outcome === 'request-changes'
+        && record.rounds[index - 1]?.verdict?.evaluatedHead === round.inputHead
+        && record.rounds[index - 1]?.adoption?.disposition === 'accepted'
+        && record.rounds[index - 1]?.adoption?.resultingHead === round.inputHead
+      );
   });
 }
 
@@ -215,8 +220,9 @@ function roundInputIsCurrent(
     case 'initial':
       return round.inputHead === facts.currentBaseOid;
     case 'repair':
-      return facts.currentPr !== undefined
-        && round.inputHead === facts.currentPr.head;
+      return livePrMatchesDurable(facts)
+        && facts.currentPr?.head === round.inputHead
+        && facts.durable?.pr?.head === round.inputHead;
     default:
       return exhaustiveFalse(round.purpose);
   }

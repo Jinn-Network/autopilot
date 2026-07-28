@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { relayGeneration, relayTaskKey } from './identity.js';
 import { buildRelaySnapshot } from './snapshot.js';
@@ -193,7 +194,12 @@ function hasValidRoundSequence(record: RelayGenerationRecordV1): boolean {
     && roundEvidenceIsConsistent(record.generation, round)
     && (
       index === 0
-      || record.rounds[index - 1]?.verdict?.outcome === 'request-changes'
+      || (
+        record.rounds[index - 1]?.verdict?.outcome === 'request-changes'
+        && record.rounds[index - 1]?.verdict?.evaluatedHead === round.inputHead
+        && record.rounds[index - 1]?.adoption?.disposition === 'accepted'
+        && record.rounds[index - 1]?.adoption?.resultingHead === round.inputHead
+      )
     )
   ));
 }
@@ -212,9 +218,24 @@ function phaseEvidenceIsConsistent(record: RelayGenerationRecordV1): boolean {
     case 'submitted':
       return round?.task !== undefined
         && round.solution === undefined
-        && round.adoption === undefined;
+        && round.adoption === undefined
+        && (
+          round.purpose === 'initial'
+          || (
+            record.pr?.head === round.inputHead
+            && record.pr.draft
+          )
+        );
     case 'solution-delivered':
-      return round?.solution !== undefined && round.adoption === undefined;
+      return round?.solution !== undefined
+        && round.adoption === undefined
+        && (
+          round.purpose === 'initial'
+          || (
+            record.pr?.head === round.inputHead
+            && record.pr.draft
+          )
+        );
     case 'draft-open':
       return round?.adoption?.disposition === 'accepted'
         && round.verdict === undefined
@@ -297,4 +318,236 @@ export function parseRelayIssueMarker(input: {
   } catch {
     return null;
   }
+}
+
+export interface RelayIssueMarkerUpdatePrecondition {
+  readonly body: string;
+  readonly expectedCurrent: {
+    readonly bodyDigest: `sha256:${string}`;
+    readonly generation: string;
+    readonly updatedAt: string;
+  };
+}
+
+function sameCanonicalValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function relayPhaseCanAdvance(
+  current: RelayGenerationRecordV1['phase'],
+  proposed: RelayGenerationRecordV1['phase'],
+): boolean {
+  if (current === proposed) {
+    return ![
+      'awaiting-clarification',
+      'refused',
+      'ready',
+      'closed',
+      'exhausted',
+    ].includes(current);
+  }
+  switch (current) {
+    case 'awaiting-clarification':
+    case 'refused':
+    case 'ready':
+    case 'closed':
+    case 'exhausted':
+      return false;
+    case 'admitted':
+      return ['submitted', 'cancelling', 'closed', 'exhausted'].includes(proposed);
+    case 'submitted':
+      return ['solution-delivered', 'cancelling', 'closed', 'exhausted']
+        .includes(proposed);
+    case 'solution-delivered':
+      return ['draft-open', 'cancelling', 'closed'].includes(proposed);
+    case 'draft-open':
+      return ['evaluating', 'cancelling', 'closed'].includes(proposed);
+    case 'evaluating':
+      return ['repair-needed', 'ready', 'cancelling', 'closed'].includes(proposed);
+    case 'repair-needed':
+      return ['submitted', 'cancelling', 'closed', 'exhausted'].includes(proposed);
+    case 'cancelling':
+      return proposed === 'closed';
+    default: {
+      const exhaustive: never = current;
+      return exhaustive;
+    }
+  }
+}
+
+function optionalEvidenceDoesNotRegress(
+  current: unknown,
+  proposed: unknown,
+): boolean {
+  return current === undefined || sameCanonicalValue(current, proposed);
+}
+
+function checksDoNotRegress(
+  current: RelayRoundRecordV1['checks'],
+  proposed: RelayRoundRecordV1['checks'],
+): boolean {
+  if (current === undefined) return true;
+  if (proposed === undefined || current.head !== proposed.head) return false;
+  switch (current.status) {
+    case 'pending':
+      return true;
+    case 'passed':
+    case 'failed':
+      return sameCanonicalValue(current, proposed);
+    default: {
+      const exhaustive: never = current.status;
+      return exhaustive;
+    }
+  }
+}
+
+function roundDoesNotRegress(
+  current: RelayRoundRecordV1,
+  proposed: RelayRoundRecordV1,
+): boolean {
+  return current.round === proposed.round
+    && current.purpose === proposed.purpose
+    && current.workspaceRepository === proposed.workspaceRepository
+    && current.inputHead === proposed.inputHead
+    && optionalEvidenceDoesNotRegress(current.task, proposed.task)
+    && optionalEvidenceDoesNotRegress(current.solution, proposed.solution)
+    && optionalEvidenceDoesNotRegress(current.adoption, proposed.adoption)
+    && checksDoNotRegress(current.checks, proposed.checks)
+    && optionalEvidenceDoesNotRegress(current.verdict, proposed.verdict);
+}
+
+function roundsDoNotRegress(
+  current: RelayGenerationRecordV1,
+  proposed: RelayGenerationRecordV1,
+): boolean {
+  if (
+    proposed.rounds.length < current.rounds.length
+    || proposed.rounds.length > current.rounds.length + 1
+  ) {
+    return false;
+  }
+  return current.rounds.every((round, index) => {
+    const proposedRound = proposed.rounds[index];
+    return proposedRound !== undefined && roundDoesNotRegress(round, proposedRound);
+  });
+}
+
+function prDoesNotRegress(
+  current: RelayGenerationRecordV1,
+  proposed: RelayGenerationRecordV1,
+): boolean {
+  if (current.pr === undefined) return true;
+  if (
+    proposed.pr === undefined
+    || current.pr.number !== proposed.pr.number
+    || current.pr.branch !== proposed.pr.branch
+    || (!current.pr.draft && proposed.pr.draft)
+  ) {
+    return false;
+  }
+  if (current.pr.head !== proposed.pr.head) {
+    return proposed.rounds.at(-1)?.adoption?.disposition === 'accepted'
+      && proposed.rounds.at(-1)?.adoption?.resultingHead === proposed.pr.head;
+  }
+  return current.pr.draft === proposed.pr.draft
+    || (proposed.phase === 'ready' && !proposed.pr.draft);
+}
+
+function sameGenerationUpdateIsMonotonic(
+  current: RelayGenerationRecordV1,
+  proposed: RelayGenerationRecordV1,
+): boolean {
+  const currentUpdatedAt = Date.parse(current.updatedAt);
+  const proposedUpdatedAt = Date.parse(proposed.updatedAt);
+  if (
+    proposedUpdatedAt <= currentUpdatedAt
+    || !sameCanonicalValue(current.snapshot, proposed.snapshot)
+    || current.deadlineAt !== proposed.deadlineAt
+    || !relayPhaseCanAdvance(current.phase, proposed.phase)
+    || !roundsDoNotRegress(current, proposed)
+    || !prDoesNotRegress(current, proposed)
+    || !optionalEvidenceDoesNotRegress(current.cancellation, proposed.cancellation)
+  ) {
+    return false;
+  }
+
+  return !sameCanonicalValue(
+    current,
+    { ...proposed, updatedAt: current.updatedAt },
+  );
+}
+
+function isTerminalForSupersession(
+  phase: RelayGenerationRecordV1['phase'],
+): boolean {
+  switch (phase) {
+    case 'awaiting-clarification':
+    case 'refused':
+    case 'ready':
+    case 'closed':
+    case 'exhausted':
+      return true;
+    case 'admitted':
+    case 'submitted':
+    case 'solution-delivered':
+    case 'draft-open':
+    case 'evaluating':
+    case 'repair-needed':
+    case 'cancelling':
+      return false;
+    default: {
+      const exhaustive: never = phase;
+      return exhaustive;
+    }
+  }
+}
+
+function generationSupersessionIsMonotonic(
+  current: RelayGenerationRecordV1,
+  proposed: RelayGenerationRecordV1,
+): boolean {
+  return isTerminalForSupersession(current.phase)
+    && current.snapshot.repository.nodeId === proposed.snapshot.repository.nodeId
+    && current.snapshot.issue.number === proposed.snapshot.issue.number
+    && Date.parse(proposed.snapshot.capturedAt) > Date.parse(current.snapshot.capturedAt)
+    && Date.parse(proposed.snapshot.capturedAt) > Date.parse(current.updatedAt)
+    && Date.parse(proposed.updatedAt) >= Date.parse(proposed.snapshot.capturedAt)
+    && ['awaiting-clarification', 'refused', 'admitted'].includes(proposed.phase);
+}
+
+/**
+ * Prepares a deterministic, read-compare-write precondition for the eventual
+ * GitHub writer. This does not claim atomic compare-and-swap support: Task 12
+ * must re-read and compare the expected body digest before updating, then
+ * verify the exact proposed body on readback.
+ */
+export function prepareRelayIssueMarkerUpdate(input: {
+  readonly current: {
+    readonly body: string;
+    readonly authorLogin: string;
+    readonly expectedAuthorLogin: string;
+  };
+  readonly proposed: RelayGenerationRecordV1;
+}): RelayIssueMarkerUpdatePrecondition | null {
+  const current = parseRelayIssueMarker(input.current);
+  const proposed = decodeRecord(input.proposed);
+  if (current === null || proposed === null) return null;
+
+  const monotonic = current.generation === proposed.generation
+    ? sameGenerationUpdateIsMonotonic(current, proposed)
+    : generationSupersessionIsMonotonic(current, proposed);
+  if (!monotonic) return null;
+
+  const body = formatRelayIssueMarker(proposed);
+  const bodyDigest = `sha256:${createHash('sha256')
+    .update(input.current.body, 'utf8')
+    .digest('hex')}` as const;
+  return {
+    body,
+    expectedCurrent: {
+      bodyDigest,
+      generation: current.generation,
+      updatedAt: current.updatedAt,
+    },
+  };
 }

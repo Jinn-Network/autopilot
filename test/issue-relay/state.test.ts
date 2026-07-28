@@ -80,6 +80,36 @@ const repairVerdict = {
   envelopeCid: 'bafy-verdict-repair',
 };
 
+function completedInitialRound(): RelayRoundRecordV1 {
+  return round({
+    task,
+    solution,
+    adoption,
+    checks: passedChecks,
+    verdict: repairVerdict,
+  });
+}
+
+function deliveredRepairRound(inputHead: string): RelayRoundRecordV1 {
+  return {
+    round: 1,
+    purpose: 'repair',
+    workspaceRepository: 'Jinn-Network/mono-fork',
+    inputHead,
+    task: {
+      taskKey: relayTaskKey(generation, 1),
+      taskId: 'task-1',
+      taskCid: 'bafy-task-1',
+      fundedAt: '2026-07-28T12:21:00.000Z',
+    },
+    solution: {
+      envelopeCid: 'bafy-solution-1',
+      operatorSafe: '0x1111111111111111111111111111111111111111',
+      observedAt: '2026-07-28T12:25:00.000Z',
+    },
+  };
+}
+
 function round(overrides: Partial<RelayRoundRecordV1> = {}): RelayRoundRecordV1 {
   return {
     round: 0,
@@ -176,6 +206,39 @@ describe('Relay state/action transition table', () => {
     });
 
     expect(deriveRelayAction(facts(record), policy)).toMatchObject({ kind: 'none' });
+  });
+
+  it('repair delivery with an arbitrary input head cannot be adopted', () => {
+    const record = durable('solution-delivered', {
+      rounds: [completedInitialRound(), deliveredRepairRound(STALE)],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: STALE, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: { number: 68, head: STALE, draft: true },
+    }), policy)).toMatchObject({ kind: 'none' });
+  });
+
+  it.each([
+    ['missing durable PR', undefined, { number: 68, head: HEAD, draft: true }],
+    [
+      'different live PR number',
+      { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+      { number: 69, head: HEAD, draft: true },
+    ],
+    [
+      'non-draft live PR',
+      { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+      { number: 68, head: HEAD, draft: false },
+    ],
+  ] as const)('repair delivery with %s cannot be adopted', (_label, pr, currentPr) => {
+    const record = durable('solution-delivered', {
+      rounds: [completedInitialRound(), deliveredRepairRound(HEAD)],
+      ...(pr === undefined ? {} : { pr }),
+    });
+
+    expect(deriveRelayAction(facts(record, { currentPr }), policy))
+      .toMatchObject({ kind: 'none' });
   });
 
   it('draft-open with accepted adoption and passed exact-head checks -> publish-evaluation-anchor', () => {
