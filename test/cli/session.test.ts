@@ -323,6 +323,51 @@ describe('session CLI grammar', () => {
     }]);
   });
 
+  it.each([
+    'port-unavailable',
+    'changed-files-unreadable',
+    'unrepresented-patch',
+    'compare-files-truncated',
+  ])('names %s on the diagnostic stream when an approval carries no digest', async (
+    refusal,
+  ) => {
+    const handler = protocol();
+    handler.reviewVerdict = async () => ({
+      status: 'approved',
+      head: SUCCESS_HEAD,
+      reviewedDiffDigestRefusal: refusal,
+    });
+    const injected = { ...deps(MANIFEST, handler), writeDiagnostic: vi.fn() };
+
+    const execution = await runSessionCli(
+      ['review-verdict', '--state', 'APPROVE', '--body-file', BODY_PATH],
+      injected,
+    );
+
+    // Loud, and on stderr so the single machine-readable stdout line callers
+    // parse stays exactly one JSON object.
+    expect(injected.writeDiagnostic).toHaveBeenCalledTimes(1);
+    const [diagnostic] = injected.writeDiagnostic.mock.calls[0];
+    expect(diagnostic).toContain(refusal);
+    expect(diagnostic).toMatch(/will NOT carry/);
+    expect(injected.writeOutput.mock.calls[0][0]).toContain(refusal);
+    // Fail-closed, never a failed approval: the verdict still succeeds.
+    expect(execution.exitCode).toBe(0);
+    expect(injected.setExitCode).not.toHaveBeenCalled();
+  });
+
+  it('emits no digest diagnostic when the approval carries a digest', async () => {
+    const handler = protocol();
+    const injected = { ...deps(MANIFEST, handler), writeDiagnostic: vi.fn() };
+
+    await runSessionCli(
+      ['review-verdict', '--state', 'APPROVE', '--body-file', BODY_PATH],
+      injected,
+    );
+
+    expect(injected.writeDiagnostic).not.toHaveBeenCalled();
+  });
+
   it('rejects a malformed follow-ups file payload', async () => {
     const badPath = '/attempt/reports/bad-follow-ups.json';
     const handler = protocol();

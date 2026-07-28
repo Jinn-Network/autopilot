@@ -848,18 +848,20 @@ export function makeProductionReviewSessionPort(
      *
      * `readReviewedDiffDigest` never throws; an unprovable digest comes back as
      * `unavailable` and is recorded as nothing at all, leaving the merge gate's
-     * exact-head requirement in place.
+     * exact-head requirement in place. The result is returned whole rather than
+     * narrowed to `string | undefined`: the reason is the only thing that lets
+     * an operator distinguish a fail-closed carry from a broken one, and
+     * discarding it here was one half of why this feature ran dead unnoticed.
      */
     async readReviewedDiffDigest(prNumber, expectedHead) {
       const manifest = currentManifest();
-      const result = await readReviewedDiffDigest({
+      return readReviewedDiffDigest({
         run: (command, args) => run(manifest, command, args),
         prNumber,
         expectedHead,
         expectedBaseRefName: manifest.targetBase,
         context: 'Review',
       });
-      return result.status === 'digest' ? result.digest : undefined;
     },
 
     async hasHumanHold(_issueNumber, prNumber, expectedHead) {
