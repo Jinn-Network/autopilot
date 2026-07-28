@@ -1,5 +1,6 @@
 import type { AttemptManifest } from './attempt-workspace.js';
 import { formatHumanCommentMarker } from './codecs.js';
+import { branchClaimPrAuthorityMatches } from './implementation-claim-authority.js';
 import type {
   BranchClaim,
   GitOid,
@@ -230,11 +231,13 @@ async function requireAuthority(
     !isOwnedImplementationPhase(latest.phase)
     || latest.attempt !== manifest.attemptId
     || latest.issueNumber !== manifest.issueNumber
-    || (
-      latest.prNumber === undefined
-        ? authority.latestClaimOid !== manifest.claimOid
-        : latest.prNumber !== manifest.prNumber
-    )
+    || !branchClaimPrAuthorityMatches({
+      claim: latest,
+      expectedPrNumber: manifest.prNumber!,
+      originClaimOid: manifest.claimOid as GitOid,
+      latestClaimOid: authority.latestClaimOid,
+      remoteHead: authority.remoteHead,
+    })
     || latest.runner !== manifest.runnerId
     || latest.login.toLowerCase() !== manifest.selectedLogin.toLowerCase()
     || latest.targetBase !== manifest.targetBase

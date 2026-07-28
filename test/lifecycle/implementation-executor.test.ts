@@ -340,7 +340,7 @@ describe('implementation action executor', () => {
     }]);
   });
 
-  it.skip('carries a brand-new executor claim into an authoritative session checkpoint', async () => {
+  it('carries a brand-new executor claim into an authoritative session checkpoint', async () => {
     let initialClaim: BranchClaim | undefined;
     let createdAttempt: Parameters<ImplementationExecutorDeps['createAttempt']>[0] | undefined;
     const { deps } = harness({
@@ -444,8 +444,6 @@ describe('implementation action executor', () => {
       sleep: async () => {},
       ensureCompletionSummary: async () => {},
       setPullRequestLabel: async () => {},
-      setProjectStatus: async () => {},
-      readProjectStatus: async () => 'In Progress',
       setPullRequestDraft: async () => {},
       hasHumanComment: async () => false,
       ensureHumanComment: async () => {},
