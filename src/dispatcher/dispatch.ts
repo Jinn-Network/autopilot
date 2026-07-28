@@ -1,4 +1,3 @@
-import { fileURLToPath } from 'node:url';
 import { basename, dirname, join } from 'node:path';
 import type { ReadyIssue, DispatcherConfig, InFlightSession } from './types.js';
 import type { CommandRunner } from './issue-source.js';
@@ -14,6 +13,7 @@ import {
   spawnCoordinatorSession,
   type SpawnFn,
 } from './coordinator-session.js';
+import { REPO_ROOT as RUNTIME_REPO_ROOT } from './runtime-path.js';
 
 export {
   effortFlag,
@@ -29,13 +29,10 @@ export type {
 // Repo root + canonical worktree base
 // ---------------------------------------------------------------------------
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-// src/dispatcher → src → packages/autopilot → packages → repo root
 // Exported so other modules that shell out `git -C <repoRoot> …` (e.g. the
 // delivery-pr-bridge worktree add/remove, issue #1892) share this single
 // computation rather than re-deriving it.
-export const REPO_ROOT = join(HERE, '..', '..', '..', '..');
-const AUTOPILOT_PACKAGE_DIR = join(REPO_ROOT, 'packages', 'autopilot');
+export const REPO_ROOT = RUNTIME_REPO_ROOT;
 
 /**
  * Per CLAUDE.md AI rule #1, multi-agent worktrees live in
@@ -270,10 +267,7 @@ export async function dispatchIssue(
       scenario,
       worktreePath,
       effort: issue.effort,
-      env: {
-        ...identityEnv,
-        JINN_AUTOPILOT_PACKAGE_DIR: AUTOPILOT_PACKAGE_DIR,
-      },
+      env: identityEnv,
       spawnOptions: {
       detached: true,
       stdio: ['ignore', 'inherit', 'inherit'],

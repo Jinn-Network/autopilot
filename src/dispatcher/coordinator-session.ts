@@ -19,6 +19,7 @@ import {
   loadRuntimeCanon,
   repositorySkillDirectories,
 } from '../config/runtime-assets.js';
+import { pinnedAutopilotPackageDir } from './runtime-path.js';
 
 export interface SpawnResult {
   pid: number | undefined;
@@ -110,12 +111,41 @@ function resolveCursorSessionModel(
  * Runtime selection lives only here: callers retain their lifecycle, cleanup,
  * logging paths, worktrees, and GitHub identities.
  */
+function composeExitHandler(
+  sessionId: string,
+  spec: CoordinatorSessionSpec,
+  log: (message: string) => void,
+  getPid: () => number | undefined,
+  callerOnExit: SpawnExitHandler | undefined,
+): SpawnExitHandler {
+  return (code, signal) => {
+    const logPath = spec.spawnOptions.logPath;
+    log(
+      `[autopilot] coordinator exit session=${sessionId} ` +
+        `pid=${getPid() ?? 'unknown'} ` +
+        `code=${code ?? 'null'} signal=${signal ?? 'null'}` +
+        (logPath === undefined ? '' : ` log=${logPath}`),
+    );
+    callerOnExit?.(code, signal);
+  };
+}
+
 export function spawnCoordinatorSession(
   spec: CoordinatorSessionSpec,
   cfg: DispatcherConfig,
   deps: CoordinatorSessionDeps,
 ): SpawnResult {
   const sessionId = `${spec.kind}-${spec.number}`;
+  const log = deps.log ?? console.log;
+  let spawnedPid: number | undefined;
+  const { onExit: callerOnExit, ...spawnOptions } = spec.spawnOptions;
+  const composedOnExit = composeExitHandler(
+    sessionId,
+    spec,
+    log,
+    () => spawnedPid,
+    callerOnExit,
+  );
   const runtimePrompt = cfg.runtime === 'hermes'
     ? buildHermesHeadlessPrompt(spec.skill, spec.scenario)
     : cfg.runtime === 'cursor'
@@ -129,6 +159,7 @@ export function spawnCoordinatorSession(
   const env: NodeJS.ProcessEnv = {
     ...spec.env,
     JINN_AUTOPILOT_RUNTIME: cfg.runtime,
+    JINN_AUTOPILOT_PACKAGE_DIR: pinnedAutopilotPackageDir(spec.env),
   };
   let result: SpawnResult;
 
@@ -151,7 +182,8 @@ export function spawnCoordinatorSession(
         provider: cfg.hermesProvider,
       }),
       {
-        ...spec.spawnOptions,
+        ...spawnOptions,
+        onExit: composedOnExit,
         cwd: spec.worktreePath,
         env: {
           ...env,
@@ -175,7 +207,8 @@ export function spawnCoordinatorSession(
         workspace: spec.worktreePath,
       }),
       {
-        ...spec.spawnOptions,
+        ...spawnOptions,
+        onExit: composedOnExit,
         cwd: spec.worktreePath,
         env: {
           ...env,
@@ -189,14 +222,17 @@ export function spawnCoordinatorSession(
       'claude',
       ['-p', ...effortFlag(spec.effort), prompt],
       {
-        ...spec.spawnOptions,
+        ...spawnOptions,
+        onExit: composedOnExit,
         cwd: spec.worktreePath,
         env,
       },
     );
   }
 
-  (deps.log ?? console.log)(
+  spawnedPid = result.pid;
+
+  log(
     `[autopilot] coordinator dispatch session=${sessionId} ` +
       `runtime=${cfg.runtime} pid=${result.pid ?? 'unknown'}`,
   );

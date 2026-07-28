@@ -341,7 +341,7 @@ function selectedReadRunner(
   });
 }
 
-function makeLoggingSpawn(): SpawnFn {
+export function makeLoggingSpawn(): SpawnFn {
   return (command, args, options) => {
     const { onExit, logPath, ...spawnOptions } = options;
     let descriptor: number | undefined;

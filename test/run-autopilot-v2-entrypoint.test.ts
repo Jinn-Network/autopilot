@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import * as lifecycleEntrypoint from '../scripts/run-autopilot-v2.js';
 import { CredentialPool } from '../src/lifecycle/credentials.js';
 
 const {
   isDirectLifecycleEntrypoint,
+  makeLoggingSpawn,
   makeMarketplaceRecoveryCallback,
   makeMarketplaceRecoveryCredentialResolver,
 } = lifecycleEntrypoint;
@@ -35,6 +39,28 @@ describe('lifecycle script entrypoint', () => {
     expect(exitCodeForReport?.(failed, false)).toBeUndefined();
     expect(exitCodeForReport?.({ status: 'rejected' }, true)).toBe(2);
     expect(exitCodeForReport?.({ status: 'ok' }, true)).toBeUndefined();
+  });
+
+  it('forwards composed coordinator exit callbacks while capturing log output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-logging-spawn-'));
+    const logPath = join(dir, 'review.log');
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    const spawn = makeLoggingSpawn();
+    const result = spawn(process.execPath, ['-e', 'process.exit(7)'], {
+      cwd: dir,
+      detached: true,
+      stdio: ['ignore', 'inherit', 'inherit'],
+      logPath,
+      onExit: (code, signal) => {
+        exits.push({ code, signal });
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(exits).toEqual([{ code: 7, signal: null }]);
+    });
+    expect(result.pid).toBeTypeOf('number');
+    expect(readFileSync(logPath, 'utf8')).toContain('active dispatch');
   });
 
   it('selects the production backend only from the dedicated configured runtime variable', () => {
