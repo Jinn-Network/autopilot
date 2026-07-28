@@ -928,11 +928,20 @@ describe('marketplace mutation adoption validation', () => {
     expect(harness.applyMutations).toBe(0);
   });
 
+  it('rejects explicit Human authority before effects', async () => {
+    const harness = new Harness();
+    harness.humanActive = true;
+    await expect(adopt(harness)).resolves.toMatchObject({ status: 'rejected', reason: 'policy-human' });
+    expect(harness.applyMutations).toBe(0);
+    expect(harness.comments).toHaveLength(1);
+  });
+
   it('rejects CODEOWNER surface before effects', async () => {
     const harness = new Harness();
     harness.codeOwnerRequired = true;
     await expect(adopt(harness)).resolves.toMatchObject({ status: 'rejected', reason: 'policy-human' });
     expect(harness.applyMutations).toBe(0);
+    expect(harness.comments).toHaveLength(1);
   });
 
   it('calls Human protocol before publishing policy-human', async () => {

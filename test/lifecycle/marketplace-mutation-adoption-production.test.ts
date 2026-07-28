@@ -53,9 +53,13 @@ function snapshotForMapping(
     readonly issueNumber?: number;
     readonly issueNumbers?: number[];
     readonly labels?: readonly string[];
+    readonly blockedOn?: 'Nothing' | 'Human';
+    readonly isDraft?: boolean;
   },
 ) {
   const issueNumber = mapping.issueNumber ?? 2001;
+  const blockedOn = mapping.blockedOn ?? 'Nothing';
+  const isDraft = mapping.isDraft ?? false;
   const base = {
     capturedAt: '2026-07-24T12:00:00.000Z',
     snapshotComplete: true,
@@ -64,7 +68,7 @@ function snapshotForMapping(
       title: 'Implement contracts',
       labels: mapping.labels ?? [],
       shape: 'feat' as const,
-      blockedOn: 'Nothing' as const,
+      blockedOn,
       blockedByIssues: [],
       effort: 'High' as const,
       priority: 'P1' as const,
@@ -84,7 +88,7 @@ function snapshotForMapping(
         status: 'Todo' as const,
         priority: 'P1' as const,
         effort: 'High' as const,
-        blockedOn: 'Nothing' as const,
+        blockedOn,
         issueType: 'feat' as const,
         blockedByIssues: [],
         sprintIterationId: null,
@@ -101,7 +105,7 @@ function snapshotForMapping(
       headRefName: 'codex/issue-2001',
       headOid: HEAD,
       headCommittedAt: '2026-07-24T12:00:00.000Z',
-      isDraft: false,
+      isDraft,
       state: 'OPEN' as const,
       labels: mapping.labels ?? [],
       closingIssueNumbers: [issueNumber],
@@ -120,7 +124,7 @@ function snapshotForMapping(
         labels: mapping.labels ?? [],
         head: HEAD,
         headChangedAt: '2026-07-24T12:00:00.000Z',
-        isDraft: false,
+        isDraft,
         merged: false,
         needsReview: true,
         approved: false,
@@ -919,8 +923,9 @@ describe('production marketplace authority surfaces', () => {
     expect(authority.pullRequest.baseRefName).toBe('attacker/retarget');
   });
 
-  it('marks Human dominance from live labels without mutating GitHub state', async () => {
+  it('keeps a production-order draft PR separate from Human authority', async () => {
     const { manifest, manifestPath } = fixture();
+    const baseline = authorityRunner(manifest);
     const runner = vi.fn(async (command: string, args: string[]) => {
       if (command === 'gh' && args[0] === 'pr') {
         return JSON.stringify({
@@ -928,24 +933,104 @@ describe('production marketplace authority surfaces', () => {
           headRefOid: HEAD,
           headRefName: 'codex/issue-2001',
           baseRefName: 'next',
-          isDraft: false,
-          labels: [{ name: 'review:needs-human' }],
+          isDraft: true,
+          labels: [{ name: 'engine:review' }],
           body: '',
           state: 'OPEN',
         });
       }
-      return authorityRunner(manifest)(command, args);
+      if (
+        command === 'gh'
+        && args.some((arg) => arg.endsWith('/contents/.github/CODEOWNERS'))
+      ) {
+        return JSON.stringify({
+          encoding: 'base64',
+          content: Buffer.from('/SPEC.md @Jinn-Network/codeowners\n').toString('base64'),
+        });
+      }
+      return baseline(command, args);
     });
-    const readSnapshot = vi.fn(async () => snapshotForMapping({
-      status: 'resolved',
-      labels: ['review:needs-human'],
-    }) as never);
     const port = makeProductionMarketplaceMutationAuthorityPort({
       originManifestPath: manifestPath,
       repositoryPath: manifest.repository.root,
       worktreeBase: '/tmp/worktrees',
       runnerId: manifest.runnerId,
-      readSnapshot,
+      readSnapshot: async () => snapshotForMapping({
+        status: 'resolved',
+        labels: ['engine:review'],
+        isDraft: true,
+      }) as never,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+
+    const authority = await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: [],
+    });
+    expect(authority.pullRequest).toMatchObject({
+      draft: true,
+      humanActive: false,
+      codeOwnerRequired: false,
+    });
+    expectNoMutatingGhApiCalls(runner.mock.calls);
+  });
+
+  it.each(['review:needs-human', 'autopilot:human'])(
+    'marks Human dominance from the live %s label without mutating GitHub state',
+    async (label) => {
+      const { manifest, manifestPath } = fixture();
+      const runner = vi.fn(async (command: string, args: string[]) => {
+        if (command === 'gh' && args[0] === 'pr') {
+          return JSON.stringify({
+            number: 2101,
+            headRefOid: HEAD,
+            headRefName: 'codex/issue-2001',
+            baseRefName: 'next',
+            isDraft: false,
+            labels: [{ name: label }],
+            body: '',
+            state: 'OPEN',
+          });
+        }
+        return authorityRunner(manifest)(command, args);
+      });
+      const readSnapshot = vi.fn(async () => snapshotForMapping({
+        status: 'resolved',
+        labels: [label],
+      }) as never);
+      const port = makeProductionMarketplaceMutationAuthorityPort({
+        originManifestPath: manifestPath,
+        repositoryPath: manifest.repository.root,
+        worktreeBase: '/tmp/worktrees',
+        runnerId: manifest.runnerId,
+        readSnapshot,
+        runner,
+        environment: { PATH: '/usr/bin' },
+      });
+
+      const authority = await port.readExactAuthority({
+        manifestPath,
+        touchedPaths: [],
+      });
+      expect(authority.pullRequest.humanActive).toBe(true);
+      expect(readSnapshot).toHaveBeenCalled();
+      expectNoMutatingGhApiCalls(runner.mock.calls);
+    },
+  );
+
+  it('marks Human dominance from Project Blocked on Human without mutating GitHub state', async () => {
+    const { manifest, manifestPath } = fixture();
+    const runner = authorityRunner(manifest);
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot: async () => snapshotForMapping({
+        status: 'resolved',
+        blockedOn: 'Human',
+      }) as never,
       runner,
       environment: { PATH: '/usr/bin' },
     });
@@ -955,7 +1040,42 @@ describe('production marketplace authority surfaces', () => {
       touchedPaths: [],
     });
     expect(authority.pullRequest.humanActive).toBe(true);
-    expect(readSnapshot).toHaveBeenCalled();
+    expectNoMutatingGhApiCalls(runner.mock.calls);
+  });
+
+  it('marks Human dominance from a Human protocol comment without mutating GitHub state', async () => {
+    const { manifest, manifestPath } = fixture();
+    const baseline = authorityRunner(manifest);
+    const runner = vi.fn(async (command: string, args: string[]) => {
+      if (
+        command === 'gh'
+        && args.some((arg) => arg.includes('/issues/2101/comments'))
+      ) {
+        return JSON.stringify([{
+          id: 73,
+          user: { login: 'jinn-autopilot' },
+          body: '<!-- jinn-autopilot:v2-human issue=2001 -->',
+          created_at: '2026-07-24T12:01:00.000Z',
+          updated_at: '2026-07-24T12:01:00.000Z',
+        }]);
+      }
+      return baseline(command, args);
+    });
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot: async () => snapshotForMapping({ status: 'resolved' }) as never,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+
+    const authority = await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: [],
+    });
+    expect(authority.pullRequest.humanActive).toBe(true);
     expectNoMutatingGhApiCalls(runner.mock.calls);
   });
 

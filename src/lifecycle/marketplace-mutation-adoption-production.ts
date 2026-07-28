@@ -435,7 +435,7 @@ export function makeProductionMarketplaceMutationAuthorityPort(options: {
         pullRequestLabels: pullRequest.labels,
         nativeIssueLabels: issue?.labels,
         projectBlockedOn: projectItem?.blockedOn ?? null,
-      }) || pullRequest.draft || humanComment;
+      }) || humanComment;
       const codeOwnerRequired = candidate?.approvalPolicy === 'human-codeowner';
       let child: MarketplaceMutationAuthority['child'];
       const execution = manifest.execution;
