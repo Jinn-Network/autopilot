@@ -463,6 +463,25 @@ describe('attempt workspace and manifest', () => {
     expect(readFileSync(manifest.paths.manifest)).toEqual(before);
   });
 
+  it('serializes marketplace process claims with execution-state transitions', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createSubmittedMarketplaceAttempt(fixture);
+    const before = readFileSync(manifest.paths.manifest);
+    const lockPath = `${manifest.paths.manifest}.marketplace-state-transition.lock`;
+    writeFileSync(lockPath, '{}\n', { mode: 0o600 });
+
+    try {
+      expect(() => claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+        pid: 700,
+        isPidAlive: () => false,
+        now: () => new Date('2026-07-28T12:03:00.000Z'),
+      })).toThrow(/marketplace state transition already in progress/i);
+      expect(readFileSync(manifest.paths.manifest)).toEqual(before);
+    } finally {
+      rmSync(lockPath);
+    }
+  });
+
   it('rebinds a marketplace attempt claim held by a dead PID without changing execution evidence', async () => {
     const fixture = repositoryFixture();
     const manifest = await createSubmittedMarketplaceAttempt(fixture);

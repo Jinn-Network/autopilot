@@ -967,55 +967,10 @@ function assertMarketplaceProcessClaimable(manifest: AttemptManifest): void {
   throw new Error('Unsupported marketplace attempt cannot acquire a process lease');
 }
 
-export function claimMarketplaceAttemptProcess(
-  manifestPath: string,
-  options: MarketplaceAttemptProcessClaimOptions = {},
-): AttemptManifest {
-  const claimantPid = positiveInteger(
-    options.pid ?? process.pid,
-    'marketplace process PID',
-  );
-  const isPidAlive = options.isPidAlive ?? marketplaceProcessPidIsAlive;
-  const current = readAttemptManifest(manifestPath);
-  assertMarketplaceProcessClaimable(current);
-  if (current.processState === 'exited') {
-    throw new Error('Exited marketplace attempt cannot acquire a process lease');
-  }
-  if (current.processState === 'running' && current.pid === claimantPid) {
-    return current;
-  }
-  if (
-    current.processState === 'running'
-    && current.pid !== null
-    && isPidAlive(current.pid)
-  ) {
-    throw new Error('Marketplace attempt process lease is held by a live PID');
-  }
-  const timestamp = transitionTimestamp(options.now ?? (() => new Date()));
-  if (Date.parse(timestamp) < Date.parse(current.timestamps.updatedAt)) {
-    throw new Error('Marketplace process claim predates the manifest update');
-  }
-  const claimed = decodeAttemptManifest({
-    ...current,
-    processState: 'running',
-    pid: claimantPid,
-    timestamps: {
-      ...current.timestamps,
-      updatedAt: timestamp,
-      childStartedAt: timestamp,
-    },
-  });
-  writeManifestAtomic(manifestPath, claimed);
-  return claimed;
-}
-
-/** Dedicated internal boundary for strict marketplace state transitions. */
-export function replaceMarketplaceExecutionState(
+function withMarketplaceStateTransitionLock<T>(
   path: string,
-  expectedState: MarketplaceExecutionState,
-  state: MarketplaceExecutionState,
-  updatedAt: string,
-): AttemptManifest {
+  transition: () => T,
+): T {
   const lockPath = `${path}.marketplace-state-transition.lock`;
   let descriptor: number | undefined;
   let acquired = false;
@@ -1038,7 +993,68 @@ export function replaceMarketplaceExecutionState(
     closeSync(descriptor);
     descriptor = undefined;
     fsyncDirectory(dirname(path));
+    return transition();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (acquired && existsSync(lockPath)) {
+      rmSync(lockPath);
+      fsyncDirectory(dirname(path));
+    }
+  }
+}
 
+export function claimMarketplaceAttemptProcess(
+  manifestPath: string,
+  options: MarketplaceAttemptProcessClaimOptions = {},
+): AttemptManifest {
+  const claimantPid = positiveInteger(
+    options.pid ?? process.pid,
+    'marketplace process PID',
+  );
+  const isPidAlive = options.isPidAlive ?? marketplaceProcessPidIsAlive;
+  return withMarketplaceStateTransitionLock(manifestPath, () => {
+    const current = readAttemptManifest(manifestPath);
+    assertMarketplaceProcessClaimable(current);
+    if (current.processState === 'exited') {
+      throw new Error('Exited marketplace attempt cannot acquire a process lease');
+    }
+    if (current.processState === 'running' && current.pid === claimantPid) {
+      return current;
+    }
+    if (
+      current.processState === 'running'
+      && current.pid !== null
+      && isPidAlive(current.pid)
+    ) {
+      throw new Error('Marketplace attempt process lease is held by a live PID');
+    }
+    const timestamp = transitionTimestamp(options.now ?? (() => new Date()));
+    if (Date.parse(timestamp) < Date.parse(current.timestamps.updatedAt)) {
+      throw new Error('Marketplace process claim predates the manifest update');
+    }
+    const claimed = decodeAttemptManifest({
+      ...current,
+      processState: 'running',
+      pid: claimantPid,
+      timestamps: {
+        ...current.timestamps,
+        updatedAt: timestamp,
+        childStartedAt: timestamp,
+      },
+    });
+    writeManifestAtomic(manifestPath, claimed);
+    return claimed;
+  });
+}
+
+/** Dedicated internal boundary for strict marketplace state transitions. */
+export function replaceMarketplaceExecutionState(
+  path: string,
+  expectedState: MarketplaceExecutionState,
+  state: MarketplaceExecutionState,
+  updatedAt: string,
+): AttemptManifest {
+  return withMarketplaceStateTransitionLock(path, () => {
     const current = readAttemptManifest(path);
     if (current.execution.backend !== 'marketplace') {
       throw new Error('Only marketplace attempts may replace marketplace execution state');
@@ -1057,13 +1073,7 @@ export function replaceMarketplaceExecutionState(
     });
     if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
     return next;
-  } finally {
-    if (descriptor !== undefined) closeSync(descriptor);
-    if (acquired && existsSync(lockPath)) {
-      rmSync(lockPath);
-      fsyncDirectory(dirname(path));
-    }
-  }
+  });
 }
 
 function fsyncDirectory(path: string): void {

@@ -94,6 +94,7 @@ Name and independently assert these breaks:
 | --- | --- | --- |
 | replays a claim by the same PID without rewriting bytes or timestamps | `running,pid=700`, claimant `700` | before/after `Buffer` equality |
 | refuses another live PID | `running,pid=701`, claimant `700`, `isPidAlive(701)=true` | throws; before/after `Buffer` equality |
+| serializes with execution-state transitions | existing `.marketplace-state-transition.lock` | throws; before/after `Buffer` equality |
 | rebinds a dead PID | `running,pid=701`, claimant `700`, `isPidAlive(701)=false` | `running,pid=700`, claim timestamp |
 | refuses exited and terminal attempts | `exited` submitted plus preparing cancelled/receipt-published cases | throws; bytes unchanged |
 | refuses clock regression | manifest updated `12:03`, claim time `12:02` | throws; bytes unchanged |
@@ -133,9 +134,13 @@ function pidIsAlive(pid: number): boolean {
 ```
 
 Strictly permit only submitted/nonterminal adoption state or anchored
-evaluator state. Use `decodeAttemptManifest()` and `writeManifestAtomic()`
-directly because generic `updateAttemptManifest()` intentionally rejects
-marketplace execution manifests.
+evaluator state. Extract the existing marketplace transition lock boundary
+from `replaceMarketplaceExecutionState()` and run the claim's complete
+read/validate/write sequence under the same lock, preventing process metadata
+from overwriting a simultaneous execution-state transition. Use
+`decodeAttemptManifest()` and `writeManifestAtomic()` directly because generic
+`updateAttemptManifest()` intentionally rejects marketplace execution
+manifests.
 
 ```ts
 export function claimMarketplaceAttemptProcess(

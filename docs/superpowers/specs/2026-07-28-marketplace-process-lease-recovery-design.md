@@ -135,6 +135,9 @@ Acquisition and rebind update only:
 
 All other manifest fields, including the complete execution state, remain
 identical. A claim timestamp older than `timestamps.updatedAt` fails closed.
+The complete claim read/validate/write sequence shares the existing
+marketplace execution-state transition lock, so a process claim cannot
+overwrite a simultaneous adoption-state transition.
 
 ## Integration
 
