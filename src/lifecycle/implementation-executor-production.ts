@@ -27,6 +27,7 @@ import { withSelectedCredential } from './production-auth.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
 import { gitOid, gitRefName } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
+import type { SelfClaimHeadTransition } from './self-claim-transition.js';
 
 export interface ProductionImplementationActionPortOptions {
   readonly repositoryPath: string;
@@ -39,7 +40,9 @@ export interface ProductionImplementationActionPortOptions {
   readonly projectMapping?: ProjectMapping;
   readonly credentials: CredentialPool;
   readonly authorAllowlist: ReadonlySet<string>;
-  readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
+  readonly readSnapshot: (
+    selfClaim?: SelfClaimHeadTransition,
+  ) => Promise<GitHubLifecycleSnapshot>;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
   readonly createWorkspace?: (
@@ -356,8 +359,8 @@ export function makeProductionImplementationActionPort(
     }));
 
   return {
-    async readIssue(issueNumber) {
-      const snapshot = await options.readSnapshot();
+    async readIssue(issueNumber, selfClaim?) {
+      const snapshot = await options.readSnapshot(selfClaim);
       return issueFromSnapshot(snapshot, issueNumber).issue;
     },
 
@@ -552,9 +555,9 @@ export function makeProductionImplementationActionPort(
         return readPr(input.branch, secureRunner);
       }),
 
-    setProjectInProgress: (issueNumber, expectedHead, credential) =>
+    setProjectInProgress: (issueNumber, expectedHead, credential, selfClaim) =>
       withCredential(credential, async ({ run }) => {
-        const current = await options.readSnapshot();
+        const current = await options.readSnapshot(selfClaim);
         const item = current.project.items.find((candidate) =>
           candidate.contentType === 'Issue' && candidate.number === issueNumber);
         if (item === undefined) throw new Error('Implementation issue is missing from Project');
@@ -600,7 +603,7 @@ export function makeProductionImplementationActionPort(
             '--single-select-option-id', fields.status.options['In Progress'],
           ]),
           async () => {
-            const after = (await options.readSnapshot()).project.items.find((candidate) =>
+            const after = (await options.readSnapshot(selfClaim)).project.items.find((candidate) =>
               candidate.contentType === 'Issue'
               && candidate.number === issueNumber);
             return after?.status === 'In Progress'

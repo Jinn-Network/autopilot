@@ -32,3 +32,11 @@ export function sessionStartedAtPath(issueNumber: number): string {
   return join(SESSIONS_LOG_DIR, `${issueNumber}.started-at`);
 }
 
+/**
+ * The log-file path for one review dispatch, keyed by PR number:
+ * `<SESSIONS_LOG_DIR>/pr-<N>.log`.
+ */
+export function reviewSessionLogPath(prNumber: number): string {
+  return join(SESSIONS_LOG_DIR, `pr-${prNumber}.log`);
+}
+

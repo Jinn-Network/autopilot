@@ -12,6 +12,7 @@ import type {
   ReviewLeaseStore,
 } from '../../src/dispatcher/review-lease.js';
 import type { ReviewCleanupOptions } from '../../src/dispatcher/review-cleanup.js';
+import { reviewSessionLogPath } from '../../src/dispatcher/session-log.js';
 import { HERMES_HOMES_DIR } from '../../src/dispatcher/hermes-home.js';
 
 const PR: ReviewablePr = {
@@ -123,6 +124,8 @@ describe('dispatchReview', () => {
     expect(prompt).toContain('non-interactive');
     expect(calls[0].opts.cwd).toBe(EXPECTED_WT);
     expect(calls[0].opts.detached).toBe(true);
+    expect(calls[0].opts.stdio).toEqual(['ignore', 'inherit', 'inherit']);
+    expect(calls[0].opts.logPath).toBe(reviewSessionLogPath(42));
   });
 
   it('passes the named reviewer credential and expected login to every review shell', async () => {
@@ -145,6 +148,8 @@ describe('dispatchReview', () => {
       JINN_REVIEW_HEAD_REF: PR.headRefName,
       JINN_AUTOPILOT_RUNTIME: 'claude',
     });
+    expect(calls[0].opts.stdio).toEqual(['ignore', 'inherit', 'inherit']);
+    expect(calls[0].opts.logPath).toBe(reviewSessionLogPath(42));
   });
 
   it('uses Cursor review model (not Effort table) for review sessions', async () => {
