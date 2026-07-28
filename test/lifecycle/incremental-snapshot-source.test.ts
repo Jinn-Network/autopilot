@@ -1904,13 +1904,17 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     expect(reconciled.githubUsage?.graphqlCost).toBeLessThanOrEqual(450);
   });
 
-  it('fails explicitly when the full oracle itself exceeds 450 GraphQL points', async () => {
+  it('saves the full snapshot with parity unavailable when the reconciliation window exceeds the observability reserve', async () => {
     const context = harness();
     context.reader.projectGraphQlCost = 451;
 
-    await expect(context.source.read({ mode: 'full', rateLimitFloor: 500 }))
-      .rejects.toThrow(/Full oracle consumed 451 GraphQL points.*450-point acceptance/i);
-    expect(context.store.saves).toBe(0);
+    const reconciled = await context.source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(reconciled.parityUnavailableReason).toMatch(
+      /full reconciliation window consumed 451 GraphQL points.*parity boundary validation.*450-point observability reserve/i,
+    );
+    expect(context.store.saves).toBe(1);
+    expect(context.store.state?.evidence.snapshotMode).toBe('full');
   });
 
   it('always obtains live GraphQL evidence and enforces the floor on an idle cycle', async () => {
