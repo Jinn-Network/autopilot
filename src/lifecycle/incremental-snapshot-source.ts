@@ -746,7 +746,6 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
         parityCandidate = await this.computeIncremental(
           rateLimitFloor + FULL_SCAN_RESERVE,
           prior,
-          false,
         );
       } catch (error) {
         parityUnavailableReason = `fresh incremental boundary candidate failed: ${
@@ -917,7 +916,6 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
   private async computeIncremental(
     rateLimitFloor: number,
     prior: LifecycleDiscoveryState | null,
-    allowGraphQl = true,
   ): Promise<IncrementalComputation> {
     if (prior === null) throw new IncrementalSnapshotUnavailableError();
     this.restDiscovery.resetBaseBranchTipMemo?.();
@@ -1013,19 +1011,6 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
     const activatedIssues = newlyActiveProjectIssues(prior.evidence.project, project);
     const hasUntrackedOpen = openIndex.some((entry) => !openEvidence.has(entry.number));
     const needsRelationRead = activatedIssues.length > 0 && hasUntrackedOpen;
-    if (!allowGraphQl && (changed.size > 0 || needsRelationRead)) {
-      const detail = changed.size > 0
-        ? `exact PR hydration for ${[...changed]
-            .sort((left, right) => left - right)
-            .map((number) => `#${number}`)
-            .join(', ')}`
-        : `closing-PR relation discovery for issues ${activatedIssues
-            .map((number) => `#${number}`)
-            .join(', ')}`;
-      throw new IncrementalSnapshotUnavailableError(
-        `same-boundary parity candidate requires GraphQL ${detail}`,
-      );
-    }
     let relationRead = false;
     if (needsRelationRead) {
       liveGraphQlRemaining = await this.requireGraphQlRemaining();
