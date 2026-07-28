@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import {
   MarketplaceMachineCliProtocolError,
@@ -113,6 +114,7 @@ const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const HEX_32_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const TASK_ID_PATTERN = /^(0|[1-9][0-9]*)$/;
 const TASK_CID_PATTERN = /^f01551220[0-9a-f]{64}$/;
+const ISSUE_RELAY_MAX_PATCH_BYTES = 2 * 1024 * 1024;
 const CANONICAL_UTC_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -238,7 +240,7 @@ function protocolError(
 
 function parseDryRun(
   result: MarketplaceMachineSubprocessResult,
-): RelaySubmissionDryRun {
+): RelaySubmissionDryRun & { readonly spec: unknown } {
   const value = parseMarketplaceMachineJson(result.stdout);
   const record = object(value);
   if (
@@ -273,6 +275,8 @@ function parseDryRun(
       'txCount',
       'solverNetManifestCid',
       'proposedSpendWei',
+      'solverType',
+      'spec',
     ])
     || typeof plan.id !== 'string'
     || plan.id.length === 0
@@ -286,6 +290,8 @@ function parseDryRun(
     || plan.solverNetManifestCid.length === 0
     || typeof plan.proposedSpendWei !== 'string'
     || !/^(0|[1-9][0-9]*)$/.test(plan.proposedSpendWei)
+    || plan.solverType !== 'jinn-repo.v1'
+    || object(plan.spec) === undefined
   ) {
     throw new Error('Invalid jinn tasks submit dry-run plan');
   }
@@ -294,6 +300,7 @@ function parseDryRun(
     creatorSafe: plan.creatorMultisig,
     solverNetManifestCid: plan.solverNetManifestCid,
     proposedSpendWei: BigInt(plan.proposedSpendWei),
+    spec: plan.spec,
   };
 }
 
@@ -406,7 +413,12 @@ const observationSchema = z.union([
     role: z.literal('solution'),
     payload: z.object({
       schemaVersion: z.literal('jinn-repo-solution.v1'),
-      patch: nonEmpty,
+      patch: nonEmpty.refine(
+        (value) =>
+          new TextEncoder().encode(value).byteLength
+          <= ISSUE_RELAY_MAX_PATCH_BYTES,
+        'Issue Relay patch exceeds 2 MiB',
+      ),
     }).strict(),
   }).strict(),
   z.object({
@@ -445,6 +457,15 @@ function idFromArgv(argv: readonly string[]): string {
     throw new Error('Relay marketplace request does not contain a Task ID');
   }
   return id;
+}
+
+function maximumSpendFromArgv(argv: readonly string[]): bigint {
+  const index = argv.indexOf('--max-spend-wei');
+  const value = index === -1 ? undefined : argv[index + 1];
+  if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
+    throw new Error('Relay marketplace request does not contain a maximum spend');
+  }
+  return BigInt(value);
 }
 
 export class IssueRelayMarketplaceCli {
@@ -497,7 +518,7 @@ export class IssueRelayMarketplaceCli {
     if (result.exitCode !== 0) {
       throwMarketplaceMachineFailure(result, 'jinn tasks submit --dry-run');
     }
-    let parsed: RelaySubmissionDryRun;
+    let parsed: RelaySubmissionDryRun & { readonly spec: unknown };
     try {
       parsed = parseDryRun(result);
     } catch (error) {
@@ -513,11 +534,25 @@ export class IssueRelayMarketplaceCli {
         result,
       );
     }
+    const expectedSpec = JSON.parse(loaded.request.specBytes) as unknown;
+    if (!isDeepStrictEqual(parsed.spec, expectedSpec)) {
+      throw protocolError(
+        'jinn tasks submit dry-run returned a different Relay Task spec',
+        result,
+      );
+    }
+    if (parsed.proposedSpendWei > maximumSpendFromArgv(argv)) {
+      throw protocolError(
+        'jinn tasks submit dry-run exceeded the persisted Relay spend maximum',
+        result,
+      );
+    }
+    const { spec: _spec, ...confirmation } = parsed;
     this.confirmations.set(requestPath, {
       requestDigest: loaded.digest,
-      result: parsed,
+      result: confirmation,
     });
-    return parsed;
+    return confirmation;
   }
 
   async submit(
@@ -537,7 +572,17 @@ export class IssueRelayMarketplaceCli {
     const result = await this.run(
       this.jinnBinary,
       loaded.request.argv,
-      { environment: this.environment },
+      {
+        environment: {
+          ...this.environment,
+          JINN_RELAY_EXPECTED_CREATOR_SAFE:
+            confirmation.result.creatorSafe,
+          JINN_RELAY_EXPECTED_SOLVERNET_MANIFEST_CID:
+            confirmation.result.solverNetManifestCid,
+          JINN_RELAY_EXPECTED_SPEND_WEI:
+            confirmation.result.proposedSpendWei.toString(),
+        },
+      },
     );
     verifyRelayMarketplaceRequest(requestPath, requestDigestPin);
     if (result.exitCode !== 0) {
@@ -603,7 +648,10 @@ export class IssueRelayMarketplaceCli {
       '--expectation-file',
       expectationPath,
       '--json',
-    ], { environment: this.environment });
+    ], {
+      environment: this.environment,
+      outputProfile: 'issue-relay-observation',
+    });
     verifyPinnedPrivateFile(
       expectationPath,
       expectationDigest,

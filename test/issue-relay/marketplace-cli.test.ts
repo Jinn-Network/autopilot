@@ -19,6 +19,7 @@ import {
 } from '../../src/issue-relay/marketplace-state.js';
 import {
   IssueRelayMarketplaceCli,
+  parseIssueRelayDeliveryObservation,
   type IssueRelayMarketplaceSubprocess,
 } from '../../src/issue-relay/marketplace-cli.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
@@ -108,6 +109,7 @@ function persistedRequest(): {
   const request = buildRelayMarketplaceRequest({
     task,
     solverNet: 'jinn-repo',
+    maximumSpendWei: 100n,
     specPath,
     createdAt: '2026-07-28T10:03:00.000Z',
     submitBy: '2026-07-28T10:18:00.000Z',
@@ -152,6 +154,8 @@ const dryRunEnvelope = {
     txCount: 1,
     solverNetManifestCid: manifestCid,
     proposedSpendWei: '40',
+    solverType: 'jinn-repo.v1',
+    spec: task.spec,
   }],
 };
 
@@ -255,19 +259,31 @@ describe('Issue Relay marketplace CLI submission', () => {
       '--json',
     ]);
     expect(run.mock.calls[1]?.[1]).toEqual(fixture.argv);
-    for (const call of run.mock.calls) {
-      expect(call[2]).toEqual({
-        environment: {
-          PATH: '/installed/bin',
-          HOME: '/operator',
-          TMPDIR: '/private/tmp',
-          JINN_CONFIG_HOME: '/operator/jinn',
-          JINN_WALLET_PASSWORD: 'wallet-secret',
-          BASE_RPC_URL: 'https://rpc.example',
-          NO_COLOR: '1',
-        },
-      });
-    }
+    expect(run.mock.calls[0]?.[2]).toEqual({
+      environment: {
+        PATH: '/installed/bin',
+        HOME: '/operator',
+        TMPDIR: '/private/tmp',
+        JINN_CONFIG_HOME: '/operator/jinn',
+        JINN_WALLET_PASSWORD: 'wallet-secret',
+        BASE_RPC_URL: 'https://rpc.example',
+        NO_COLOR: '1',
+      },
+    });
+    expect(run.mock.calls[1]?.[2]).toEqual({
+      environment: {
+        PATH: '/installed/bin',
+        HOME: '/operator',
+        TMPDIR: '/private/tmp',
+        JINN_CONFIG_HOME: '/operator/jinn',
+        JINN_WALLET_PASSWORD: 'wallet-secret',
+        BASE_RPC_URL: 'https://rpc.example',
+        NO_COLOR: '1',
+        JINN_RELAY_EXPECTED_CREATOR_SAFE: creatorSafe,
+        JINN_RELAY_EXPECTED_SOLVERNET_MANIFEST_CID: manifestCid,
+        JINN_RELAY_EXPECTED_SPEND_WEI: '40',
+      },
+    });
   });
 
   it('requires a fresh spend confirmation and rejects stale or changed dry-run pins', async () => {
@@ -326,6 +342,41 @@ describe('Issue Relay marketplace CLI submission', () => {
     await mismatch.dryRun(fixture.requestPath, fixture.requestDigest);
     await expect(mismatch.submit(fixture.requestPath, fixture.requestDigest))
       .rejects.toThrow(/dry-run.*solvernet/i);
+  });
+
+  it('rejects a successful dry-run that changes the exact spec or exceeds the persisted cap', async () => {
+    const fixture = persistedRequest();
+    for (const envelope of [
+      {
+        ...dryRunEnvelope,
+        plan: [{
+          ...dryRunEnvelope.plan[0],
+          spec: { ...task.spec, base_commit: '2'.repeat(40) },
+        }],
+      },
+      {
+        ...dryRunEnvelope,
+        plan: [{
+          ...dryRunEnvelope.plan[0],
+          proposedSpendWei: '101',
+        }],
+      },
+    ]) {
+      const run = vi.fn<IssueRelayMarketplaceSubprocess>(async () => ({
+        exitCode: 0,
+        stdout: JSON.stringify(envelope),
+        stderr: '',
+      }));
+      const cli = new IssueRelayMarketplaceCli({
+        jinnBinary: '/installed/bin/jinn',
+        environment: { PATH: '/bin' },
+        now: () => new Date('2026-07-28T10:06:00.000Z'),
+        run,
+      });
+
+      await expect(cli.dryRun(fixture.requestPath, fixture.requestDigest))
+        .rejects.toBeInstanceOf(MarketplaceMachineCliProtocolError);
+    }
   });
 
   it('accepts exact already-submitted readback and rejects malformed success output', async () => {
@@ -465,6 +516,41 @@ describe('Issue Relay marketplace CLI submission', () => {
 });
 
 describe('Issue Relay marketplace CLI observation', () => {
+  it('accepts a 2 MiB UTF-8 patch and rejects the next byte', () => {
+    const common = {
+      status: 'verified' as const,
+      role: 'solution' as const,
+      task: { taskId: '501', taskCid },
+      attempt: {
+        attemptIndex: 0,
+        requestId: `0x${'d'.repeat(64)}`,
+        operator: `0x${'e'.repeat(40)}`,
+      },
+      delivery: {
+        envelopeCid: 'bafy-delivery',
+        transactionHash: `0x${'f'.repeat(64)}`,
+        blockNumber: 120,
+      },
+      round: task.spec.relay,
+    };
+    const maximumPatch = 'x'.repeat(2 * 1024 * 1024);
+
+    expect(parseIssueRelayDeliveryObservation({
+      ...common,
+      payload: {
+        schemaVersion: 'jinn-repo-solution.v1',
+        patch: maximumPatch,
+      },
+    })).toMatchObject({ status: 'verified', role: 'solution' });
+    expect(() => parseIssueRelayDeliveryObservation({
+      ...common,
+      payload: {
+        schemaVersion: 'jinn-repo-solution.v1',
+        patch: `${maximumPatch}x`,
+      },
+    })).toThrow();
+  });
+
   it('uses the exact read-only observation argv and accepts one strict verified envelope', async () => {
     const fixture = persistedRequest();
     const observation = {
@@ -516,6 +602,7 @@ describe('Issue Relay marketplace CLI observation', () => {
       '--json',
     ], {
       environment: { PATH: '/bin', NO_COLOR: '1' },
+      outputProfile: 'issue-relay-observation',
     });
   });
 

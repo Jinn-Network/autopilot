@@ -88,6 +88,7 @@ function canonicalRelayArgv(input: {
   readonly round: number;
   readonly solverNet: string;
   readonly specPath: string;
+  readonly maximumSpendWei: string;
 }): readonly string[] {
   return [
     'tasks',
@@ -106,6 +107,8 @@ function canonicalRelayArgv(input: {
     '1',
     '--required-verdicts',
     '1',
+    '--max-spend-wei',
+    input.maximumSpendWei,
     '--yes',
     '--json',
   ];
@@ -300,6 +303,7 @@ function assertSafeArgument(value: string, label: string): void {
 export function buildRelayMarketplaceRequest(input: {
   readonly task: RelayTaskSpec;
   readonly solverNet: string;
+  readonly maximumSpendWei: bigint;
   readonly specPath: string;
   readonly createdAt: string;
   readonly submitBy: string;
@@ -308,6 +312,9 @@ export function buildRelayMarketplaceRequest(input: {
     throw new Error('Relay Task spec path must be absolute');
   }
   assertSafeArgument(input.solverNet, 'SolverNet');
+  if (input.maximumSpendWei <= 0n) {
+    throw new RangeError('Relay maximum spend must be positive');
+  }
   const createdAt = canonicalUtc(input.createdAt, 'Relay request creation time');
   const submitBy = canonicalUtc(input.submitBy, 'Relay request submission deadline');
   if (submitBy <= createdAt) {
@@ -336,6 +343,7 @@ export function buildRelayMarketplaceRequest(input: {
     round: relay.round,
     solverNet: input.solverNet,
     specPath: input.specPath,
+    maximumSpendWei: input.maximumSpendWei.toString(),
   });
 
   return {
@@ -497,6 +505,16 @@ function parseRelayMarketplaceRequest(
     throw new Error('Relay marketplace request argv is not canonical');
   }
   assertSafeArgument(solverNet, 'SolverNet');
+  const maximumSpendFlag = request.argv.indexOf('--max-spend-wei');
+  const maximumSpendWei = maximumSpendFlag === -1
+    ? undefined
+    : request.argv[maximumSpendFlag + 1];
+  if (
+    maximumSpendWei === undefined
+    || !/^[1-9][0-9]*$/.test(maximumSpendWei)
+  ) {
+    throw new Error('Relay marketplace request argv maximum spend is not canonical');
+  }
   const expectedArgv = canonicalRelayArgv({
     instanceId: spec.instance_id,
     repository: spec.repo,
@@ -504,6 +522,7 @@ function parseRelayMarketplaceRequest(
     round: relay.round,
     solverNet,
     specPath: request.specPath,
+    maximumSpendWei,
   });
   if (JSON.stringify(request.argv) !== JSON.stringify(expectedArgv)) {
     throw new Error('Relay marketplace request argv is not canonical');
