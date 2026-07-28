@@ -16,28 +16,54 @@ import type { ExactChangedFiles } from './github-changed-files.js';
  * pushing new code, and it is deliberately conservative in every direction it
  * cannot prove.
  *
+ * WHAT THIS DIGEST DOES NOT SEE — read this before relying on it.
+ *
+ * GitHub renders `patch` as a unified diff with **three lines of context**. Two
+ * comparisons therefore produce byte-identical patches whenever every base
+ * change lies more than three lines away from each of this PR's hunks *and*
+ * leaves that hunk's `@@` start offsets unchanged. Same-line-count edits above a
+ * hunk, and any edit below it, both satisfy that. Concretely: a base commit can
+ * rewrite the body of a function this PR calls — **including inside a file this
+ * PR itself changed** — and this digest will report the diff as unchanged.
+ *
+ * Equality of this digest therefore means "the PR contributes the same patch
+ * text", not "the merged result behaves the same". It is a statement about the
+ * PR's contribution in isolation. CI on the new head is the only thing covering
+ * the difference, and it covers it only as far as the test suite reaches. Do not
+ * restate this as "a base change touching a file the PR touched forces
+ * re-review"; that claim is false and was measured to be false.
+ *
  * Why `patch` and not `sha`:
  * `files[].sha` is the blob OID of the file *at the head side only*. It says
  * nothing about the other side of the diff, so two comparisons with identical
  * head blobs can still be different diffs — e.g. the base rewrote a file and
  * the merge kept the head's version, which changes the reviewed diff while
- * leaving every head-side blob untouched. `patch` is the only field in the
- * response that identifies both sides, so it is the only sound identity.
- * Consequently a response that omits `patch` for any entry — binary content,
- * or a diff GitHub declined to render because it was too large — yields no
- * digest at all rather than a digest that silently ignores that file.
+ * leaving every head-side blob untouched. `patch` identifies both sides, which
+ * makes it the soundest field available here — not a complete one. A compare
+ * `files[]` entry carries no file mode, and `patch` begins at the first `@@`,
+ * so a mode change (a script becoming executable) that rides along with a
+ * content change is invisible to this digest. A mode-only change is not: it
+ * produces no hunks, GitHub omits `patch`, and the entry fails closed as
+ * `unrepresented-patch` — as do binary content and diffs GitHub declined to
+ * render.
  *
  * Why truncation is guarded twice:
  * `compare` caps its `files[]` array at 300 entries and gives no total from
  * which truncation could be detected, so any response at or above the cap is
  * refused outright — 300 exactly and 300-of-4000 are indistinguishable, and
  * digesting the visible prefix of a truncated list is precisely the "silently
- * ignores a file" failure this module must not have. Where an
- * `ExactChangedFiles` reading is already in hand (the merge gate has one, for
- * CODEOWNERS) it is additionally required to name the same set of paths:
+ * ignores a file" failure this module must not have. An `ExactChangedFiles`
+ * reading is additionally required to name the same set of paths:
  * `readExactChangedFiles` proves completeness against
  * `pulls/{n}.changed_files`, so equality of the two sets is a second,
- * independent completeness proof at no extra API cost.
+ * independent completeness proof.
+ *
+ * `changedFiles` is optional in the signature only so this function stays a
+ * pure helper for callers that hold nothing to prove with — those callers get a
+ * strictly weaker reading, and no consumer in this engine is allowed to base a
+ * carry on one. Both consumers that do (`readCandidate` and
+ * `readExactCompareEvidence`) pass it, so the two sides of the carry decision
+ * evaluate identical evidence. See the note on `readExactCompareEvidence`.
  */
 export type ReviewedDiffDigest = string;
 

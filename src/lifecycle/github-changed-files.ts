@@ -158,8 +158,7 @@ export interface ExactCompareEvidence {
   readonly status: CompareStatus;
   /**
    * Identity of the diff this head presents against its base branch tip, or
-   * `undefined` when it could not be proven. Derived from the very same
-   * response `status` comes from, so it costs no additional request.
+   * `undefined` when it could not be proven.
    *
    * `undefined` is not "no change": every consumer must fall back to requiring
    * exact head identity when it is absent.
@@ -167,9 +166,32 @@ export interface ExactCompareEvidence {
   readonly reviewedDiffDigest?: string;
 }
 
+export interface ReadExactCompareEvidenceOptions
+  extends Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'> {
+  /**
+   * Read and require the exact changed-file proof before emitting a digest.
+   *
+   * Off by default, and off means **no digest at all** rather than a cheaper,
+   * weaker one. That is not squeamishness: the lifecycle view and the merge gate
+   * both decide whether an approval carries, and if the view could carry on
+   * evidence the gate would reject, the PR reaches `merge-ready`, the gate
+   * refuses with `terminal-approval`, and `reviewEnrollmentEligible` no longer
+   * dispatches a review — a permanent strand with no safety breach and no
+   * recovery. The gate always has an `ExactChangedFiles` reading (it needs one
+   * for CODEOWNERS), so the only way the two sides can evaluate identical
+   * evidence is for this side to read one too.
+   *
+   * The caller turns it on only when a carry is actually in question — a
+   * terminal-approved claim that recorded a digest at a head that is no longer
+   * the PR head — so the extra `pulls/{n}/files` pagination is paid by the
+   * handful of PRs that were just update-branched, not by every open PR.
+   */
+  readonly proveReviewedDiff?: boolean;
+}
+
 /** See `readExactCompareStatus` for the full head/base authority analysis. */
 export async function readExactCompareEvidence(
-  options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
+  options: ReadExactCompareEvidenceOptions,
 ): Promise<ExactCompareEvidence> {
   const repositorySlug = options.repositorySlug ?? REPO;
   const metadata = JSON.parse(await options.run('gh', [
@@ -195,9 +217,27 @@ export async function readExactCompareEvidence(
     'api',
     `repos/${repositorySlug}/compare/heads/${compareBase}...${options.expectedHead}`,
   ])) as { status?: unknown; files?: unknown };
-  const digest = reviewedDiffDigestFromCompare(compare.files);
+  const status = decodeCompareStatus(compare.status);
+  if (options.proveReviewedDiff !== true) return { status };
+  // Fail closed on the changed-file proof exactly as the merge gate does. A
+  // read failure yields no digest, never a digest computed from weaker
+  // evidence, so the view can never carry where the gate would refuse.
+  let changedFiles: ExactChangedFiles;
+  try {
+    changedFiles = await readExactChangedFiles({
+      run: options.run,
+      prNumber: options.prNumber,
+      expectedHead: options.expectedHead,
+      expectedBaseRefName: options.expectedBaseRefName,
+      context: 'Compare',
+      repositorySlug,
+    });
+  } catch {
+    return { status };
+  }
+  const digest = reviewedDiffDigestFromCompare(compare.files, changedFiles);
   return {
-    status: decodeCompareStatus(compare.status),
+    status,
     ...(digest.status === 'digest' ? { reviewedDiffDigest: digest.digest } : {}),
   };
 }

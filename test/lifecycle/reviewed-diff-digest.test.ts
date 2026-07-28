@@ -73,6 +73,55 @@ describe('reviewed diff digest', () => {
     expect(after).not.toBe(before);
   });
 
+  // Known behaviour, pinned deliberately. This is the residual risk, stated as a
+  // test so nobody can claim the digest is stricter than it is.
+  //
+  // GitHub renders `patch` with three lines of context. A base commit that
+  // rewrites line 5 of this same file — in place, so no offsets move — is more
+  // than three lines from the PR's hunk at line 40, so it appears nowhere in
+  // either comparison. Both comparisons emit the identical patch, the digest
+  // matches, and the approval carries even though the merged file now differs
+  // from the file the reviewer read.
+  it('does NOT notice a base change outside the patch context window', () => {
+    const hunk = [
+      '@@ -40,7 +40,7 @@ export function callsIntoTheBase() {',
+      '   const a = 1;',
+      '   const b = 2;',
+      '   const c = 3;',
+      '-  return helper(a, b, c);',
+      '+  return helper(a, b, c) + 1;',
+      '   const d = 4;',
+      '   const e = 5;',
+    ].join('\n');
+    const beforeBaseEdit = digestOf([compareFile({ patch: hunk })]);
+    // Same PR hunk, same offsets, same context. The base's edit to line 5 of
+    // this file is simply not in the diff.
+    const afterBaseEdit = digestOf([compareFile({ patch: hunk })]);
+    expect(afterBaseEdit).toBe(beforeBaseEdit);
+  });
+
+  it('does notice a base change that shifts the hunk offsets', () => {
+    const before = digestOf([compareFile({
+      patch: '@@ -40,3 +40,3 @@\n   const a = 1;\n-  old\n+  new',
+    })]);
+    // The base inserted a line above the hunk, so GitHub renumbers it.
+    const after = digestOf([compareFile({
+      patch: '@@ -41,3 +41,3 @@\n   const a = 1;\n-  old\n+  new',
+    })]);
+    expect(after).not.toBe(before);
+  });
+
+  // Mutant guard: ordering the digest entries by `patch` instead of `path` is
+  // not a total order — two files can carry the same patch text — so a stable
+  // sort would leave those two in whatever order GitHub listed them and make
+  // the digest depend on that order.
+  it('is order-independent even when two files carry the same patch text', () => {
+    const shared = '@@ -1,1 +1,1 @@\n-x\n+y';
+    const a = compareFile({ filename: 'src/a.ts', patch: shared });
+    const b = compareFile({ filename: 'src/b.ts', patch: shared });
+    expect(digestOf([a, b])).toBe(digestOf([b, a]));
+  });
+
   it('changes when the path, the status, or the rename source changes', () => {
     const base = digestOf([compareFile()]);
     expect(digestOf([compareFile({ filename: 'src/b.ts' })])).not.toBe(base);

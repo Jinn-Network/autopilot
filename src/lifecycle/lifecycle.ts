@@ -127,9 +127,21 @@ function correlatedReviewClaim(item: PullRequestLifecycleItem) {
  * still be anchored to the head the reviewer read, and every other conjunct of
  * `underlyingPhase` and of the merge gate keeps applying unchanged.
  *
- * Fail-closed by shape: both digests are optional, and `undefined === undefined`
- * is short-circuited by the explicit `!== undefined` guards, so an unproven
- * digest on either side can never satisfy this.
+ * `reviewerApprovedAtHead` is the merge gate's `terminalReview` conjunct
+ * projected onto the item, and requiring it here is what keeps this predicate a
+ * strict subset of the gate. Without it the view carries on `approved` — *any*
+ * reviewer's latest decisive review at head — while the gate demands the claim
+ * reviewer's own marker-bearing APPROVED review at head. The two disagree when a
+ * human approves the new head, or when the claim reviewer's latest review at
+ * head is `COMMENTED`; the PR then reaches merge-ready, the gate refuses with
+ * `terminal-approval`, and `reviewEnrollmentEligible` will not dispatch a review
+ * because `engineApprovalLapsed` is false. No unsafe merge — and no recovery.
+ * The digest readings are likewise held identical on both sides; see
+ * `proveReviewedDiff` in `github-changed-files.ts`.
+ *
+ * Fail-closed by shape: every input here is optional, and each is checked
+ * against `undefined` explicitly, so `undefined === undefined` can never
+ * satisfy any conjunct.
  */
 function approvalCarriesToCurrentHead(
   item: PullRequestLifecycleItem,
@@ -139,6 +151,7 @@ function approvalCarriesToCurrentHead(
   return claim.reviewedDiffDigest !== undefined
     && item.reviewedDiffDigest !== undefined
     && claim.reviewedDiffDigest === item.reviewedDiffDigest
+    && item.reviewerApprovedAtHead === true
     && claim.verdict !== undefined
     && verdict !== undefined
     && verdict.head === claim.head
@@ -186,10 +199,16 @@ export function engineApprovedAtHead(item: PullRequestLifecycleItem): boolean {
  * every diff GitHub declines to represent. It is not the answer when the diff
  * is provably identical: re-reviewing then buys nothing but a review slot, and
  * the pipeline was serialising on exactly that (PR #2130 reviewed three times
- * to land one change). The residual exposure that remains — a base change that
- * alters semantics without altering this PR's diff — is not something a fresh
- * review of the same diff would catch either; CI on the new head is what covers
- * it, and the `checks` conjunct evaluates against the current head.
+ * to land one change).
+ *
+ * "Provably identical" is a statement about the PR's own patch text and nothing
+ * more. GitHub renders `patch` with three lines of context, so any base change
+ * more than three lines from each of this PR's hunks that does not shift those
+ * hunks' offsets — *including a change inside a file this PR also edited* —
+ * leaves the digest equal. A base commit can rewrite a function this PR calls
+ * and the approval will carry. CI on the new head is what covers that, and only
+ * as far as the test suite reaches; the `checks` conjunct evaluates against the
+ * current head. See `reviewed-diff-digest.ts` for the full statement.
  */
 export function engineApprovalLapsed(item: PullRequestLifecycleItem): boolean {
   return item.approved && !item.needsReview && !engineApprovedAtHead(item);

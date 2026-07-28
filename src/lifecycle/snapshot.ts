@@ -530,6 +530,48 @@ function latestDecisiveReview(
     .sort((left, right) => right.submittedAt.localeCompare(left.submittedAt))[0];
 }
 
+/**
+ * The merge gate's `terminalReview` conjunct, projected onto the lifecycle item.
+ *
+ * The gate requires the *claim reviewer's* effective (latest) native review at
+ * the **current** head to be `APPROVED` and to carry the signed marker naming
+ * the reviewed head (`merge-executor-production.ts`). Nothing else in the
+ * lifecycle item expresses that: `approved` is any reviewer's latest decisive
+ * review at head, and `terminalVerdict` is selected by marker across every
+ * commit. Without this projection the view can carry an approval the gate then
+ * refuses, and because `reviewEnrollmentEligible` only dispatches a review when
+ * `engineApprovalLapsed` is true, the PR strands in merge-ready with no
+ * recovery. Two shapes reach that state: a human approving at the new head while
+ * the engine's marker-bearing review is still pinned to the old one, and the
+ * claim reviewer's latest review at head being `COMMENTED`.
+ *
+ * Deliberately duplicated rather than shared: the gate reads live REST, this
+ * reads the cycle snapshot, and the point is that both answer the same question
+ * about the same evidence. Any drift between them is a strand, so the two
+ * implementations are pinned against each other by test.
+ */
+function reviewerApprovedAtHead(pr: PullRequestSnapshot): boolean {
+  const claim = pr.reviewClaim?.record;
+  if (claim?.state !== 'terminal-approved') return false;
+  const expectedMarker = formatAutomatedReviewMarker({
+    generation: claim.generation,
+    attempt: claim.attempt,
+    intent: claim.verdict.marker,
+    reviewer: claim.reviewer,
+    head: claim.head,
+    verdict: claim.verdict.state,
+  });
+  const latest = new Map<string, NativeReviewSnapshot>();
+  for (const review of pr.reviews
+    .filter((candidate) => candidate.commitId === pr.headOid)
+    .sort((left, right) => left.submittedAt.localeCompare(right.submittedAt))) {
+    latest.set(review.reviewer.toLowerCase(), review);
+  }
+  const effective = latest.get(claim.reviewer.toLowerCase());
+  return effective?.state === 'APPROVED'
+    && effective.body.includes(expectedMarker);
+}
+
 function terminalVerdict(pr: PullRequestSnapshot) {
   const claim = pr.reviewClaim?.record;
   if (claim?.verdict === undefined) return undefined;
@@ -557,9 +599,15 @@ function terminalVerdict(pr: PullRequestSnapshot) {
   // that rewrite and is the stronger of the two bindings. Filtering on it and
   // reporting `head: claim.head` therefore *tightens* the identity rather than
   // relaxing it, and is unchanged in the common case where the head has not
-  // moved and `commit_id === claim.head` anyway. Every consumer of
-  // `terminalVerdict.head` still requires it to equal the item head before it
-  // grants anything, except the digest-proven carry in `engineApprovedAtHead`.
+  // moved and `commit_id === claim.head` anyway.
+  //
+  // Note what this makes `head` mean, because a caller could get it wrong:
+  // it is now `claim.head` by definition, not an independently observed value.
+  // Comparing `terminalVerdict.head` to `reviewClaim.head` is therefore a
+  // tautology for any snapshot-derived item and proves nothing; the head
+  // bindings that do prove something are `terminalVerdict.head === item.head`
+  // (used by every exact-head consumer) and the signed marker inside the review
+  // body (used by the merge gate).
   const review = pr.reviews
     .filter((candidate) => (
       candidate.reviewer.toLowerCase() === claim.reviewer.toLowerCase()
@@ -718,6 +766,7 @@ function lifecyclePr(
       : { implementationSummary: pr.implementationCompletionSummary }),
     ...(reviewClaim === undefined ? {} : { reviewClaim }),
     ...(terminalVerdict(pr) === undefined ? {} : { terminalVerdict: terminalVerdict(pr) }),
+    ...(reviewerApprovedAtHead(pr) ? { reviewerApprovedAtHead: true } : {}),
     ...(pr.reviewedDiffDigest === undefined
       ? {}
       : { reviewedDiffDigest: pr.reviewedDiffDigest }),

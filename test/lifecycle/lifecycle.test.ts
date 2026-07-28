@@ -966,6 +966,9 @@ describe('engine approval must be head-bound to reach merge-ready', () => {
         recordedAt: '2026-07-20T11:00:00.000Z',
       },
       reviewedDiffDigest: DIGEST,
+      // The merge gate's `terminalReview` conjunct, projected. Without it the
+      // view would carry on `approved` alone and could outrun the gate.
+      reviewerApprovedAtHead: true,
       ...overrides,
     });
   }
@@ -1008,6 +1011,10 @@ describe('engine approval must be head-bound to reach merge-ready', () => {
       },
     ],
     ['there is no reconstructed verdict at all', { terminalVerdict: undefined }],
+    [
+      'the claim reviewer has no marker-bearing APPROVED review at the head',
+      { reviewerApprovedAtHead: undefined },
+    ],
     [
       'the claim never reached terminal-approved',
       {

@@ -303,6 +303,14 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   readonly reviewClaim?: ReviewClaimRecord;
   readonly terminalVerdict?: TerminalVerdictEvidence;
   /**
+   * The claim reviewer's effective native review at `head` is APPROVED and
+   * carries the signed marker naming the reviewed head — the merge gate's
+   * `terminalReview` conjunct, projected so the lifecycle view can require the
+   * same thing the gate will. Absent means false; absence must never let an
+   * approval carry.
+   */
+  readonly reviewerApprovedAtHead?: boolean;
+  /**
    * Identity of the diff `head` presents against its base branch tip — the same
    * construction as `ReviewClaimRecord.reviewedDiffDigest`, computed for the
    * head that exists now. Equality of the two is the only evidence that an

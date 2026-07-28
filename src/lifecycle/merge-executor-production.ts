@@ -320,6 +320,16 @@ export function makeProductionMergeActionPort(
     // for the head that was actually read, verified here against the recorded
     // head — and it is the *only* head binding on the native review that GitHub
     // does not rewrite, which is precisely why it is the one that is kept.
+    //
+    // Read the `terminalVerdict.head` conjunct below for what it actually is.
+    // `snapshot.ts` derives `terminalVerdict.head` as `claim.head` by
+    // definition, so `terminalVerdict.head === reviewClaim.head` is a *tautology*
+    // for any snapshot-derived item: it degenerates to "a verdict exists" and
+    // binds no head. It is retained only because it is free and still rejects a
+    // foreign lifecycle projection whose verdict metadata contradicts its own
+    // claim — not because it proves anything about which commit was reviewed.
+    // The head binding that does the work is the signed-marker check on the
+    // native review, on the last line of this conjunction.
     const terminalApprovalMatches = reviewClaim?.state === 'terminal-approved'
       && (approvalHead === pr.headOid || carriedApproval)
       && lifecycle.terminalVerdict?.head === reviewClaim.head

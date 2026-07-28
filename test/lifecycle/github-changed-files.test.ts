@@ -19,16 +19,30 @@ describe('readExactCompareEvidence', () => {
     patch: '@@ -1,1 +1,1 @@\n-old\n+new',
   };
 
-  async function evidence(compare: unknown) {
+  async function evidence(
+    compare: unknown,
+    options: {
+      readonly proveReviewedDiff?: boolean;
+      readonly changedFiles?: readonly string[];
+      readonly changedFileCount?: number;
+      readonly filesFail?: boolean;
+    } = {},
+  ) {
     const calls: string[] = [];
+    const changedFiles = options.changedFiles ?? ['src/a.ts'];
     const result = await readExactCompareEvidence({
       run: async (_command, args) => {
         calls.push(args[1]!);
         if (args[1] === 'repos/Jinn-Network/mono/pulls/101') {
           return JSON.stringify({
+            changed_files: options.changedFileCount ?? changedFiles.length,
             head: { sha: HEAD },
             base: { ref: 'next', sha: BASE },
           });
+        }
+        if (args[1]!.startsWith('repos/Jinn-Network/mono/pulls/101/files?')) {
+          if (options.filesFail === true) throw new Error('HTTP 500');
+          return JSON.stringify([changedFiles.map((filename) => ({ filename }))]);
         }
         return JSON.stringify(compare);
       },
@@ -36,33 +50,67 @@ describe('readExactCompareEvidence', () => {
       expectedHead: HEAD,
       expectedBaseRefName: 'next',
       repositorySlug: 'Jinn-Network/mono',
+      ...(options.proveReviewedDiff === undefined
+        ? {}
+        : { proveReviewedDiff: options.proveReviewedDiff }),
     });
     return { result, calls };
   }
 
-  it('derives status and the reviewed-diff digest from one compare request', async () => {
+  it('emits no digest at all unless the changed-file proof was requested', async () => {
     const { result, calls } = await evidence({ status: 'ahead', files: [COMPARE_FILE] });
-    const expected = reviewedDiffDigestFromCompare([COMPARE_FILE]);
-    expect(expected.status).toBe('digest');
-    expect(result).toEqual({
-      status: 'ahead',
-      reviewedDiffDigest: expected.status === 'digest' ? expected.digest : undefined,
-    });
-    // No second request: the digest rides the response `status` already needs.
+    // A cheaper, weaker digest is worse than none: the merge gate always proves
+    // the changed-file set, so a view that carried on less would strand the PR.
+    expect(result).toEqual({ status: 'ahead' });
     expect(calls).toEqual([
       'repos/Jinn-Network/mono/pulls/101',
       `repos/Jinn-Network/mono/compare/heads/next...${HEAD}`,
     ]);
   });
 
+  it('derives status and a fully proven digest when the proof is requested', async () => {
+    const { result, calls } = await evidence(
+      { status: 'ahead', files: [COMPARE_FILE] },
+      { proveReviewedDiff: true },
+    );
+    const expected = reviewedDiffDigestFromCompare([COMPARE_FILE], {
+      baseOid: gitOid(BASE),
+      baseRefName: gitRefName('next'),
+      files: ['src/a.ts'],
+      complete: true,
+    });
+    expect(expected.status).toBe('digest');
+    expect(result).toEqual({
+      status: 'ahead',
+      reviewedDiffDigest: expected.status === 'digest' ? expected.digest : undefined,
+    });
+    expect(calls).toContain(`repos/Jinn-Network/mono/pulls/101/files?per_page=100`);
+  });
+
   it.each([
-    ['a compare with no files array', { status: 'ahead' }],
+    ['a compare with no files array', { status: 'ahead' }, {}],
     [
       'a file GitHub could not represent as a patch',
       { status: 'ahead', files: [{ filename: 'logo.png', status: 'modified' }] },
+      { changedFiles: ['logo.png'] },
     ],
-  ])('keeps the status but omits the digest for %s', async (_name, compare) => {
-    const { result } = await evidence(compare);
+    [
+      'a changed-file read that failed',
+      { status: 'ahead', files: [COMPARE_FILE] },
+      { filesFail: true },
+    ],
+    [
+      'a changed-file list GitHub could not prove complete',
+      { status: 'ahead', files: [COMPARE_FILE] },
+      { changedFileCount: 4 },
+    ],
+    [
+      'a compare file set that disagrees with the changed-file list',
+      { status: 'ahead', files: [COMPARE_FILE] },
+      { changedFiles: ['src/a.ts', 'src/b.ts'] },
+    ],
+  ])('keeps the status but omits the digest for %s', async (_name, compare, options) => {
+    const { result } = await evidence(compare, { ...options, proveReviewedDiff: true });
     expect(result).toEqual({ status: 'ahead' });
     expect(result).not.toHaveProperty('reviewedDiffDigest');
   });
