@@ -19,6 +19,7 @@ import {
   type CommandRunner,
 } from '../dispatcher/issue-source.js';
 import {
+  claimMarketplaceAttemptProcess,
   claimMarketplaceDispatchDecision,
   findMarketplaceEvaluatorLegReviews,
   markAttemptExited,
@@ -254,9 +255,12 @@ export interface MarketplaceSessionExecutionBackendOptions {
   readonly readAttemptManifest?: typeof readAttemptManifest;
   readonly verifyMarketplaceTaskRequest?: typeof verifyMarketplaceTaskRequest;
   readonly claimMarketplaceDispatchDecision?: typeof claimMarketplaceDispatchDecision;
+  readonly claimMarketplaceAttemptProcess?: typeof claimMarketplaceAttemptProcess;
   readonly reconcileMarketplaceTerminalEvidence?: typeof reconcileMarketplaceTerminalEvidence;
   readonly transitionMarketplaceExecution?: typeof transitionMarketplaceExecution;
   readonly runner?: CommandRunner;
+  readonly processPid?: number;
+  readonly isPidAlive?: (pid: number) => boolean;
   readonly now?: () => Date;
 }
 
@@ -280,9 +284,12 @@ export class MarketplaceSessionExecutionBackend
   private readonly readManifest: typeof readAttemptManifest;
   private readonly verifyRequest: typeof verifyMarketplaceTaskRequest;
   private readonly claimDispatch: typeof claimMarketplaceDispatchDecision;
+  private readonly claimProcess: typeof claimMarketplaceAttemptProcess;
   private readonly reconcileTerminal: typeof reconcileMarketplaceTerminalEvidence;
   private readonly transition: typeof transitionMarketplaceExecution;
   private readonly runner: CommandRunner;
+  private readonly processPid: number | undefined;
+  private readonly isPidAlive: ((pid: number) => boolean) | undefined;
   private readonly now: () => Date;
 
   constructor(options: MarketplaceSessionExecutionBackendOptions = {}) {
@@ -292,12 +299,16 @@ export class MarketplaceSessionExecutionBackend
       options.verifyMarketplaceTaskRequest ?? verifyMarketplaceTaskRequest;
     this.claimDispatch =
       options.claimMarketplaceDispatchDecision ?? claimMarketplaceDispatchDecision;
+    this.claimProcess =
+      options.claimMarketplaceAttemptProcess ?? claimMarketplaceAttemptProcess;
     this.reconcileTerminal =
       options.reconcileMarketplaceTerminalEvidence
       ?? reconcileMarketplaceTerminalEvidence;
     this.transition =
       options.transitionMarketplaceExecution ?? transitionMarketplaceExecution;
     this.runner = options.runner ?? defaultRunner;
+    this.processPid = options.processPid;
+    this.isPidAlive = options.isPidAlive;
     this.now = options.now ?? (() => new Date());
   }
 
@@ -513,7 +524,22 @@ export class MarketplaceSessionExecutionBackend
     ) {
       throw new Error('Marketplace submission did not persist submitted state');
     }
-    const submission = manifest.execution.state.submission;
+    const claimed = this.claimProcess(manifest.paths.manifest, {
+      ...(this.processPid === undefined ? {} : { pid: this.processPid }),
+      ...(this.isPidAlive === undefined ? {} : { isPidAlive: this.isPidAlive }),
+      now: this.now,
+    });
+    if (
+      claimed.execution.backend !== 'marketplace'
+      || (claimed.execution.state.schemaVersion
+        !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+        && claimed.execution.state.schemaVersion
+          !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION)
+      || claimed.execution.state.status !== 'submitted'
+    ) {
+      throw new Error('Marketplace process claim changed submitted state');
+    }
+    const submission = claimed.execution.state.submission;
     return {
       status: 'started',
       backend: 'marketplace',
@@ -636,6 +662,7 @@ export interface RecoverSubmittedMarketplaceAttemptsOptions {
   readonly releaseReviewAnchor?: (
     anchor: MarketplaceReviewAnchorEvidence,
   ) => Promise<void>;
+  readonly processPid?: number;
   readonly isPidAlive: (pid: number) => boolean;
   readonly now?: () => Date;
 }
@@ -768,6 +795,14 @@ export async function recoverSubmittedMarketplaceAttempts(
             case 'host-committed':
             case 'lifecycle-completed':
             case 'review-anchored': {
+              manifest = claimMarketplaceAttemptProcess(
+                manifest.paths.manifest,
+                {
+                  pid: options.processPid ?? process.pid,
+                  isPidAlive: options.isPidAlive,
+                  now,
+                },
+              );
               const adoptionResult = await options.makeAdopter(manifest.paths.manifest)
                 .adopt(manifest.paths.manifest);
               if (adoptionResult.status === 'rejected') {

@@ -204,6 +204,34 @@ function installHarnessAtV2(
   return manifestPath;
 }
 
+function setMarketplaceProcessMetadata(
+  manifestPath: string,
+  processState: 'preparing' | 'running',
+  pid: number | null,
+): AttemptManifest {
+  const raw = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    processState: 'preparing' | 'running';
+    pid: number | null;
+    timestamps: {
+      createdAt: string;
+      updatedAt: string;
+      childStartedAt?: string;
+      childExitedAt?: string;
+    };
+  };
+  raw.processState = processState;
+  raw.pid = pid;
+  delete raw.timestamps.childExitedAt;
+  if (processState === 'preparing') {
+    delete raw.timestamps.childStartedAt;
+  } else {
+    raw.timestamps.childStartedAt ??= raw.timestamps.updatedAt;
+  }
+  const manifest = decodeAttemptManifest(raw);
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return manifest;
+}
+
 function installEvaluatorLegAtV2(
   v2Base: string,
   runnerId: string,
@@ -354,6 +382,7 @@ describe('marketplace solution recovery', () => {
     const result = await recoverSubmittedMarketplaceAttempts({
       v2Base,
       recoverPrepared: async () => [],
+      processPid: 4242,
       makeAdopter: () => ({
         adopt: async (manifestPath) => {
           adopted.push(manifestPath);
@@ -368,6 +397,120 @@ describe('marketplace solution recovery', () => {
     expect(
       marketplaceExecutionState(readAttemptManifest(first)).schemaVersion,
     ).toBe('marketplace-execution-v3');
+  });
+
+  it('claims a preparing submitted marketplace process before invoking its adopter', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const harness = new Harness('implement', 'submitted');
+    const manifestPath = installHarnessAtV2(
+      harness,
+      v2Base,
+      'runner-1',
+      ATTEMPT_ID,
+    );
+    setMarketplaceProcessMetadata(manifestPath, 'preparing', null);
+    const seen: AttemptManifest[] = [];
+
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base,
+      recoverPrepared: async () => [],
+      processPid: 720,
+      isPidAlive: () => false,
+      makeAdopter: () => ({
+        adopt: async (path) => {
+          seen.push(readAttemptManifest(path));
+          return { status: 'recoverable', stage: 'observation', detail: 'pending' };
+        },
+      }),
+      now: () => NOW,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      processState: 'running',
+      pid: 720,
+    });
+  });
+
+  it('blocks a live foreign marketplace process lease before constructing its adopter', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const harness = new Harness('implement', 'submitted');
+    const manifestPath = installHarnessAtV2(
+      harness,
+      v2Base,
+      'runner-1',
+      ATTEMPT_ID,
+    );
+    setMarketplaceProcessMetadata(manifestPath, 'running', 721);
+    const before = readFileSync(manifestPath);
+    const makeAdopter = vi.fn(() => ({
+      adopt: vi.fn(async () => ({
+        status: 'recoverable' as const,
+        stage: 'observation',
+        detail: 'pending',
+      })),
+    }));
+
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base,
+      recoverPrepared: async () => [],
+      processPid: 720,
+      isPidAlive: (pid) => pid === 721,
+      makeAdopter,
+      now: () => NOW,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      detail: expect.stringMatching(/live PID/i),
+    });
+    expect(makeAdopter).not.toHaveBeenCalled();
+    expect(readFileSync(manifestPath)).toEqual(before);
+  });
+
+  it('rebinds a dead marketplace process lease before replaying mid-adoption state', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'marketplace-solution-recovery-'));
+    roots.push(root);
+    const v2Base = join(root, 'v2');
+    const harness = new Harness('implement', 'solution-observed');
+    const manifestPath = installHarnessAtV2(
+      harness,
+      v2Base,
+      'runner-1',
+      ATTEMPT_ID,
+    );
+    setMarketplaceProcessMetadata(manifestPath, 'running', 721);
+    const seen: AttemptManifest[] = [];
+
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base,
+      recoverPrepared: async () => [],
+      processPid: 720,
+      isPidAlive: () => false,
+      makeAdopter: () => ({
+        adopt: async (path) => {
+          seen.push(readAttemptManifest(path));
+          return { status: 'recoverable', stage: 'verification', detail: 'pending' };
+        },
+      }),
+      now: () => NOW,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      processState: 'running',
+      pid: 720,
+      execution: {
+        backend: 'marketplace',
+        state: { status: 'solution-observed' },
+      },
+    });
   });
 
   it('skips re-adoption for accepted receipt-published attempts', async () => {
@@ -466,16 +609,19 @@ describe('marketplace solution recovery', () => {
       },
     }, null, 2)}\n`);
     const release = vi.fn(async () => {});
+    const pidProbe = vi.fn(() => true);
     const result = await recoverSubmittedMarketplaceAttempts({
       v2Base,
       recoverPrepared: async () => [],
       makeAdopter: () => ({ adopt }),
       releaseReviewAnchor: release,
-      isPidAlive: () => true,
+      processPid: 720,
+      isPidAlive: pidProbe,
       now: () => new Date('2026-07-28T12:00:00.000Z'),
     });
     expect(result).toEqual({ ok: true });
     expect(adopt).not.toHaveBeenCalled();
+    expect(pidProbe).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledWith(progress.reviewAnchor);
     expect(readAttemptManifest(manifestPath).processState).toBe('exited');
   });
@@ -489,6 +635,7 @@ describe('marketplace solution recovery', () => {
     const result = await recoverSubmittedMarketplaceAttempts({
       v2Base,
       recoverPrepared: async () => [],
+      processPid: 4242,
       makeAdopter: () => ({
         adopt: async () => ({
           status: 'rejected',
@@ -528,6 +675,7 @@ describe('marketplace solution recovery', () => {
     const result = await recoverSubmittedMarketplaceAttempts({
       v2Base,
       recoverPrepared: async () => [],
+      processPid: 4242,
       makeAdopter: () => ({
         adopt: async () => ({
           status: 'recoverable',
@@ -626,6 +774,7 @@ describe('marketplace solution recovery', () => {
     const result = await recoverSubmittedMarketplaceAttempts({
       v2Base,
       recoverPrepared: async () => [],
+      processPid: 4242,
       makeAdopter: () => ({ adopt }),
       isPidAlive: () => true,
       now: () => NOW,

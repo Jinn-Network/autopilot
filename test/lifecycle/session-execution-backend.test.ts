@@ -633,7 +633,7 @@ describe('session execution backends', () => {
     });
   });
 
-  it('verifies, submits, and durably records a marketplace task before returning its persisted identity', async () => {
+  it('records a fresh marketplace process lease before returning its persisted identity', async () => {
     const fixture = marketplaceFixture();
     const submit = vi.fn(async () => SUBMISSION);
     const recover = vi.fn(async () => {
@@ -643,6 +643,8 @@ describe('session execution backends', () => {
       adapter: { submit, recover },
       runner: marketplaceProofRunner(fixture.manifest),
       now: () => new Date('2026-07-26T12:02:00.000Z'),
+      processPid: 710,
+      isPidAlive: () => false,
     });
 
     await expect(backend.start(fixture.request)).resolves.toEqual({
@@ -654,13 +656,21 @@ describe('session execution backends', () => {
     });
     expect(submit).toHaveBeenCalledWith(fixture.requestPath);
     expect(recover).not.toHaveBeenCalled();
-    expect(readAttemptManifest(fixture.manifest.paths.manifest).execution)
+    expect(readAttemptManifest(fixture.manifest.paths.manifest))
       .toMatchObject({
-        backend: 'marketplace',
-        state: {
-          status: 'submitted',
-          submission: SUBMISSION,
-          submittedAt: '2026-07-26T12:02:00.000Z',
+        processState: 'running',
+        pid: 710,
+        timestamps: {
+          updatedAt: '2026-07-26T12:02:00.000Z',
+          childStartedAt: '2026-07-26T12:02:00.000Z',
+        },
+        execution: {
+          backend: 'marketplace',
+          state: {
+            status: 'submitted',
+            submission: SUBMISSION,
+            submittedAt: '2026-07-26T12:02:00.000Z',
+          },
         },
       });
   });
@@ -710,7 +720,7 @@ describe('session execution backends', () => {
     },
   );
 
-  it('recovers a crash after CLI success by replaying the exact bytes and converging on a matching duplicate', async () => {
+  it('records a marketplace process lease after replaying prepared recovery', async () => {
     const fixture = marketplaceFixture();
     const before = readFileSync(fixture.requestPath);
     const submit = vi.fn(async () => SUBMISSION);
@@ -738,6 +748,8 @@ describe('session execution backends', () => {
       adapter: { submit: vi.fn(async () => SUBMISSION), recover },
       runner: marketplaceProofRunner(fixture.manifest),
       now: () => new Date('2026-07-26T12:03:00.000Z'),
+      processPid: 710,
+      isPidAlive: () => false,
     });
     await expect(restarted.recover(fixture.request)).resolves.toEqual({
       status: 'started',
@@ -748,14 +760,18 @@ describe('session execution backends', () => {
     });
     expect(recover).toHaveBeenCalledWith(fixture.requestPath);
     expect(readFileSync(fixture.requestPath)).toEqual(before);
-    expect(readAttemptManifest(fixture.manifest.paths.manifest).execution)
+    expect(readAttemptManifest(fixture.manifest.paths.manifest))
       .toMatchObject({
-        backend: 'marketplace',
-        state: { status: 'submitted', submission: duplicate },
+        processState: 'running',
+        pid: 710,
+        execution: {
+          backend: 'marketplace',
+          state: { status: 'submitted', submission: duplicate },
+        },
       });
   });
 
-  it('returns a submitted task from durable state without invoking either CLI operation', async () => {
+  it('repairs submitted plus preparing state without invoking either CLI operation', async () => {
     const fixture = marketplaceFixture('submitted');
     rmSync(fixture.manifest.paths.worktree, { recursive: true });
     const submit = vi.fn(async () => {
@@ -766,6 +782,9 @@ describe('session execution backends', () => {
     });
     const backend = new MarketplaceSessionExecutionBackend({
       adapter: { submit, recover },
+      processPid: 710,
+      isPidAlive: () => false,
+      now: () => new Date('2026-07-26T12:03:00.000Z'),
     });
 
     await expect(backend.recover(fixture.request)).resolves.toEqual({
@@ -777,6 +796,14 @@ describe('session execution backends', () => {
     });
     expect(submit).not.toHaveBeenCalled();
     expect(recover).not.toHaveBeenCalled();
+    expect(readAttemptManifest(fixture.manifest.paths.manifest)).toMatchObject({
+      processState: 'running',
+      pid: 710,
+      execution: {
+        backend: 'marketplace',
+        state: { status: 'submitted', submission: SUBMISSION },
+      },
+    });
   });
 
   it('rejects a submitted manifest whose persisted result contradicts the verified request identity', async () => {
@@ -828,7 +855,7 @@ describe('session execution backends', () => {
       .toMatchObject({ backend: 'marketplace', state: { status: 'prepared' } });
   });
 
-  it('reconciles committed submission evidence without replaying the adapter', async () => {
+  it('repairs the marketplace process lease in the terminal-evidence crash window', async () => {
     const fixture = marketplaceFixture();
     const preparedBytes = readFileSync(fixture.manifest.paths.manifest);
     transitionMarketplaceExecution(
@@ -851,6 +878,8 @@ describe('session execution backends', () => {
       },
       runner: marketplaceProofRunner(fixture.manifest),
       now: () => new Date('2026-07-26T12:03:00.000Z'),
+      processPid: 710,
+      isPidAlive: () => false,
     });
 
     await expect(backend.recover(fixture.request)).resolves.toMatchObject({
@@ -859,8 +888,15 @@ describe('session execution backends', () => {
       taskId: SUBMISSION.taskId,
     });
     expect(recover).not.toHaveBeenCalled();
-    expect(readAttemptManifest(fixture.manifest.paths.manifest).execution)
-      .toMatchObject({ backend: 'marketplace', state: { status: 'submitted' } });
+    expect(readAttemptManifest(fixture.manifest.paths.manifest))
+      .toMatchObject({
+        processState: 'running',
+        pid: 710,
+        execution: {
+          backend: 'marketplace',
+          state: { status: 'submitted' },
+        },
+      });
   });
 
   it('records cancellation as durable local intent without invoking the CLI', async () => {

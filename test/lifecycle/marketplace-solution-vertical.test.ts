@@ -623,6 +623,51 @@ async function adopt(harness: RealGitVerticalHarness) {
 }
 
 describe('marketplace solution vertical acceptance (real git)', () => {
+  it('recovers a preparing marketplace process through an accepted receipt without local execution', async () => {
+    const harness = new RealGitVerticalHarness('submitted');
+    installAtV2(harness);
+    const {
+      childStartedAt: _childStartedAt,
+      childExitedAt: _childExitedAt,
+      ...preparingTimestamps
+    } = harness.currentManifest.timestamps;
+    harness.currentManifest = decodeAttemptManifest({
+      ...harness.currentManifest,
+      processState: 'preparing',
+      pid: null,
+      timestamps: preparingTimestamps,
+    });
+    writeFileSync(
+      harness.manifestPath,
+      `${JSON.stringify(harness.currentManifest, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const result = await recoverSubmittedMarketplaceAttempts({
+      v2Base: harness.v2Base,
+      recoverPrepared: async () => [],
+      processPid: 720,
+      isPidAlive: () => false,
+      makeAdopter: () => {
+        harness.currentManifest = readAttemptManifest(harness.manifestPath);
+        return harness.coordinator();
+      },
+      now: () => harness.clock(),
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(marketplaceStatus(readAttemptManifest(harness.manifestPath)))
+      .toBe('receipt-published');
+    expect(readAttemptManifest(harness.manifestPath)).toMatchObject({
+      processState: 'running',
+      pid: 720,
+    });
+    expect(harness.taskSubmissions).toBe(0);
+    expect(harness.agentSpawns).toBe(0);
+    expect(harness.comments).toHaveLength(1);
+    expect(harness.reviewAnchorLinked()).toBe(true);
+  });
+
   it('adopts a submitted mutation through accepted receipt without duplicate side effects', async () => {
     const harness = new RealGitVerticalHarness('submitted');
     installAtV2(harness);
