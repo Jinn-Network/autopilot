@@ -50,6 +50,7 @@ const adoption: AcceptedRelayAdoption = {
 const success: RelayGitHubCheckFact = {
   kind: 'check-run',
   name: 'build',
+  appId: 101,
   head: HEAD,
   status: 'completed',
   conclusion: 'success',
@@ -62,7 +63,7 @@ function aggregate(
 ) {
   return aggregateRelayChecks({
     head: HEAD,
-    branchRequiredChecks: ['build'],
+    branchRequiredChecks: [{ name: 'build', appId: 101 }],
     profile: {
       name: 'jinn-mono.v1',
       requiredChecks: ['relay/typecheck'],
@@ -73,6 +74,153 @@ function aggregate(
 }
 
 describe('exact-head Relay check aggregation', () => {
+  it('keeps case-distinct check names as different identities', () => {
+    const summary = aggregate([{
+      ...success,
+      name: 'Build',
+      appId: 101,
+    }], {
+      branchRequiredChecks: [{ name: 'build', appId: 101 }],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+    });
+
+    expect(summary.required).toEqual([{
+      kind: 'check-run',
+      name: 'build',
+      appId: 101,
+      status: 'pending',
+    }]);
+    expect(summary.optional).toEqual([{
+      kind: 'check-run',
+      name: 'Build',
+      appId: 101,
+      status: 'passed',
+      url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
+    }]);
+  });
+
+  it('rejects a check run without an exact positive App id', () => {
+    expect(() => aggregate([{
+      ...success,
+      appId: undefined,
+    } as unknown as RelayGitHubCheckFact], {
+      branchRequiredChecks: [{ name: 'build', appId: 101 }],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+    })).toThrow(/App id|incomplete/i);
+    expect(() => aggregate([{
+      ...success,
+      appId: null,
+    } as unknown as RelayGitHubCheckFact], {
+      branchRequiredChecks: [{ name: 'build', appId: 101 }],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+    })).toThrow(/App id|incomplete/i);
+  });
+
+  it('allows the same exact check-run name from distinct Apps', () => {
+    const summary = aggregate([
+      { ...success, appId: 101 },
+      { ...success, appId: 202, conclusion: 'failure' },
+    ], {
+      branchRequiredChecks: [{ name: 'build', appId: 101 }],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+    });
+
+    expect(summary.required).toEqual([{
+      kind: 'check-run',
+      name: 'build',
+      appId: 101,
+      status: 'passed',
+      url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
+    }]);
+    expect(summary.optional).toEqual([{
+      kind: 'check-run',
+      name: 'build',
+      appId: 202,
+      status: 'failed',
+      url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
+    }]);
+  });
+
+  it('keeps a status context distinct from a same-name check run', () => {
+    const summary = aggregate([
+      {
+        kind: 'status-context',
+        name: 'build',
+        head: HEAD,
+        state: 'success',
+      },
+      { ...success, appId: 101 },
+    ], {
+      branchRequiredChecks: [
+        { name: 'build', appId: null },
+        { name: 'build', appId: 101 },
+      ],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+    });
+
+    expect(summary.required).toEqual([
+      {
+        kind: 'check-run',
+        name: 'build',
+        appId: 101,
+        status: 'passed',
+        url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
+      },
+      {
+        kind: 'status-context',
+        name: 'build',
+        status: 'passed',
+      },
+    ]);
+    expect(summary.optional).toEqual([]);
+  });
+
+  it('rejects duplicate identical requirements but permits distinct App pins', () => {
+    expect(() => aggregate([{ ...success, appId: 101 }], {
+      branchRequiredChecks: [
+        { name: 'build', appId: null },
+        { name: 'build', appId: -1 },
+      ],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+    })).toThrow(/duplicate.*requirement/i);
+
+    expect(aggregate([
+      { ...success, appId: 101 },
+      { ...success, appId: 202 },
+    ], {
+      branchRequiredChecks: [
+        { name: 'build', appId: 101 },
+        { name: 'build', appId: 202 },
+      ],
+      profile: { name: 'jinn-mono.v1', requiredChecks: [] },
+    }).required).toHaveLength(2);
+  });
+
+  it.each([
+    ['an exact App pin', { name: 'build', appId: 101 }],
+    ['an explicit any-App rule', { name: 'build', appId: null }],
+  ] as const)(
+    'treats profile overlap with %s as one union requirement',
+    (_label, branchRequirement) => {
+      const summary = aggregate([{ ...success, appId: 101 }], {
+        branchRequiredChecks: [branchRequirement],
+        profile: {
+          name: 'jinn-mono.v1',
+          requiredChecks: ['build'],
+        },
+      });
+
+      expect(summary.required).toEqual([{
+        kind: 'check-run',
+        name: 'build',
+        appId: 101,
+        status: 'passed',
+        url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
+      }]);
+      expect(summary.optional).toEqual([]);
+    },
+  );
+
   it('unions visible branch rules with configured profile checks and leaves optional failures non-gating', () => {
     const summary = aggregate([
       success,
@@ -86,6 +234,7 @@ describe('exact-head Relay check aggregation', () => {
       {
         kind: 'check-run',
         name: 'optional/coverage',
+        appId: 303,
         head: HEAD,
         status: 'completed',
         conclusion: 'failure',
@@ -94,18 +243,26 @@ describe('exact-head Relay check aggregation', () => {
 
     expect(summary.required).toEqual([
       {
+        kind: 'check-run',
         name: 'build',
+        appId: 101,
         status: 'passed',
         url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
       },
       {
+        kind: 'status-context',
         name: 'relay/typecheck',
         status: 'passed',
         url: 'https://ci.example/typecheck',
       },
     ]);
     expect(summary.optional).toEqual([
-      { name: 'optional/coverage', status: 'failed' },
+      {
+        kind: 'check-run',
+        name: 'optional/coverage',
+        appId: 303,
+        status: 'failed',
+      },
     ]);
   });
 
@@ -169,11 +326,13 @@ describe('exact-head Relay check aggregation', () => {
   it('records configured or branch-required checks missing from a nonempty observation as pending', () => {
     expect(aggregate([success]).required).toEqual([
       {
+        kind: 'check-run',
         name: 'build',
+        appId: 101,
         status: 'passed',
         url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
       },
-      { name: 'relay/typecheck', status: 'pending' },
+      { kind: 'any', name: 'relay/typecheck', status: 'pending' },
     ]);
   });
 
@@ -194,15 +353,22 @@ describe('exact-head Relay check aggregation', () => {
     });
 
     expect(wrongApp.required).toEqual([
-      { name: 'build', appId: 101, status: 'pending' },
+      {
+        kind: 'check-run',
+        name: 'build',
+        appId: 101,
+        status: 'pending',
+      },
     ]);
     expect(wrongApp.optional).toEqual([{
+      kind: 'check-run',
       name: 'build',
       appId: 202,
       status: 'passed',
       url: 'https://github.com/Jinn-Network/mono/actions/runs/1',
     }]);
     expect(correctApp.required).toEqual([{
+      kind: 'check-run',
       name: 'build',
       appId: 101,
       status: 'passed',
@@ -217,6 +383,7 @@ describe('exact-head Relay check aggregation', () => {
       branchRequiredChecks: [{ name: 'build', appId: null }],
       profile: { name: 'jinn-mono.v1', requiredChecks: [] },
     }).required).toEqual([{
+      kind: 'check-run',
       name: 'build',
       appId: 202,
       status: 'passed',
@@ -266,6 +433,7 @@ describe('exact-head Relay check aggregation', () => {
     const optional = {
       kind: 'check-run',
       name: 'analysis',
+      appId: 303,
       head: HEAD,
       status: 'completed',
       conclusion: 'neutral',
@@ -563,4 +731,63 @@ describe('Relay evaluation-anchor publication', () => {
     await expect(publisher.publish(input)).rejects.toThrow(/changed|head/i);
     expect(reads).toBe(2);
   });
+
+  it.each([
+    ['head', { head: '3'.repeat(40) }],
+    ['base', { base: 'release' }],
+    ['branch', { branch: 'jinn/issue-relay/other' }],
+    ['generation', { generation: 'other-generation' }],
+    ['number', { number: 69 }],
+    ['open state', { open: false }],
+    ['draft state', { draft: false }],
+    ['repository authority', { targetRepositoryId: 'R_other' }],
+  ] as const)(
+    'rejects a new anchor when the PR %s changes during comment readback',
+    async (_label, mutation) => {
+      const current = fixture();
+      const checks = aggregate([
+        success,
+        {
+          kind: 'status-context',
+          name: 'relay/typecheck',
+          head: HEAD,
+          state: 'success',
+        },
+      ]);
+      const originalList = current.port.listAssuranceComments
+        .bind(current.port);
+      let commentReads = 0;
+      let prReads = 0;
+      current.port.listAssuranceComments = async (input) => {
+        const comments = await originalList(input);
+        commentReads += 1;
+        return comments;
+      };
+      current.port.readPullRequest = async () => {
+        prReads += 1;
+        return commentReads < 2
+          ? current.pr
+          : { ...current.pr, ...mutation };
+      };
+      const publisher = createRelayEvaluationAnchorPublisher({
+        port: current.port,
+      });
+
+      await expect(publisher.publish({
+        authority: {
+          targetRepositoryId: 'R_target',
+          forkRepositoryId: 'R_fork',
+          forkParentRepositoryId: 'R_target',
+        },
+        targetRepository: 'Jinn-Network/mono',
+        targetBase: 'main',
+        serviceLogin: 'jinn-relay',
+        pr: current.pr,
+        currentBaseOid: BASE,
+        adoption,
+        checks,
+      })).rejects.toThrow(/changed|anchoring/i);
+      expect(prReads).toBe(3);
+    },
+  );
 });
