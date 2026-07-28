@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   formatRelayIssueMarker,
   parseRelayIssueMarker,
+  prepareRelayIssueMarkerUpdate,
 } from '../../src/issue-relay/markers.js';
 import { relayGeneration } from '../../src/issue-relay/identity.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
@@ -264,5 +265,246 @@ describe('Relay issue generation markers', () => {
     expect(() => formatRelayIssueMarker(generationRecord({
       deadlineAt: '2026-07-28T15:00:02.000+02:00',
     }))).toThrow(/deadline|timestamp/i);
+  });
+
+  it('rejects a repair round whose input head does not bind the preceding verdict head', () => {
+    const initialHead = '2222222222222222222222222222222222222222';
+    const unrelatedHead = '3333333333333333333333333333333333333333';
+    const record = generationRecord({
+      phase: 'solution-delivered',
+      rounds: [{
+        round: 0,
+        purpose: 'initial',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: issueInput.repository.baseOid,
+        task: {
+          taskKey: `issue-relay:${generationRecord().generation}:round:0`,
+          taskId: 'task-0',
+          taskCid: 'bafy-task-0',
+          fundedAt: '2026-07-28T12:05:00.000Z',
+        },
+        solution: {
+          envelopeCid: 'bafy-solution-0',
+          operatorSafe: '0x1111111111111111111111111111111111111111',
+          observedAt: '2026-07-28T12:10:00.000Z',
+        },
+        adoption: {
+          disposition: 'accepted',
+          resultingHead: initialHead,
+          receiptDigest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+        checks: {
+          head: initialHead,
+          status: 'passed',
+          digest: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        },
+        verdict: {
+          outcome: 'request-changes',
+          evaluatedHead: initialHead,
+          envelopeCid: 'bafy-verdict-0',
+        },
+      }, {
+        round: 1,
+        purpose: 'repair',
+        workspaceRepository: 'Jinn-Network/mono-fork',
+        inputHead: unrelatedHead,
+        task: {
+          taskKey: `issue-relay:${generationRecord().generation}:round:1`,
+          taskId: 'task-1',
+          taskCid: 'bafy-task-1',
+          fundedAt: '2026-07-28T12:21:00.000Z',
+        },
+        solution: {
+          envelopeCid: 'bafy-solution-1',
+          operatorSafe: '0x1111111111111111111111111111111111111111',
+          observedAt: '2026-07-28T12:25:00.000Z',
+        },
+      }],
+      pr: {
+        number: 68,
+        branch: 'jinn/issue-relay/example',
+        head: unrelatedHead,
+        draft: true,
+      },
+      updatedAt: '2026-07-28T12:25:00.000Z',
+    });
+
+    expect(() => formatRelayIssueMarker(record)).toThrow(/contradictory|generation/i);
+  });
+});
+
+describe('Relay issue marker update preconditions', () => {
+  it('returns the proposed canonical body and exact expected-current version', () => {
+    const current = generationRecord();
+    const proposed = generationRecord({
+      phase: 'submitted',
+      rounds: [{
+        round: 0,
+        purpose: 'initial',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: issueInput.repository.baseOid,
+        task: {
+          taskKey: `issue-relay:${current.generation}:round:0`,
+          taskId: 'task-0',
+          taskCid: 'bafy-task-0',
+          fundedAt: '2026-07-28T12:05:00.000Z',
+        },
+      }],
+      updatedAt: '2026-07-28T12:05:00.000Z',
+    });
+    const currentBody = formatRelayIssueMarker(current);
+
+    expect(prepareRelayIssueMarkerUpdate({
+      current: {
+        body: currentBody,
+        authorLogin: BOT_LOGIN,
+        expectedAuthorLogin: BOT_LOGIN,
+      },
+      proposed,
+    })).toEqual({
+      body: formatRelayIssueMarker(proposed),
+      expectedCurrent: {
+        bodyDigest: 'sha256:725bb9d9db0cc2a2d180cfb9b6b7c6b9170575873279949a9906368b1cb55b35',
+        generation: current.generation,
+        updatedAt: current.updatedAt,
+      },
+    });
+  });
+
+  it('rejects replacing one newer marker with a stale older generation', () => {
+    const newer = generationRecord({ phase: 'refused' });
+    const olderSnapshot = buildRelaySnapshot({
+      ...issueInput,
+      issue: {
+        ...issueInput.issue,
+        body: 'older issue body',
+        updatedAt: '2026-07-28T11:00:00.000Z',
+      },
+      capturedAt: '2026-07-28T11:00:02.000Z',
+    });
+    const older = generationRecord({
+      generation: relayGeneration(olderSnapshot),
+      snapshot: olderSnapshot,
+      deadlineAt: '2026-07-28T12:00:02.000Z',
+      updatedAt: '2026-07-28T11:00:02.000Z',
+    });
+
+    expect(prepareRelayIssueMarkerUpdate({
+      current: {
+        body: formatRelayIssueMarker(newer),
+        authorLogin: BOT_LOGIN,
+        expectedAuthorLogin: BOT_LOGIN,
+      },
+      proposed: older,
+    })).toBeNull();
+  });
+
+  it.each([
+    ['phase regression', (_current: RelayGenerationRecordV1) => generationRecord({
+      updatedAt: '2026-07-28T12:06:00.000Z',
+    })],
+    ['timestamp regression', (current: RelayGenerationRecordV1) => ({
+      ...current,
+      updatedAt: '2026-07-28T12:04:00.000Z',
+    })],
+    ['deadline mutation', (current: RelayGenerationRecordV1) => ({
+      ...current,
+      deadlineAt: '2026-07-28T14:00:02.000Z',
+      updatedAt: '2026-07-28T12:06:00.000Z',
+    })],
+  ] as const)('rejects same-generation %s', (_label, proposedRecord) => {
+    const admitted = generationRecord();
+    const current = generationRecord({
+      phase: 'submitted',
+      rounds: [{
+        round: 0,
+        purpose: 'initial',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: issueInput.repository.baseOid,
+        task: {
+          taskKey: `issue-relay:${admitted.generation}:round:0`,
+          taskId: 'task-0',
+          taskCid: 'bafy-task-0',
+          fundedAt: '2026-07-28T12:05:00.000Z',
+        },
+      }],
+      updatedAt: '2026-07-28T12:05:00.000Z',
+    });
+
+    expect(prepareRelayIssueMarkerUpdate({
+      current: {
+        body: formatRelayIssueMarker(current),
+        authorLogin: BOT_LOGIN,
+        expectedAuthorLogin: BOT_LOGIN,
+      },
+      proposed: proposedRecord(current),
+    })).toBeNull();
+  });
+
+  it('accepts a strictly newer generation only after the current generation is terminal', () => {
+    const current = generationRecord({ phase: 'closed' });
+    const newerSnapshot = buildRelaySnapshot({
+      ...issueInput,
+      issue: {
+        ...issueInput.issue,
+        body: 'new issue demand',
+        updatedAt: '2026-07-28T13:00:00.000Z',
+      },
+      capturedAt: '2026-07-28T13:00:02.000Z',
+    });
+    const newer = generationRecord({
+      generation: relayGeneration(newerSnapshot),
+      snapshot: newerSnapshot,
+      deadlineAt: '2026-07-28T14:00:02.000Z',
+      updatedAt: '2026-07-28T13:00:02.000Z',
+    });
+    const currentInput = {
+      body: formatRelayIssueMarker(current),
+      authorLogin: BOT_LOGIN,
+      expectedAuthorLogin: BOT_LOGIN,
+    };
+
+    expect(prepareRelayIssueMarkerUpdate({
+      current: currentInput,
+      proposed: newer,
+    })).not.toBeNull();
+    expect(prepareRelayIssueMarkerUpdate({
+      current: {
+        ...currentInput,
+        body: formatRelayIssueMarker(generationRecord()),
+      },
+      proposed: newer,
+    })).toBeNull();
+  });
+
+  it('rejects a generation captured before the current terminal transition', () => {
+    const current = generationRecord({
+      phase: 'closed',
+      updatedAt: '2026-07-28T13:00:00.000Z',
+    });
+    const staleSnapshot = buildRelaySnapshot({
+      ...issueInput,
+      issue: {
+        ...issueInput.issue,
+        body: 'captured before closure',
+        updatedAt: '2026-07-28T12:29:00.000Z',
+      },
+      capturedAt: '2026-07-28T12:30:00.000Z',
+    });
+    const stale = generationRecord({
+      generation: relayGeneration(staleSnapshot),
+      snapshot: staleSnapshot,
+      deadlineAt: '2026-07-28T13:30:00.000Z',
+      updatedAt: '2026-07-28T12:30:00.000Z',
+    });
+
+    expect(prepareRelayIssueMarkerUpdate({
+      current: {
+        body: formatRelayIssueMarker(current),
+        authorLogin: BOT_LOGIN,
+        expectedAuthorLogin: BOT_LOGIN,
+      },
+      proposed: stale,
+    })).toBeNull();
   });
 });
