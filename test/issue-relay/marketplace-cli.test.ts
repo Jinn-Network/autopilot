@@ -269,6 +269,7 @@ describe('Issue Relay marketplace CLI submission', () => {
         BASE_RPC_URL: 'https://rpc.example',
         NO_COLOR: '1',
       },
+      outputProfile: 'issue-relay-dry-run',
     });
     expect(run.mock.calls[1]?.[2]).toEqual({
       environment: {
