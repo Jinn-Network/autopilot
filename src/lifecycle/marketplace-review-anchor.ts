@@ -67,6 +67,7 @@ export interface MarketplaceReviewAnchorDependencies {
     readonly confirmed: ReviewActionCandidate;
   }) => Promise<AttemptManifest>;
   readonly releasePort?: ReviewSessionPort;
+  readonly releasePortFor?: (manifestPath: string) => ReviewSessionPort;
   readonly now?: () => Date;
 }
 
@@ -181,7 +182,7 @@ async function abandonOrphanedActiveClaim(
     readonly expectedHead: GitOid;
     readonly v2Base: string;
   },
-  port: ReviewSessionPort,
+  deps: Pick<MarketplaceReviewAnchorDependencies, 'releasePort' | 'releasePortFor'>,
   readCandidate: ReviewClaimAcquisitionDeps['readCandidate'],
 ): Promise<boolean> {
   const candidate = await readCandidate(input.prNumber);
@@ -198,8 +199,17 @@ async function abandonOrphanedActiveClaim(
   }
   const manifest = findMarketplaceEvaluatorReviewByAttemptId(input.v2Base, activeClaim.attempt);
   if (manifest === null) return false;
+  const port = releasePortForManifest(deps, manifest.paths.manifest);
+  if (port === undefined) return false;
   await abandonAcquiredReviewClaim(manifest, port);
   return true;
+}
+
+function releasePortForManifest(
+  deps: Pick<MarketplaceReviewAnchorDependencies, 'releasePort' | 'releasePortFor'>,
+  manifestPath: string,
+): ReviewSessionPort | undefined {
+  return deps.releasePortFor?.(manifestPath) ?? deps.releasePort;
 }
 
 async function recoverPreparedEvaluatorReview(
@@ -314,10 +324,13 @@ export async function anchorMarketplaceEvaluatorReview(
       const recovered = await recoverPreparedEvaluatorReview(input, deps, now);
       if (recovered !== null) return recovered;
     }
-    if (acquired.status === 'human' && deps.releasePort !== undefined) {
+    if (
+      acquired.status === 'human'
+      && (deps.releasePort !== undefined || deps.releasePortFor !== undefined)
+    ) {
       await abandonOrphanedActiveClaim(
         input,
-        deps.releasePort,
+        deps,
         deps.claimAcquisition.readCandidate,
       );
     }
@@ -325,10 +338,11 @@ export async function anchorMarketplaceEvaluatorReview(
   }
   const { claim, confirmed } = acquired;
   if (confirmed.approvalPolicy !== 'approve-eligible') {
-    if (deps.releasePort !== undefined) {
-      const manifest = findMarketplaceEvaluatorReviewByAttemptId(input.v2Base, claim.attemptId)
-        ?? readAttemptManifest(claim.manifestPath);
-      await abandonAcquiredReviewClaim(manifest, deps.releasePort);
+    const manifest = findMarketplaceEvaluatorReviewByAttemptId(input.v2Base, claim.attemptId)
+      ?? readAttemptManifest(claim.manifestPath);
+    const releasePort = releasePortForManifest(deps, manifest.paths.manifest);
+    if (releasePort !== undefined) {
+      await abandonAcquiredReviewClaim(manifest, releasePort);
     }
     return {
       status: 'rejected',
@@ -426,7 +440,6 @@ export async function releaseMarketplaceReviewAnchor(
 export function makeMarketplaceReviewAnchorPort(
   deps: MarketplaceReviewAnchorDependencies & {
     readonly v2Base: string;
-    readonly releasePort: ReviewSessionPort;
   },
 ): MarketplaceReviewAnchorPort {
   const now = deps.now ?? (() => new Date());
@@ -435,6 +448,12 @@ export function makeMarketplaceReviewAnchorPort(
       { ...input, v2Base: deps.v2Base },
       deps,
     ),
-    release: (anchor) => releaseMarketplaceReviewAnchor(anchor, deps.releasePort, now),
+    release: (anchor) => {
+      const releasePort = releasePortForManifest(deps, anchor.manifestPath);
+      if (releasePort === undefined) {
+        throw new Error('Review anchor release port is unavailable');
+      }
+      return releaseMarketplaceReviewAnchor(anchor, releasePort, now);
+    },
   };
 }

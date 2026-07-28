@@ -29,6 +29,7 @@ import {
   type MarketplaceReviewAnchorPort,
 } from './marketplace-review-anchor.js';
 import { makeProductionReviewSessionPort } from './review-session-production.js';
+import type { ReviewSessionPort } from './review-session.js';
 import type { CredentialPool } from './credentials.js';
 import { randomUUID } from 'node:crypto';
 import { encodeReviewClaimPayload } from './codecs.js';
@@ -607,11 +608,15 @@ export function makeProductionMarketplaceReviewAnchorPort(
   const nextId = options.nextAttemptId ?? (() => randomUUID());
   const reviewPort = makeProductionReviewActionPort(options);
   const v2Base = join(options.worktreeBase, 'v2');
-  const releasePort = makeProductionReviewSessionPort({
-    runner,
-    environment: ambient,
-    now,
-  });
+  const releasePortFor = (manifestPath: string): ReviewSessionPort =>
+    makeProductionReviewSessionPort({
+      runner,
+      environment: {
+        ...ambient,
+        JINN_AUTOPILOT_SESSION_MANIFEST: manifestPath,
+      },
+      now,
+    });
   const claimAcquisition: ReviewClaimAcquisitionDeps = {
     ...reviewPort,
     credentials: options.credentials,
@@ -671,7 +676,7 @@ export function makeProductionMarketplaceReviewAnchorPort(
   };
   return makeMarketplaceReviewAnchorPort({
     v2Base,
-    releasePort,
+    releasePortFor,
     now,
     claimAcquisition,
     createEvaluatorReviewWorkspace: async ({ claim }) =>

@@ -617,6 +617,28 @@ describe('production marketplace patch application ports', () => {
 });
 
 describe('makeProductionMarketplaceMutationAdoptionCoordinator', () => {
+  it('does not require review credentials before an evaluator manifest exists', () => {
+    const { manifestPath } = fixture();
+    expect(() => makeProductionMarketplaceMutationAdoptionCoordinator({
+      originManifestPath: manifestPath,
+      repositoryPath: '/repo',
+      worktreeBase: '/tmp/worktrees',
+      runnerId: 'runner-1',
+      credentials: credentialPool(),
+      readSnapshot: async () => ({ snapshotComplete: true } as never),
+      staleAfterMs: 60_000,
+      environment: {
+        PATH: '/usr/bin',
+      },
+      verification: {
+        preflight: async () => ({ ok: true }),
+        verify: async () => {
+          throw new Error('verification must not run during construction');
+        },
+      },
+    })).not.toThrow();
+  });
+
   it('constructs a coordinator with production ports', () => {
     const { manifestPath } = fixture();
     const coordinator = makeProductionMarketplaceMutationAdoptionCoordinator({
