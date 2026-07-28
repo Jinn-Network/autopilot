@@ -719,6 +719,71 @@ describe('Relay acceptance clarity', () => {
     });
   });
 
+  it('extracts a nested GFM task-list criterion under an ordered parent', () => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      issue: {
+        ...issue,
+        issue: {
+          ...issue.issue,
+          body: [
+            '10. Platform',
+            '    - [ ] The command exits zero.',
+          ].join('\n'),
+        },
+      },
+    });
+
+    expect(decision).toMatchObject({
+      status: 'admitted',
+      input: {
+        acceptanceEvidence: ['The command exits zero.'],
+      },
+    });
+  });
+
+  it('does not nest a four-space task item under a wider ordered marker', () => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      issue: {
+        ...issue,
+        issue: {
+          ...issue.issue,
+          body: [
+            '123. Platform',
+            '    - [ ] This is not nested deeply enough.',
+          ].join('\n'),
+        },
+      },
+    });
+
+    expect(decision).toMatchObject({
+      status: 'awaiting-clarification',
+      code: 'missing-acceptance-evidence',
+    });
+  });
+
+  it('does not treat list-indented code as a nested task item', () => {
+    const decision = admitRelayIssue({
+      ...baseInput,
+      issue: {
+        ...issue,
+        issue: {
+          ...issue.issue,
+          body: [
+            '- Platform',
+            '      - [ ] This is code, not a nested task.',
+          ].join('\n'),
+        },
+      },
+    });
+
+    expect(decision).toMatchObject({
+      status: 'awaiting-clarification',
+      code: 'missing-acceptance-evidence',
+    });
+  });
+
   it('keeps acceptance context through nested child headings', () => {
     const decision = admitRelayIssue({
       ...baseInput,

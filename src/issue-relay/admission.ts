@@ -95,12 +95,31 @@ function stripBoundedItem(line: string): string | undefined {
   return item === undefined || item.length === 0 ? undefined : item;
 }
 
+function markdownColumnWidth(value: string): number {
+  let column = 0;
+  for (const character of value) {
+    column = character === '\t'
+      ? column + (4 - (column % 4))
+      : column + 1;
+  }
+  return column;
+}
+
+function markdownListContentIndent(line: string): number | undefined {
+  const marker = line.match(
+    /^([ \t]*)([-*+]|\d{1,9}[.)])((?: {1,4}|\t))(?=\S)/,
+  );
+  return marker === null
+    ? undefined
+    : markdownColumnWidth(`${marker[1]}${marker[2]}${marker[3]}`);
+}
+
 function acceptanceEvidence(body: string): readonly string[] {
   const evidence: string[] = [];
   let recognizedSectionDepth: number | undefined;
   let fence: { readonly character: string; readonly length: number } | undefined;
   let inHtmlComment = false;
-  let inListContext = false;
+  let listContentIndent: number | undefined;
   let pendingPlainLine:
     | { readonly text: string; readonly inRecognizedSection: boolean }
     | undefined;
@@ -151,8 +170,16 @@ function acceptanceEvidence(body: string): readonly string[] {
       cursor = commentStart + 4;
     }
 
-    const nestedTaskListItem = inListContext
-      && /^(?: {4}|\t)[-*+]\s+\[[ xX]\]\s+/.test(line);
+    const nestedTaskIndent = line.match(
+      /^([ \t]+)[-*+]\s+\[[ xX]\]\s+/,
+    )?.[1];
+    const nestedTaskIndentColumns = nestedTaskIndent === undefined
+      ? undefined
+      : markdownColumnWidth(nestedTaskIndent);
+    const nestedTaskListItem = listContentIndent !== undefined
+      && nestedTaskIndentColumns !== undefined
+      && nestedTaskIndentColumns >= listContentIndent
+      && nestedTaskIndentColumns < listContentIndent + 4;
     if (/^(?: {4}|\t)/.test(line) && !nestedTaskListItem) {
       flushPendingPlainLine();
       continue;
@@ -165,7 +192,7 @@ function acceptanceEvidence(body: string): readonly string[] {
         character: openingMarker[0]!,
         length: openingMarker.length,
       };
-      inListContext = false;
+      listContentIndent = undefined;
       continue;
     }
 
@@ -181,7 +208,7 @@ function acceptanceEvidence(body: string): readonly string[] {
         recognizedSectionDepth = undefined;
       }
       pendingPlainLine = undefined;
-      inListContext = false;
+      listContentIndent = undefined;
       continue;
     }
 
@@ -197,7 +224,7 @@ function acceptanceEvidence(body: string): readonly string[] {
       ) {
         recognizedSectionDepth = undefined;
       }
-      inListContext = false;
+      listContentIndent = undefined;
       continue;
     }
 
@@ -205,7 +232,7 @@ function acceptanceEvidence(body: string): readonly string[] {
     if (checklist !== undefined && checklist.length > 0) {
       flushPendingPlainLine();
       evidence.push(checklist);
-      inListContext = true;
+      listContentIndent = markdownListContentIndent(line);
       continue;
     }
 
@@ -219,7 +246,7 @@ function acceptanceEvidence(body: string): readonly string[] {
       text: line,
       inRecognizedSection: recognizedSectionDepth !== undefined,
     };
-    inListContext = /^\s{0,3}[-*+]\s+/.test(line);
+    listContentIndent = markdownListContentIndent(line);
   }
 
   flushPendingPlainLine();
