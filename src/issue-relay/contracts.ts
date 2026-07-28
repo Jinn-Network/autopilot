@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-
-const MAX_FINDINGS = 50;
-const MAX_FINDING_TITLE_BYTES = 240;
-const MAX_FINDING_DETAIL_BYTES = 8 * 1024;
-const MAX_REPOSITORY_BYTES = 200;
+import {
+  ISSUE_RELAY_MAX_FINDINGS,
+  ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+  ISSUE_RELAY_MAX_FINDING_LABEL_BYTES,
+  ISSUE_RELAY_MAX_GENERATION_BYTES,
+  ISSUE_RELAY_MAX_REPOSITORY_BYTES,
+} from './limits.js';
 
 export const Sha256DigestSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 export const GitOidSchema = z.string().regex(/^[0-9a-f]{40}$/);
@@ -29,18 +31,20 @@ const GitHubRepositorySlugSchema = z.string()
   );
 
 const RepositorySchema = GitHubRepositorySlugSchema.refine(
-  (repository) => new TextEncoder().encode(repository).byteLength <= MAX_REPOSITORY_BYTES,
-  `Repository must be no larger than ${MAX_REPOSITORY_BYTES} UTF-8 bytes`,
+  (repository) =>
+    new TextEncoder().encode(repository).byteLength
+    <= ISSUE_RELAY_MAX_REPOSITORY_BYTES,
+  `Repository must be no larger than ${ISSUE_RELAY_MAX_REPOSITORY_BYTES} UTF-8 bytes`,
 );
 
 export const IssueRelayFindingV1Schema = z.object({
-  code: boundedText(MAX_FINDING_TITLE_BYTES, 'Finding code'),
-  title: boundedText(MAX_FINDING_TITLE_BYTES, 'Finding title').refine(
+  code: boundedText(ISSUE_RELAY_MAX_FINDING_LABEL_BYTES, 'Finding code'),
+  title: boundedText(ISSUE_RELAY_MAX_FINDING_LABEL_BYTES, 'Finding title').refine(
     (value) => !/[\r\n]/.test(value),
     'Finding title must be a single line',
   ),
-  detail: boundedText(MAX_FINDING_DETAIL_BYTES, 'Finding detail'),
-  path: boundedText(MAX_FINDING_DETAIL_BYTES, 'Finding path').optional(),
+  detail: boundedText(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Finding detail'),
+  path: boundedText(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Finding path').optional(),
 }).strict();
 
 export interface IssueRelayFindingV1 {
@@ -68,7 +72,7 @@ export interface IssueRelayRoundV1 {
 
 const roundCommonFields = {
   schemaVersion: z.literal('jinn-issue-relay-round.v1'),
-  generation: boundedText(MAX_FINDING_DETAIL_BYTES, 'Generation'),
+  generation: boundedText(ISSUE_RELAY_MAX_GENERATION_BYTES, 'Generation'),
   round: z.number().int().safe().nonnegative(),
   snapshotDigest: Sha256DigestSchema,
   targetRepository: RepositorySchema,
@@ -79,14 +83,16 @@ const roundCommonFields = {
 const InitialIssueRelayRoundV1Schema = z.object({
   ...roundCommonFields,
   purpose: z.literal('initial'),
-  findings: z.array(IssueRelayFindingV1Schema).max(MAX_FINDINGS),
+  findings: z.array(IssueRelayFindingV1Schema).max(ISSUE_RELAY_MAX_FINDINGS),
   prNumber: z.never().optional(),
 }).strict();
 
 const RepairIssueRelayRoundV1Schema = z.object({
   ...roundCommonFields,
   purpose: z.literal('repair'),
-  findings: z.array(IssueRelayFindingV1Schema).min(1).max(MAX_FINDINGS),
+  findings: z.array(IssueRelayFindingV1Schema)
+    .min(1)
+    .max(ISSUE_RELAY_MAX_FINDINGS),
   prNumber: z.number().int().positive(),
 }).strict();
 
@@ -113,13 +119,16 @@ export interface IssueRelayCorrelationV1 {
 }
 
 export const IssueRelayCorrelationV1Schema = z.object({
-  generation: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Generation'),
+  generation: SingleLineSchema(ISSUE_RELAY_MAX_GENERATION_BYTES, 'Generation'),
   round: NonNegativeSafeIntegerSchema,
   snapshotDigest: Sha256DigestSchema,
-  taskId: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Task ID'),
+  taskId: SingleLineSchema(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Task ID'),
   attemptIndex: NonNegativeSafeIntegerSchema,
-  requestId: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Request ID'),
-  deliveryEnvelopeCid: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Delivery envelope CID'),
+  requestId: SingleLineSchema(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Request ID'),
+  deliveryEnvelopeCid: SingleLineSchema(
+    ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+    'Delivery envelope CID',
+  ),
 }).strict();
 
 export type IssueRelayAdoptionReceiptV1 =
@@ -161,7 +170,7 @@ const AcceptedIssueRelayAdoptionReceiptV1Schema = z.object({
   workspaceRepository: RepositorySchema,
   issueNumber: PositiveIntegerSchema,
   prNumber: PositiveIntegerSchema,
-  headRef: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Head ref'),
+  headRef: SingleLineSchema(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Head ref'),
   inputHead: GitOidSchema,
   resultingHead: GitOidSchema,
   patchDigest: Sha256DigestSchema,
@@ -181,7 +190,7 @@ const RejectedIssueRelayAdoptionReceiptV1Schema = z.object({
     'authority-changed',
     'cancelled',
   ]),
-  detail: boundedText(MAX_FINDING_DETAIL_BYTES, 'Rejection detail'),
+  detail: boundedText(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Rejection detail'),
   recordedAt: IsoTimestampSchema,
 }).strict();
 
@@ -211,9 +220,9 @@ export const IssueRelayEvaluationAnchorV1Schema = z.object({
   targetRepository: RepositorySchema,
   workspaceRepository: RepositorySchema,
   prNumber: PositiveIntegerSchema,
-  targetBase: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Target base'),
+  targetBase: SingleLineSchema(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Target base'),
   baseOid: GitOidSchema,
-  headRef: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Head ref'),
+  headRef: SingleLineSchema(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Head ref'),
   evaluatedHead: GitOidSchema,
   adoptionReceiptDigest: Sha256DigestSchema,
   checksDigest: Sha256DigestSchema,
@@ -264,8 +273,14 @@ export interface IssueRelayEvaluationContextV1 {
   };
 }
 
-const CheckNameSchema = SingleLineSchema(MAX_FINDING_TITLE_BYTES, 'Check name');
-const OptionalCheckUrlSchema = SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Check URL').optional();
+const CheckNameSchema = SingleLineSchema(
+  ISSUE_RELAY_MAX_FINDING_LABEL_BYTES,
+  'Check name',
+);
+const OptionalCheckUrlSchema = SingleLineSchema(
+  ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+  'Check URL',
+).optional();
 
 function correlationsMatch(
   left: z.infer<typeof IssueRelayCorrelationV1Schema>,
@@ -302,8 +317,14 @@ export const IssueRelayEvaluationContextV1Schema = z.object({
   schemaVersion: z.literal('jinn-issue-relay-evaluation-context.v1'),
   goal: z.object({
     snapshotDigest: Sha256DigestSchema,
-    problemStatement: boundedText(MAX_FINDING_DETAIL_BYTES, 'Problem statement'),
-    acceptanceEvidence: z.array(boundedText(MAX_FINDING_DETAIL_BYTES, 'Acceptance evidence')),
+    problemStatement: boundedText(
+      ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+      'Problem statement',
+    ),
+    acceptanceEvidence: z.array(boundedText(
+      ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+      'Acceptance evidence',
+    )),
     verificationProfile: z.literal('jinn-mono.v1'),
   }).strict(),
   operators: z.object({
@@ -317,9 +338,12 @@ export const IssueRelayEvaluationContextV1Schema = z.object({
     workspaceRepository: RepositorySchema,
     issueNumber: PositiveIntegerSchema,
     prNumber: PositiveIntegerSchema,
-    targetBase: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Target base'),
+    targetBase: SingleLineSchema(
+      ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+      'Target base',
+    ),
     baseOid: GitOidSchema,
-    headRef: SingleLineSchema(MAX_FINDING_DETAIL_BYTES, 'Head ref'),
+    headRef: SingleLineSchema(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Head ref'),
     evaluatedHead: GitOidSchema,
   }).strict(),
   adoptionReceipt: AcceptedIssueRelayAdoptionReceiptV1Schema,
@@ -432,7 +456,7 @@ const verdictCommonFields = {
   schemaVersion: z.literal('jinn-issue-relay-verdict.v1'),
   correlation: IssueRelayCorrelationV1Schema,
   evaluatedHead: GitOidSchema,
-  summary: boundedText(MAX_FINDING_DETAIL_BYTES, 'Verdict summary'),
+  summary: boundedText(ISSUE_RELAY_MAX_FINDING_BODY_BYTES, 'Verdict summary'),
 };
 
 export const IssueRelayVerdictV1Schema = z.union([
@@ -444,7 +468,9 @@ export const IssueRelayVerdictV1Schema = z.union([
   z.object({
     ...verdictCommonFields,
     outcome: z.literal('request-changes'),
-    findings: z.array(IssueRelayFindingV1Schema).min(1).max(MAX_FINDINGS),
+    findings: z.array(IssueRelayFindingV1Schema)
+      .min(1)
+      .max(ISSUE_RELAY_MAX_FINDINGS),
   }).strict(),
   z.object({
     ...verdictCommonFields,

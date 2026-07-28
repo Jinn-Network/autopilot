@@ -10,6 +10,10 @@ import {
   resolveInstalledJinnBinary,
   runMarketplaceMachineSubprocess,
 } from '../../src/lifecycle/marketplace-cli.js';
+import {
+  parseIssueRelayDeliveryObservation,
+} from '../../src/issue-relay/marketplace-cli.js';
+import { ISSUE_RELAY_MAX_SPEC_BYTES } from '../../src/issue-relay/limits.js';
 
 describe('marketplace machine CLI boundary', () => {
   afterEach(() => {
@@ -97,7 +101,7 @@ describe('marketplace machine CLI boundary', () => {
           status: 'verified',
           role: 'solution',
           task: {
-            taskId: String(Number.MAX_SAFE_INTEGER),
+            taskId: ((1n << 256n) - 1n).toString(),
             taskCid: 'f01551220' + 'c'.repeat(64),
           },
           attempt: {
@@ -106,7 +110,7 @@ describe('marketplace machine CLI boundary', () => {
             operator: '0x' + 'e'.repeat(40),
           },
           delivery: {
-            envelopeCid: 'bafy-delivery',
+            envelopeCid: 'f01551220' + 'd'.repeat(64),
             transactionHash: '0x' + 'f'.repeat(64),
             blockNumber: Number.MAX_SAFE_INTEGER,
           },
@@ -127,7 +131,12 @@ describe('marketplace machine CLI boundary', () => {
       },
     );
     expect(accepted.exitCode).toBe(0);
-    expect(Buffer.byteLength(accepted.stdout)).toBe(13_437_988);
+    expect(Buffer.byteLength(accepted.stdout)).toBe(13_438_110);
+    const envelope = JSON.parse(accepted.stdout) as {
+      readonly observation: unknown;
+    };
+    expect(parseIssueRelayDeliveryObservation(envelope.observation))
+      .toMatchObject({ status: 'verified', role: 'solution' });
 
     await expect(runMarketplaceMachineSubprocess(
       process.execPath,
@@ -139,7 +148,7 @@ describe('marketplace machine CLI boundary', () => {
     )).rejects.toThrow(/output limit/i);
   });
 
-  it('accepts a schema-max Relay dry-run and rejects bounded-profile overflow', async () => {
+  it('accepts an exact 2 MiB Relay dry-run and rejects bounded-profile overflow', async () => {
     const maximumDryRunSource = `
       const finding = {
         code: 'c'.repeat(240),
@@ -194,6 +203,19 @@ describe('marketplace machine CLI boundary', () => {
         issue_number: Number.MAX_SAFE_INTEGER,
         relay: round,
       };
+      const currentSpecBytes = Buffer.byteLength(
+        JSON.stringify(spec, null, 2) + '\\n',
+      );
+      const remainingSpecBytes = 2 * 1024 * 1024 - currentSpecBytes;
+      spec.problem_statement +=
+        '\\u0001'.repeat(Math.floor(remainingSpecBytes / 6))
+        + 'x'.repeat(remainingSpecBytes % 6);
+      if (
+        Buffer.byteLength(JSON.stringify(spec, null, 2) + '\\n')
+        !== 2 * 1024 * 1024
+      ) {
+        throw new Error('failed to synthesize exact Relay spec');
+      }
       process.stdout.write(JSON.stringify({
         schemaVersion: 1,
         generatedAt: '2026-07-28T10:04:00.000Z',
@@ -222,7 +244,12 @@ describe('marketplace machine CLI boundary', () => {
       },
     );
     expect(accepted.exitCode).toBe(0);
-    expect(Buffer.byteLength(accepted.stdout)).toBe(1_718_193);
+    const envelope = JSON.parse(accepted.stdout) as {
+      readonly plan: readonly [{ readonly spec: unknown }];
+    };
+    expect(Buffer.byteLength(
+      `${JSON.stringify(envelope.plan[0].spec, null, 2)}\n`,
+    )).toBe(ISSUE_RELAY_MAX_SPEC_BYTES);
 
     await expect(runMarketplaceMachineSubprocess(
       process.execPath,

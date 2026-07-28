@@ -23,6 +23,7 @@ import {
   type IssueRelayRoundV1,
 } from './contracts.js';
 import { relayGeneration, relayTaskKey } from './identity.js';
+import { ISSUE_RELAY_MAX_SPEC_BYTES } from './limits.js';
 import {
   buildRelaySnapshot,
   type IssueRelaySnapshotV1,
@@ -282,6 +283,14 @@ function digest(bytes: Uint8Array): `sha256:${string}` {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 
+function assertRelaySpecSize(bytes: string | Buffer): void {
+  if (Buffer.byteLength(bytes) > ISSUE_RELAY_MAX_SPEC_BYTES) {
+    throw new RangeError(
+      'Relay Task spec exceeds the 2 MiB canonical UTF-8 byte limit',
+    );
+  }
+}
+
 function canonicalUtc(value: string, label: string): number {
   const timestamp = Date.parse(value);
   if (
@@ -336,6 +345,7 @@ export function buildRelayMarketplaceRequest(input: {
     throw new Error('Relay Task spec contains inconsistent immutable bindings');
   }
   const specBytes = `${JSON.stringify(input.task.spec, null, 2)}\n`;
+  assertRelaySpecSize(specBytes);
   const argv = canonicalRelayArgv({
     instanceId: input.task.spec.instance_id,
     repository: input.task.spec.repo,
@@ -453,6 +463,7 @@ function parseRelayMarketplaceRequest(
   canonicalUtc(record.createdAt, 'Relay request creation time');
   canonicalUtc(record.submitBy, 'Relay request submission deadline');
   const request = record as unknown as RelayMarketplaceRequestV1;
+  assertRelaySpecSize(request.specBytes);
   if (digest(Buffer.from(request.specBytes)) !== request.specDigest) {
     throw new Error('Relay marketplace request spec digest mismatch');
   }
@@ -592,6 +603,7 @@ export function verifyRelayMarketplaceRequest(
   const request = parseRelayMarketplaceRequest(bytes);
   assertPrivateRegularFile(request.specPath, 'Relay Task spec');
   const specBytes = readFileSync(request.specPath);
+  assertRelaySpecSize(specBytes);
   if (
     digest(specBytes) !== request.specDigest
     || !specBytes.equals(Buffer.from(request.specBytes))
