@@ -26,6 +26,7 @@ import { SelectedCredential } from '../../src/lifecycle/credentials.js';
 import {
   advanceAttemptExpectedHead,
   advanceAttemptReviewPair,
+  claimMarketplaceAttemptProcess,
   cleanupAttempt,
   countRunnerLiveAttempts,
   createAttemptWorkspace,
@@ -236,6 +237,95 @@ function marketplaceInitializationJournal(
   return join(phaseDir, journals[0]!);
 }
 
+async function createSubmittedMarketplaceAttempt(
+  fixture: ReturnType<typeof repositoryFixture>,
+): Promise<AttemptManifest> {
+  const prepared = await createAttemptWorkspace(options(fixture, {
+    prNumber: 84,
+    branch: 'autopilot/42',
+    targetBaseOid: fixture.oid,
+    marketplacePreparation: marketplacePreparation(fixture),
+  }), defaultRunner);
+  if (
+    prepared.execution.backend !== 'marketplace'
+    || prepared.execution.state.schemaVersion !== 'marketplace-execution-v3'
+  ) {
+    throw new Error('expected a version-3 marketplace execution');
+  }
+  return transitionMarketplaceExecution(
+    prepared.paths.manifest,
+    prepared.execution.state.requestDigest,
+    {
+      status: 'submitted',
+      submission: { ...SUBMISSION_RESULT, taskId: '501' },
+    },
+    () => new Date('2026-07-28T12:02:00.000Z'),
+  );
+}
+
+async function createAnchoredMarketplaceEvaluatorLeg(
+  fixture: ReturnType<typeof repositoryFixture>,
+): Promise<{
+  readonly manifest: AttemptManifest;
+  readonly identity: Parameters<typeof installMarketplaceEvaluatorLeg>[1];
+}> {
+  const origin = await createSubmittedMarketplaceAttempt(fixture);
+  if (
+    origin.execution.backend !== 'marketplace'
+    || !('submission' in origin.execution.state)
+  ) {
+    throw new Error('expected a submitted marketplace execution');
+  }
+  const requestDigest = origin.execution.state.requestDigest;
+  const review = await createAttemptWorkspace(options(fixture, {
+    attemptId: UUID_B,
+    phase: 'review',
+    subject: 'pr-84',
+    prNumber: 84,
+    branch: 'autopilot/42',
+    reviewGeneration: UUID_C,
+    reviewRefOid: fixture.oid,
+    reviewApprovalPolicy: 'approve-eligible',
+    selectedLogin: 'review-bot',
+    credential: new SelectedCredential('review-bot', 'review', 'review-secret'),
+    execution: {
+      backend: 'marketplace',
+      state: {
+        schemaVersion: 'marketplace-execution-v2',
+        status: 'prepared',
+        requestPath: join(fixture.root, 'evaluator-request.json'),
+        requestDigest,
+        solverNetSelectionPath: join(fixture.root, 'evaluator-solvernet-selection.json'),
+        preparedAt: '2026-07-28T12:02:00.000Z',
+        agentSoftDeadline: '2026-07-28T13:02:00.000Z',
+        adoptionDeadline: '2026-07-28T14:02:00.000Z',
+      },
+    },
+    now: () => new Date('2026-07-28T12:02:00.000Z'),
+  }), defaultRunner);
+  const identity = {
+    originManifestPath: origin.paths.manifest,
+    originV2AttemptId: origin.attemptId,
+    originRequestDigest: requestDigest,
+    taskId: '501',
+    taskCid: origin.execution.state.submission.taskCid,
+    taskCreationBlock: origin.execution.state.submission.creationBlock,
+    prNumber: 84,
+    expectedHead: fixture.oid,
+    generation: UUID_C,
+    reviewRefOid: fixture.oid,
+    reviewer: 'review-bot',
+  };
+  return {
+    manifest: installMarketplaceEvaluatorLeg(
+      review.paths.manifest,
+      identity,
+      () => new Date('2026-07-28T12:03:00.000Z'),
+    ),
+    identity,
+  };
+}
+
 function marketplaceInitializationJournalPathForTest(
   fixture: ReturnType<typeof repositoryFixture>,
 ): string {
@@ -316,6 +406,262 @@ function transitionInWorker(input: Record<string, unknown>): Promise<{
 }
 
 describe('attempt workspace and manifest', () => {
+  it('claims a submitted preparing marketplace attempt without changing execution evidence', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createSubmittedMarketplaceAttempt(fixture);
+    const executionBefore = structuredClone(manifest.execution);
+
+    const claimed = claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      isPidAlive: () => false,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+
+    expect(claimed).toMatchObject({
+      processState: 'running',
+      pid: 700,
+      timestamps: {
+        updatedAt: '2026-07-28T12:03:00.000Z',
+        childStartedAt: '2026-07-28T12:03:00.000Z',
+      },
+    });
+    expect(claimed.execution).toEqual(executionBefore);
+  });
+
+  it('replays a marketplace attempt claim by the same PID without rewriting bytes or timestamps', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createSubmittedMarketplaceAttempt(fixture);
+    const first = claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+    const before = readFileSync(manifest.paths.manifest);
+
+    const replayed = claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      now: () => new Date('2026-07-28T12:04:00.000Z'),
+    });
+
+    expect(replayed).toEqual(first);
+    expect(readFileSync(manifest.paths.manifest)).toEqual(before);
+  });
+
+  it('refuses a marketplace attempt claim held by another live PID without rewriting bytes', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createSubmittedMarketplaceAttempt(fixture);
+    claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 701,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+    const before = readFileSync(manifest.paths.manifest);
+
+    expect(() => claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      isPidAlive: (pid) => pid === 701,
+      now: () => new Date('2026-07-28T12:04:00.000Z'),
+    })).toThrow(/held by a live PID/i);
+    expect(readFileSync(manifest.paths.manifest)).toEqual(before);
+  });
+
+  it('rebinds a marketplace attempt claim held by a dead PID without changing execution evidence', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createSubmittedMarketplaceAttempt(fixture);
+    const executionBefore = structuredClone(manifest.execution);
+    claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 701,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+
+    const rebound = claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      isPidAlive: () => false,
+      now: () => new Date('2026-07-28T12:04:00.000Z'),
+    });
+
+    expect(rebound).toMatchObject({
+      processState: 'running',
+      pid: 700,
+      timestamps: {
+        updatedAt: '2026-07-28T12:04:00.000Z',
+        childStartedAt: '2026-07-28T12:04:00.000Z',
+      },
+    });
+    expect(rebound.execution).toEqual(executionBefore);
+  });
+
+  it('refuses exited and terminal marketplace attempts without rewriting bytes', async () => {
+    const exitedFixture = repositoryFixture();
+    const exited = await createSubmittedMarketplaceAttempt(exitedFixture);
+    claimMarketplaceAttemptProcess(exited.paths.manifest, {
+      pid: 701,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+    markAttemptExited(
+      exited.paths.manifest,
+      () => new Date('2026-07-28T12:04:00.000Z'),
+    );
+    const exitedBytes = readFileSync(exited.paths.manifest);
+    expect(() => claimMarketplaceAttemptProcess(exited.paths.manifest, {
+      pid: 700,
+      isPidAlive: () => false,
+      now: () => new Date('2026-07-28T12:05:00.000Z'),
+    })).toThrow(/exited marketplace attempt/i);
+    expect(readFileSync(exited.paths.manifest)).toEqual(exitedBytes);
+
+    const cancelledFixture = repositoryFixture();
+    const prepared = await createAttemptWorkspace(options(cancelledFixture, {
+      prNumber: 84,
+      branch: 'autopilot/42',
+      targetBaseOid: cancelledFixture.oid,
+      marketplacePreparation: marketplacePreparation(cancelledFixture),
+    }), defaultRunner);
+    if (
+      prepared.execution.backend !== 'marketplace'
+      || prepared.execution.state.schemaVersion !== 'marketplace-execution-v3'
+    ) {
+      throw new Error('expected a version-3 marketplace execution');
+    }
+    const cancelled = transitionMarketplaceExecution(
+      prepared.paths.manifest,
+      prepared.execution.state.requestDigest,
+      { status: 'cancelled', reason: 'operator-cancelled' },
+      () => new Date('2026-07-28T12:02:00.000Z'),
+    );
+    const cancelledBytes = readFileSync(cancelled.paths.manifest);
+    expect(() => claimMarketplaceAttemptProcess(cancelled.paths.manifest, {
+      pid: 700,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    })).toThrow(/terminal marketplace attempt/i);
+    expect(readFileSync(cancelled.paths.manifest)).toEqual(cancelledBytes);
+
+    const publishedFixture = repositoryFixture();
+    const submitted = await createSubmittedMarketplaceAttempt(publishedFixture);
+    if (
+      submitted.execution.backend !== 'marketplace'
+      || submitted.execution.state.schemaVersion !== 'marketplace-execution-v3'
+      || submitted.execution.state.status !== 'submitted'
+    ) {
+      throw new Error('expected a submitted version-3 marketplace execution');
+    }
+    const state = submitted.execution.state;
+    const delivery = {
+      observationPath: join(submitted.paths.attemptDir, 'delivery.json'),
+      observationDigest: `sha256:${'b'.repeat(64)}`,
+      taskId: state.submission.taskId,
+      taskCid: state.submission.taskCid,
+      taskCreationTransaction: state.submission.creationTx,
+      taskCreationBlock: state.submission.creationBlock,
+      solverNetManifestCid: state.submission.solverNetManifestCid,
+      attemptIndex: 0,
+      requestId: `0x${'c'.repeat(64)}`,
+      deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid',
+      deliveryEnvelopeDigest: `sha256:${'d'.repeat(64)}`,
+      deliveryTransaction: `0x${'e'.repeat(64)}`,
+      deliveryBlock: state.submission.creationBlock + 1,
+      solverSafe: `0x${'1'.repeat(40)}`,
+      solverAgentEoa: `0x${'2'.repeat(40)}`,
+      signer: `0x${'2'.repeat(40)}`,
+      publisherAgentId: '501',
+      correlation: {
+        taskId: state.submission.taskId,
+        attemptIndex: 0,
+        requestId: `0x${'c'.repeat(64)}`,
+        deliveryEnvelopeCid: 'bafybeigdyrzt5m6u2r3o4exampleenvelopecid',
+        v2AttemptId: submitted.attemptId,
+        claimOid: submitted.claimOid,
+        prNumber: submitted.prNumber!,
+        expectedHead: submitted.expectedHead,
+      },
+      observedAt: '2026-07-28T12:03:00.000Z',
+    };
+    transitionMarketplaceAdoption(
+      submitted.paths.manifest,
+      state.requestDigest,
+      { status: 'solution-observed', delivery },
+      () => new Date('2026-07-28T12:03:00.000Z'),
+    );
+    const receipt = {
+      schemaVersion: 'jinn-autopilot-marketplace-adoption.v1',
+      disposition: 'rejected',
+      role: 'solution',
+      reason: 'stale-claim',
+      detail: 'The claim is stale.',
+      ...delivery.correlation,
+      recordedAt: '2026-07-28T12:04:00.000Z',
+    } as const;
+    const published = transitionMarketplaceAdoption(
+      submitted.paths.manifest,
+      state.requestDigest,
+      {
+        status: 'receipt-published',
+        receipt: {
+          receipt,
+          commentId: 501,
+          author: 'jinn-autopilot',
+          recordedAt: receipt.recordedAt,
+        },
+      },
+      () => new Date(receipt.recordedAt),
+    );
+    const publishedBytes = readFileSync(published.paths.manifest);
+    expect(() => claimMarketplaceAttemptProcess(published.paths.manifest, {
+      pid: 700,
+      now: () => new Date('2026-07-28T12:05:00.000Z'),
+    })).toThrow(/terminal marketplace attempt/i);
+    expect(readFileSync(published.paths.manifest)).toEqual(publishedBytes);
+  });
+
+  it('refuses a marketplace attempt claim whose timestamp regresses without rewriting bytes', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createSubmittedMarketplaceAttempt(fixture);
+    claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 701,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+    const before = readFileSync(manifest.paths.manifest);
+
+    expect(() => claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      isPidAlive: () => false,
+      now: () => new Date('2026-07-28T12:02:00.000Z'),
+    })).toThrow(/predates the manifest update/i);
+    expect(readFileSync(manifest.paths.manifest)).toEqual(before);
+  });
+
+  it('claims an anchored evaluator leg and refuses its released terminal state', async () => {
+    const fixture = repositoryFixture();
+    const { manifest, identity } = await createAnchoredMarketplaceEvaluatorLeg(fixture);
+    const executionBefore = structuredClone(manifest.execution);
+
+    const claimed = claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      now: () => new Date('2026-07-28T12:04:00.000Z'),
+    });
+
+    expect(claimed).toMatchObject({
+      processState: 'running',
+      pid: 700,
+      timestamps: {
+        updatedAt: '2026-07-28T12:04:00.000Z',
+        childStartedAt: '2026-07-28T12:04:00.000Z',
+      },
+    });
+    expect(claimed.execution).toEqual(executionBefore);
+
+    transitionMarketplaceEvaluatorLeg(
+      manifest.paths.manifest,
+      identity,
+      { status: 'released', releaseReason: 'receipt-published' },
+      () => new Date('2026-07-28T12:05:00.000Z'),
+    );
+    const releasedBytes = readFileSync(manifest.paths.manifest);
+    expect(() => claimMarketplaceAttemptProcess(manifest.paths.manifest, {
+      pid: 700,
+      now: () => new Date('2026-07-28T12:06:00.000Z'),
+    })).toThrow(/terminal marketplace evaluator leg/i);
+    expect(readFileSync(manifest.paths.manifest)).toEqual(releasedBytes);
+  });
+
   it('gives two processes unique detached attempts in one Git common directory', async () => {
     const fixture = repositoryFixture();
     const [one, two] = await Promise.all([

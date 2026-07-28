@@ -917,6 +917,98 @@ function writeManifestAtomic(path: string, manifest: AttemptManifest): void {
   }
 }
 
+export interface MarketplaceAttemptProcessClaimOptions {
+  readonly pid?: number;
+  readonly isPidAlive?: (pid: number) => boolean;
+  readonly now?: () => Date;
+}
+
+function marketplaceProcessPidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function assertMarketplaceProcessClaimable(manifest: AttemptManifest): void {
+  if (manifest.execution.backend !== 'marketplace') {
+    throw new Error('Only marketplace attempts may acquire a process lease');
+  }
+  const state = manifest.execution.state;
+  if (state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) {
+    if (state.status === 'anchored') return;
+    throw new Error('Terminal marketplace evaluator leg cannot acquire a process lease');
+  }
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION) {
+    if (state.status === 'submitted') return;
+    if (state.status === 'cancelled') {
+      throw new Error('Terminal marketplace attempt cannot acquire a process lease');
+    }
+    throw new Error('Only a submitted marketplace attempt may acquire a process lease');
+  }
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) {
+    switch (state.status) {
+      case 'submitted':
+      case 'solution-observed':
+      case 'solution-verified':
+      case 'host-committed':
+      case 'lifecycle-completed':
+      case 'review-anchored':
+        return;
+      case 'cancelled':
+      case 'receipt-published':
+        throw new Error('Terminal marketplace attempt cannot acquire a process lease');
+      case 'prepared':
+        throw new Error('Only a submitted marketplace attempt may acquire a process lease');
+    }
+  }
+  throw new Error('Unsupported marketplace attempt cannot acquire a process lease');
+}
+
+export function claimMarketplaceAttemptProcess(
+  manifestPath: string,
+  options: MarketplaceAttemptProcessClaimOptions = {},
+): AttemptManifest {
+  const claimantPid = positiveInteger(
+    options.pid ?? process.pid,
+    'marketplace process PID',
+  );
+  const isPidAlive = options.isPidAlive ?? marketplaceProcessPidIsAlive;
+  const current = readAttemptManifest(manifestPath);
+  assertMarketplaceProcessClaimable(current);
+  if (current.processState === 'exited') {
+    throw new Error('Exited marketplace attempt cannot acquire a process lease');
+  }
+  if (current.processState === 'running' && current.pid === claimantPid) {
+    return current;
+  }
+  if (
+    current.processState === 'running'
+    && current.pid !== null
+    && isPidAlive(current.pid)
+  ) {
+    throw new Error('Marketplace attempt process lease is held by a live PID');
+  }
+  const timestamp = transitionTimestamp(options.now ?? (() => new Date()));
+  if (Date.parse(timestamp) < Date.parse(current.timestamps.updatedAt)) {
+    throw new Error('Marketplace process claim predates the manifest update');
+  }
+  const claimed = decodeAttemptManifest({
+    ...current,
+    processState: 'running',
+    pid: claimantPid,
+    timestamps: {
+      ...current.timestamps,
+      updatedAt: timestamp,
+      childStartedAt: timestamp,
+    },
+  });
+  writeManifestAtomic(manifestPath, claimed);
+  return claimed;
+}
+
 /** Dedicated internal boundary for strict marketplace state transitions. */
 export function replaceMarketplaceExecutionState(
   path: string,
