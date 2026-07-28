@@ -124,8 +124,33 @@ const TASK_CID_PATTERN = /^f01551220[0-9a-f]{64}$/;
 const CANONICAL_UTC_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const UINT256_MAX = (1n << 256n) - 1n;
-const ENVELOPE_CID_PATTERN =
-  /^(?:f01551220[0-9a-f]{64}|b[a-z2-7]{57}[aeimquy6])$/;
+const BASE32_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
+const RAW_SHA256_CID_PREFIX = [0x01, 0x55, 0x12, 0x20] as const;
+
+function isCanonicalRawSha256Cid(value: string): boolean {
+  if (/^f01551220[0-9a-f]{64}$/.test(value)) return true;
+  if (value.length !== 59 || !value.startsWith('b')) return false;
+
+  const bytes: number[] = [];
+  let pending = 0;
+  let pendingBits = 0;
+  for (const character of value.slice(1)) {
+    const index = BASE32_ALPHABET.indexOf(character);
+    if (index < 0) return false;
+    pending = (pending << 5) | index;
+    pendingBits += 5;
+    if (pendingBits >= 8) {
+      pendingBits -= 8;
+      bytes.push((pending >> pendingBits) & 0xff);
+      pending &= (1 << pendingBits) - 1;
+    }
+  }
+
+  return bytes.length === 36
+    && pendingBits === 2
+    && pending === 0
+    && RAW_SHA256_CID_PREFIX.every((byte, index) => bytes[index] === byte);
+}
 
 function exactKeys(
   record: Readonly<Record<string, unknown>>,
@@ -402,7 +427,10 @@ const taskId = z.string()
 const taskCid = z.string().regex(TASK_CID_PATTERN);
 const envelopeCid = z.string()
   .max(ISSUE_RELAY_MAX_ENVELOPE_CID_BYTES)
-  .regex(ENVELOPE_CID_PATTERN);
+  .refine(
+    isCanonicalRawSha256Cid,
+    'Envelope CID must be a canonical raw sha2-256 CIDv1',
+  );
 const observationReason = boundedText(
   ISSUE_RELAY_MAX_OBSERVATION_REASON_BYTES,
   'Issue Relay observation reason',

@@ -613,6 +613,41 @@ describe('Issue Relay marketplace CLI observation', () => {
     }
   });
 
+  it('accepts canonical base32 CID padding bits and rejects noncanonical padding', () => {
+    const verified = {
+      status: 'verified' as const,
+      role: 'solution' as const,
+      task: { taskId: '501', taskCid },
+      attempt: {
+        attemptIndex: 0,
+        requestId: `0x${'d'.repeat(64)}`,
+        operator: `0x${'e'.repeat(40)}`,
+      },
+      delivery: {
+        envelopeCid:
+          'bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4',
+        transactionHash: `0x${'f'.repeat(64)}`,
+        blockNumber: 120,
+      },
+      round: task.spec.relay,
+      payload: {
+        schemaVersion: 'jinn-repo-solution.v1' as const,
+        patch: 'diff --git a/a.ts b/a.ts\n',
+      },
+    };
+
+    expect(parseIssueRelayDeliveryObservation(verified))
+      .toMatchObject({ delivery: { envelopeCid: verified.delivery.envelopeCid } });
+    expect(() => parseIssueRelayDeliveryObservation({
+      ...verified,
+      delivery: {
+        ...verified.delivery,
+        envelopeCid:
+          'bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6',
+      },
+    })).toThrow();
+  });
+
   it('uses the exact read-only observation argv and accepts one strict verified envelope', async () => {
     const fixture = persistedRequest();
     const observation = {

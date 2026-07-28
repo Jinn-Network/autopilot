@@ -258,7 +258,7 @@ export function buildRelayTaskSpec(input: {
       + input.findings.map(renderFinding).join('\n>\n')
     : '';
 
-  return {
+  const task: RelayTaskSpec = {
     solverType: 'jinn-repo.v1',
     spec: {
       schemaVersion: 'jinn-repo.v1',
@@ -277,6 +277,8 @@ export function buildRelayTaskSpec(input: {
       snapshot_digest: input.snapshot.snapshotDigest,
     },
   };
+  canonicalRelaySpecBytes(task.spec);
+  return task;
 }
 
 function digest(bytes: Uint8Array): `sha256:${string}` {
@@ -289,6 +291,16 @@ function assertRelaySpecSize(bytes: string | Buffer): void {
       'Relay Task spec exceeds the 2 MiB canonical UTF-8 byte limit',
     );
   }
+}
+
+function canonicalRelaySpecBytes(spec: unknown): Buffer {
+  const json = JSON.stringify(spec, null, 2);
+  if (json === undefined) {
+    throw new Error('Relay Task spec cannot be serialized as JSON');
+  }
+  const bytes = Buffer.from(`${json}\n`);
+  assertRelaySpecSize(bytes);
+  return bytes;
 }
 
 function canonicalUtc(value: string, label: string): number {
@@ -344,8 +356,7 @@ export function buildRelayMarketplaceRequest(input: {
   ) {
     throw new Error('Relay Task spec contains inconsistent immutable bindings');
   }
-  const specBytes = `${JSON.stringify(input.task.spec, null, 2)}\n`;
-  assertRelaySpecSize(specBytes);
+  const specBytes = canonicalRelaySpecBytes(input.task.spec).toString('utf8');
   const argv = canonicalRelayArgv({
     instanceId: input.task.spec.instance_id,
     repository: input.task.spec.repo,
@@ -463,7 +474,6 @@ function parseRelayMarketplaceRequest(
   canonicalUtc(record.createdAt, 'Relay request creation time');
   canonicalUtc(record.submitBy, 'Relay request submission deadline');
   const request = record as unknown as RelayMarketplaceRequestV1;
-  assertRelaySpecSize(request.specBytes);
   if (digest(Buffer.from(request.specBytes)) !== request.specDigest) {
     throw new Error('Relay marketplace request spec digest mismatch');
   }
@@ -510,6 +520,10 @@ function parseRelayMarketplaceRequest(
     || spec.repo !== relay.targetRepository
   ) {
     throw new Error('Relay marketplace request spec has inconsistent immutable bindings');
+  }
+  const canonicalSpecBytes = canonicalRelaySpecBytes(rawSpec);
+  if (!canonicalSpecBytes.equals(Buffer.from(request.specBytes))) {
+    throw new Error('Relay marketplace request spec bytes are not canonical');
   }
   const solverNet = request.argv[7];
   if (solverNet === undefined) {
@@ -616,7 +630,7 @@ export function verifyRelayMarketplaceRequest(
   } catch {
     throw new Error('Relay Task spec contains malformed JSON');
   }
-  const canonicalSpec = Buffer.from(`${JSON.stringify(spec, null, 2)}\n`);
+  const canonicalSpec = canonicalRelaySpecBytes(spec);
   if (!canonicalSpec.equals(specBytes)) {
     throw new Error('Relay Task spec bytes are not canonical');
   }
