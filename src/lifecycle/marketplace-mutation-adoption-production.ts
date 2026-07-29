@@ -411,7 +411,7 @@ export function makeProductionMarketplaceMutationAuthorityPort(options: {
         repositoryPath: options.repositoryPath,
         worktreeBase: options.worktreeBase,
         runnerId: options.runnerId,
-        readSnapshot: () => options.readSnapshot(),
+        readSnapshot: async () => snapshot,
         runner,
         environment: ambient,
       });
@@ -564,6 +564,7 @@ export async function copyWorktreeForVerification(
   await cp(sourcePath, workspacePath, {
     recursive: true,
     force: true,
+    verbatimSymlinks: true,
     filter: (path) => !shouldExcludeWorktreeVerificationCopyPath(sourcePath, path),
   });
 }

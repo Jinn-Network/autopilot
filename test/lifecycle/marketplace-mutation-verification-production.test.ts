@@ -137,9 +137,9 @@ function confirmedCleanup(): MarketplaceVerificationSandboxCleanup {
 }
 
 describe('marketplace verification sandbox helpers', () => {
-  it('pins the Node 22 bookworm-slim manifest digest', () => {
+  it('pins a Node 22 image with the Git and Python verification toolchain', () => {
     expect(JINN_MONO_V1_VERIFICATION_NODE_IMAGE).toBe(
-      'node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3',
+      'cimg/node@sha256:dd75a8e98b54cbb37b262a9c31abc09212fd0a2bd47b2087758a5771e8167b2d',
     );
   });
 
@@ -169,6 +169,10 @@ describe('marketplace verification sandbox helpers', () => {
       YARN_ENABLE_SCRIPTS: '0',
       YARN_ENABLE_IMMUTABLE_INSTALLS: '1',
       CI: 'true',
+      GIT_AUTHOR_NAME: 'Jinn Marketplace Verifier',
+      GIT_AUTHOR_EMAIL: 'verifier@jinn.network',
+      GIT_COMMITTER_NAME: 'Jinn Marketplace Verifier',
+      GIT_COMMITTER_EMAIL: 'verifier@jinn.network',
     });
   });
 
@@ -187,6 +191,10 @@ describe('marketplace verification sandbox helpers', () => {
       NO_COLOR: '1',
       CI: 'true',
       HOME: '/workspace',
+      GIT_AUTHOR_NAME: 'Jinn Marketplace Verifier',
+      GIT_AUTHOR_EMAIL: 'verifier@jinn.network',
+      GIT_COMMITTER_NAME: 'Jinn Marketplace Verifier',
+      GIT_COMMITTER_EMAIL: 'verifier@jinn.network',
     });
   });
 
@@ -215,10 +223,10 @@ describe('marketplace verification sandbox helpers', () => {
       repositoryPath: REPO,
       workspacePath: WORKSPACE,
       command: {
-        label: 'install',
+        label: 'install:packages/autopilot',
         command: 'corepack',
         args: ['yarn', 'install', '--immutable'],
-        cwd: REPO,
+        cwd: `${REPO}/packages/autopilot`,
       },
       network: 'bridge',
       environment: sanitizeMarketplaceVerificationSandboxEnvironment({ PATH: '/usr/bin' }),
@@ -234,7 +242,7 @@ describe('marketplace verification sandbox helpers', () => {
       '--init',
       '--read-only',
       '--tmpfs',
-      '/tmp:rw,noexec,nosuid',
+      '/tmp:rw,exec,nosuid',
       '--tmpfs',
       '/run:rw,noexec,nosuid',
       '--security-opt',
@@ -250,7 +258,7 @@ describe('marketplace verification sandbox helpers', () => {
       `--mount=type=bind,source=${REPO},target=/source,readonly`,
       `--mount=type=bind,source=${WORKSPACE},target=/workspace`,
       '--workdir',
-      '/workspace',
+      '/workspace/packages/autopilot',
       JINN_MONO_V1_VERIFICATION_NODE_IMAGE,
       'corepack',
       'yarn',
@@ -265,9 +273,13 @@ describe('marketplace verification sandbox helpers', () => {
       CI: 'true',
       PATH: '/usr/bin',
       HOME: '/workspace',
+      GIT_AUTHOR_NAME: 'Jinn Marketplace Verifier',
+      GIT_AUTHOR_EMAIL: 'verifier@jinn.network',
+      GIT_COMMITTER_NAME: 'Jinn Marketplace Verifier',
+      GIT_COMMITTER_EMAIL: 'verifier@jinn.network',
     });
     expect(invocation.network).toBe('bridge');
-    expect(invocation.label).toBe('install');
+    expect(invocation.label).toBe('install:packages/autopilot');
     expect(invocation.phase).toBe('install');
   });
 
@@ -276,10 +288,10 @@ describe('marketplace verification sandbox helpers', () => {
       repositoryPath: REPO,
       workspacePath: WORKSPACE,
       command: {
-        label: 'install',
+        label: 'install:packages/autopilot',
         command: 'corepack',
         args: ['yarn', 'install', '--immutable'],
-        cwd: REPO,
+        cwd: `${REPO}/packages/autopilot`,
       },
       network: 'bridge',
       environment: {},
@@ -409,7 +421,9 @@ describe('createProductionMarketplaceVerificationPort', () => {
     await port.verify(verifyInput);
 
     expect(invocations.map((entry) => [entry.label, entry.network, entry.phase])).toEqual([
-      ['install', 'bridge', 'install'],
+      ['install:packages/sdk', 'bridge', 'install'],
+      ['install:packages/autopilot', 'bridge', 'install'],
+      ['build:packages/sdk', 'none', 'verify'],
       ['typecheck:packages/autopilot', 'none', 'verify'],
       ['test:packages/autopilot', 'none', 'verify'],
     ]);
@@ -419,7 +433,7 @@ describe('createProductionMarketplaceVerificationPort', () => {
     const port = createProductionMarketplaceVerificationPort({
       now: clock(),
       dockerRunner: async (invocation) => (
-        invocation.label === 'install'
+        invocation.label.startsWith('install:')
           ? {
             exitCode: 1,
             stdout: '',
@@ -446,7 +460,7 @@ describe('createProductionMarketplaceVerificationPort', () => {
       const port = createProductionMarketplaceVerificationPort({
         now: clock(),
         dockerRunner: async (invocation) => (
-          invocation.label === 'install'
+          invocation.label.startsWith('install:')
             ? { exitCode: 0, stdout: invocation.label, stderr: '' }
             : { exitCode, stdout: '', stderr: '' }
         ),
@@ -491,7 +505,7 @@ describe('createProductionMarketplaceVerificationPort', () => {
     const port = createProductionMarketplaceVerificationPort({
       now: clock(),
       dockerRunner: async (invocation) => (
-        invocation.label === 'install'
+        invocation.label.startsWith('install:')
           ? {
             exitCode: 1,
             stdout: '',
@@ -566,8 +580,9 @@ describe('createProductionMarketplaceVerificationPort', () => {
       .rejects.toMatchObject({
         reason: 'deadline-expired',
         disposition: 'abandoned',
-      });
-    expect(invocations.map((entry) => entry.label)).toEqual(['install']);
+    });
+    expect(invocations.map((entry) => entry.label))
+      .toEqual(['install:packages/sdk']);
   });
 
   it('escalates SIGTERM ambiguity to SIGKILL before failing closed', async () => {
@@ -652,7 +667,7 @@ describe('createProductionMarketplaceVerificationPort', () => {
         now: () => new Date(Date.parse('2020-01-01T00:00:00.000Z')),
         dockerRunner: async (invocation) => {
           invocations.push(invocation);
-          if (invocation.label === 'install') {
+          if (invocation.label.startsWith('install:')) {
             await installBlocked;
           }
           return { exitCode: 0, stdout: invocation.label, stderr: '' };
@@ -703,12 +718,15 @@ describe('createProductionMarketplaceVerificationPort', () => {
     const evidence = await port.verify(verifyInput);
 
     expect(evidence.commands.map((entry) => entry.label)).toEqual([
-      'install',
+      'install:packages/sdk',
+      'install:packages/autopilot',
+      'build:packages/sdk',
       'typecheck:packages/autopilot',
       'test:packages/autopilot',
     ]);
     expect(evidence.commands.every((entry) => entry.exitCode === 0 && entry.status === 'passed'))
       .toBe(true);
-    expect(evidence.commands[0]?.stdoutDigest).toBe(digestOf('install'));
+    expect(evidence.commands[0]?.stdoutDigest)
+      .toBe(digestOf('install:packages/sdk'));
   });
 });

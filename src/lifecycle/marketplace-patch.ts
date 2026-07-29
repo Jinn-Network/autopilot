@@ -671,6 +671,10 @@ export interface MarketplacePatchApplicationPorts {
 
 const MARKETPLACE_PATCH_GIT_TIMEOUT_MS = 30_000;
 const MARKETPLACE_PATCH_GIT_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+// A repository-wide index listing is materially larger than ordinary Git
+// diagnostics. Keep it bounded, but size the bound for large supported
+// repositories (Jinn-Network/mono currently exceeds 1 MiB here).
+const MARKETPLACE_PATCH_GIT_INDEX_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
 
 export const runMarketplacePatchGit: MarketplacePatchGitRunner = (
   args,
@@ -839,7 +843,7 @@ async function proveIndexAndFilesystem(
       {
         cwd: worktreePath,
         timeoutMs: MARKETPLACE_PATCH_GIT_TIMEOUT_MS,
-        outputLimitBytes: MARKETPLACE_PATCH_GIT_OUTPUT_LIMIT_BYTES,
+        outputLimitBytes: MARKETPLACE_PATCH_GIT_INDEX_OUTPUT_LIMIT_BYTES,
       },
     );
   } catch (error) {

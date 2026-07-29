@@ -2,6 +2,8 @@ import {
   mkdtempSync,
   mkdirSync,
   rmSync,
+  readlinkSync,
+  symlinkSync,
   writeFileSync,
   existsSync,
 } from 'node:fs';
@@ -729,6 +731,22 @@ describe('production worktree verification copy filter', () => {
     expect(existsSync(join(workspace, '.github', 'workflows', 'ci.yml'))).toBe(true);
     expect(existsSync(join(workspace, '.git', 'HEAD'))).toBe(false);
   });
+
+  it('preserves relative skill symlinks for repository tests', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'jinn-adoption-copy-symlink-'));
+    const source = join(root, 'source');
+    const workspace = join(root, 'workspace');
+    directories.push(root);
+    mkdirSync(join(source, '.claude', 'skills', 'runtime'), { recursive: true });
+    mkdirSync(join(source, '.codex', 'skills'), { recursive: true });
+    writeFileSync(join(source, '.claude', 'skills', 'runtime', 'SKILL.md'), '# runtime\n');
+    symlinkSync('../../.claude/skills/runtime', join(source, '.codex', 'skills', 'runtime'));
+
+    await copyWorktreeForVerification(source, workspace);
+
+    expect(readlinkSync(join(workspace, '.codex', 'skills', 'runtime')))
+      .toBe('../../.claude/skills/runtime');
+  });
 });
 
 describe('production default docker verification sandbox', () => {
@@ -754,9 +772,9 @@ describe('production default docker verification sandbox', () => {
   it('fails closed when the production docker runner returns a non-zero exit code', async () => {
     const port = createProductionMarketplaceVerificationPort({
       dockerRunner: async (invocation) => ({
-        exitCode: invocation.label === 'install' ? 0 : 1,
+        exitCode: invocation.label.startsWith('install:') ? 0 : 1,
         stdout: invocation.label,
-        stderr: invocation.label === 'install' ? '' : 'type error',
+        stderr: invocation.label.startsWith('install:') ? '' : 'type error',
       }),
       dockerInspector: {
         inspectDaemon: async () => true,
@@ -814,7 +832,9 @@ describe('production default docker verification sandbox', () => {
       touchedPaths: ['packages/autopilot/src/engine.ts'],
     });
     expect(plan.commands.map((entry) => entry.label)).toEqual([
-      'install',
+      'install:packages/sdk',
+      'install:packages/autopilot',
+      'build:packages/sdk',
       'typecheck:packages/autopilot',
       'test:packages/autopilot',
     ]);
@@ -823,6 +843,30 @@ describe('production default docker verification sandbox', () => {
 });
 
 describe('production marketplace authority surfaces', () => {
+  it('reuses one authoritative snapshot for mapping and review-candidate facts', async () => {
+    const { manifest, manifestPath } = fixture();
+    const runner = authorityRunner(manifest);
+    const readSnapshot = vi.fn(
+      async () => snapshotForMapping({ status: 'resolved' }) as never,
+    );
+    const port = makeProductionMarketplaceMutationAuthorityPort({
+      originManifestPath: manifestPath,
+      repositoryPath: manifest.repository.root,
+      worktreeBase: '/tmp/worktrees',
+      runnerId: manifest.runnerId,
+      readSnapshot,
+      runner,
+      environment: { PATH: '/usr/bin' },
+    });
+
+    await port.readExactAuthority({
+      manifestPath,
+      touchedPaths: [],
+    });
+
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
+  });
+
   it('returns live open PR head, branch, base, and claim facts', async () => {
     const { manifest, manifestPath } = fixture();
     const runner = authorityRunner(manifest);

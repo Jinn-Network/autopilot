@@ -120,7 +120,12 @@ const JINN_MONO_V1_WORKSPACES = [
   },
   // `contracts` declares `compile` and no `typecheck`, and no `build`.
   { path: 'contracts', dependsOn: [], typeCheckScript: 'compile', buildScript: null },
-  { path: 'packages/autopilot', dependsOn: [], typeCheckScript: 'typecheck', buildScript: null },
+  {
+    path: 'packages/autopilot',
+    dependsOn: ['packages/sdk'],
+    typeCheckScript: 'typecheck',
+    buildScript: null,
+  },
   {
     path: 'packages/core',
     dependsOn: ['packages/plugin'],
@@ -322,12 +327,12 @@ export function buildJinnMonoV1VerificationPlan(input: {
     workspaces,
     atRiskWorkspaces,
     commands: [
-      {
-        label: 'install',
+      ...workspaces.map((workspace) => ({
+        label: `install:${workspace}`,
         command: 'corepack',
         args: ['yarn', 'install', '--immutable'],
-        cwd: input.repositoryPath,
-      },
+        cwd: workspaceCwd(workspace),
+      })),
       ...workspaces
         .filter((workspace) => entryOf(workspace).buildScript !== null)
         .map((workspace) => ({
@@ -361,7 +366,16 @@ export function marketplaceVerificationCommandCwdRelative(
   plan: MarketplaceVerificationPlan,
   command: MarketplaceVerificationCommand,
 ): string {
-  const root = plan.commands[0]?.cwd ?? command.cwd;
+  const firstInstall = plan.commands.find((entry) => entry.label.startsWith('install:'));
+  const installedWorkspace = firstInstall?.label.slice('install:'.length);
+  const workspaceSuffix = installedWorkspace === undefined
+    ? undefined
+    : `/${installedWorkspace}`;
+  const root = firstInstall !== undefined
+    && workspaceSuffix !== undefined
+    && firstInstall.cwd.endsWith(workspaceSuffix)
+    ? firstInstall.cwd.slice(0, -workspaceSuffix.length)
+    : (plan.commands[0]?.cwd ?? command.cwd);
   const relative = posix.relative(root, command.cwd);
   return relative === '' ? '.' : relative;
 }
@@ -464,7 +478,7 @@ export function createSequentialMarketplaceVerificationPort(options: {
           );
         }
         if (result.exitCode !== 0) {
-          const isInstall = command.label === 'install';
+          const isInstall = command.label.startsWith('install:');
           throw new MarketplaceVerificationError(
             'command-failed',
             isInstall ? 'recoverable' : 'stable-rejection',

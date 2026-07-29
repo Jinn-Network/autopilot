@@ -911,7 +911,7 @@ describe('marketplace patch worktree application', () => {
     );
 
     expect(limits).toEqual([
-      { timeoutMs: 30_000, outputLimitBytes: 1024 * 1024 },
+      { timeoutMs: 30_000, outputLimitBytes: 8 * 1024 * 1024 },
       { timeoutMs: 30_000, outputLimitBytes: 1024 * 1024 },
       { timeoutMs: 30_000, outputLimitBytes: 1024 * 1024 },
     ]);

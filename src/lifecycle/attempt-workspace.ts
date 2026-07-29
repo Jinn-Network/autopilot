@@ -663,7 +663,14 @@ function requireMarketplaceManifestAuthority(
     progress.delivery.correlation.v2AttemptId !== authority.attemptId
     || progress.delivery.correlation.prNumber !== authority.prNumber
     || progress.delivery.correlation.claimOid !== authority.claimOid
-    || progress.delivery.correlation.expectedHead !== authority.expectedHead
+    // Delivery correlation binds the immutable head submitted to the
+    // marketplace. The outer manifest expectedHead remains equal to it until
+    // adoption creates a host commit, after which the dedicated publication
+    // CAS may advance expectedHead through checkpoint and completion heads.
+    || (
+      progress.delivery.correlation.expectedHead !== authority.expectedHead
+      && !('hostCommit' in progress)
+    )
   ) {
     throw new Error('Marketplace execution contradicts manifest authority');
   }
@@ -1073,6 +1080,43 @@ export function replaceMarketplaceExecutionState(
     });
     if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
     return next;
+  });
+}
+
+/** Dedicated internal boundary for a marketplace branch-head publication. */
+export function advanceMarketplaceExecutionExpectedHead(
+  path: string,
+  expectedState: MarketplaceExecutionState,
+  expectedHead: string,
+  nextHead: string,
+  updatedAt: string,
+): AttemptManifest {
+  return withMarketplaceStateTransitionLock(path, () => {
+    const current = readAttemptManifest(path);
+    if (current.execution.backend !== 'marketplace') {
+      throw new Error('Only marketplace attempts may advance marketplace expected head');
+    }
+    if (!isDeepStrictEqual(current.execution.state, expectedState)) {
+      throw new Error('Marketplace execution state changed before expected-head advance');
+    }
+    const expected = gitOid(expectedHead);
+    const next = gitOid(nextHead);
+    if (current.expectedHead !== expected) {
+      throw new Error('Marketplace attempt expected head changed before progressive update');
+    }
+    if (Date.parse(updatedAt) < Date.parse(current.timestamps.updatedAt)) {
+      throw new Error('Marketplace expected-head advance predates manifest updated timestamp');
+    }
+    const advanced = decodeAttemptManifest({
+      ...current,
+      expectedHead: next,
+      timestamps: {
+        ...current.timestamps,
+        updatedAt,
+      },
+    });
+    writeManifestAtomic(path, advanced);
+    return advanced;
   });
 }
 

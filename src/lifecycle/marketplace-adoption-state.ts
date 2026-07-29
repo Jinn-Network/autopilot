@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import {
+  advanceMarketplaceExecutionExpectedHead,
   MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
   readAttemptManifest,
   replaceMarketplaceExecutionState,
@@ -190,6 +191,35 @@ export function upgradeMarketplaceExecutionV2(
     throw new Error('Marketplace upgrade timestamp predates manifest updated timestamp');
   }
   return replaceMarketplaceExecutionState(manifestPath, state, upgraded, at);
+}
+
+export function advanceMarketplaceAdoptionExpectedHead(
+  manifestPath: string,
+  expectedRequestDigest: string,
+  expectedHead: string,
+  nextHead: string,
+  now: () => Date = () => new Date(),
+): AttemptManifest {
+  const expected = digest(expectedRequestDigest);
+  const manifest = readAttemptManifest(manifestPath);
+  if (manifest.execution.backend !== 'marketplace') {
+    throw new Error('Only marketplace attempts may advance adoption expected head');
+  }
+  const state = manifest.execution.state;
+  if (
+    state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    || state.requestDigest !== expected
+    || state.status !== 'host-committed'
+  ) {
+    throw new Error('Only a host-committed marketplace adoption may advance expected head');
+  }
+  return advanceMarketplaceExecutionExpectedHead(
+    manifestPath,
+    state,
+    expectedHead,
+    nextHead,
+    timestamp(now),
+  );
 }
 
 export function transitionMarketplaceAdoption(

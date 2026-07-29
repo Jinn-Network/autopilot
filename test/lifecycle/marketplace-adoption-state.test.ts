@@ -18,6 +18,7 @@ import {
   type AttemptManifest,
 } from '../../src/lifecycle/attempt-workspace.js';
 import {
+  advanceMarketplaceAdoptionExpectedHead,
   installMarketplaceEvaluatorLeg,
   transitionMarketplaceAdoption,
   transitionMarketplaceEvaluatorLeg,
@@ -731,6 +732,59 @@ describe('marketplace adoption transition API', () => {
       () => new Date('2026-07-27T12:09:00.000Z'),
     )).toEqual(published);
     expect(readFileSync(path)).toEqual(publishedBytes);
+  });
+
+  it('advances a host-committed adoption head through the dedicated manifest CAS', () => {
+    const { path, attemptDir } = fixture('submitted');
+    const nextHead = gitOid('c'.repeat(40));
+    transitionMarketplaceAdoption(
+      path,
+      DIGEST,
+      { status: 'solution-observed', delivery: delivery(attemptDir) },
+      () => new Date('2026-07-27T12:03:00.000Z'),
+    );
+    transitionMarketplaceAdoption(
+      path,
+      DIGEST,
+      {
+        status: 'solution-verified',
+        artifact: ARTIFACT,
+        verification: VERIFICATION,
+      },
+      () => new Date('2026-07-27T12:04:00.000Z'),
+    );
+    transitionMarketplaceAdoption(
+      path,
+      DIGEST,
+      {
+        status: 'host-committed',
+        hostCommit: { ...HOST_COMMIT, head: nextHead },
+      },
+      () => new Date('2026-07-27T12:05:00.000Z'),
+    );
+
+    const advanced = advanceMarketplaceAdoptionExpectedHead(
+      path,
+      DIGEST,
+      OID,
+      nextHead,
+      () => new Date('2026-07-27T12:06:00.000Z'),
+    );
+
+    expect(advanced.expectedHead).toBe(nextHead);
+    expect(advanced.execution).toMatchObject({
+      backend: 'marketplace',
+      state: {
+        status: 'host-committed',
+        hostCommit: { head: nextHead },
+      },
+    });
+    expect(() => advanceMarketplaceAdoptionExpectedHead(
+      path,
+      DIGEST,
+      OID,
+      gitOid('d'.repeat(40)),
+    )).toThrow(/expected head changed/i);
   });
 
   // This catches a receipt transition that incorrectly requires success-only review evidence.

@@ -26,7 +26,7 @@ import {
 const execFileAsync = promisify(execFile);
 
 export const JINN_MONO_V1_VERIFICATION_NODE_IMAGE =
-  'node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3';
+  'cimg/node@sha256:dd75a8e98b54cbb37b262a9c31abc09212fd0a2bd47b2087758a5771e8167b2d';
 
 export const MARKETPLACE_VERIFICATION_SANDBOX_LIMITS = {
   cpus: '2',
@@ -129,6 +129,10 @@ export function sanitizeMarketplaceVerificationSandboxEnvironment(
   environment.NO_COLOR = '1';
   environment.CI = 'true';
   environment.HOME = '/workspace';
+  environment.GIT_AUTHOR_NAME = 'Jinn Marketplace Verifier';
+  environment.GIT_AUTHOR_EMAIL = 'verifier@jinn.network';
+  environment.GIT_COMMITTER_NAME = 'Jinn Marketplace Verifier';
+  environment.GIT_COMMITTER_EMAIL = 'verifier@jinn.network';
   return environment;
 }
 
@@ -167,14 +171,14 @@ export function buildMarketplaceVerificationDockerInvocation(input: {
   readonly environment: Readonly<Record<string, string>>;
 }): MarketplaceVerificationDockerInvocation {
   const phase: MarketplaceVerificationDockerPhase =
-    input.command.label === 'install' ? 'install' : 'verify';
+    input.command.label.startsWith('install:') ? 'install' : 'verify';
   const argv = [
     'run',
     '--rm',
     '--init',
     '--read-only',
     '--tmpfs',
-    '/tmp:rw,noexec,nosuid',
+    '/tmp:rw,exec,nosuid',
     '--tmpfs',
     '/run:rw,noexec,nosuid',
     '--security-opt',
@@ -211,7 +215,7 @@ export function buildMarketplaceVerificationDockerInvocation(input: {
 
 function networkForCommand(command: MarketplaceVerificationCommand):
 MarketplaceVerificationDockerNetwork {
-  return command.label === 'install' ? 'bridge' : 'none';
+  return command.label.startsWith('install:') ? 'bridge' : 'none';
 }
 
 function classifyInstallFailure(stdout: string, stderr: string): 'stable-rejection' | 'recoverable' {
@@ -529,7 +533,7 @@ export function createProductionMarketplaceVerificationPort(
             );
           }
           if (result.exitCode !== 0) {
-            const disposition = command.label === 'install'
+            const disposition = command.label.startsWith('install:')
               ? classifyInstallFailure(rawStdout, rawStderr)
               : classifyNonInstallFailure(result.exitCode);
             throw new MarketplaceVerificationError(

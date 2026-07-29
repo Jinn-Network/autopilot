@@ -137,14 +137,26 @@ describe('buildJinnMonoV1VerificationPlan', () => {
 
     expect(plan).toEqual({
       profile: 'jinn-mono.v1',
-      workspaces: ['packages/autopilot'],
+      workspaces: ['packages/sdk', 'packages/autopilot'],
       atRiskWorkspaces: ['packages/autopilot'],
       commands: [
         {
-          label: 'install',
+          label: 'install:packages/sdk',
           command: 'corepack',
           args: ['yarn', 'install', '--immutable'],
-          cwd: REPO,
+          cwd: `${REPO}/packages/sdk`,
+        },
+        {
+          label: 'install:packages/autopilot',
+          command: 'corepack',
+          args: ['yarn', 'install', '--immutable'],
+          cwd: `${REPO}/packages/autopilot`,
+        },
+        {
+          label: 'build:packages/sdk',
+          command: 'corepack',
+          args: ['yarn', 'build'],
+          cwd: `${REPO}/packages/sdk`,
         },
         {
           label: 'typecheck:packages/autopilot',
@@ -174,7 +186,7 @@ describe('buildJinnMonoV1VerificationPlan', () => {
 
     expect(plan.workspaces).toEqual(['contracts']);
     expect(plan.commands.map((entry) => [entry.label, ...entry.args])).toEqual([
-      ['install', 'yarn', 'install', '--immutable'],
+      ['install:contracts', 'yarn', 'install', '--immutable'],
       ['typecheck:contracts', 'yarn', 'compile'],
       ['test:contracts', 'yarn', 'test'],
     ]);
@@ -281,7 +293,7 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
     ['apps/broadcast-bot/src/index.ts', ['apps/broadcast-bot']],
     ['client/src/app.ts', CORE_CLOSURE],
     ['contracts/src/Jinn.sol', ['contracts']],
-    ['packages/autopilot/src/engine.ts', ['packages/autopilot']],
+    ['packages/autopilot/src/engine.ts', ['packages/sdk', 'packages/autopilot']],
     ['packages/core/src/index.ts', CORE_CLOSURE],
     ['packages/indexer/src/index.ts', INDEXER_CLOSURE],
     ['packages/indexer-enrichment/src/index.ts', INDEXER_CLOSURE],
@@ -289,7 +301,7 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
     ['packages/plugin/src/index.ts', CORE_CLOSURE],
     ['packages/sdk/src/index.ts', [
       'packages/plugin', 'packages/core', 'packages/layer', 'packages/sdk', 'client',
-      'packages/indexer', 'packages/indexer-enrichment',
+      'packages/autopilot', 'packages/indexer', 'packages/indexer-enrichment',
     ]],
   ])('closes %s over dependents then dependencies', (path, expected) => {
     expect(buildJinnMonoV1VerificationPlan({
@@ -397,7 +409,11 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
 
     expect(plan.atRiskWorkspaces).toEqual(['client']);
     expect(plan.commands.map((entry) => entry.label)).toEqual([
-      'install',
+      'install:packages/plugin',
+      'install:packages/core',
+      'install:packages/layer',
+      'install:packages/sdk',
+      'install:client',
       'build:packages/plugin',
       'build:packages/core',
       'build:packages/layer',
@@ -417,7 +433,9 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
     expect(plan.atRiskWorkspaces)
       .toEqual(['packages/indexer', 'packages/indexer-enrichment']);
     expect(plan.commands.map((entry) => entry.label)).toEqual([
-      'install',
+      'install:packages/sdk',
+      'install:packages/indexer',
+      'install:packages/indexer-enrichment',
       'build:packages/sdk',
       'build:packages/indexer',
       'build:packages/indexer-enrichment',
@@ -432,12 +450,15 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
   // workspace has one turns a contracts delivery into a missing-script exit —
   // read by the caller as the solver's fault.
   it('omits a build command for a workspace that declares none', () => {
-    for (const path of ['contracts/src/Jinn.sol', 'packages/autopilot/src/engine.ts']) {
+    for (const [path, omittedBuild] of [
+      ['contracts/src/Jinn.sol', 'build:contracts'],
+      ['packages/autopilot/src/engine.ts', 'build:packages/autopilot'],
+    ] as const) {
       const labels = buildJinnMonoV1VerificationPlan({
         repositoryPath: REPO,
         touchedPaths: [path],
       }).commands.map((entry) => entry.label);
-      expect(labels.some((label) => label.startsWith('build:'))).toBe(false);
+      expect(labels).not.toContain(omittedBuild);
     }
   });
 
@@ -482,6 +503,7 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
       ['packages/plugin', 'client'],
       ['packages/layer', 'client'],
       ['packages/sdk', 'client'],
+      ['packages/sdk', 'packages/autopilot'],
       ['packages/sdk', 'packages/indexer'],
       ['packages/indexer', 'packages/indexer-enrichment'],
     ];
@@ -491,7 +513,7 @@ describe('buildJinnMonoV1VerificationPlan dependency closure', () => {
         expect(position.get(dependency)!).toBeLessThan(position.get(dependent)!);
       }
     }
-    expect(plan.workspaces.length).toBe(7);
+    expect(plan.workspaces.length).toBe(8);
   });
 });
 
@@ -662,7 +684,9 @@ describe('createSequentialMarketplaceVerificationPort', () => {
       }),
     ));
     expect(evidence.commands.map((entry) => [entry.label, entry.cwdRelative])).toEqual([
-      ['install', '.'],
+      ['install:packages/sdk', 'packages/sdk'],
+      ['install:packages/autopilot', 'packages/autopilot'],
+      ['build:packages/sdk', 'packages/sdk'],
       ['typecheck:packages/autopilot', 'packages/autopilot'],
       ['test:packages/autopilot', 'packages/autopilot'],
     ]);
@@ -700,7 +724,12 @@ describe('createSequentialMarketplaceVerificationPort', () => {
       reason: 'command-failed',
       disposition: 'stable-rejection',
     });
-    expect(attempted).toEqual(['install', 'typecheck:packages/autopilot']);
+    expect(attempted).toEqual([
+      'install:packages/sdk',
+      'install:packages/autopilot',
+      'build:packages/sdk',
+      'typecheck:packages/autopilot',
+    ]);
   });
 
   // Install is the only network-enabled command. A registry outage exits
@@ -710,7 +739,7 @@ describe('createSequentialMarketplaceVerificationPort', () => {
     const port = createSequentialMarketplaceVerificationPort({
       now: clock(),
       run: async ({ command }) => (
-        command.label === 'install'
+        command.label.startsWith('install:')
           ? { exitCode: 1, stdoutDigest: digestOf('a'), stderrDigest: digestOf('b') }
           : { exitCode: 0, stdoutDigest: digestOf('c'), stderrDigest: digestOf('d') }
       ),
@@ -783,7 +812,7 @@ describe('createSequentialMarketplaceVerificationPort', () => {
         reason: 'deadline-expired',
         disposition: 'abandoned',
       });
-    expect(attempted).toEqual(['install']);
+    expect(attempted).toEqual(['install:packages/sdk']);
   });
 
   // A dead daemon is not a verdict on the patch. Letting the raw error escape
