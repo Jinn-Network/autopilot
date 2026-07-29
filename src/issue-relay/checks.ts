@@ -7,7 +7,7 @@ import {
 } from './contracts.js';
 import type { AcceptedRelayAdoption } from './adoption.js';
 import {
-  parseRelayAdoptionReceiptBlock,
+  findRelayAdoptionReceiptBlock,
   type RelayPullRequest,
   type RelayRepositoryAuthority,
 } from './git-publisher.js';
@@ -429,33 +429,59 @@ export function formatRelayEvaluationAnchorBlock(
 export function parseRelayEvaluationAnchorBlock(
   body: string,
 ): IssueRelayEvaluationAnchorV1 | null {
-  const first = body.indexOf(EVALUATION_ANCHOR_MARKER);
-  if (first === -1) return null;
-  if (
-    body.indexOf(
-      EVALUATION_ANCHOR_MARKER,
-      first + EVALUATION_ANCHOR_MARKER.length,
-    ) !== -1
-  ) {
+  const anchors = parseRelayEvaluationAnchorBlocks(body);
+  if (anchors.length === 0) return null;
+  if (anchors.length !== 1) {
     throw new Error('Relay assurance comment contains multiple evaluation anchors');
   }
-  const match =
-    /^<!-- jinn-issue-relay:evaluation-anchor:v1 -->\n\n```json\n([^\r\n]+)\n```(?:\n|$)/
-      .exec(body.slice(first));
-  if (match?.[1] === undefined) {
-    throw new Error('Relay evaluation anchor marker is malformed');
-  }
-  try {
-    const parsed = IssueRelayEvaluationAnchorV1Schema.parse(
-      JSON.parse(match[1]) as unknown,
-    ) as IssueRelayEvaluationAnchorV1;
-    if (JSON.stringify(parsed) !== match[1]) {
-      throw new Error('noncanonical anchor JSON');
+  return anchors[0]!;
+}
+
+export function parseRelayEvaluationAnchorBlocks(
+  body: string,
+): readonly IssueRelayEvaluationAnchorV1[] {
+  const anchors: IssueRelayEvaluationAnchorV1[] = [];
+  const correlations = new Set<string>();
+  let cursor = 0;
+  while (true) {
+    const marker = body.indexOf(EVALUATION_ANCHOR_MARKER, cursor);
+    if (marker === -1) return anchors;
+    const match =
+      /^<!-- jinn-issue-relay:evaluation-anchor:v1 -->\n\n```json\n([^\r\n]+)\n```(?:\n|$)/
+        .exec(body.slice(marker));
+    if (match?.[1] === undefined) {
+      throw new Error('Relay evaluation anchor marker is malformed');
     }
-    return parsed;
-  } catch (error) {
-    throw new Error('Relay evaluation anchor is not canonical', { cause: error });
+    try {
+      const parsed = IssueRelayEvaluationAnchorV1Schema.parse(
+        JSON.parse(match[1]) as unknown,
+      ) as IssueRelayEvaluationAnchorV1;
+      if (JSON.stringify(parsed) !== match[1]) {
+        throw new Error('noncanonical anchor JSON');
+      }
+      const key = JSON.stringify(parsed.correlation);
+      if (correlations.has(key)) {
+        throw new Error(
+          'Relay assurance comment duplicates an evaluation anchor correlation',
+        );
+      }
+      correlations.add(key);
+      anchors.push(parsed);
+    } catch (error) {
+      throw new Error('Relay evaluation anchor is not canonical', {
+        cause: error,
+      });
+    }
+    cursor = marker + match[0].length;
   }
+}
+
+export function findRelayEvaluationAnchorBlock(
+  body: string,
+  correlation: IssueRelayEvaluationAnchorV1['correlation'],
+): IssueRelayEvaluationAnchorV1 | null {
+  return parseRelayEvaluationAnchorBlocks(body).find((anchor) =>
+    isDeepStrictEqual(anchor.correlation, correlation)) ?? null;
 }
 
 export interface RelayEvaluationAnchorComment {
@@ -540,7 +566,7 @@ export function createRelayEvaluationAnchorPublisher(options: {
       }
       const receipt = IssueRelayAdoptionReceiptV1Schema.parse(
         input.adoption.receipt,
-      );
+      ) as AcceptedRelayAdoption['receipt'];
       if (
         receipt.disposition !== 'accepted'
         || input.adoption.status !== 'accepted'
@@ -584,12 +610,15 @@ export function createRelayEvaluationAnchorPublisher(options: {
       }
       const comment = owned[0];
       if (!isDeepStrictEqual(
-        parseRelayAdoptionReceiptBlock(comment.body),
+        findRelayAdoptionReceiptBlock(comment.body, receipt.correlation),
         receipt,
       )) {
         throw new Error('Relay assurance marker adoption receipt is contradictory');
       }
-      const existing = parseRelayEvaluationAnchorBlock(comment.body);
+      const existing = findRelayEvaluationAnchorBlock(
+        comment.body,
+        receipt.correlation,
+      );
       if (existing !== null) {
         if (!anchorBindings(existing, input)) {
           throw new Error('Relay assurance marker evaluation anchor is contradictory');
@@ -643,7 +672,10 @@ export function createRelayEvaluationAnchorPublisher(options: {
       ) {
         throw new Error('Relay evaluation anchor did not read back exactly');
       }
-      const parsed = parseRelayEvaluationAnchorBlock(readback[0].body);
+      const parsed = findRelayEvaluationAnchorBlock(
+        readback[0].body,
+        receipt.correlation,
+      );
       if (parsed === null || !isDeepStrictEqual(parsed, anchor)) {
         throw new Error('Relay evaluation anchor did not parse after publication');
       }

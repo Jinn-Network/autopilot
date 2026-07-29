@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   formatRelayEvaluationAnchorBlock,
   parseRelayEvaluationAnchorBlock,
+  parseRelayEvaluationAnchorBlocks,
   type RelayCheckSummary,
 } from './checks.js';
 import type { AcceptedRelayAdoption } from './adoption.js';
@@ -9,6 +10,7 @@ import type { IssueRelayEvaluationAnchorV1 } from './contracts.js';
 import {
   formatRelayAdoptionReceiptBlock,
   parseRelayAdoptionReceiptBlock,
+  parseRelayAdoptionReceiptBlocks,
 } from './git-publisher.js';
 import type { VerifiedIssueRelayVerdictObservation } from './marketplace-cli.js';
 import {
@@ -832,6 +834,7 @@ export function renderRelayAssuranceComment(
     '',
     `## Assurance for exact revision ${headLabel}`,
     '',
+    ...(ready === undefined ? [] : ['- Readiness: ready for human review.']),
     `- Recorded verdict: ${ready === undefined ? lastVerdict(model) : 'passed'} at ${headLabel}.`,
     `- Solution operator: ${solution}.`,
     `- Separate evaluator: ${evaluator}.`,
@@ -868,16 +871,12 @@ export function renderRelayAssuranceComment(
 }
 
 function preserveTechnicalBlocks(body: string): readonly string[] {
-  const blocks: string[] = [];
-  const receipt = parseRelayAdoptionReceiptBlock(body);
-  if (receipt !== null) {
-    blocks.push(formatRelayAdoptionReceiptBlock(receipt));
-  }
-  const anchor = parseRelayEvaluationAnchorBlock(body);
-  if (anchor !== null) {
-    blocks.push(formatRelayEvaluationAnchorBlock(anchor));
-  }
-  return blocks;
+  return [
+    ...parseRelayAdoptionReceiptBlocks(body)
+      .map(formatRelayAdoptionReceiptBlock),
+    ...parseRelayEvaluationAnchorBlocks(body)
+      .map(formatRelayEvaluationAnchorBlock),
+  ];
 }
 
 function composeAssurance(
@@ -886,7 +885,9 @@ function composeAssurance(
 ): string {
   if (model.status === 'READY FOR HUMAN REVIEW') {
     const ready = validateReadyAssurance(model);
-    if (!isDeepStrictEqual(technicalBlocks, ready.technicalBlocks)) {
+    if (ready.technicalBlocks.some((expected) =>
+      technicalBlocks.filter((block) => block === expected).length !== 1
+    )) {
       throw new Error(
         'Ready assurance requires its exact preserved receipt and anchor blocks',
       );

@@ -82,14 +82,14 @@ import {
 import {
   createRelayGitPublisher,
   formatRelayAdoptionReceiptBlock,
-  parseRelayAdoptionReceiptBlock,
+  parseRelayAdoptionReceiptBlocks,
   type RelayGitCommand,
   type RelayGitCommandResult,
   type RelayGitCommandRunner,
 } from './git-publisher.js';
 import {
   formatRelayEvaluationAnchorBlock,
-  parseRelayEvaluationAnchorBlock,
+  findRelayEvaluationAnchorBlock,
 } from './checks.js';
 import { relayAdoptionReceiptDigest } from './checks.js';
 import {
@@ -1159,7 +1159,16 @@ export function createIssueRelayProductionReconciliation(options: {
     if (owned.length !== 1 || owned[0] === undefined) {
       throw new Error('Relay does not own exactly one assurance comment');
     }
-    const receipt = parseRelayAdoptionReceiptBlock(owned[0].body);
+    const receipt = round.task === undefined || round.solution === undefined
+      ? null
+      : parseRelayAdoptionReceiptBlocks(owned[0].body).find((candidate) =>
+        candidate.correlation.generation === record.generation
+        && candidate.correlation.round === round.round
+        && candidate.correlation.snapshotDigest
+          === record.snapshot.snapshotDigest
+        && candidate.correlation.taskId === round.task!.taskId
+        && candidate.correlation.deliveryEnvelopeCid
+          === round.solution!.envelopeCid) ?? null;
     if (
       receipt === null
       || receipt.disposition !== 'accepted'
@@ -1179,7 +1188,10 @@ export function createIssueRelayProductionReconciliation(options: {
       throw new Error('Relay assurance receipt contradicts the durable generation');
     }
     const receiptBlock = formatRelayAdoptionReceiptBlock(receipt);
-    const anchor = parseRelayEvaluationAnchorBlock(owned[0].body) ?? undefined;
+    const anchor = findRelayEvaluationAnchorBlock(
+      owned[0].body,
+      receipt.correlation,
+    ) ?? undefined;
     const anchorBlock = anchor === undefined
       ? undefined
       : formatRelayEvaluationAnchorBlock(anchor);
@@ -1213,6 +1225,21 @@ export function createIssueRelayProductionReconciliation(options: {
         : { expectedChecksDigest }),
     })).checks;
   };
+
+  const reportPublisher = createRelayReportPublisher({
+    port: {
+      listIssueComments: async ({ issueNumber }) =>
+        options.githubAuthority.listIssueComments(issueNumber),
+      editIssueComment: async (input) => {
+        await options.githubAuthority.editIssueCommentExact(input);
+      },
+      listAssuranceComments: async ({ prNumber }) =>
+        options.githubAuthority.listAssuranceComments(prNumber),
+      editAssuranceComment: async (input) => {
+        await options.githubAuthority.editAssuranceCommentExact(input);
+      },
+    },
+  });
 
   const publicationAuthority = async (
     record: RelayGenerationRecordV1,
@@ -2117,21 +2144,7 @@ export function createIssueRelayProductionReconciliation(options: {
             pr: { ...record.pr, draft: false },
             updatedAt: timestamp,
           };
-          const report = createRelayReportPublisher({
-            port: {
-              listIssueComments: async ({ issueNumber }) =>
-                options.githubAuthority.listIssueComments(issueNumber),
-              editIssueComment: async (input) => {
-                await options.githubAuthority.editIssueCommentExact(input);
-              },
-              listAssuranceComments: async ({ prNumber }) =>
-                options.githubAuthority.listAssuranceComments(prNumber),
-              editAssuranceComment: async (input) => {
-                await options.githubAuthority.editAssuranceCommentExact(input);
-              },
-            },
-          });
-          await report.publishAssurance({
+          await reportPublisher.publishAssurance({
             repository: proposed.snapshot.repository.slug,
             prNumber: readyPr.number,
             expectedHead: readyPr.head,
@@ -2209,6 +2222,29 @@ export function createIssueRelayProductionReconciliation(options: {
             phase: terminal,
             updatedAt: options.now().toISOString(),
           };
+          if (record.pr !== undefined) {
+            const latest = proposed.rounds.at(-1);
+            await reportPublisher.publishAssurance({
+              repository: proposed.snapshot.repository.slug,
+              prNumber: record.pr.number,
+              expectedHead: record.pr.head,
+              serviceLogin: options.config.relayBotLogin,
+              model: {
+                status: terminal === 'closed' ? 'CANCELLED' : 'EXHAUSTED',
+                head: record.pr.head,
+                solutionOperator: latest?.solution?.operatorSafe,
+                evaluator: latest?.verdict?.evaluatorSafe,
+                checks: [],
+                rounds: canonicalRelayTimeline(proposed),
+                limitations: [
+                  terminal === 'closed'
+                    ? 'Soft cancellation prevents a ready transition.'
+                    : 'The configured Relay round, spend, or deadline bound was exhausted.',
+                ],
+                technicalEvidence: [],
+              },
+            });
+          }
           await replaceMarker(
             candidate,
             proposed,

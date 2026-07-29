@@ -33,6 +33,11 @@ autopilot logs --follow
 autopilot stop
 ```
 
+Internal operators running the separate Jinn mono marketplace canary should
+use the [Jinn Issue Relay runbook](docs/runbooks/jinn-issue-relay-jinn-mono.md).
+It is not part of the normal Project lifecycle or an authorization to deploy a
+continuous active loop.
+
 The initialization command installs a generic maintainer skill pack for
 filing, triaging, and explaining Autopilot work. The Jinn Plugin owns its own
 capture, retrieval, privacy, corpus, and publication behavior; Autopilot only
