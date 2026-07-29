@@ -24,7 +24,10 @@ import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
 const BASE = '1111111111111111111111111111111111111111';
 const HEAD_1 = '2222222222222222222222222222222222222222';
 const HEAD_2 = '3333333333333333333333333333333333333333';
+const HEAD_3 = '5555555555555555555555555555555555555555';
 const DIGEST = `sha256:${'a'.repeat(64)}` as const;
+const TARGET_REPOSITORY_ID = 'R_kgDOExample';
+const FORK_REPOSITORY_ID = 'R_managed_fork';
 
 const snapshot = buildRelaySnapshot({
   repository: {
@@ -254,6 +257,13 @@ const readyRecord = {
     branch: receipt.headRef,
     head: HEAD_2,
     draft: false,
+    targetRepository: receipt.targetRepository,
+    targetRepositoryId: TARGET_REPOSITORY_ID,
+    forkRepository: receipt.workspaceRepository,
+    forkRepositoryId: FORK_REPOSITORY_ID,
+    forkParentRepositoryId: TARGET_REPOSITORY_ID,
+    visibility: 'PUBLIC',
+    managedFork: true,
   },
   updatedAt: '2026-07-28T10:12:00.000Z',
 } satisfies RelayGenerationRecordV1;
@@ -309,6 +319,13 @@ const readyEvidence = {
     open: true,
     draft: false,
     generation,
+    targetRepository: receipt.targetRepository,
+    targetRepositoryId: TARGET_REPOSITORY_ID,
+    forkRepository: receipt.workspaceRepository,
+    forkRepositoryId: FORK_REPOSITORY_ID,
+    forkParentRepositoryId: TARGET_REPOSITORY_ID,
+    visibility: 'PUBLIC',
+    managedFork: true,
   },
   adoption,
   checks,
@@ -329,30 +346,58 @@ const readyModel = {
     {
       round: 0,
       purpose: 'initial' as const,
+      head: BASE,
+      outcome: 'funded' as const,
+      summary: 'Round funded.',
+    },
+    {
+      round: 0,
+      purpose: 'initial' as const,
+      head: BASE,
+      outcome: 'solution-delivered' as const,
+      summary: 'Solution delivery observed.',
+    },
+    {
+      round: 0,
+      purpose: 'initial' as const,
       head: HEAD_1,
       outcome: 'adopted' as const,
-      summary: 'Initial solution adopted.',
+      summary: 'Solution adopted.',
     },
     {
       round: 0,
       purpose: 'initial' as const,
       head: HEAD_1,
       outcome: 'request-changes' as const,
-      summary: 'Evaluator found a missing regression test.',
+      summary: 'Evaluator requested changes.',
+    },
+    {
+      round: 1,
+      purpose: 'repair' as const,
+      head: HEAD_1,
+      outcome: 'funded' as const,
+      summary: 'Round funded.',
+    },
+    {
+      round: 1,
+      purpose: 'repair' as const,
+      head: HEAD_1,
+      outcome: 'solution-delivered' as const,
+      summary: 'Solution delivery observed.',
     },
     {
       round: 1,
       purpose: 'repair' as const,
       head: HEAD_2,
       outcome: 'adopted' as const,
-      summary: 'Repair added the regression test.',
+      summary: 'Solution adopted.',
     },
     {
       round: 1,
       purpose: 'repair' as const,
       head: HEAD_2,
       outcome: 'passed' as const,
-      summary: 'Full cumulative head passed evaluation.',
+      summary: 'Independent evaluation passed.',
     },
   ],
   limitations: [],
@@ -361,6 +406,354 @@ const readyModel = {
     url: 'https://jinn.example/evidence/adoption',
     digest: DIGEST,
   }],
+};
+
+const initialReceipt = {
+  ...receipt,
+  correlation: {
+    ...receipt.correlation,
+    round: 0,
+    taskId: record.rounds[0]!.task!.taskId,
+    requestId: `0x${'c'.repeat(64)}`,
+    deliveryEnvelopeCid: `f01551220${'0'.repeat(64)}`,
+  },
+  workspaceRepository: snapshot.repository.slug,
+  inputHead: BASE,
+  resultingHead: HEAD_1,
+  patchDigest: `sha256:${'c'.repeat(64)}`,
+  solutionSafe: `0x${'3'.repeat(40)}`,
+  adoptedAt: '2026-07-28T10:08:00.000Z',
+} as const;
+const initialAdoption = {
+  status: 'accepted',
+  receipt: initialReceipt,
+  branch: initialReceipt.headRef,
+  resultingHead: initialReceipt.resultingHead,
+  prNumber: initialReceipt.prNumber,
+} as const;
+const initialChecks = aggregateRelayChecks({
+  head: HEAD_1,
+  branchRequiredChecks: [{ name: 'build', appId: 101 }],
+  profile: {
+    name: 'jinn-mono.v1',
+    requiredChecks: ['relay/typecheck'],
+  },
+  checks: [
+    {
+      kind: 'check-run',
+      name: 'build',
+      appId: 101,
+      head: HEAD_1,
+      status: 'completed',
+      conclusion: 'success',
+    },
+    {
+      kind: 'status-context',
+      name: 'relay/typecheck',
+      head: HEAD_1,
+      state: 'success',
+    },
+  ],
+});
+const initialAnchor = {
+  ...anchor,
+  correlation: initialReceipt.correlation,
+  workspaceRepository: snapshot.repository.slug,
+  evaluatedHead: HEAD_1,
+  adoptionReceiptDigest: relayAdoptionReceiptDigest(initialAdoption),
+  checksDigest: initialChecks.digest,
+  anchoredAt: '2026-07-28T10:09:00.000Z',
+} as const;
+const initialVerdict = {
+  ...verdict,
+  task: {
+    taskId: initialReceipt.correlation.taskId,
+    taskCid: `f01551220${'d'.repeat(64)}`,
+  },
+  attempt: {
+    ...verdict.attempt,
+    requestId: initialReceipt.correlation.requestId,
+  },
+  delivery: {
+    ...verdict.delivery,
+    envelopeCid: `f01551220${'e'.repeat(64)}`,
+    transactionHash: `0x${'d'.repeat(64)}`,
+    blockNumber: 129,
+  },
+  round: {
+    schemaVersion: 'jinn-issue-relay-round.v1',
+    generation,
+    round: 0,
+    snapshotDigest: snapshot.snapshotDigest,
+    targetRepository: initialReceipt.targetRepository,
+    workspaceRepository: snapshot.repository.slug,
+    inputHead: BASE,
+    purpose: 'initial',
+    findings: [],
+  },
+  payload: {
+    ...verdict.payload,
+    correlation: initialReceipt.correlation,
+    evaluatedHead: HEAD_1,
+    summary: 'The initial cumulative head passed evaluation.',
+  },
+} as const;
+const initialReadyRecord = {
+  ...readyRecord,
+  rounds: [{
+    ...readyRecord.rounds[0]!,
+    task: {
+      ...readyRecord.rounds[0]!.task!,
+      taskCid: initialVerdict.task.taskCid,
+    },
+    adoption: {
+      disposition: 'accepted',
+      resultingHead: HEAD_1,
+      receiptDigest: initialAnchor.adoptionReceiptDigest,
+    },
+    checks: {
+      head: HEAD_1,
+      status: 'passed',
+      digest: initialChecks.digest,
+    },
+    verdict: {
+      outcome: 'pass',
+      evaluatedHead: HEAD_1,
+      envelopeCid: initialVerdict.delivery.envelopeCid,
+    },
+  }],
+  pr: {
+    ...readyRecord.pr,
+    head: HEAD_1,
+  },
+  updatedAt: '2026-07-28T10:10:00.000Z',
+} satisfies RelayGenerationRecordV1;
+const initialReadyModel = {
+  ...readyModel,
+  head: HEAD_1,
+  readyEvidence: {
+    ...readyEvidence,
+    record: initialReadyRecord,
+    currentHead: HEAD_1,
+    draft: {
+      ...readyEvidence.draft,
+      head: HEAD_1,
+    },
+    currentPr: {
+      ...readyEvidence.currentPr,
+      head: HEAD_1,
+    },
+    adoption: initialAdoption,
+    checks: initialChecks,
+    evaluationAnchor: initialAnchor,
+    verdict: initialVerdict,
+    adoptionReceiptBlock: formatRelayAdoptionReceiptBlock(initialReceipt),
+    evaluationAnchorBlock: formatRelayEvaluationAnchorBlock(initialAnchor),
+  },
+  checks: initialChecks.required,
+  rounds: [
+    ...readyModel.rounds.slice(0, 3),
+    {
+      round: 0,
+      purpose: 'initial' as const,
+      head: HEAD_1,
+      outcome: 'passed' as const,
+      summary: 'Independent evaluation passed.',
+    },
+  ],
+};
+
+const thirdReceipt = {
+  ...receipt,
+  correlation: {
+    ...receipt.correlation,
+    round: 2,
+    taskId: '125',
+    requestId: `0x${'8'.repeat(64)}`,
+    deliveryEnvelopeCid: `f01551220${'8'.repeat(64)}`,
+  },
+  inputHead: HEAD_2,
+  resultingHead: HEAD_3,
+  patchDigest: `sha256:${'b'.repeat(64)}`,
+  adoptedAt: '2026-07-28T10:17:00.000Z',
+} as const;
+const thirdAdoption = {
+  status: 'accepted',
+  receipt: thirdReceipt,
+  branch: thirdReceipt.headRef,
+  resultingHead: thirdReceipt.resultingHead,
+  prNumber: thirdReceipt.prNumber,
+} as const;
+const thirdChecks = aggregateRelayChecks({
+  head: HEAD_3,
+  branchRequiredChecks: [{ name: 'build', appId: 101 }],
+  profile: {
+    name: 'jinn-mono.v1',
+    requiredChecks: ['relay/typecheck'],
+  },
+  checks: [
+    {
+      kind: 'check-run',
+      name: 'build',
+      appId: 101,
+      head: HEAD_3,
+      status: 'completed',
+      conclusion: 'success',
+    },
+    {
+      kind: 'status-context',
+      name: 'relay/typecheck',
+      head: HEAD_3,
+      state: 'success',
+    },
+  ],
+});
+const thirdAnchor = {
+  ...anchor,
+  correlation: thirdReceipt.correlation,
+  evaluatedHead: HEAD_3,
+  adoptionReceiptDigest: relayAdoptionReceiptDigest(thirdAdoption),
+  checksDigest: thirdChecks.digest,
+  anchoredAt: '2026-07-28T10:18:00.000Z',
+} as const;
+const thirdVerdict = {
+  ...verdict,
+  task: {
+    taskId: thirdReceipt.correlation.taskId,
+    taskCid: `f01551220${'9'.repeat(64)}`,
+  },
+  attempt: {
+    ...verdict.attempt,
+    requestId: thirdReceipt.correlation.requestId,
+  },
+  delivery: {
+    ...verdict.delivery,
+    envelopeCid: `f01551220${'a'.repeat(64)}`,
+    transactionHash: `0x${'b'.repeat(64)}`,
+    blockNumber: 131,
+  },
+  round: {
+    ...verdict.round,
+    round: 2,
+    inputHead: HEAD_2,
+  },
+  payload: {
+    ...verdict.payload,
+    correlation: thirdReceipt.correlation,
+    evaluatedHead: HEAD_3,
+    summary: 'The second repair passed evaluation.',
+  },
+} as const;
+const threeRoundRecord = {
+  ...readyRecord,
+  rounds: [
+    readyRecord.rounds[0]!,
+    {
+      ...readyRecord.rounds[1]!,
+      verdict: {
+        ...readyRecord.rounds[1]!.verdict!,
+        outcome: 'request-changes',
+      },
+    },
+    {
+      round: 2,
+      purpose: 'repair',
+      workspaceRepository: thirdReceipt.workspaceRepository,
+      inputHead: HEAD_2,
+      task: {
+        taskKey: `issue-relay:${generation}:round:2`,
+        taskId: thirdReceipt.correlation.taskId,
+        taskCid: thirdVerdict.task.taskCid,
+        fundedAt: '2026-07-28T10:13:00.000Z',
+      },
+      solution: {
+        envelopeCid: thirdReceipt.correlation.deliveryEnvelopeCid,
+        operatorSafe: thirdReceipt.solutionSafe,
+        observedAt: '2026-07-28T10:14:00.000Z',
+      },
+      adoption: {
+        disposition: 'accepted',
+        resultingHead: HEAD_3,
+        receiptDigest: thirdAnchor.adoptionReceiptDigest,
+      },
+      checks: {
+        head: HEAD_3,
+        status: 'passed',
+        digest: thirdChecks.digest,
+      },
+      verdict: {
+        outcome: 'pass',
+        evaluatedHead: HEAD_3,
+        envelopeCid: thirdVerdict.delivery.envelopeCid,
+      },
+    },
+  ],
+  pr: {
+    ...readyRecord.pr,
+    head: HEAD_3,
+  },
+  updatedAt: '2026-07-28T10:19:00.000Z',
+} satisfies RelayGenerationRecordV1;
+const threeRoundEvidence = {
+  ...readyEvidence,
+  record: threeRoundRecord,
+  currentHead: HEAD_3,
+  draft: {
+    ...readyEvidence.draft,
+    head: HEAD_3,
+  },
+  currentPr: {
+    ...readyEvidence.currentPr,
+    head: HEAD_3,
+  },
+  adoption: thirdAdoption,
+  checks: thirdChecks,
+  evaluationAnchor: thirdAnchor,
+  verdict: thirdVerdict,
+  adoptionReceiptBlock: formatRelayAdoptionReceiptBlock(thirdReceipt),
+  evaluationAnchorBlock: formatRelayEvaluationAnchorBlock(thirdAnchor),
+} satisfies RelayReadyAssuranceEvidence;
+const threeRoundModel = {
+  ...readyModel,
+  head: HEAD_3,
+  readyEvidence: threeRoundEvidence,
+  checks: thirdChecks.required,
+  rounds: [
+    ...readyModel.rounds.slice(0, -1),
+    {
+      ...readyModel.rounds.at(-1)!,
+      outcome: 'request-changes' as const,
+      summary: 'Evaluator requested changes.',
+    },
+    {
+      round: 2,
+      purpose: 'repair' as const,
+      head: HEAD_2,
+      outcome: 'funded' as const,
+      summary: 'Round funded.',
+    },
+    {
+      round: 2,
+      purpose: 'repair' as const,
+      head: HEAD_2,
+      outcome: 'solution-delivered' as const,
+      summary: 'Solution delivery observed.',
+    },
+    {
+      round: 2,
+      purpose: 'repair' as const,
+      head: HEAD_3,
+      outcome: 'adopted' as const,
+      summary: 'Solution adopted.',
+    },
+    {
+      round: 2,
+      purpose: 'repair' as const,
+      head: HEAD_3,
+      outcome: 'passed' as const,
+      summary: 'Independent evaluation passed.',
+    },
+  ],
 };
 
 describe('Relay issue status rendering', () => {
@@ -555,10 +948,14 @@ describe('Relay PR assurance rendering', () => {
 
       ## Timeline
 
-      - Round 0 · initial · adopted · \`2222222222222222222222222222222222222222\` — Initial solution adopted.
-      - Round 0 · initial · request-changes · \`2222222222222222222222222222222222222222\` — Evaluator found a missing regression test.
-      - Round 1 · repair · adopted · \`3333333333333333333333333333333333333333\` — Repair added the regression test.
-      - Round 1 · repair · passed · \`3333333333333333333333333333333333333333\` — Full cumulative head passed evaluation.
+      - Round 0 · initial · funded · \`1111111111111111111111111111111111111111\` — Round funded.
+      - Round 0 · initial · solution-delivered · \`1111111111111111111111111111111111111111\` — Solution delivery observed.
+      - Round 0 · initial · adopted · \`2222222222222222222222222222222222222222\` — Solution adopted.
+      - Round 0 · initial · request-changes · \`2222222222222222222222222222222222222222\` — Evaluator requested changes.
+      - Round 1 · repair · funded · \`2222222222222222222222222222222222222222\` — Round funded.
+      - Round 1 · repair · solution-delivered · \`2222222222222222222222222222222222222222\` — Solution delivery observed.
+      - Round 1 · repair · adopted · \`3333333333333333333333333333333333333333\` — Solution adopted.
+      - Round 1 · repair · passed · \`3333333333333333333333333333333333333333\` — Independent evaluation passed.
 
       <details>
       <summary>Technical receipts and evidence</summary>
@@ -572,6 +969,87 @@ describe('Relay PR assurance rendering', () => {
     );
     expect(rendered).toContain(READY_FOR_REVIEW_LIMITATION);
     expect(rendered).not.toMatch(/safe to merge|guaranteed|maintainer approved/i);
+  });
+
+  it('rejects READY when caller timeline omits durable funded and solution events', () => {
+    expect(() => renderRelayAssuranceComment({
+      ...readyModel,
+      rounds: readyModel.rounds.filter(({ outcome }) =>
+        outcome !== 'funded' && outcome !== 'solution-delivered'),
+    })).toThrow(/ready|timeline|durable|complete/i);
+  });
+
+  it('accepts direct initial-round READY with target solver input and managed-fork PR', () => {
+    const rendered = renderRelayAssuranceComment(initialReadyModel);
+
+    expect(rendered).toContain(
+      `Round 0 · initial · passed · \`${HEAD_1}\``,
+    );
+    expect(rendered).not.toContain('Round 1 · repair');
+  });
+
+  it('rejects READY when caller timeline omits an earlier request-changes verdict', () => {
+    expect(() => renderRelayAssuranceComment({
+      ...threeRoundModel,
+      rounds: threeRoundModel.rounds.filter((item) =>
+        !(item.round === 0 && item.outcome === 'request-changes')),
+    })).toThrow(/ready|timeline|durable|complete/i);
+  });
+
+  it('rejects READY when caller timeline reorders durable events', () => {
+    expect(() => renderRelayAssuranceComment({
+      ...threeRoundModel,
+      rounds: [
+        threeRoundModel.rounds[1]!,
+        threeRoundModel.rounds[0]!,
+        ...threeRoundModel.rounds.slice(2),
+      ],
+    })).toThrow(/ready|timeline|durable|order/i);
+  });
+
+  it('rejects READY when caller timeline adds a contradictory event', () => {
+    expect(() => renderRelayAssuranceComment({
+      ...threeRoundModel,
+      rounds: [
+        ...threeRoundModel.rounds.slice(0, -1),
+        {
+          round: 2,
+          purpose: 'repair',
+          head: HEAD_2,
+          outcome: 'rejected',
+          summary: 'Contradictory extra event.',
+        },
+        threeRoundModel.rounds.at(-1)!,
+      ],
+    })).toThrow(/ready|timeline|durable|contradict/i);
+  });
+
+  it('rejects READY when the final repair pass is labeled initial', () => {
+    expect(() => renderRelayAssuranceComment({
+      ...threeRoundModel,
+      rounds: threeRoundModel.rounds.map((item, index) =>
+        index === threeRoundModel.rounds.length - 1
+          ? { ...item, purpose: 'initial' as const }
+          : item),
+    })).toThrow(/ready|timeline|durable|purpose/i);
+  });
+
+  it('renders every durable event and both prior failures in canonical order', () => {
+    const rendered = renderRelayAssuranceComment(threeRoundModel);
+    const timeline = rendered.slice(rendered.indexOf('## Timeline'));
+
+    expect(timeline.match(/^- Round /gm)).toHaveLength(12);
+    expect(timeline.match(/request-changes/g)).toHaveLength(2);
+    expect(timeline.indexOf('Round 0 · initial · funded')).toBeLessThan(
+      timeline.indexOf('Round 0 · initial · solution-delivered'),
+    );
+    expect(timeline.indexOf('Round 0 · initial · request-changes'))
+      .toBeLessThan(timeline.indexOf('Round 1 · repair · funded'));
+    expect(timeline.indexOf('Round 1 · repair · request-changes'))
+      .toBeLessThan(timeline.indexOf('Round 2 · repair · funded'));
+    expect(timeline).toContain(
+      `Round 2 · repair · passed · \`${HEAD_3}\``,
+    );
   });
 
   it('derives READY head, operators, and checks from validated authority', () => {
@@ -642,7 +1120,7 @@ describe('Relay PR assurance rendering', () => {
       evaluator: attack,
       checks: [{ ...model.checks[0], name: attack, url: undefined }],
       rounds: [{
-        ...model.rounds[1],
+        ...model.rounds.find(({ outcome }) => outcome === 'request-changes')!,
         summary: attack,
       }],
       limitations: [attack],
@@ -878,6 +1356,150 @@ describe('Relay PR assurance rendering', () => {
         },
       },
     })).toThrow(/ready|evidence|draft/i);
+  });
+
+  it('rejects READY without durable managed-fork PR identity', () => {
+    expect(() => renderRelayAssuranceComment({
+      ...readyModel,
+      readyEvidence: {
+        ...readyEvidence,
+        record: {
+          ...readyRecord,
+          pr: {
+            number: readyRecord.pr.number,
+            branch: readyRecord.pr.branch,
+            head: readyRecord.pr.head,
+            draft: readyRecord.pr.draft,
+          },
+        },
+      },
+    })).toThrow(/ready|durable|fork|authority/i);
+  });
+
+  it.each([
+    ['wrong target slug', { targetRepository: 'attacker/target' }],
+    ['wrong target ID', { targetRepositoryId: 'R_other_target' }],
+    ['target reused as fork ID', { forkRepositoryId: TARGET_REPOSITORY_ID }],
+    ['wrong fork parent', { forkParentRepositoryId: 'R_other_parent' }],
+    ['private fork', { visibility: 'PRIVATE' }],
+    ['unmanaged fork', { managedFork: false }],
+    ['wrong head repository', { forkRepository: 'attacker/mono' }],
+    ['wrong branch identity', { branch: 'attacker/branch' }],
+  ] as const)('rejects READY with live PR authority using %s', (
+    _label,
+    mutation,
+  ) => {
+    expect(() => renderRelayAssuranceComment({
+      ...readyModel,
+      readyEvidence: {
+        ...readyEvidence,
+        currentPr: {
+          ...readyEvidence.currentPr,
+          ...mutation,
+        },
+      } as unknown as RelayReadyAssuranceEvidence,
+    })).toThrow(/ready|durable|fork|repository|authority/i);
+  });
+
+  it.each([
+    ['wrong durable target ID', { targetRepositoryId: 'R_other_target' }],
+    ['wrong durable fork repository', { forkRepository: 'attacker/mono' }],
+    ['wrong durable fork ID', { forkRepositoryId: 'R_attacker_fork' }],
+    ['wrong durable fork parent', { forkParentRepositoryId: 'R_other_parent' }],
+    ['wrong durable visibility', { visibility: 'PRIVATE' }],
+    ['wrong durable managed-fork flag', { managedFork: false }],
+  ] as const)('rejects READY with %s', (_label, mutation) => {
+    expect(() => renderRelayAssuranceComment({
+      ...readyModel,
+      readyEvidence: {
+        ...readyEvidence,
+        record: {
+          ...readyRecord,
+          pr: {
+            ...readyRecord.pr,
+            ...mutation,
+          },
+        },
+      },
+    })).toThrow(/ready|durable|fork|repository|authority/i);
+  });
+
+  it('rejects self-consistent attacker-fork artifacts against live PR authority', () => {
+    const attackerWorkspace = 'attacker/mono';
+    const attackerReceipt = {
+      ...receipt,
+      workspaceRepository: attackerWorkspace,
+    };
+    const attackerAdoption = {
+      ...adoption,
+      receipt: attackerReceipt,
+    };
+    const attackerAnchor = {
+      ...anchor,
+      workspaceRepository: attackerWorkspace,
+      adoptionReceiptDigest: relayAdoptionReceiptDigest(attackerAdoption),
+    };
+
+    expect(() => renderRelayAssuranceComment({
+      ...readyModel,
+      readyEvidence: {
+        ...readyEvidence,
+        record: {
+          ...readyRecord,
+          rounds: readyRecord.rounds.map((round) =>
+            round.round === 1
+              ? {
+                  ...round,
+                  workspaceRepository: attackerWorkspace,
+                  adoption: {
+                    ...round.adoption!,
+                    receiptDigest: attackerAnchor.adoptionReceiptDigest,
+                  },
+                }
+              : round),
+        },
+        adoption: attackerAdoption,
+        evaluationAnchor: attackerAnchor,
+        verdict: {
+          ...verdict,
+          round: {
+            ...verdict.round,
+            workspaceRepository: attackerWorkspace,
+          },
+        },
+        adoptionReceiptBlock: formatRelayAdoptionReceiptBlock(attackerReceipt),
+        evaluationAnchorBlock: formatRelayEvaluationAnchorBlock(attackerAnchor),
+      },
+    })).toThrow(/ready|durable|fork|repository|authority/i);
+  });
+
+  it.each([
+    [
+      'managed-fork workspace',
+      {
+        workspaceRepository: receipt.workspaceRepository,
+        inputHead: BASE,
+      },
+    ],
+    [
+      'non-frozen input',
+      {
+        workspaceRepository: snapshot.repository.slug,
+        inputHead: '4444444444444444444444444444444444444444',
+      },
+    ],
+  ] as const)('rejects READY when round 0 uses %s', (_label, mutation) => {
+    expect(() => renderRelayAssuranceComment({
+      ...readyModel,
+      readyEvidence: {
+        ...readyEvidence,
+        record: {
+          ...readyRecord,
+          rounds: readyRecord.rounds.map((round) =>
+            round.round === 0 ? { ...round, ...mutation } : round),
+        },
+      },
+    })).toThrow(/ready|durable|initial|workspace|input/i);
   });
 
   it('rejects READY when the durable latest round uses a different workspace', () => {

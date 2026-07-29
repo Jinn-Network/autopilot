@@ -412,6 +412,75 @@ describe('Relay issue marker update preconditions', () => {
     })).toBeNull();
   });
 
+  it('rejects mutation of persisted managed-fork repository identity', () => {
+    const head = '2222222222222222222222222222222222222222';
+    const current = generationRecord({
+      phase: 'draft-open',
+      rounds: [{
+        round: 0,
+        purpose: 'initial',
+        workspaceRepository: issueInput.repository.slug,
+        inputHead: issueInput.repository.baseOid,
+        task: {
+          taskKey: `issue-relay:${generationRecord().generation}:round:0`,
+          taskId: 'task-0',
+          taskCid: 'bafy-task-0',
+          fundedAt: '2026-07-28T12:05:00.000Z',
+        },
+        solution: {
+          envelopeCid: 'bafy-solution-0',
+          operatorSafe: '0x1111111111111111111111111111111111111111',
+          observedAt: '2026-07-28T12:10:00.000Z',
+        },
+        adoption: {
+          disposition: 'accepted',
+          resultingHead: head,
+          receiptDigest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+      }],
+      pr: {
+        number: 68,
+        branch: 'jinn/issue-relay/example',
+        head,
+        draft: true,
+        targetRepository: issueInput.repository.slug,
+        targetRepositoryId: issueInput.repository.nodeId,
+        forkRepository: 'jinn-relay/mono',
+        forkRepositoryId: 'R_managed_fork',
+        forkParentRepositoryId: issueInput.repository.nodeId,
+        visibility: 'PUBLIC',
+        managedFork: true,
+      },
+      updatedAt: '2026-07-28T12:15:00.000Z',
+    });
+    const proposed = {
+      ...current,
+      phase: 'evaluating',
+      rounds: [{
+        ...current.rounds[0]!,
+        checks: {
+          head,
+          status: 'passed',
+          digest: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        },
+      }],
+      pr: {
+        ...current.pr!,
+        forkRepositoryId: 'R_attacker_fork',
+      },
+      updatedAt: '2026-07-28T12:16:00.000Z',
+    } satisfies RelayGenerationRecordV1;
+
+    expect(prepareRelayIssueMarkerUpdate({
+      current: {
+        body: formatRelayIssueMarker(current),
+        authorLogin: BOT_LOGIN,
+        expectedAuthorLogin: BOT_LOGIN,
+      },
+      proposed,
+    })).toBeNull();
+  });
+
   it.each([
     ['phase regression', (_current: RelayGenerationRecordV1) => generationRecord({
       updatedAt: '2026-07-28T12:06:00.000Z',

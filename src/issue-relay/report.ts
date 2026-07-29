@@ -43,7 +43,9 @@ export interface RelayRoundTimelineItem {
     | 'adopted'
     | 'request-changes'
     | 'passed'
-    | 'rejected';
+    | 'rejected'
+    | 'human'
+    | 'unresolved';
   readonly summary: string;
 }
 
@@ -63,13 +65,24 @@ export interface RelayIssueStatusModel {
   readonly nextAction: string;
 }
 
+export type RelayReadyPullRequestAuthority =
+  NonNullable<RelayReadyInput['draft']> & {
+    readonly targetRepository: string;
+    readonly targetRepositoryId: string;
+    readonly forkRepository: string;
+    readonly forkRepositoryId: string;
+    readonly forkParentRepositoryId: string;
+    readonly visibility: 'PUBLIC';
+    readonly managedFork: true;
+  };
+
 export interface RelayReadyAssuranceEvidence {
   readonly record: RelayGenerationRecordV1;
   readonly currentHead: string;
   readonly currentBaseOid: string;
   readonly targetBase: string;
   /** Exact open, non-draft PR facts read after the mark-ready transition. */
-  readonly currentPr: Omit<NonNullable<RelayReadyInput['draft']>, 'draft'> & {
+  readonly currentPr: Omit<RelayReadyPullRequestAuthority, 'draft'> & {
     readonly draft: false;
   };
   /** Exact open draft facts used by Task 10 immediately before mark-ready. */
@@ -329,7 +342,80 @@ interface ValidatedReadyAssurance {
   readonly solutionOperator: string;
   readonly evaluator: string;
   readonly checks: RelayCheckSummary['required'];
+  readonly timeline: readonly RelayRoundTimelineItem[];
   readonly technicalBlocks: readonly [string, string];
+}
+
+function canonicalRelayTimeline(
+  record: RelayGenerationRecordV1,
+): readonly RelayRoundTimelineItem[] {
+  const timeline: RelayRoundTimelineItem[] = [];
+  for (const round of record.rounds) {
+    const identity = {
+      round: round.round,
+      purpose: round.purpose,
+    };
+    if (round.task !== undefined) {
+      timeline.push({
+        ...identity,
+        head: round.inputHead,
+        outcome: 'funded',
+        summary: 'Round funded.',
+      });
+    }
+    if (round.solution !== undefined) {
+      timeline.push({
+        ...identity,
+        head: round.inputHead,
+        outcome: 'solution-delivered',
+        summary: 'Solution delivery observed.',
+      });
+    }
+    if (round.adoption !== undefined) {
+      timeline.push({
+        ...identity,
+        head: round.adoption.resultingHead ?? round.inputHead,
+        outcome: round.adoption.disposition === 'accepted'
+          ? 'adopted'
+          : 'rejected',
+        summary: round.adoption.disposition === 'accepted'
+          ? 'Solution adopted.'
+          : 'Solution rejected.',
+      });
+    }
+    if (round.verdict !== undefined) {
+      const verdict = (() => {
+        switch (round.verdict.outcome) {
+          case 'pass':
+            return {
+              outcome: 'passed' as const,
+              summary: 'Independent evaluation passed.',
+            };
+          case 'request-changes':
+            return {
+              outcome: 'request-changes' as const,
+              summary: 'Evaluator requested changes.',
+            };
+          case 'human':
+            return {
+              outcome: 'human' as const,
+              summary: 'Evaluator requested human review.',
+            };
+          case 'unresolved':
+            return {
+              outcome: 'unresolved' as const,
+              summary: 'Evaluation remained unresolved.',
+            };
+        }
+      })();
+      timeline.push({
+        ...identity,
+        head: round.verdict.evaluatedHead,
+        ...verdict,
+      });
+    }
+  }
+  return timeline;
 }
 
 function validateReadyAssurance(
@@ -399,6 +485,8 @@ function validateReadyAssurance(
   }
 
   const durableRound = evidence.record.rounds.at(-1);
+  const initialRound = evidence.record.rounds[0];
+  const currentPr = evidence.currentPr;
   const receipt = evidence.adoption.receipt;
   const cancelled = evidence.record.cancellation !== undefined
     || evidence.record.phase === 'cancelling'
@@ -412,6 +500,11 @@ function validateReadyAssurance(
     || evidence.record.snapshot.snapshotDigest
       !== receipt.correlation.snapshotDigest
     || evidence.record.snapshot.repository.slug !== receipt.targetRepository
+    || initialRound?.round !== 0
+    || initialRound.purpose !== 'initial'
+    || initialRound.workspaceRepository
+      !== evidence.record.snapshot.repository.slug
+    || initialRound.inputHead !== evidence.record.snapshot.repository.baseOid
     || evidence.record.snapshot.repository.defaultBranch
       !== evidence.evaluationAnchor.targetBase
     || evidence.record.snapshot.repository.baseOid
@@ -421,6 +514,39 @@ function validateReadyAssurance(
     || evidence.record.pr.branch !== receipt.headRef
     || evidence.record.pr.head !== receipt.resultingHead
     || evidence.record.pr.draft !== false
+    || typeof evidence.currentPr.targetRepository !== 'string'
+    || typeof evidence.currentPr.targetRepositoryId !== 'string'
+    || typeof evidence.currentPr.forkRepository !== 'string'
+    || typeof evidence.currentPr.forkRepositoryId !== 'string'
+    || typeof evidence.currentPr.forkParentRepositoryId !== 'string'
+    || evidence.currentPr.targetRepository.length === 0
+    || evidence.currentPr.targetRepositoryId.length === 0
+    || evidence.currentPr.forkRepository.length === 0
+    || evidence.currentPr.forkRepositoryId.length === 0
+    || evidence.currentPr.targetRepository
+      !== evidence.record.snapshot.repository.slug
+    || evidence.currentPr.targetRepositoryId
+      !== evidence.record.snapshot.repository.nodeId
+    || evidence.currentPr.forkRepository.toLocaleLowerCase('en-US')
+      === evidence.currentPr.targetRepository.toLocaleLowerCase('en-US')
+    || evidence.currentPr.forkRepositoryId
+      === evidence.currentPr.targetRepositoryId
+    || evidence.currentPr.forkParentRepositoryId
+      !== evidence.currentPr.targetRepositoryId
+    || evidence.currentPr.visibility !== 'PUBLIC'
+    || evidence.currentPr.managedFork !== true
+    || evidence.record.pr.targetRepository
+      !== evidence.currentPr.targetRepository
+    || evidence.record.pr.targetRepositoryId
+      !== evidence.currentPr.targetRepositoryId
+    || evidence.record.pr.forkRepository
+      !== evidence.currentPr.forkRepository
+    || evidence.record.pr.forkRepositoryId
+      !== evidence.currentPr.forkRepositoryId
+    || evidence.record.pr.forkParentRepositoryId
+      !== evidence.currentPr.forkParentRepositoryId
+    || evidence.record.pr.visibility !== evidence.currentPr.visibility
+    || evidence.record.pr.managedFork !== evidence.currentPr.managedFork
     || evidence.currentPr.number !== receipt.prNumber
     || evidence.currentPr.branch !== receipt.headRef
     || evidence.currentPr.head !== receipt.resultingHead
@@ -436,6 +562,9 @@ function validateReadyAssurance(
     || evidence.draft.open !== true
     || evidence.draft.draft !== true
     || evidence.record.generation !== evidence.verdict.round.generation
+    || evidence.record.rounds.slice(1).some((round) =>
+      round.purpose !== 'repair'
+      || round.workspaceRepository !== currentPr.forkRepository)
     || durableRound?.round !== receipt.correlation.round
     || durableRound.round !== evidence.verdict.round.round
     || durableRound.purpose !== evidence.verdict.round.purpose
@@ -448,6 +577,11 @@ function validateReadyAssurance(
       durableRound.purpose === 'initial'
       && (
         durableRound.workspaceRepository !== receipt.targetRepository
+        || receipt.workspaceRepository !== receipt.targetRepository
+        || evidence.evaluationAnchor.workspaceRepository
+          !== receipt.targetRepository
+        || evidence.verdict.round.workspaceRepository
+          !== receipt.targetRepository
         || durableRound.inputHead
           !== evidence.record.snapshot.repository.baseOid
         || evidence.verdict.round.prNumber !== undefined
@@ -457,6 +591,11 @@ function validateReadyAssurance(
       durableRound.purpose === 'repair'
       && (
         durableRound.workspaceRepository === receipt.targetRepository
+        || currentPr.forkRepository !== receipt.workspaceRepository
+        || currentPr.forkRepository
+          !== evidence.evaluationAnchor.workspaceRepository
+        || currentPr.forkRepository
+          !== evidence.verdict.round.workspaceRepository
         || evidence.verdict.round.prNumber !== receipt.prNumber
       )
     )
@@ -504,16 +643,23 @@ function validateReadyAssurance(
   if (!decision.ready || model.head !== decision.head) {
     throw new TypeError('Ready assurance evidence does not bind the exact head');
   }
-  const passed = model.rounds
+  const timeline = canonicalRelayTimeline(evidence.record);
+  if (!isDeepStrictEqual(model.rounds, timeline)) {
+    throw new TypeError(
+      'Ready assurance timeline is not the complete durable event history',
+    );
+  }
+  const passed = timeline
     .map((item, index) => ({ item, index }))
     .filter(({ item }) => item.outcome === 'passed');
   const authenticatedPass = passed[0];
   if (
     passed.length !== 1
     || authenticatedPass === undefined
-    || authenticatedPass.index !== model.rounds.length - 1
+    || authenticatedPass.index !== timeline.length - 1
     || authenticatedPass.item.round
       !== evidence.adoption.receipt.correlation.round
+    || authenticatedPass.item.purpose !== durableRound.purpose
     || authenticatedPass.item.head !== decision.head
   ) {
     throw new TypeError(
@@ -528,6 +674,7 @@ function validateReadyAssurance(
     solutionOperator: evidence.adoption.receipt.solutionSafe,
     evaluator: evidence.verdict.attempt.operator,
     checks: evidence.checks.required,
+    timeline,
     technicalBlocks: [
       evidence.adoptionReceiptBlock,
       evidence.evaluationAnchorBlock,
@@ -631,6 +778,7 @@ export function renderRelayAssuranceComment(
   const checks = ready?.checks ?? model.checks;
   const solutionOperator = ready?.solutionOperator ?? model.solutionOperator;
   const evaluatorOperator = ready?.evaluator ?? model.evaluator;
+  const rounds = ready?.timeline ?? model.rounds;
   if (model.status === 'READY FOR HUMAN REVIEW') {
     if (
       head === undefined
@@ -666,9 +814,9 @@ export function renderRelayAssuranceComment(
   const checkLines = checks.length === 0
     ? ['- No required GitHub checks were usable; Relay verification and semantic evaluation remain recorded above.']
     : checks.map(renderCheck);
-  const timeline = model.rounds.length === 0
+  const timeline = rounds.length === 0
     ? ['- No funded round has been recorded.']
-    : model.rounds.map((item) => {
+    : rounds.map((item) => {
       safeRound(item.round);
       return `- Round ${item.round} · ${item.purpose} · ${item.outcome} · `
         + `\`${exactOid(item.head, 'Timeline head')}\` — ${safeDisplay(item.summary)}`;

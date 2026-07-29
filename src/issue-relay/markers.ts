@@ -117,6 +117,13 @@ const GenerationSchema = z.object({
     branch: NonEmptyStringSchema,
     head: GitOidSchema,
     draft: z.boolean(),
+    targetRepository: NonEmptyStringSchema.optional(),
+    targetRepositoryId: NonEmptyStringSchema.optional(),
+    forkRepository: NonEmptyStringSchema.optional(),
+    forkRepositoryId: NonEmptyStringSchema.optional(),
+    forkParentRepositoryId: NonEmptyStringSchema.optional(),
+    visibility: z.enum(['PUBLIC', 'PRIVATE', 'INTERNAL']).optional(),
+    managedFork: z.boolean().optional(),
   }).strict().optional(),
   cancellation: z.object({
     requestedAt: CanonicalUtcSchema,
@@ -436,11 +443,23 @@ function prDoesNotRegress(
   proposed: RelayGenerationRecordV1,
 ): boolean {
   if (current.pr === undefined) return true;
+  const repositoryIdentityKeys = [
+    'targetRepository',
+    'targetRepositoryId',
+    'forkRepository',
+    'forkRepositoryId',
+    'forkParentRepositoryId',
+    'visibility',
+    'managedFork',
+  ] as const;
   if (
     proposed.pr === undefined
     || current.pr.number !== proposed.pr.number
     || current.pr.branch !== proposed.pr.branch
     || (!current.pr.draft && proposed.pr.draft)
+    || repositoryIdentityKeys.some((key) =>
+      current.pr?.[key] !== undefined
+      && current.pr[key] !== proposed.pr?.[key])
   ) {
     return false;
   }
