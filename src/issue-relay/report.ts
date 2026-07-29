@@ -4,18 +4,23 @@ import {
   parseRelayEvaluationAnchorBlock,
   type RelayCheckSummary,
 } from './checks.js';
+import type { AcceptedRelayAdoption } from './adoption.js';
+import type { IssueRelayEvaluationAnchorV1 } from './contracts.js';
 import {
   formatRelayAdoptionReceiptBlock,
   parseRelayAdoptionReceiptBlock,
 } from './git-publisher.js';
+import type { VerifiedIssueRelayVerdictObservation } from './marketplace-cli.js';
 import {
   formatRelayIssueMarker,
   parseRelayIssueMarker,
   prepareRelayIssueMarkerUpdate,
 } from './markers.js';
-import type {
-  RelayGenerationRecordV1,
-  RelayPhase,
+import {
+  deriveRelayReady,
+  type RelayGenerationRecordV1,
+  type RelayPhase,
+  type RelayReadyInput,
 } from './state.js';
 
 const ISSUE_MARKER = '<!-- jinn-issue-relay:generation:v1 -->';
@@ -58,6 +63,25 @@ export interface RelayIssueStatusModel {
   readonly nextAction: string;
 }
 
+export interface RelayReadyAssuranceEvidence {
+  readonly record: RelayGenerationRecordV1;
+  readonly currentHead: string;
+  readonly currentBaseOid: string;
+  readonly targetBase: string;
+  /** Exact open, non-draft PR facts read after the mark-ready transition. */
+  readonly currentPr: Omit<NonNullable<RelayReadyInput['draft']>, 'draft'> & {
+    readonly draft: false;
+  };
+  /** Exact open draft facts used by Task 10 immediately before mark-ready. */
+  readonly draft: NonNullable<RelayReadyInput['draft']>;
+  readonly adoption: AcceptedRelayAdoption;
+  readonly checks: RelayCheckSummary;
+  readonly evaluationAnchor: IssueRelayEvaluationAnchorV1;
+  readonly verdict: VerifiedIssueRelayVerdictObservation;
+  readonly adoptionReceiptBlock: string;
+  readonly evaluationAnchorBlock: string;
+}
+
 export interface RelayAssuranceModel {
   readonly status:
     | 'IN PROGRESS'
@@ -70,6 +94,7 @@ export interface RelayAssuranceModel {
   readonly solutionOperator?: string;
   readonly evaluator?: string;
   readonly checks: ReadonlyArray<RelayCheckSummary['required'][number]>;
+  readonly readyEvidence?: RelayReadyAssuranceEvidence;
   readonly rounds: readonly RelayRoundTimelineItem[];
   readonly limitations: readonly string[];
   readonly technicalEvidence: readonly RelayEvidenceLink[];
@@ -112,15 +137,26 @@ function sameLogin(left: string, right: string): boolean {
 }
 
 function bounded(value: string): string {
-  const normalized = value.normalize('NFC');
-  let result = '';
-  for (const character of normalized) {
-    if (Buffer.byteLength(result + character, 'utf8') > MAX_DISPLAY_BYTES) {
-      return `${result}…`;
+  const characters: string[] = [];
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > MAX_DISPLAY_BYTES) {
+      const ellipsis = '…';
+      const ellipsisBytes = Buffer.byteLength(ellipsis, 'utf8');
+      while (
+        characters.length > 0
+        && bytes + ellipsisBytes > MAX_DISPLAY_BYTES
+      ) {
+        const removed = characters.pop()!;
+        bytes -= Buffer.byteLength(removed, 'utf8');
+      }
+      return `${characters.join('')}${ellipsis}`;
     }
-    result += character;
+    characters.push(character);
+    bytes += characterBytes;
   }
-  return result;
+  return characters.join('');
 }
 
 /**
@@ -128,8 +164,9 @@ function bounded(value: string): string {
  * Authority continues to come only from the strict hidden codecs.
  */
 function safeDisplay(value: string): string {
-  return bounded(value)
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+  const sanitized = value
+    .normalize('NFC')
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/&/g, '&amp;')
@@ -147,7 +184,7 @@ function safeDisplay(value: string): string {
     .replace(/^-/, '‐')
     .replace(/^\+/, '＋')
     .replace(/^(\d+)\./, '$1․')
-    .replace(/@/g, '@\u200b')
+    .replace(/@/g, '＠')
     .replace(/\bhttps?:\/\//gi, (match) =>
       match.toLocaleLowerCase('en-US').startsWith('https')
         ? 'hxxps://'
@@ -155,11 +192,12 @@ function safeDisplay(value: string): string {
     .replace(/\bwww\./gi, 'www․')
     .replace(
       /\b(close[sd]?|closing|fix(?:e[sd]?|ing)?|resolve[sd]?|resolving)\b/gi,
-      (match) => `${match.slice(0, 3)}\u200b${match.slice(3)}`,
+      (match) => `${match.slice(0, 3)}·${match.slice(3)}`,
     )
-    .replace(/\bsafe to merge\b/gi, 'safe to mer\u200bge')
-    .replace(/\bguaranteed\b/gi, 'guaran\u200bteed')
-    .replace(/\bmaintainer approved\b/gi, 'maintainer appro\u200bved');
+    .replace(/\bsafe to merge\b/gi, 'safe to mer·ge')
+    .replace(/\bguaranteed\b/gi, 'guaran·teed')
+    .replace(/\bmaintainer approved\b/gi, 'maintainer appro·ved');
+  return bounded(sanitized);
 }
 
 function exactOid(value: string, label: string): string {
@@ -205,6 +243,7 @@ function issueStatus(model: RelayIssueStatusModel): string {
 export function renderRelayIssueComment(
   model: RelayIssueStatusModel,
 ): string {
+  const durableRound = model.record.rounds.at(-1)?.round ?? 0;
   if (
     model.record.generation !== model.generation
     || model.record.phase !== model.phase
@@ -212,6 +251,16 @@ export function renderRelayIssueComment(
     throw new TypeError('Relay visible issue status contradicts its durable marker');
   }
   safeRound(model.round);
+  if (model.round !== durableRound) {
+    throw new TypeError(
+      'Relay visible issue round contradicts the durable latest round',
+    );
+  }
+  if (model.prNumber !== model.record.pr?.number) {
+    throw new TypeError(
+      'Relay visible pull request contradicts the durable marker',
+    );
+  }
   const marker = formatRelayIssueMarker(model.record);
   const lines = [
     `## Jinn Issue Relay — ${issueStatus(model)}`,
@@ -273,7 +322,227 @@ function lastVerdict(model: RelayAssuranceModel): string {
   }
 }
 
+interface ValidatedReadyAssurance {
+  readonly head: string;
+  readonly targetRepository: string;
+  readonly prNumber: number;
+  readonly solutionOperator: string;
+  readonly evaluator: string;
+  readonly checks: RelayCheckSummary['required'];
+  readonly technicalBlocks: readonly [string, string];
+}
+
+function validateReadyAssurance(
+  model: RelayAssuranceModel,
+): ValidatedReadyAssurance {
+  const candidate = model.readyEvidence as unknown;
+  if (
+    candidate === null
+    || typeof candidate !== 'object'
+    || Array.isArray(candidate)
+  ) {
+    throw new TypeError('Ready assurance requires structured exact evidence');
+  }
+  const evidence = candidate as Partial<RelayReadyAssuranceEvidence>;
+  if (
+    typeof evidence.adoptionReceiptBlock !== 'string'
+    || typeof evidence.evaluationAnchorBlock !== 'string'
+    || evidence.adoption === undefined
+    || evidence.checks === undefined
+    || evidence.evaluationAnchor === undefined
+    || evidence.verdict === undefined
+    || evidence.draft === undefined
+    || evidence.currentPr === undefined
+    || evidence.record === undefined
+    || typeof evidence.currentHead !== 'string'
+    || typeof evidence.currentBaseOid !== 'string'
+    || typeof evidence.targetBase !== 'string'
+  ) {
+    throw new TypeError('Ready assurance evidence is incomplete');
+  }
+
+  try {
+    formatRelayIssueMarker(evidence.record);
+  } catch (error) {
+    throw new TypeError('Ready assurance durable generation is invalid', {
+      cause: error,
+    });
+  }
+
+  let parsedReceipt: ReturnType<typeof parseRelayAdoptionReceiptBlock>;
+  let parsedAnchor: ReturnType<typeof parseRelayEvaluationAnchorBlock>;
+  try {
+    parsedReceipt = parseRelayAdoptionReceiptBlock(
+      evidence.adoptionReceiptBlock,
+    );
+    parsedAnchor = parseRelayEvaluationAnchorBlock(
+      evidence.evaluationAnchorBlock,
+    );
+  } catch (error) {
+    throw new TypeError('Ready assurance technical evidence is malformed', {
+      cause: error,
+    });
+  }
+  if (
+    parsedReceipt === null
+    || parsedAnchor === null
+    || !isDeepStrictEqual(parsedReceipt, evidence.adoption.receipt)
+    || !isDeepStrictEqual(parsedAnchor, evidence.evaluationAnchor)
+    || evidence.adoptionReceiptBlock
+      !== formatRelayAdoptionReceiptBlock(parsedReceipt)
+    || evidence.evaluationAnchorBlock
+      !== formatRelayEvaluationAnchorBlock(parsedAnchor)
+  ) {
+    throw new TypeError(
+      'Ready assurance preserved receipt or anchor evidence does not match',
+    );
+  }
+
+  const durableRound = evidence.record.rounds.at(-1);
+  const receipt = evidence.adoption.receipt;
+  const cancelled = evidence.record.cancellation !== undefined
+    || evidence.record.phase === 'cancelling'
+    || evidence.record.phase === 'closed';
+  const exhausted = evidence.record.phase === 'exhausted';
+  if (
+    evidence.record.phase !== 'ready'
+    || cancelled
+    || exhausted
+    || evidence.record.generation !== receipt.correlation.generation
+    || evidence.record.snapshot.snapshotDigest
+      !== receipt.correlation.snapshotDigest
+    || evidence.record.snapshot.repository.slug !== receipt.targetRepository
+    || evidence.record.snapshot.repository.defaultBranch
+      !== evidence.evaluationAnchor.targetBase
+    || evidence.record.snapshot.repository.baseOid
+      !== evidence.evaluationAnchor.baseOid
+    || evidence.record.snapshot.issue.number !== receipt.issueNumber
+    || evidence.record.pr?.number !== receipt.prNumber
+    || evidence.record.pr.branch !== receipt.headRef
+    || evidence.record.pr.head !== receipt.resultingHead
+    || evidence.record.pr.draft !== false
+    || evidence.currentPr.number !== receipt.prNumber
+    || evidence.currentPr.branch !== receipt.headRef
+    || evidence.currentPr.head !== receipt.resultingHead
+    || evidence.currentPr.base !== evidence.evaluationAnchor.targetBase
+    || evidence.currentPr.generation !== receipt.correlation.generation
+    || evidence.currentPr.open !== true
+    || evidence.currentPr.draft !== false
+    || evidence.draft.number !== evidence.currentPr.number
+    || evidence.draft.branch !== evidence.currentPr.branch
+    || evidence.draft.head !== evidence.currentPr.head
+    || evidence.draft.base !== evidence.currentPr.base
+    || evidence.draft.generation !== evidence.currentPr.generation
+    || evidence.draft.open !== true
+    || evidence.draft.draft !== true
+    || evidence.record.generation !== evidence.verdict.round.generation
+    || durableRound?.round !== receipt.correlation.round
+    || durableRound.round !== evidence.verdict.round.round
+    || durableRound.purpose !== evidence.verdict.round.purpose
+    || durableRound.workspaceRepository !== receipt.workspaceRepository
+    || durableRound.workspaceRepository
+      !== evidence.verdict.round.workspaceRepository
+    || durableRound.inputHead !== receipt.inputHead
+    || durableRound.inputHead !== evidence.verdict.round.inputHead
+    || (
+      durableRound.purpose === 'initial'
+      && (
+        durableRound.workspaceRepository !== receipt.targetRepository
+        || durableRound.inputHead
+          !== evidence.record.snapshot.repository.baseOid
+        || evidence.verdict.round.prNumber !== undefined
+      )
+    )
+    || (
+      durableRound.purpose === 'repair'
+      && (
+        durableRound.workspaceRepository === receipt.targetRepository
+        || evidence.verdict.round.prNumber !== receipt.prNumber
+      )
+    )
+    || durableRound.task?.taskId !== receipt.correlation.taskId
+    || durableRound.task.taskCid !== evidence.verdict.task.taskCid
+    || durableRound.solution?.envelopeCid
+      !== receipt.correlation.deliveryEnvelopeCid
+    || durableRound.solution.operatorSafe.toLocaleLowerCase('en-US')
+      !== receipt.solutionSafe.toLocaleLowerCase('en-US')
+    || durableRound.adoption?.disposition !== 'accepted'
+    || durableRound.adoption.resultingHead !== receipt.resultingHead
+    || durableRound.adoption.receiptDigest
+      !== evidence.evaluationAnchor.adoptionReceiptDigest
+    || durableRound.checks?.head !== evidence.checks.head
+    || durableRound.checks.status !== 'passed'
+    || durableRound.checks.digest !== evidence.checks.digest
+    || durableRound.verdict?.outcome !== 'pass'
+    || durableRound.verdict.evaluatedHead
+      !== evidence.verdict.payload.evaluatedHead
+    || durableRound.verdict.envelopeCid
+      !== evidence.verdict.delivery.envelopeCid
+  ) {
+    throw new TypeError(
+      'Ready assurance does not match the current durable generation',
+    );
+  }
+
+  let decision: ReturnType<typeof deriveRelayReady>;
+  try {
+    decision = deriveRelayReady({
+      currentHead: evidence.currentHead,
+      currentBaseOid: evidence.currentBaseOid,
+      targetBase: evidence.targetBase,
+      draft: evidence.draft,
+      adoption: evidence.adoption,
+      checks: evidence.checks,
+      evaluationAnchor: evidence.evaluationAnchor,
+      verdict: evidence.verdict,
+      cancelled,
+      exhausted,
+    });
+  } catch (error) {
+    throw new TypeError('Ready assurance evidence is invalid', { cause: error });
+  }
+  if (!decision.ready || model.head !== decision.head) {
+    throw new TypeError('Ready assurance evidence does not bind the exact head');
+  }
+  const passed = model.rounds
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.outcome === 'passed');
+  const authenticatedPass = passed[0];
+  if (
+    passed.length !== 1
+    || authenticatedPass === undefined
+    || authenticatedPass.index !== model.rounds.length - 1
+    || authenticatedPass.item.round
+      !== evidence.adoption.receipt.correlation.round
+    || authenticatedPass.item.head !== decision.head
+  ) {
+    throw new TypeError(
+      'Ready assurance timeline does not match the authenticated verdict',
+    );
+  }
+
+  return {
+    head: decision.head,
+    targetRepository: evidence.adoption.receipt.targetRepository,
+    prNumber: evidence.adoption.receipt.prNumber,
+    solutionOperator: evidence.adoption.receipt.solutionSafe,
+    evaluator: evidence.verdict.attempt.operator,
+    checks: evidence.checks.required,
+    technicalBlocks: [
+      evidence.adoptionReceiptBlock,
+      evidence.evaluationAnchorBlock,
+    ],
+  };
+}
+
 function safeHttpsUrl(value: string, label: string): string {
+  if (
+    Buffer.byteLength(value, 'utf8') > MAX_DISPLAY_BYTES
+    || !value.startsWith('https://')
+    || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)
+  ) {
+    throw new TypeError(`${label} must be a bounded canonical HTTPS URL`);
+  }
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -284,10 +553,41 @@ function safeHttpsUrl(value: string, label: string): string {
     parsed.protocol !== 'https:'
     || parsed.username.length > 0
     || parsed.password.length > 0
+    || parsed.search.length > 0
+    || parsed.hash.length > 0
+    || parsed.href !== value
   ) {
-    throw new TypeError(`${label} must be an unauthenticated HTTPS URL`);
+    throw new TypeError(
+      `${label} must be a canonical unauthenticated HTTPS URL without query or fragment`,
+    );
   }
-  return parsed.href.replace(/>/g, '%3E');
+  for (const match of value.matchAll(/%([0-9A-Fa-f]{2})/g)) {
+    const encoded = match[1]!;
+    const byte = Number.parseInt(encoded, 16);
+    const unreserved =
+      (byte >= 0x41 && byte <= 0x5a)
+      || (byte >= 0x61 && byte <= 0x7a)
+      || (byte >= 0x30 && byte <= 0x39)
+      || [0x2d, 0x2e, 0x5f, 0x7e].includes(byte);
+    if (encoded !== encoded.toLocaleUpperCase('en-US') || unreserved) {
+      throw new TypeError(
+        `${label} URL contains noncanonical percent encoding`,
+      );
+    }
+  }
+  try {
+    if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(
+      decodeURIComponent(parsed.pathname),
+    )) {
+      throw new TypeError(`${label} URL path contains a control character`);
+    }
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) {
+      throw error;
+    }
+    throw new TypeError(`${label} URL path is not canonical`, { cause: error });
+  }
+  return value;
 }
 
 function renderCheck(
@@ -322,18 +622,23 @@ export function renderRelayAssuranceComment(
   requireBoundedItems(model.limitations, 'Relay limitations');
   requireBoundedItems(model.technicalEvidence, 'Relay technical evidence');
 
-  const head = model.head === undefined
+  const ready = model.status === 'READY FOR HUMAN REVIEW'
+    ? validateReadyAssurance(model)
+    : undefined;
+  const head = ready?.head ?? (model.head === undefined
     ? undefined
-    : exactOid(model.head, 'Relay assurance head');
+    : exactOid(model.head, 'Relay assurance head'));
+  const checks = ready?.checks ?? model.checks;
+  const solutionOperator = ready?.solutionOperator ?? model.solutionOperator;
+  const evaluatorOperator = ready?.evaluator ?? model.evaluator;
   if (model.status === 'READY FOR HUMAN REVIEW') {
     if (
       head === undefined
-      || model.solutionOperator === undefined
-      || model.evaluator === undefined
-      || model.solutionOperator.toLocaleLowerCase('en-US')
-        === model.evaluator.toLocaleLowerCase('en-US')
-      || model.checks.some(({ status }) => status !== 'passed')
-      || lastVerdict(model) !== 'passed'
+      || solutionOperator === undefined
+      || evaluatorOperator === undefined
+      || solutionOperator.toLocaleLowerCase('en-US')
+        === evaluatorOperator.toLocaleLowerCase('en-US')
+      || checks.some(({ status }) => status !== 'passed')
     ) {
       throw new TypeError(
         'Ready assurance requires a distinct evaluator and passed exact-head evidence',
@@ -342,25 +647,25 @@ export function renderRelayAssuranceComment(
   }
 
   const headLabel = head === undefined ? 'not yet recorded' : `\`${head}\``;
-  const solution = model.solutionOperator === undefined
+  const solution = solutionOperator === undefined
     ? 'not yet recorded'
-    : `\`${safeDisplay(model.solutionOperator)}\``;
-  const evaluator = model.evaluator === undefined
+    : `\`${safeDisplay(solutionOperator)}\``;
+  const evaluator = evaluatorOperator === undefined
     ? 'not yet recorded'
-    : `\`${safeDisplay(model.evaluator)}\``;
-  const distinct = model.solutionOperator !== undefined
-    && model.evaluator !== undefined
-    && model.solutionOperator.toLocaleLowerCase('en-US')
-      !== model.evaluator.toLocaleLowerCase('en-US');
+    : `\`${safeDisplay(evaluatorOperator)}\``;
+  const distinct = solutionOperator !== undefined
+    && evaluatorOperator !== undefined
+    && solutionOperator.toLocaleLowerCase('en-US')
+      !== evaluatorOperator.toLocaleLowerCase('en-US');
   const limitations = [
     ...(model.status === 'READY FOR HUMAN REVIEW'
       ? [READY_FOR_REVIEW_LIMITATION]
       : []),
     ...model.limitations.map(safeDisplay).filter((value) => value.length > 0),
   ];
-  const checkLines = model.checks.length === 0
+  const checkLines = checks.length === 0
     ? ['- No required GitHub checks were usable; Relay verification and semantic evaluation remain recorded above.']
-    : model.checks.map(renderCheck);
+    : checks.map(renderCheck);
   const timeline = model.rounds.length === 0
     ? ['- No funded round has been recorded.']
     : model.rounds.map((item) => {
@@ -379,7 +684,7 @@ export function renderRelayAssuranceComment(
     '',
     `## Assurance for exact revision ${headLabel}`,
     '',
-    `- Recorded verdict: ${lastVerdict(model)} at ${headLabel}.`,
+    `- Recorded verdict: ${ready === undefined ? lastVerdict(model) : 'passed'} at ${headLabel}.`,
     `- Solution operator: ${solution}.`,
     `- Separate evaluator: ${evaluator}.`,
     `- Role separation: ${distinct
@@ -431,6 +736,14 @@ function composeAssurance(
   model: RelayAssuranceModel,
   technicalBlocks: readonly string[],
 ): string {
+  if (model.status === 'READY FOR HUMAN REVIEW') {
+    const ready = validateReadyAssurance(model);
+    if (!isDeepStrictEqual(technicalBlocks, ready.technicalBlocks)) {
+      throw new Error(
+        'Ready assurance requires its exact preserved receipt and anchor blocks',
+      );
+    }
+  }
   const visible = renderRelayAssuranceComment(model);
   if (technicalBlocks.length === 0) return visible;
   const closing = '\n</details>';
@@ -535,6 +848,17 @@ export function createRelayReportPublisher(options: {
       exactOid(input.expectedHead, 'Expected PR head');
       if (input.model.head !== undefined && input.model.head !== input.expectedHead) {
         throw new Error('Relay assurance model does not describe the expected PR head');
+      }
+      if (input.model.status === 'READY FOR HUMAN REVIEW') {
+        const ready = validateReadyAssurance(input.model);
+        if (
+          ready.targetRepository !== input.repository
+          || ready.prNumber !== input.prNumber
+        ) {
+          throw new Error(
+            'Ready assurance repository or pull request contradicts its evidence',
+          );
+        }
       }
       const key = {
         repository: input.repository,
