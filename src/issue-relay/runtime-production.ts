@@ -103,7 +103,7 @@ import { makeRelayAdoptionCoordinator } from './adoption.js';
 import type {
   IssueRelayEvaluationAnchorV1,
 } from './contracts.js';
-import { resolveInstalledJinnBinary } from '../lifecycle/marketplace-cli.js';
+import { verifyIssueRelayJinnDistribution } from './jinn-distribution.js';
 import {
   createMarketplaceVerificationDockerSandbox,
   createProductionMarketplaceVerificationPort,
@@ -2716,12 +2716,10 @@ function createRelayProductionGitAndWorktrees(input: {
 
 export interface IssueRelayProductionEnvironmentDependencies {
   readonly readConfig: (path: string) => unknown;
-  readonly resolveJinnBinary: () => string;
 }
 
 const productionEnvironmentDependencies: IssueRelayProductionEnvironmentDependencies = {
   readConfig: (path) => JSON.parse(readFileSync(path, 'utf8')) as unknown,
-  resolveJinnBinary: () => resolveInstalledJinnBinary(),
 };
 
 export async function runIssueRelayProductionFromEnvironment(options: {
@@ -2733,33 +2731,41 @@ productionEnvironmentDependencies): Promise<void> {
   const configPath = options.environment.JINN_ISSUE_RELAY_CONFIG;
   const configuredJinnBinary =
     options.environment.JINN_ISSUE_RELAY_JINN_BINARY;
+  const configuredJinnCommit =
+    options.environment.JINN_ISSUE_RELAY_JINN_COMMIT;
+  const configuredJinnDistributionSha256 =
+    options.environment.JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256;
   const token = options.environment.JINN_ISSUE_RELAY_GITHUB_TOKEN;
   const stateDirectory =
     options.environment.JINN_ISSUE_RELAY_STATE_DIRECTORY;
   if (
     configPath === undefined
     || !isAbsolute(configPath)
-    || (
-      configuredJinnBinary !== undefined
-      && !isAbsolute(configuredJinnBinary)
-    )
+    || configuredJinnBinary === undefined
+    || !isAbsolute(configuredJinnBinary)
+    || configuredJinnCommit === undefined
+    || configuredJinnDistributionSha256 === undefined
     || token === undefined
     || token.length === 0
     || stateDirectory === undefined
     || !isAbsolute(stateDirectory)
   ) {
     throw new Error(
-      'Issue Relay requires absolute config/state/binary paths and a GitHub token',
+      'Issue Relay requires absolute config/state/binary paths, reviewed Jinn commit/digest, and a GitHub token',
     );
   }
+  const reviewedJinn = verifyIssueRelayJinnDistribution({
+    binaryPath: configuredJinnBinary,
+    expectedCommit: configuredJinnCommit,
+    expectedDigest: configuredJinnDistributionSha256,
+  });
   const config = parseIssueRelayConfig(dependencies.readConfig(configPath));
   const now = () => new Date();
   const artifacts = options.mode === 'observe'
     ? createRelayReadOnlyArtifactStore(stateDirectory)
     : createRelayDurableArtifactStore(stateDirectory, { deferCreation: true });
   const github = createRelayGitHubProductionPorts({ config, token });
-  const jinnBinary =
-    configuredJinnBinary ?? dependencies.resolveJinnBinary();
+  const jinnBinary = reviewedJinn.binaryPath;
   const marketplace = new IssueRelayMarketplaceCli({
     jinnBinary,
     environment: options.environment,

@@ -33,6 +33,7 @@ import {
   type RelayGitHubApiRequest,
 } from '../../src/issue-relay/github-production.js';
 import type { IssueRelayConfig } from '../../src/issue-relay/config.js';
+import { digestIssueRelayJinnDistribution } from '../../src/issue-relay/jinn-distribution.js';
 
 const directories: string[] = [];
 
@@ -536,6 +537,53 @@ describe('production Relay cadence', () => {
       });
     }));
     const raw = config();
+    const reviewedDist = join(parent, 'reviewed-dist');
+    const reviewedJinn = join(reviewedDist, 'bin', 'jinn.js');
+    await mkdir(join(reviewedDist, 'bin'), { recursive: true });
+    await mkdir(join(reviewedDist, 'cli', 'commands'), { recursive: true });
+    await writeFile(reviewedJinn, '#!/usr/bin/env node\n');
+    await chmod(reviewedJinn, 0o755);
+    await writeFile(
+      join(reviewedDist, 'build-meta.json'),
+      `${JSON.stringify({ commit: 'a'.repeat(40) })}\n`,
+    );
+    await writeFile(
+      join(reviewedDist, 'cli', 'commands', 'tasks.js'),
+      'const command = "observe-issue-relay-delivery";\n',
+    );
+    await writeFile(
+      join(
+        reviewedDist,
+        'cli',
+        'commands',
+        'tasks-observe-issue-relay.js',
+      ),
+      'const command = "observe-issue-relay-delivery";\n',
+    );
+    const reviewedJinnSha256 =
+      digestIssueRelayJinnDistribution(reviewedJinn);
+    const readConfig = () => ({
+      ...raw,
+      budget: {
+        ...raw.budget,
+        maxGenerationSpendWei: raw.budget.maxGenerationSpendWei.toString(),
+        maxGlobalSpendWeiPerUtcDay:
+          raw.budget.maxGlobalSpendWeiPerUtcDay.toString(),
+      },
+    });
+
+    await expect(runIssueRelayProductionFromEnvironment({
+      mode: 'observe',
+      once: true,
+      environment: {
+        PATH: process.env.PATH,
+        JINN_ISSUE_RELAY_CONFIG: join(parent, 'config.json'),
+        JINN_ISSUE_RELAY_GITHUB_TOKEN: 'test-token',
+        JINN_ISSUE_RELAY_STATE_DIRECTORY: state,
+      },
+    }, {
+      readConfig,
+    })).rejects.toThrow(/binary/i);
 
     let failure: unknown;
     try {
@@ -546,22 +594,13 @@ describe('production Relay cadence', () => {
           PATH: process.env.PATH,
           JINN_ISSUE_RELAY_CONFIG: join(parent, 'config.json'),
           JINN_ISSUE_RELAY_GITHUB_TOKEN: 'test-token',
-          JINN_ISSUE_RELAY_JINN_BINARY: join(parent, 'reviewed-jinn'),
+          JINN_ISSUE_RELAY_JINN_BINARY: reviewedJinn,
+          JINN_ISSUE_RELAY_JINN_COMMIT: 'a'.repeat(40),
+          JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256: reviewedJinnSha256,
           JINN_ISSUE_RELAY_STATE_DIRECTORY: state,
         },
       }, {
-        readConfig: () => ({
-          ...raw,
-          budget: {
-            ...raw.budget,
-            maxGenerationSpendWei: raw.budget.maxGenerationSpendWei.toString(),
-            maxGlobalSpendWeiPerUtcDay:
-              raw.budget.maxGlobalSpendWeiPerUtcDay.toString(),
-          },
-        }),
-        resolveJinnBinary: () => {
-          throw new Error('registry Jinn client must not be resolved');
-        },
+        readConfig,
       });
     } catch (error) {
       failure = error;

@@ -66,7 +66,8 @@ Pin the Relay to that reviewed worktree build, never to Autopilot's registry
 ```sh
 export JINN_ISSUE_RELAY_JINN_BINARY="$JINN_MONO_WORKTREE/client/dist/bin/jinn.js"
 test -x "$JINN_ISSUE_RELAY_JINN_BINARY"
-rg -q 'observe-issue-relay-delivery' "$JINN_ISSUE_RELAY_JINN_BINARY"
+rg -q 'observe-issue-relay-delivery' \
+  "$JINN_MONO_WORKTREE/client/dist/cli/commands"
 node -e '
   const fs = require("node:fs");
   const path = require("node:path");
@@ -76,16 +77,20 @@ node -e '
   ));
   if (meta.commit !== process.env.JINN_MONO_COMMIT) process.exit(1);
 '
-export JINN_ISSUE_RELAY_JINN_BINARY_SHA256="$(
-  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
+export JINN_ISSUE_RELAY_JINN_COMMIT="$JINN_MONO_COMMIT"
+export JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256="$(
+  yarn --cwd "$AUTOPILOT_WORKTREE" tsx \
+    scripts/digest-jinn-issue-relay-client.ts \
+    "$JINN_ISSUE_RELAY_JINN_BINARY"
 )"
-test "${#JINN_ISSUE_RELAY_JINN_BINARY_SHA256}" -eq 64
+test "${#JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256}" -eq 64
 ```
 
-Record the companion commit, absolute binary path, and SHA-256 in the rollout
-approval and retained evidence. Stop if any differs after preflight. The
-runtime consumes `JINN_ISSUE_RELAY_JINN_BINARY`; the SHA-256 is an operator
-pin checked before every approved pass.
+Record the companion commit, absolute binary path, and canonical whole-`dist`
+SHA-256 in the rollout approval and retained evidence. Stop if any differs
+after preflight. Runtime requires and verifies all three pins, including the
+build metadata and compiled Relay command modules, at process startup. The
+digest is also checked before every approved pass.
 
 The SDK contract bytes must agree before rollout:
 
@@ -137,13 +142,16 @@ Both Wei placeholders must be replaced by positive decimal integers before
 the config is used. The managed fork must be public, distinct from the target,
 owned by `relayBotLogin`, and have the target repository as its parent.
 
-Set the four Relay variables. Keep the GitHub token in the process secret
+Set the six Relay variables. Keep the GitHub token in the process secret
 store, not the config or state directory:
 
 ```sh
 export JINN_ISSUE_RELAY_CONFIG="$RELAY_CONFIG"
 export JINN_ISSUE_RELAY_STATE_DIRECTORY="$RELAY_STATE_DIRECTORY"
 export JINN_ISSUE_RELAY_JINN_BINARY="$JINN_MONO_WORKTREE/client/dist/bin/jinn.js"
+export JINN_ISSUE_RELAY_JINN_COMMIT="$JINN_MONO_COMMIT"
+# Retain the whole-distribution SHA-256 computed and approved above.
+test "${#JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256}" -eq 64
 export JINN_ISSUE_RELAY_GITHUB_TOKEN='<bot token from the secret store>'
 ```
 
@@ -188,16 +196,19 @@ state directory, and marketplace environment.
 ```sh
 cd "$AUTOPILOT_WORKTREE"
 test "$(
-  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
-)" = "$JINN_ISSUE_RELAY_JINN_BINARY_SHA256"
+  yarn tsx scripts/digest-jinn-issue-relay-client.ts \
+    "$JINN_ISSUE_RELAY_JINN_BINARY"
+)" = "$JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256"
 yarn issue-relay --mode observe --once
 test "$(
-  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
-)" = "$JINN_ISSUE_RELAY_JINN_BINARY_SHA256"
+  yarn tsx scripts/digest-jinn-issue-relay-client.ts \
+    "$JINN_ISSUE_RELAY_JINN_BINARY"
+)" = "$JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256"
 yarn issue-relay --mode recover --once
 test "$(
-  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
-)" = "$JINN_ISSUE_RELAY_JINN_BINARY_SHA256"
+  yarn tsx scripts/digest-jinn-issue-relay-client.ts \
+    "$JINN_ISSUE_RELAY_JINN_BINARY"
+)" = "$JINN_ISSUE_RELAY_JINN_DISTRIBUTION_SHA256"
 yarn issue-relay --mode active --once
 ```
 
