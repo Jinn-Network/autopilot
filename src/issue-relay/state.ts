@@ -81,6 +81,13 @@ export interface RelayGenerationRecordV1 {
     readonly branch: string;
     readonly head: string;
     readonly draft: boolean;
+    readonly targetRepository?: string;
+    readonly targetRepositoryId?: string;
+    readonly forkRepository?: string;
+    readonly forkRepositoryId?: string;
+    readonly forkParentRepositoryId?: string;
+    readonly visibility?: 'PUBLIC' | 'PRIVATE' | 'INTERNAL';
+    readonly managedFork?: boolean;
   };
   readonly cancellation?: {
     readonly requestedAt: string;
