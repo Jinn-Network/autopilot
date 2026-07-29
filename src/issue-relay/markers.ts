@@ -7,6 +7,7 @@ import type {
   RelayGenerationRecordV1,
   RelayRoundRecordV1,
 } from './state.js';
+import { IssueRelayFindingV1Schema } from './contracts.js';
 
 const RELAY_ISSUE_MARKER_PREFIX = '<!-- jinn-issue-relay:generation:v1 -->';
 const MAX_RELAY_ISSUE_MARKER_BYTES = 256 * 1024;
@@ -14,6 +15,8 @@ const CANONICAL_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const GIT_OID_PATTERN = /^[0-9a-f]{40}$/;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const SAFE_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+const CANONICAL_POSITIVE_WEI_PATTERN = /^[1-9][0-9]*$/;
+const UINT256_MAX = (1n << 256n) - 1n;
 
 const NonEmptyStringSchema = z.string().min(1);
 const CanonicalUtcSchema = z.string().refine(
@@ -64,10 +67,28 @@ const RoundSchema = z.object({
   purpose: z.enum(['initial', 'repair']),
   workspaceRepository: NonEmptyStringSchema,
   inputHead: GitOidSchema,
+  findings: z.array(IssueRelayFindingV1Schema).optional(),
+  prNumber: z.number().int().safe().positive().optional(),
+  fundingIntent: z.object({
+    taskKey: NonEmptyStringSchema,
+    creatorSafe: z.string().regex(SAFE_ADDRESS_PATTERN),
+    solverNetManifestCid: NonEmptyStringSchema,
+    requestDigest: DigestSchema,
+    maximumSpendWei: z.string()
+      .regex(CANONICAL_POSITIVE_WEI_PATTERN)
+      .refine((value) => BigInt(value) <= UINT256_MAX),
+    spendWei: z.string()
+      .regex(CANONICAL_POSITIVE_WEI_PATTERN)
+      .refine((value) => BigInt(value) <= UINT256_MAX),
+    preparedAt: CanonicalUtcSchema,
+  }).strict().optional(),
   task: z.object({
     taskKey: NonEmptyStringSchema,
     taskId: NonEmptyStringSchema,
     taskCid: NonEmptyStringSchema,
+    spendWei: z.string()
+      .regex(CANONICAL_POSITIVE_WEI_PATTERN)
+      .refine((value) => BigInt(value) <= UINT256_MAX),
     fundedAt: CanonicalUtcSchema,
   }).strict().optional(),
   solution: z.object({
@@ -100,6 +121,7 @@ const GenerationSchema = z.object({
     'awaiting-clarification',
     'refused',
     'admitted',
+    'funding',
     'submitted',
     'solution-delivered',
     'draft-open',
@@ -156,7 +178,50 @@ function roundEvidenceIsConsistent(
   generation: string,
   round: RelayRoundRecordV1,
 ): boolean {
-  if (round.task !== undefined && round.task.taskKey !== relayTaskKey(generation, round.round)) {
+  const taskKey = relayTaskKey(generation, round.round);
+  if (
+    (
+      round.purpose === 'initial'
+      && (
+        (round.findings !== undefined && round.findings.length !== 0)
+        || round.prNumber !== undefined
+      )
+    )
+    || (
+      round.purpose === 'repair'
+      && round.fundingIntent !== undefined
+      && (
+        round.findings === undefined
+        || round.findings.length === 0
+        || round.prNumber === undefined
+      )
+    )
+  ) {
+    return false;
+  }
+  if (
+    round.fundingIntent !== undefined
+    && (
+      round.fundingIntent.taskKey !== taskKey
+      || BigInt(round.fundingIntent.spendWei)
+        > BigInt(round.fundingIntent.maximumSpendWei)
+    )
+  ) {
+    return false;
+  }
+  if (
+    round.task !== undefined
+    && (
+      round.task.taskKey !== taskKey
+      || (
+        round.fundingIntent !== undefined
+        && (
+          round.task.taskKey !== round.fundingIntent.taskKey
+          || round.task.spendWei !== round.fundingIntent.spendWei
+        )
+      )
+    )
+  ) {
     return false;
   }
   if (round.solution !== undefined && round.task === undefined) return false;
@@ -222,6 +287,16 @@ function phaseEvidenceIsConsistent(record: RelayGenerationRecordV1): boolean {
     case 'refused':
     case 'admitted':
       return record.rounds.length === 0 && record.pr === undefined;
+    case 'funding':
+      return round?.fundingIntent !== undefined
+        && round.task === undefined
+        && (
+          round.purpose === 'initial'
+          || (
+            record.pr?.head === round.inputHead
+            && record.pr.draft
+          )
+        );
     case 'submitted':
       return round?.task !== undefined
         && round.solution === undefined
@@ -360,6 +435,8 @@ function relayPhaseCanAdvance(
     case 'exhausted':
       return false;
     case 'admitted':
+      return ['funding', 'cancelling', 'closed', 'exhausted'].includes(proposed);
+    case 'funding':
       return ['submitted', 'cancelling', 'closed', 'exhausted'].includes(proposed);
     case 'submitted':
       return ['solution-delivered', 'cancelling', 'closed', 'exhausted']
@@ -371,7 +448,7 @@ function relayPhaseCanAdvance(
     case 'evaluating':
       return ['repair-needed', 'ready', 'cancelling', 'closed'].includes(proposed);
     case 'repair-needed':
-      return ['submitted', 'cancelling', 'closed', 'exhausted'].includes(proposed);
+      return ['funding', 'cancelling', 'closed', 'exhausted'].includes(proposed);
     case 'cancelling':
       return proposed === 'closed';
     default: {
@@ -415,6 +492,12 @@ function roundDoesNotRegress(
     && current.purpose === proposed.purpose
     && current.workspaceRepository === proposed.workspaceRepository
     && current.inputHead === proposed.inputHead
+    && optionalEvidenceDoesNotRegress(current.findings, proposed.findings)
+    && optionalEvidenceDoesNotRegress(current.prNumber, proposed.prNumber)
+    && optionalEvidenceDoesNotRegress(
+      current.fundingIntent,
+      proposed.fundingIntent,
+    )
     && optionalEvidenceDoesNotRegress(current.task, proposed.task)
     && optionalEvidenceDoesNotRegress(current.solution, proposed.solution)
     && optionalEvidenceDoesNotRegress(current.adoption, proposed.adoption)
@@ -506,6 +589,7 @@ function isTerminalForSupersession(
     case 'exhausted':
       return true;
     case 'admitted':
+    case 'funding':
     case 'submitted':
     case 'solution-delivered':
     case 'draft-open':
