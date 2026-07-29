@@ -346,7 +346,7 @@ interface ValidatedReadyAssurance {
   readonly technicalBlocks: readonly [string, string];
 }
 
-function canonicalRelayTimeline(
+export function canonicalRelayTimeline(
   record: RelayGenerationRecordV1,
 ): readonly RelayRoundTimelineItem[] {
   const timeline: RelayRoundTimelineItem[] = [];

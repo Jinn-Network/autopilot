@@ -75,6 +75,7 @@ const record: RelayGenerationRecordV1 = {
       taskKey: `issue-relay:${generation}:round:0`,
       taskId: '123',
       taskCid: 'bafy-task',
+      spendWei: '1000000000000000',
       fundedAt: '2026-07-28T10:03:00.000Z',
     },
   }],
@@ -228,6 +229,7 @@ const readyRecord = {
         taskKey: `issue-relay:${generation}:round:1`,
         taskId: receipt.correlation.taskId,
         taskCid: verdict.task.taskCid,
+        spendWei: '1000000000000000',
         fundedAt: '2026-07-28T10:05:00.000Z',
       },
       solution: {
@@ -664,6 +666,7 @@ const threeRoundRecord = {
         taskKey: `issue-relay:${generation}:round:2`,
         taskId: thirdReceipt.correlation.taskId,
         taskCid: thirdVerdict.task.taskCid,
+        spendWei: '1000000000000000',
         fundedAt: '2026-07-28T10:13:00.000Z',
       },
       solution: {
@@ -780,7 +783,7 @@ describe('Relay issue status rendering', () => {
       <!-- jinn-issue-relay:generation:v1 -->
 
       \`\`\`json
-      {"schemaVersion":"jinn-issue-relay-generation.v1","generation":"R_kgDOExample:101:sha256:dd2241a3f2e4865b572fc038b6d52fd91823f7c534c6672507c3a31a46d152b1","snapshot":{"repository":{"slug":"Jinn-Network/mono","nodeId":"R_kgDOExample","visibility":"PUBLIC","defaultBranch":"main","baseOid":"1111111111111111111111111111111111111111"},"issue":{"number":101,"url":"https://github.com/Jinn-Network/mono/issues/101","title":"Render the Relay report","body":"The body is frozen.","authorLogin":"maintainer","authorId":"MDQ6VXNlcjE=","updatedAt":"2026-07-28T10:00:00.000Z"},"optIn":{"label":"engine:marketplace","actorLogin":"maintainer","createdAt":"2026-07-28T10:01:00.000Z","permission":"MAINTAIN"},"language":"typescript","verificationProfile":"jinn-mono.v1","acceptanceEvidence":["The report is inspectable."],"admissionPolicyVersion":"jinn-issue-relay-admission.v1","capturedAt":"2026-07-28T10:02:00.000Z","schemaVersion":"jinn-issue-relay-snapshot.v1","snapshotDigest":"sha256:dd2241a3f2e4865b572fc038b6d52fd91823f7c534c6672507c3a31a46d152b1"},"phase":"submitted","deadlineAt":"2026-07-28T13:02:00.000Z","rounds":[{"round":0,"purpose":"initial","workspaceRepository":"Jinn-Network/mono","inputHead":"1111111111111111111111111111111111111111","task":{"taskKey":"issue-relay:R_kgDOExample:101:sha256:dd2241a3f2e4865b572fc038b6d52fd91823f7c534c6672507c3a31a46d152b1:round:0","taskId":"123","taskCid":"bafy-task","fundedAt":"2026-07-28T10:03:00.000Z"}}],"updatedAt":"2026-07-28T10:03:00.000Z"}
+      {"schemaVersion":"jinn-issue-relay-generation.v1","generation":"R_kgDOExample:101:sha256:dd2241a3f2e4865b572fc038b6d52fd91823f7c534c6672507c3a31a46d152b1","snapshot":{"repository":{"slug":"Jinn-Network/mono","nodeId":"R_kgDOExample","visibility":"PUBLIC","defaultBranch":"main","baseOid":"1111111111111111111111111111111111111111"},"issue":{"number":101,"url":"https://github.com/Jinn-Network/mono/issues/101","title":"Render the Relay report","body":"The body is frozen.","authorLogin":"maintainer","authorId":"MDQ6VXNlcjE=","updatedAt":"2026-07-28T10:00:00.000Z"},"optIn":{"label":"engine:marketplace","actorLogin":"maintainer","createdAt":"2026-07-28T10:01:00.000Z","permission":"MAINTAIN"},"language":"typescript","verificationProfile":"jinn-mono.v1","acceptanceEvidence":["The report is inspectable."],"admissionPolicyVersion":"jinn-issue-relay-admission.v1","capturedAt":"2026-07-28T10:02:00.000Z","schemaVersion":"jinn-issue-relay-snapshot.v1","snapshotDigest":"sha256:dd2241a3f2e4865b572fc038b6d52fd91823f7c534c6672507c3a31a46d152b1"},"phase":"submitted","deadlineAt":"2026-07-28T13:02:00.000Z","rounds":[{"round":0,"purpose":"initial","workspaceRepository":"Jinn-Network/mono","inputHead":"1111111111111111111111111111111111111111","task":{"taskKey":"issue-relay:R_kgDOExample:101:sha256:dd2241a3f2e4865b572fc038b6d52fd91823f7c534c6672507c3a31a46d152b1:round:0","taskId":"123","taskCid":"bafy-task","spendWei":"1000000000000000","fundedAt":"2026-07-28T10:03:00.000Z"}}],"updatedAt":"2026-07-28T10:03:00.000Z"}
       \`\`\`"
     `);
     expect(rendered.match(/<!-- jinn-issue-relay:generation:v1 -->/g))

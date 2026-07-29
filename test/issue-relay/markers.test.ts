@@ -121,6 +121,7 @@ describe('Relay issue generation markers', () => {
           taskKey: `issue-relay:${generationRecord().generation}:round:0`,
           taskId: 'task-0',
           taskCid: 'bafy-task-0',
+          spendWei: '1000000000000000',
           fundedAt: '2026-07-28T12:05:00.000Z',
         },
         solution: {
@@ -154,6 +155,37 @@ describe('Relay issue generation markers', () => {
     });
 
     expect(parse(formatRelayIssueMarker(record))).toEqual(record);
+  });
+
+  it('requires one canonical immutable funded spend in every durable task record', () => {
+    const record = generationRecord({
+      phase: 'submitted',
+      rounds: [{
+        round: 0,
+        purpose: 'initial',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: issueInput.repository.baseOid,
+        task: {
+          taskKey: `issue-relay:${generationRecord().generation}:round:0`,
+          taskId: '7',
+          taskCid: 'bafy-task-0',
+          spendWei: '1000000000000000',
+          fundedAt: '2026-07-28T12:05:00.000Z',
+        },
+      }],
+      updatedAt: '2026-07-28T12:05:00.000Z',
+    });
+    const missingSpend = structuredClone(record) as unknown as {
+      rounds: Array<{ task?: Record<string, unknown> }>;
+    };
+    delete missingSpend.rounds[0]!.task!.spendWei;
+    const noncanonicalSpend = structuredClone(record);
+    (noncanonicalSpend.rounds[0]!.task as { spendWei: string }).spendWei = '01';
+
+    expect(parse(formatRelayIssueMarker(record))?.rounds[0]?.task?.spendWei)
+      .toBe('1000000000000000');
+    expect(parse(rawMarker(missingSpend))).toBeNull();
+    expect(parse(rawMarker(noncanonicalSpend))).toBeNull();
   });
 
   it('trusts the configured bot login case-insensitively and no other author', () => {
@@ -294,6 +326,7 @@ describe('Relay issue generation markers', () => {
           taskKey: `issue-relay:${generationRecord().generation}:round:0`,
           taskId: 'task-0',
           taskCid: 'bafy-task-0',
+          spendWei: '1000000000000000',
           fundedAt: '2026-07-28T12:05:00.000Z',
         },
         solution: {
@@ -325,6 +358,7 @@ describe('Relay issue generation markers', () => {
           taskKey: `issue-relay:${generationRecord().generation}:round:1`,
           taskId: 'task-1',
           taskCid: 'bafy-task-1',
+          spendWei: '1000000000000000',
           fundedAt: '2026-07-28T12:21:00.000Z',
         },
         solution: {
@@ -350,20 +384,23 @@ describe('Relay issue marker update preconditions', () => {
   it('returns the proposed canonical body and exact expected-current version', () => {
     const current = generationRecord();
     const proposed = generationRecord({
-      phase: 'submitted',
+      phase: 'funding',
       rounds: [{
         round: 0,
         purpose: 'initial',
         workspaceRepository: 'Jinn-Network/mono',
         inputHead: issueInput.repository.baseOid,
-        task: {
+        fundingIntent: {
           taskKey: `issue-relay:${current.generation}:round:0`,
-          taskId: 'task-0',
-          taskCid: 'bafy-task-0',
-          fundedAt: '2026-07-28T12:05:00.000Z',
+          creatorSafe: '0x1111111111111111111111111111111111111111',
+          solverNetManifestCid: 'bafy-solver-net',
+          requestDigest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          maximumSpendWei: '2000000000000000',
+          spendWei: '1000000000000000',
+          preparedAt: '2026-07-28T12:04:00.000Z',
         },
       }],
-      updatedAt: '2026-07-28T12:05:00.000Z',
+      updatedAt: '2026-07-28T12:04:00.000Z',
     });
     const currentBody = formatRelayIssueMarker(current);
 
@@ -425,6 +462,7 @@ describe('Relay issue marker update preconditions', () => {
           taskKey: `issue-relay:${generationRecord().generation}:round:0`,
           taskId: 'task-0',
           taskCid: 'bafy-task-0',
+          spendWei: '1000000000000000',
           fundedAt: '2026-07-28T12:05:00.000Z',
         },
         solution: {
@@ -507,6 +545,7 @@ describe('Relay issue marker update preconditions', () => {
           taskKey: `issue-relay:${admitted.generation}:round:0`,
           taskId: 'task-0',
           taskCid: 'bafy-task-0',
+          spendWei: '1000000000000000',
           fundedAt: '2026-07-28T12:05:00.000Z',
         },
       }],

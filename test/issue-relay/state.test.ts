@@ -61,6 +61,7 @@ const task = {
   taskKey: relayTaskKey(generation, 0),
   taskId: '501',
   taskCid: `f01551220${'4'.repeat(64)}`,
+  spendWei: '1000000000000000',
   fundedAt: '2026-07-28T12:05:00.000Z',
 };
 const solution = {
@@ -195,6 +196,7 @@ function deliveredRepairRound(inputHead: string): RelayRoundRecordV1 {
       taskKey: relayTaskKey(generation, 1),
       taskId: 'task-1',
       taskCid: 'bafy-task-1',
+      spendWei: '1000000000000000',
       fundedAt: '2026-07-28T12:21:00.000Z',
     },
     solution: {
@@ -509,8 +511,31 @@ describe('Relay state/action transition table', () => {
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
-  it('admitted with exact base -> submit-round 0', () => {
+  it('admitted with exact base -> persist funding intent before submit-round 0', () => {
     expect(deriveRelayAction(facts(durable('admitted')), policy))
+      .toEqual({ kind: 'prepare-round', round: 0 });
+  });
+
+  it('funding intent with exact immutable spend -> submit-round 0', () => {
+    const record = durable('funding', {
+      rounds: [{
+        round: 0,
+        purpose: 'initial',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: BASE,
+        fundingIntent: {
+          taskKey: relayTaskKey(generation, 0),
+          creatorSafe: `0x${'1'.repeat(40)}`,
+          solverNetManifestCid: `f01551220${'2'.repeat(64)}`,
+          requestDigest: `sha256:${'3'.repeat(64)}`,
+          maximumSpendWei: '2000000000000000',
+          spendWei: '1000000000000000',
+          preparedAt: '2026-07-28T12:04:00.000Z',
+        },
+      }],
+    });
+
+    expect(deriveRelayAction(facts(record), policy))
       .toEqual({ kind: 'submit-round', round: 0 });
   });
 
@@ -619,13 +644,6 @@ describe('Relay state/action transition table', () => {
       adoption: { disposition: 'rejected', receiptDigest: DIGEST },
       checks: passedChecks,
     })],
-    ['missing checks', round({ task, solution, adoption })],
-    ['pending checks', round({
-      task,
-      solution,
-      adoption,
-      checks: { ...passedChecks, status: 'pending' },
-    })],
     ['failed checks', round({
       task,
       solution,
@@ -641,6 +659,25 @@ describe('Relay state/action transition table', () => {
     expect(deriveRelayAction(facts(record, {
       currentPr: livePr(),
     }), policy)).toMatchObject({ kind: 'none' });
+  });
+
+  it.each([
+    ['missing', round({ task, solution, adoption })],
+    ['pending', round({
+      task,
+      solution,
+      adoption,
+      checks: { ...passedChecks, status: 'pending' },
+    })],
+  ])('draft-open with %s checks -> observe exact-head checks', (_label, currentRound) => {
+    const record = durable('draft-open', {
+      rounds: [currentRound],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(),
+    }), policy)).toEqual({ kind: 'observe-checks', round: 0 });
   });
 
   it('draft-open cannot skip authenticated delivery evidence -> none', () => {
@@ -778,6 +815,34 @@ describe('Relay state/action transition table', () => {
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
+  it('replays readiness after the exact pull request mutation committed before its marker', () => {
+    const record = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: {
+        number: 68,
+        branch: acceptedAdoption.branch,
+        head: HEAD,
+        draft: true,
+      },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: { ...livePr(), draft: false },
+      readiness: {
+        adoption: acceptedAdoption,
+        checks: readyChecks,
+        evaluationAnchor,
+        verdict: authenticatedVerdict,
+      },
+    }), policy)).toEqual({ kind: 'mark-ready' });
+  });
+
   it('evaluating does not carry readiness across contradictory Task delivery facts', () => {
     const record = durable('evaluating', {
       rounds: [round({
@@ -842,7 +907,7 @@ describe('Relay state/action transition table', () => {
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
-  it('repair-needed with request changes -> submit-repair for the next round', () => {
+  it('repair-needed with request changes -> persist the next funding intent before submission', () => {
     const record = durable('repair-needed', {
       rounds: [round({
         task,
@@ -856,7 +921,7 @@ describe('Relay state/action transition table', () => {
 
     expect(deriveRelayAction(facts(record, {
       currentPr: livePr(),
-    }), policy)).toEqual({ kind: 'submit-repair', round: 1 });
+    }), policy)).toEqual({ kind: 'prepare-round', round: 1 });
   });
 
   it('repair-needed at the round limit -> close-exhausted', () => {
@@ -911,7 +976,7 @@ describe('Relay state/action transition table', () => {
     expect(deriveRelayAction(facts(record, {
       currentPr: livePr(),
     }), { ...policy, generationDeadlineMs: 1 }))
-      .toEqual({ kind: 'submit-repair', round: 1 });
+      .toEqual({ kind: 'prepare-round', round: 1 });
     expect(record.deadlineAt).toBe('2026-07-28T13:00:02.000Z');
   });
 

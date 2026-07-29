@@ -5,7 +5,9 @@ import type { AcceptedRelayAdoption } from './adoption.js';
 import {
   IssueRelayAdoptionReceiptV1Schema,
   IssueRelayEvaluationAnchorV1Schema,
+  IssueRelayFindingV1Schema,
   type IssueRelayEvaluationAnchorV1,
+  type IssueRelayFindingV1,
 } from './contracts.js';
 import {
   parseIssueRelayDeliveryObservation,
@@ -22,6 +24,7 @@ export type RelayPhase =
   | 'awaiting-clarification'
   | 'refused'
   | 'admitted'
+  | 'funding'
   | 'submitted'
   | 'solution-delivered'
   | 'draft-open'
@@ -37,10 +40,24 @@ export interface RelayRoundRecordV1 {
   readonly purpose: 'initial' | 'repair';
   readonly workspaceRepository: string;
   readonly inputHead: string;
+  /** Durable task input needed to reconstruct a repair after local-state loss. */
+  readonly findings?: readonly IssueRelayFindingV1[];
+  readonly prNumber?: number;
+  readonly fundingIntent?: {
+    readonly taskKey: string;
+    readonly creatorSafe: string;
+    readonly solverNetManifestCid: string;
+    readonly requestDigest: `sha256:${string}`;
+    readonly maximumSpendWei: string;
+    readonly spendWei: string;
+    readonly preparedAt: string;
+  };
   readonly task?: {
     readonly taskKey: string;
     readonly taskId: string;
     readonly taskCid: string;
+    /** Exact dry-run/funding-fenced amount, persisted as canonical uint256 text. */
+    readonly spendWei: string;
     readonly fundedAt: string;
   };
   readonly solution?: {
@@ -103,6 +120,7 @@ export type RelayCancellationReason =
 
 export type RelayAction =
   | { readonly kind: 'publish-snapshot' }
+  | { readonly kind: 'prepare-round'; readonly round: number }
   | {
       readonly kind: 'record-cancellation';
       readonly reason: RelayCancellationReason;
@@ -110,6 +128,7 @@ export type RelayAction =
   | { readonly kind: 'submit-round'; readonly round: number }
   | { readonly kind: 'observe-solution'; readonly round: number }
   | { readonly kind: 'adopt-solution'; readonly round: number }
+  | { readonly kind: 'observe-checks'; readonly round: number }
   | { readonly kind: 'publish-evaluation-anchor'; readonly round: number }
   | { readonly kind: 'observe-verdict'; readonly round: number }
   | { readonly kind: 'submit-repair'; readonly round: number }
@@ -186,6 +205,8 @@ export interface RelayDerivationPolicy {
 
 const CANONICAL_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const GIT_OID_PATTERN = /^[0-9a-f]{40}$/;
+const CANONICAL_POSITIVE_WEI_PATTERN = /^[1-9][0-9]*$/;
+const UINT256_MAX = (1n << 256n) - 1n;
 
 function none(reason: string): RelayAction {
   return { kind: 'none', reason };
@@ -233,10 +254,55 @@ function durableShapeIsConsistent(record: RelayGenerationRecordV1): boolean {
     ) {
       return false;
     }
+    const expectedTaskKey = relayTaskKey(record.generation, round.round);
+    const intent = round.fundingIntent;
     if (
-      round.task !== undefined
-      && round.task.taskKey !== relayTaskKey(record.generation, round.round)
+      (
+        round.purpose === 'initial'
+        && (
+          (round.findings !== undefined && round.findings.length !== 0)
+          || round.prNumber !== undefined
+        )
+      )
+      || (
+        round.purpose === 'repair'
+        && intent !== undefined
+        && (
+          round.findings === undefined
+          || round.findings.length === 0
+          || !round.findings.every((finding: IssueRelayFindingV1) =>
+            IssueRelayFindingV1Schema.safeParse(finding).success)
+          || round.prNumber === undefined
+        )
+      )
     ) {
+      return false;
+    }
+    if (intent !== undefined && (
+      intent.taskKey !== expectedTaskKey
+      || !/^0x[0-9a-fA-F]{40}$/.test(intent.creatorSafe)
+      || intent.solverNetManifestCid.length === 0
+      || !/^sha256:[0-9a-f]{64}$/.test(intent.requestDigest)
+      || !CANONICAL_POSITIVE_WEI_PATTERN.test(intent.maximumSpendWei)
+      || !CANONICAL_POSITIVE_WEI_PATTERN.test(intent.spendWei)
+      || BigInt(intent.maximumSpendWei) > UINT256_MAX
+      || BigInt(intent.spendWei) > BigInt(intent.maximumSpendWei)
+      || canonicalUtcTimestamp(intent.preparedAt) === undefined
+    )) {
+      return false;
+    }
+    if (round.task !== undefined && (
+      round.task.taskKey !== expectedTaskKey
+      || (
+        intent !== undefined
+        && (
+          round.task.taskKey !== intent.taskKey
+          || round.task.spendWei !== intent.spendWei
+        )
+      )
+      || !CANONICAL_POSITIVE_WEI_PATTERN.test(round.task.spendWei)
+      || BigInt(round.task.spendWei) > UINT256_MAX
+    )) {
       return false;
     }
     if (round.solution !== undefined && round.task === undefined) return false;
@@ -375,6 +441,18 @@ function acceptedExactHead(
   }
   return round.adoption.resultingHead === round.checks.head
     && round.checks.head === facts.durable.pr.head;
+}
+
+function acceptedLiveHead(
+  facts: RelayAuthoritativeFacts,
+  round: RelayRoundRecordV1,
+): boolean {
+  return round.adoption?.disposition === 'accepted'
+    && round.adoption.resultingHead !== undefined
+    && facts.durable?.pr !== undefined
+    && livePrMatchesDurable(facts)
+    && facts.currentBaseOid === facts.durable.snapshot.repository.baseOid
+    && round.adoption.resultingHead === facts.durable.pr.head;
 }
 
 function notReady(reason: Exclude<RelayReadyDecision, { readonly ready: true }>['reason']):
@@ -586,7 +664,7 @@ function deriveDraftOpenAction(
   facts: RelayAuthoritativeFacts,
   round: RelayRoundRecordV1 | undefined,
 ): RelayAction {
-  if (round === undefined || !acceptedExactHead(facts, round)) {
+  if (round === undefined || !acceptedLiveHead(facts, round)) {
     return none('Accepted adoption and an exact live PR head are required');
   }
   const checksStatus = round.checks?.status;
@@ -594,11 +672,11 @@ function deriveDraftOpenAction(
     case 'passed':
       return { kind: 'publish-evaluation-anchor', round: round.round };
     case 'pending':
-      return none('Exact-head checks are still pending');
+      return { kind: 'observe-checks', round: round.round };
     case 'failed':
       return none('Exact-head checks failed');
     case undefined:
-      return none('Exact-head checks are missing');
+      return { kind: 'observe-checks', round: round.round };
     default:
       return exhaustiveNone(checksStatus);
   }
@@ -608,6 +686,17 @@ function deriveEvaluatingAction(
   facts: RelayAuthoritativeFacts,
   round: RelayRoundRecordV1 | undefined,
 ): RelayAction {
+  const readyMutationRecovery =
+    round?.verdict?.outcome === 'pass'
+    && facts.currentPr?.open === true
+    && facts.currentPr.draft === false
+    && readinessMatchesRound({
+      ...facts,
+      currentPr: { ...facts.currentPr, draft: true },
+    }, round);
+  if (readyMutationRecovery) {
+    return { kind: 'mark-ready' };
+  }
   if (
     round === undefined
     || !acceptedExactHead(facts, round)
@@ -656,7 +745,7 @@ function deriveRepairAction(
   if (nextRound >= policy.maxRoundsPerGeneration || nowMs >= deadlineMs) {
     return { kind: 'close-exhausted' };
   }
-  return { kind: 'submit-repair', round: nextRound };
+  return { kind: 'prepare-round', round: nextRound };
 }
 
 function deriveCancellationSettlement(
@@ -712,6 +801,7 @@ export function deriveRelayAction(
     case 'exhausted':
       return none(`Relay phase ${record.phase} is terminal`);
     case 'admitted':
+    case 'funding':
     case 'submitted':
     case 'solution-delivered':
     case 'draft-open':
@@ -755,7 +845,16 @@ export function deriveRelayAction(
       }
       return policy.maxRoundsPerGeneration === 0 || nowMs >= deadlineMs
         ? { kind: 'close-exhausted' }
-        : { kind: 'submit-round', round: 0 };
+        : { kind: 'prepare-round', round: 0 };
+    case 'funding':
+      if (
+        round?.fundingIntent === undefined
+        || round.task !== undefined
+        || !roundInputIsCurrent(facts, round)
+      ) {
+        return none('Funding requires one exact current durable funding intent');
+      }
+      return { kind: 'submit-round', round: round.round };
     case 'submitted':
       if (
         round?.task === undefined
