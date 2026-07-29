@@ -99,17 +99,27 @@ const RoundSchema = z.object({
   adoption: z.object({
     disposition: z.enum(['accepted', 'rejected']),
     resultingHead: GitOidSchema.optional(),
+    prNumber: z.number().int().safe().positive().optional(),
     receiptDigest: DigestSchema,
+    recordedAt: CanonicalUtcSchema.optional(),
   }).strict().optional(),
   checks: z.object({
     head: GitOidSchema,
     status: z.enum(['pending', 'passed', 'failed']),
     digest: DigestSchema,
+    observedAt: CanonicalUtcSchema.optional(),
+  }).strict().optional(),
+  evaluation: z.object({
+    head: GitOidSchema,
+    anchorDigest: DigestSchema,
+    anchoredAt: CanonicalUtcSchema,
   }).strict().optional(),
   verdict: z.object({
     outcome: z.enum(['pass', 'request-changes', 'human', 'unresolved']),
     evaluatedHead: GitOidSchema,
+    evaluatorSafe: z.string().regex(SAFE_ADDRESS_PATTERN).optional(),
     envelopeCid: NonEmptyStringSchema,
+    observedAt: CanonicalUtcSchema.optional(),
   }).strict().optional(),
 }).strict();
 
@@ -234,7 +244,10 @@ function roundEvidenceIsConsistent(
   }
   if (
     round.adoption?.disposition === 'rejected'
-    && round.adoption.resultingHead !== undefined
+    && (
+      round.adoption.resultingHead !== undefined
+      || round.adoption.prNumber !== undefined
+    )
   ) {
     return false;
   }
@@ -243,6 +256,15 @@ function roundEvidenceIsConsistent(
     && (
       round.adoption?.disposition !== 'accepted'
       || round.adoption.resultingHead !== round.checks.head
+    )
+  ) {
+    return false;
+  }
+  if (
+    round.evaluation !== undefined
+    && (
+      round.checks?.status !== 'passed'
+      || round.evaluation.head !== round.checks.head
     )
   ) {
     return false;
@@ -502,6 +524,7 @@ function roundDoesNotRegress(
     && optionalEvidenceDoesNotRegress(current.solution, proposed.solution)
     && optionalEvidenceDoesNotRegress(current.adoption, proposed.adoption)
     && checksDoNotRegress(current.checks, proposed.checks)
+    && optionalEvidenceDoesNotRegress(current.evaluation, proposed.evaluation)
     && optionalEvidenceDoesNotRegress(current.verdict, proposed.verdict);
 }
 

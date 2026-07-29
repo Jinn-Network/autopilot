@@ -157,6 +157,65 @@ describe('Relay issue generation markers', () => {
     expect(parse(formatRelayIssueMarker(record))).toEqual(record);
   });
 
+  it('round-trips every canonical field emitted by production transitions', () => {
+    const head = '2222222222222222222222222222222222222222';
+    const record = generationRecord({
+      phase: 'evaluating',
+      rounds: [{
+        round: 0,
+        purpose: 'initial',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: issueInput.repository.baseOid,
+        task: {
+          taskKey: `issue-relay:${generationRecord().generation}:round:0`,
+          taskId: 'task-0',
+          taskCid: 'bafy-task-0',
+          spendWei: '1000000000000000',
+          fundedAt: '2026-07-28T12:05:00.000Z',
+        },
+        solution: {
+          envelopeCid: 'bafy-solution-0',
+          operatorSafe: '0x1111111111111111111111111111111111111111',
+          observedAt: '2026-07-28T12:10:00.000Z',
+        },
+        adoption: {
+          disposition: 'accepted',
+          resultingHead: head,
+          prNumber: 68,
+          receiptDigest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          recordedAt: '2026-07-28T12:12:00.000Z',
+        },
+        checks: {
+          head,
+          status: 'passed',
+          digest: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          observedAt: '2026-07-28T12:14:00.000Z',
+        },
+        evaluation: {
+          head,
+          anchorDigest: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          anchoredAt: '2026-07-28T12:15:00.000Z',
+        },
+        verdict: {
+          outcome: 'pass',
+          evaluatedHead: head,
+          evaluatorSafe: '0x2222222222222222222222222222222222222222',
+          envelopeCid: 'bafy-verdict-0',
+          observedAt: '2026-07-28T12:20:00.000Z',
+        },
+      } as never],
+      pr: {
+        number: 68,
+        branch: 'jinn/issue-relay/example',
+        head,
+        draft: true,
+      },
+      updatedAt: '2026-07-28T12:20:00.000Z',
+    });
+
+    expect(parse(formatRelayIssueMarker(record))).toEqual(record);
+  });
+
   it('requires one canonical immutable funded spend in every durable task record', () => {
     const record = generationRecord({
       phase: 'submitted',

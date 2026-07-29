@@ -3,6 +3,7 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
@@ -19,6 +20,9 @@ import {
   isAbsolute,
   join,
   posix,
+  relative,
+  resolve as resolvePath,
+  sep,
 } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -194,16 +198,19 @@ function ensurePrivateParents(
 
 export function createRelayDurableArtifactStore(
   stateDirectory: string,
+  options: { readonly deferCreation?: boolean } = {},
 ): RelayDurableArtifactStore {
   if (!isAbsolute(stateDirectory)) {
     throw new Error('Relay state directory must be absolute');
   }
-  if (!existsSync(stateDirectory)) {
+  if (!existsSync(stateDirectory) && options.deferCreation !== true) {
     mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
     chmodSync(stateDirectory, 0o700);
     fsyncDirectory(dirname(stateDirectory));
   }
-  assertOwnerOnlyDirectory(stateDirectory, 'Relay state directory');
+  if (existsSync(stateDirectory)) {
+    assertOwnerOnlyDirectory(stateDirectory, 'Relay state directory');
+  }
 
   const resolve = (relativePath: string): {
     readonly path: string;
@@ -219,6 +226,10 @@ export function createRelayDurableArtifactStore(
 
   return {
     async installImmutable(input) {
+      if (!existsSync(stateDirectory)) {
+        throw new Error('Relay state directory requires an active writer lease');
+      }
+      assertOwnerOnlyDirectory(stateDirectory, 'Relay state directory');
       const target = resolve(input.relativePath);
       const temporary = join(
         target.parent,
@@ -254,6 +265,8 @@ export function createRelayDurableArtifactStore(
     },
 
     async read(relativePath) {
+      if (!existsSync(stateDirectory)) return null;
+      assertOwnerOnlyDirectory(stateDirectory, 'Relay state directory');
       const target = resolve(relativePath);
       try {
         assertPrivateRegularFile(target.path, 'Relay artifact');
@@ -264,6 +277,129 @@ export function createRelayDurableArtifactStore(
       }
     },
   };
+}
+
+function createRelayReadOnlyArtifactStore(
+  stateDirectory: string,
+): RelayDurableArtifactStore {
+  if (!isAbsolute(stateDirectory)) {
+    throw new Error('Relay state directory must be absolute');
+  }
+  return {
+    async installImmutable() {
+      throw new Error('Observe mode permits no durable artifact writes');
+    },
+    async read(relativePath) {
+      const segments = safeRelativePath(relativePath);
+      if (!existsSync(stateDirectory)) return null;
+      assertOwnerOnlyDirectory(stateDirectory, 'Relay state directory');
+      let parent = stateDirectory;
+      for (const segment of segments.slice(0, -1)) {
+        parent = join(parent, segment);
+        try {
+          assertOwnerOnlyDirectory(parent, 'Relay artifact directory');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+          throw error;
+        }
+      }
+      const path = join(parent, segments.at(-1)!);
+      try {
+        assertPrivateRegularFile(path, 'Relay artifact');
+        return readFileSync(path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+    },
+  };
+}
+
+export interface IssueRelayRuntimeLease {
+  /**
+   * Releases the single-host V0 writer lease. A process crash intentionally
+   * leaves `runtime.lock` behind so restart fails closed until an operator
+   * verifies that no writer remains and removes that one file.
+   */
+  release(): void;
+}
+
+export function acquireIssueRelayRuntimeLease(
+  stateDirectory: string,
+): IssueRelayRuntimeLease {
+  createRelayDurableArtifactStore(stateDirectory);
+  const lockPath = join(stateDirectory, 'runtime.lock');
+  let descriptor: number;
+  try {
+    descriptor = openSync(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error(
+        'Issue Relay writer lease is already active or requires operator recovery',
+      );
+    }
+    throw error;
+  }
+  try {
+    writeFileSync(descriptor, Buffer.from(`${JSON.stringify({
+      schemaVersion: 1,
+      pid: process.pid,
+      acquiredAt: new Date().toISOString(),
+    })}\n`));
+    chmodSync(lockPath, 0o600);
+    fsyncSync(descriptor);
+    fsyncDirectory(stateDirectory);
+  } catch (error) {
+    closeSync(descriptor);
+    if (existsSync(lockPath)) unlinkSync(lockPath);
+    throw error;
+  }
+  const identity = fstatSync(descriptor);
+  let released = false;
+  return {
+    release() {
+      if (released) return;
+      released = true;
+      try {
+        const current = lstatSync(lockPath);
+        if (
+          current.isSymbolicLink()
+          || !current.isFile()
+          || current.dev !== identity.dev
+          || current.ino !== identity.ino
+        ) {
+          throw new Error('Issue Relay writer lease authority changed');
+        }
+        unlinkSync(lockPath);
+        fsyncDirectory(stateDirectory);
+      } finally {
+        closeSync(descriptor);
+      }
+    },
+  };
+}
+
+export async function prepareRelayVerificationWorkspace(input: {
+  readonly sourcePath: string;
+  readonly workspacePath: string;
+}): Promise<void> {
+  const source = resolvePath(input.sourcePath);
+  const workspace = resolvePath(input.workspacePath);
+  if (workspace === source || workspace.startsWith(`${source}${sep}`)) {
+    throw new Error('Relay verification workspace must be outside its source');
+  }
+  await rm(workspace, { recursive: true, force: true });
+  await cp(source, workspace, {
+    recursive: true,
+    force: false,
+    errorOnExist: true,
+    filter: (path) => {
+      const segments = relative(source, resolvePath(path))
+        .split(sep)
+        .filter(Boolean);
+      return !segments.includes('.git') && !segments.includes('node_modules');
+    },
+  });
 }
 
 export interface IssueRelayGitHubPreflight {
@@ -338,6 +474,95 @@ function issueStatusBody(
     summary,
     nextAction,
   });
+}
+
+export async function readRelayPublicationAuthority(input: {
+  readonly config: IssueRelayConfig;
+  readonly record: RelayGenerationRecordV1;
+  readonly githubRead: RelayGitHubReadPort;
+  readonly githubAuthority: RelayGitHubProductionAuthorityPort;
+  readonly allowReady: boolean;
+  readonly expectedChecksDigest?: string;
+}): Promise<{
+  readonly pr: Awaited<
+  ReturnType<RelayGitHubProductionAuthorityPort['readPullRequest']>
+  >;
+  readonly currentBaseOid: string;
+  readonly checks: RelayCheckSummary;
+}> {
+  const durablePr = input.record.pr;
+  if (durablePr === undefined) {
+    throw new Error('Relay publication authority requires a pull request');
+  }
+  const assertPullRequest = (
+    pr: Awaited<
+    ReturnType<RelayGitHubProductionAuthorityPort['readPullRequest']>
+    >,
+  ): void => {
+    const draftMatches = pr.draft === durablePr.draft
+      || (
+        input.allowReady
+        && durablePr.draft
+        && !pr.draft
+      );
+    if (
+      pr.number !== durablePr.number
+      || pr.generation !== input.record.generation
+      || pr.branch !== durablePr.branch
+      || pr.head !== durablePr.head
+      || pr.base !== input.config.targetBase
+      || !pr.open
+      || !draftMatches
+      || (
+        durablePr.targetRepositoryId !== undefined
+        && pr.targetRepositoryId !== durablePr.targetRepositoryId
+      )
+      || (
+        durablePr.forkRepositoryId !== undefined
+        && pr.forkRepositoryId !== durablePr.forkRepositoryId
+      )
+      || (
+        durablePr.forkParentRepositoryId !== undefined
+        && pr.forkParentRepositoryId !== durablePr.forkParentRepositoryId
+      )
+    ) {
+      throw new Error('Relay pull request publication authority changed');
+    }
+  };
+
+  const pr = await input.githubAuthority.readPullRequest(durablePr.number);
+  assertPullRequest(pr);
+  const currentBaseOid = await input.githubRead.readDefaultBranchHead();
+  if (currentBaseOid !== input.record.snapshot.repository.baseOid) {
+    throw new Error('Relay base publication authority changed');
+  }
+  const observed = await input.githubAuthority.readChecks({
+    head: pr.head,
+    base: pr.base,
+  });
+  const checks = aggregateRelayChecks({
+    head: pr.head,
+    branchRequiredChecks: observed.branchRequiredChecks,
+    profile: {
+      name: input.config.verificationProfile,
+      requiredChecks: input.config.requiredChecks,
+    },
+    checks: observed.checks,
+  });
+  const readback = await input.githubAuthority.readPullRequest(durablePr.number);
+  assertPullRequest(readback);
+  if (
+    readback.head !== pr.head
+    || readback.base !== pr.base
+    || readback.draft !== pr.draft
+    || (
+      input.expectedChecksDigest !== undefined
+      && checks.digest !== input.expectedChecksDigest
+    )
+  ) {
+    throw new Error('Relay final check publication authority changed');
+  }
+  return { pr: readback, currentBaseOid, checks };
 }
 
 export function createIssueRelayProductionReconciliation(options: {
@@ -418,6 +643,30 @@ export function createIssueRelayProductionReconciliation(options: {
     });
     const marker = owned[0];
     if (marker?.record !== undefined && marker.record !== null) {
+      if (
+        !sameName(marker.record.snapshot.repository.slug, options.config.repository)
+        || !sameName(issue.repository.slug, options.config.repository)
+        || marker.record.snapshot.repository.nodeId !== issue.repository.nodeId
+        || marker.record.snapshot.issue.number !== issueNumber
+        || issue.issue.number !== issueNumber
+      ) {
+        return {
+          generation: marker.record.generation,
+          repository: issue.repository.slug,
+          issueNumber,
+          transitionedAt: marker.record.updatedAt,
+          authority: 'ambiguous',
+          facts: {
+            issue: {
+              open: issue.issue.state === 'OPEN',
+              optedIn: issue.issue.labels.some((label) =>
+                sameName(label, options.config.label)),
+            },
+            currentBaseOid,
+            now: options.now().toISOString(),
+          },
+        };
+      }
       const nextSnapshot = admission.status === 'admitted'
         ? buildRelaySnapshot(admission.input)
         : undefined;
@@ -576,6 +825,15 @@ export function createIssueRelayProductionReconciliation(options: {
         }];
       }) ?? []),
   });
+
+  const refreshFundingLedger = async (): Promise<RelaySpendLedger> => {
+    const refreshed: RelayReconciliationCandidate[] = [];
+    for (const scanned of lastScan) {
+      refreshed.push(await exactCurrent(scanned));
+    }
+    lastScan = refreshed;
+    return fundingLedger();
+  };
 
   const roundDirectory = (
     candidate: RelayReconciliationCandidate,
@@ -819,38 +1077,43 @@ export function createIssueRelayProductionReconciliation(options: {
 
   const exactChecks = async (
     record: RelayGenerationRecordV1,
+    allowReady = false,
+    expectedChecksDigest?: string,
   ): Promise<RelayCheckSummary> => {
-    if (record.pr === undefined) {
-      throw new Error('Relay check observation requires a pull request');
-    }
-    const pr = await options.githubAuthority.readPullRequest(record.pr.number);
-    if (
-      pr.head !== record.pr.head
-      || pr.base !== options.config.targetBase
-      || !pr.open
-      || !pr.draft
-    ) {
-      throw new Error('Relay draft pull request changed before check observation');
-    }
-    const observed = await options.githubAuthority.readChecks({
-      head: pr.head,
-      base: pr.base,
-    });
-    return aggregateRelayChecks({
-      head: pr.head,
-      branchRequiredChecks: observed.branchRequiredChecks,
-      profile: {
-        name: options.config.verificationProfile,
-        requiredChecks: options.config.requiredChecks,
-      },
-      checks: observed.checks,
-    });
+    return (await readRelayPublicationAuthority({
+      config: options.config,
+      record,
+      githubRead: options.githubRead,
+      githubAuthority: options.githubAuthority,
+      allowReady,
+      ...(expectedChecksDigest === undefined
+        ? {}
+        : { expectedChecksDigest }),
+    })).checks;
   };
+
+  const publicationAuthority = async (
+    record: RelayGenerationRecordV1,
+    input: {
+      readonly allowReady?: boolean;
+      readonly expectedChecksDigest?: string;
+    } = {},
+  ) => readRelayPublicationAuthority({
+    config: options.config,
+    record,
+    githubRead: options.githubRead,
+    githubAuthority: options.githubAuthority,
+    allowReady: input.allowReady ?? false,
+    ...(input.expectedChecksDigest === undefined
+      ? {}
+      : { expectedChecksDigest: input.expectedChecksDigest }),
+  });
 
   const observeExactVerdict = async (
     candidate: RelayReconciliationCandidate,
     record: RelayGenerationRecordV1,
     roundNumber: number,
+    allowReady = false,
   ) => {
     const recovered = await recoverSubmission(candidate, record, roundNumber);
     const solutionExpectation = buildRelaySolutionExpectation({
@@ -858,7 +1121,11 @@ export function createIssueRelayProductionReconciliation(options: {
       round: recovered.task.spec.relay,
     });
     const adoptionEvidence = await acceptedAdoption(record);
-    const checks = await exactChecks(record);
+    const checks = await exactChecks(
+      record,
+      allowReady,
+      record.rounds[roundNumber]?.checks?.digest,
+    );
     const anchor = adoptionEvidence.anchor;
     if (
       anchor === undefined
@@ -925,7 +1192,12 @@ export function createIssueRelayProductionReconciliation(options: {
     ) {
       return undefined;
     }
-    const verdict = await observeExactVerdict(candidate, record, round.round);
+    const verdict = await observeExactVerdict(
+      candidate,
+      record,
+      round.round,
+      true,
+    );
     if (verdict.status !== 'verified') return undefined;
     return {
       adoption: verdict.adoptionEvidence.adoption,
@@ -1109,7 +1381,7 @@ export function createIssueRelayProductionReconciliation(options: {
             );
             const budget = admitRelaySpend({
               policy: options.config.budget,
-              ledger: fundingLedger(),
+              ledger: await refreshFundingLedger(),
               candidate: {
                 generation: record.generation,
                 repository: record.snapshot.repository.slug,
@@ -1192,7 +1464,7 @@ export function createIssueRelayProductionReconciliation(options: {
           );
           const budget = admitRelaySpend({
             policy: options.config.budget,
-            ledger: fundingLedger(),
+            ledger: await refreshFundingLedger(),
             candidate: {
               generation: candidate.generation,
               repository: candidate.repository,
@@ -1250,8 +1522,21 @@ export function createIssueRelayProductionReconciliation(options: {
           ) {
             throw new Error('Relay funding lost exact durable funding intent');
           }
+          const prepared = await prepareRoundRequest({
+            candidate: current,
+            record,
+            round: action.round,
+            task: requestTask(record, action.round),
+            createdAt: intent.preparedAt,
+            maximumSpendWei: BigInt(intent.maximumSpendWei),
+          });
+          if (prepared.persisted.requestDigest !== intent.requestDigest) {
+            throw new Error(
+              'Relay reconstructed request differs from durable funding intent',
+            );
+          }
           const directory = roundDirectory(current, record, action.round);
-          const requestPath = join(directory.absolute, 'request.json');
+          const requestPath = prepared.persisted.requestPath;
           verifyRelayMarketplaceRequest(requestPath, intent.requestDigest);
           const dryRun = await options.marketplace.dryRun(
             requestPath,
@@ -1511,9 +1796,14 @@ export function createIssueRelayProductionReconciliation(options: {
           ) {
             throw new Error('Relay evaluation anchor lost passed-check authority');
           }
-          const checks = await exactChecks(record);
           const adoptionEvidence = await acceptedAdoption(record);
-          const pr = await options.githubAuthority.readPullRequest(record.pr.number);
+          const finalAuthority = await publicationAuthority(record, {
+            expectedChecksDigest: round.checks.digest,
+          });
+          if (relayRequiredCheckStatus(finalAuthority.checks) !== 'passed') {
+            throw new Error('Relay evaluation anchor checks changed before publication');
+          }
+          const { checks, pr } = finalAuthority;
           const publisher = createRelayEvaluationAnchorPublisher({
             now: options.now,
             port: {
@@ -1548,10 +1838,20 @@ export function createIssueRelayProductionReconciliation(options: {
             targetBase: options.config.targetBase,
             serviceLogin: options.config.relayBotLogin,
             pr,
-            currentBaseOid: candidate.facts.currentBaseOid,
+            currentBaseOid: finalAuthority.currentBaseOid,
             adoption: adoptionEvidence.adoption,
             checks,
           });
+          const anchoredAuthority = await publicationAuthority(record, {
+            expectedChecksDigest: round.checks.digest,
+          });
+          if (
+            relayRequiredCheckStatus(anchoredAuthority.checks) !== 'passed'
+            || anchoredAuthority.pr.head !== anchor.evaluatedHead
+            || anchoredAuthority.currentBaseOid !== anchor.baseOid
+          ) {
+            throw new Error('Relay evaluation anchor authority changed after publication');
+          }
           const timestamp = options.now().toISOString();
           const proposed: RelayGenerationRecordV1 = {
             ...record,
@@ -1647,20 +1947,21 @@ export function createIssueRelayProductionReconciliation(options: {
             candidate,
             record,
             round.round,
+            true,
           );
           if (verdict.status === 'pending') {
             return { outcome: 'pending', detail: verdict.detail };
           }
-          const draft = await options.githubAuthority.readPullRequest(record.pr.number);
+          const finalAuthority = await publicationAuthority(record, {
+            allowReady: true,
+            expectedChecksDigest: round.checks?.digest,
+          });
+          const draft = finalAuthority.pr;
           if (
-            draft.head !== record.pr.head
-            || !draft.open
-          ) {
-            throw new Error('Relay readiness lost exact pull request');
-          }
-          if (
-            candidate.facts.currentBaseOid !== verdict.anchor.baseOid
+            finalAuthority.currentBaseOid !== verdict.anchor.baseOid
+            || relayRequiredCheckStatus(finalAuthority.checks) !== 'passed'
             || verdict.checks.digest !== round.checks?.digest
+            || finalAuthority.checks.digest !== verdict.checks.digest
             || verdict.observation.delivery.envelopeCid
               !== round.verdict.envelopeCid
           ) {
@@ -1672,8 +1973,19 @@ export function createIssueRelayProductionReconciliation(options: {
               expectedHead: draft.head,
             });
           }
-          const readyPr = await options.githubAuthority.readPullRequest(draft.number);
-          if (!readyPr.open || readyPr.draft || readyPr.head !== draft.head) {
+          const readyAuthority = await publicationAuthority(record, {
+            allowReady: true,
+            expectedChecksDigest: round.checks?.digest,
+          });
+          const readyPr = readyAuthority.pr;
+          if (
+            !readyPr.open
+            || readyPr.draft
+            || readyPr.head !== draft.head
+            || readyAuthority.currentBaseOid !== finalAuthority.currentBaseOid
+            || readyAuthority.checks.digest !== finalAuthority.checks.digest
+            || relayRequiredCheckStatus(readyAuthority.checks) !== 'passed'
+          ) {
             throw new Error('Relay pull request did not read back ready at the exact head');
           }
           const timestamp = options.now().toISOString();
@@ -1715,7 +2027,7 @@ export function createIssueRelayProductionReconciliation(options: {
               readyEvidence: {
                 record: proposed,
                 currentHead: readyPr.head,
-                currentBaseOid: candidate.facts.currentBaseOid,
+                currentBaseOid: readyAuthority.currentBaseOid,
                 targetBase: options.config.targetBase,
                 currentPr: {
                   ...readyPr,
@@ -1863,6 +2175,7 @@ export async function runIssueRelayRuntime(options: {
   readonly mode: 'observe' | 'recover' | 'active';
   readonly once: boolean;
   readonly pollSeconds: number;
+  readonly acquireWriterLease?: () => IssueRelayRuntimeLease;
   readonly preflight: () => Promise<void>;
   readonly cycle: () => Promise<RelayCycleReport>;
   readonly sleep?: (milliseconds: number) => Promise<void>;
@@ -1874,16 +2187,23 @@ export async function runIssueRelayRuntime(options: {
   ) {
     throw new Error('Issue Relay polling cadence must be a positive integer');
   }
-  await options.preflight();
-  const reports: RelayCycleReport[] = [];
-  const sleep = options.sleep ?? ((milliseconds) =>
-    new Promise((resolve) => setTimeout(resolve, milliseconds)));
-  do {
-    reports.push(await options.cycle());
-    if (options.once || Boolean(options.signal?.aborted)) break;
-    await sleep(options.pollSeconds * 1_000);
-  } while (!Boolean(options.signal?.aborted));
-  return reports;
+  const lease = options.mode === 'observe'
+    ? undefined
+    : options.acquireWriterLease?.();
+  try {
+    await options.preflight();
+    const reports: RelayCycleReport[] = [];
+    const sleep = options.sleep ?? ((milliseconds) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    do {
+      reports.push(await options.cycle());
+      if (options.once || Boolean(options.signal?.aborted)) break;
+      await sleep(options.pollSeconds * 1_000);
+    } while (!Boolean(options.signal?.aborted));
+    return reports;
+  } finally {
+    lease?.release();
+  }
 }
 
 const execFileAsync = promisify(execFile);
@@ -2263,7 +2583,9 @@ productionEnvironmentDependencies): Promise<void> {
   }
   const config = parseIssueRelayConfig(dependencies.readConfig(configPath));
   const now = () => new Date();
-  const artifacts = createRelayDurableArtifactStore(stateDirectory);
+  const artifacts = options.mode === 'observe'
+    ? createRelayReadOnlyArtifactStore(stateDirectory)
+    : createRelayDurableArtifactStore(stateDirectory, { deferCreation: true });
   const github = createRelayGitHubProductionPorts({ config, token });
   const jinnBinary = dependencies.resolveJinnBinary();
   const marketplace = new IssueRelayMarketplaceCli({
@@ -2286,15 +2608,7 @@ productionEnvironmentDependencies): Promise<void> {
     workspacePath: join(stateDirectory, 'verification-workspace'),
     ambientEnvironment: options.environment,
     now,
-    prepareWorkspace: async ({ sourcePath, workspacePath }) => {
-      await cp(sourcePath, workspacePath, {
-        recursive: true,
-        force: true,
-        filter: (path) =>
-          !path.includes(`${join(sourcePath, '.git')}`)
-          && !path.split('/').includes('node_modules'),
-      });
-    },
+    prepareWorkspace: prepareRelayVerificationWorkspace,
   });
   const publisher = createRelayGitPublisher({
     git: gitComposition.git,
@@ -2401,7 +2715,33 @@ productionEnvironmentDependencies): Promise<void> {
     mode: options.mode,
     once: options.once,
     pollSeconds: config.pollSeconds,
+    ...(options.mode === 'observe'
+      ? {}
+      : {
+        acquireWriterLease: () =>
+          acquireIssueRelayRuntimeLease(stateDirectory),
+      }),
     preflight: async () => {
+      if (options.mode === 'observe') {
+        const observed = await github.preflight();
+        if (
+          !sameName(observed.authenticatedLogin, config.relayBotLogin)
+          || observed.targetRepository !== config.repository
+          || observed.targetVisibility !== 'PUBLIC'
+          || observed.targetBase !== config.targetBase
+          || observed.label !== config.label
+          || observed.targetRepositoryId.length === 0
+          || observed.forkRepository !== config.managedForkRepository
+          || !sameName(observed.forkOwner, config.relayBotLogin)
+          || observed.forkRepositoryId.length === 0
+          || observed.forkParentRepositoryId !== observed.targetRepositoryId
+          || observed.forkVisibility !== 'PUBLIC'
+          || !isAbsolute(jinnBinary)
+        ) {
+          throw new Error('Issue Relay observe preflight rejected authority');
+        }
+        return;
+      }
       preflightEvidence = await preflightIssueRelayProduction({
         config,
         stateDirectory,

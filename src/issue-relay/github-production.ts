@@ -945,8 +945,8 @@ export function createRelayGitHubProductionPorts(options: {
     },
     async editAssuranceCommentExact(input) {
       const pr = await readPr(input.prNumber);
-      if (pr.head !== input.expectedHead || !pr.open || !pr.draft) {
-        throw new Error('Relay assurance edit lost exact draft head authority');
+      if (pr.head !== input.expectedHead || !pr.open) {
+        throw new Error('Relay assurance edit lost exact open head authority');
       }
       return this.editIssueCommentExact({
         issueNumber: input.prNumber,
