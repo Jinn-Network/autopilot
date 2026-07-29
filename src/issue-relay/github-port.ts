@@ -70,6 +70,7 @@ export interface RelayGitHubWritePort {
   closePullRequest(input: {
     readonly prNumber: number;
     readonly expectedHead: string;
+    readonly expectedDraft: boolean;
     readonly reason: string;
   }): Promise<void>;
 }

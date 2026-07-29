@@ -963,6 +963,35 @@ describe('Relay state/action transition table', () => {
     }), policy)).toEqual({ kind: 'mark-ready' });
   });
 
+  it('finishes an authenticated ready mutation after the deadline while authority stays active and exact', () => {
+    const record = durable('evaluating', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: passedChecks,
+        verdict: passingVerdict,
+      })],
+      pr: {
+        number: 68,
+        branch: acceptedAdoption.branch,
+        head: HEAD,
+        draft: true,
+      },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      now: record.deadlineAt,
+      currentPr: { ...livePr(), draft: false },
+      readiness: {
+        adoption: acceptedAdoption,
+        checks: readyChecks,
+        evaluationAnchor,
+        verdict: authenticatedVerdict,
+      },
+    }), policy)).toEqual({ kind: 'mark-ready' });
+  });
+
   it('evaluating does not carry readiness across contradictory Task delivery facts', () => {
     const record = durable('evaluating', {
       rounds: [round({

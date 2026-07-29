@@ -762,6 +762,42 @@ const threeRoundModel = {
 };
 
 describe('Relay issue status rendering', () => {
+  it('keeps a recovery locator until the exact terminal marker edit', () => {
+    const activeLocator = '<!-- jinn-issue-relay:active:v1 -->';
+    const active = renderRelayIssueComment({
+      record,
+      generation,
+      phase: 'submitted',
+      round: 0,
+      summary: 'Task funded.',
+      nextAction: 'Observe the funded round.',
+    });
+
+    expect(active.match(/<!-- jinn-issue-relay:active:v1 -->/g))
+      .toHaveLength(1);
+    expect(parseRelayIssueCommentMarker(active, 'jinn-relay[bot]'))
+      .toEqual(record);
+
+    for (const terminal of [
+      readyRecord,
+      { ...readyRecord, phase: 'exhausted' as const },
+    ]) {
+      const rendered = renderRelayIssueComment({
+        record: terminal,
+        generation: terminal.generation,
+        phase: terminal.phase,
+        prNumber: terminal.pr.number,
+        round: terminal.rounds.at(-1)!.round,
+        summary: 'The generation is terminal.',
+        nextAction: 'No further Relay work.',
+      });
+
+      expect(rendered).not.toContain(activeLocator);
+      expect(parseRelayIssueCommentMarker(rendered, 'jinn-relay[bot]'))
+        .toEqual(terminal);
+    }
+  });
+
   it('composes visible status with exactly one strict durable marker', () => {
     const rendered = renderRelayIssueComment({
       record,
@@ -781,6 +817,8 @@ describe('Relay issue status rendering', () => {
       - Next action: Relay will observe the funded round.
 
       Closing the issue or removing \`engine:marketplace\` requests soft cancellation. Already-funded marketplace work cannot be withdrawn on-chain.
+
+      <!-- jinn-issue-relay:active:v1 -->
 
       <!-- jinn-issue-relay:generation:v1 -->
 

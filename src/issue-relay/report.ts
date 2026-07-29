@@ -26,9 +26,17 @@ import {
 } from './state.js';
 
 const ISSUE_MARKER = '<!-- jinn-issue-relay:generation:v1 -->';
+const ACTIVE_ISSUE_MARKER = '<!-- jinn-issue-relay:active:v1 -->';
 const ASSURANCE_MARKER = '<!-- jinn-issue-relay:assurance:v1 -->';
 const MAX_DISPLAY_BYTES = 1_024;
 const MAX_REPORT_ITEMS = 100;
+const TERMINAL_ISSUE_PHASES: ReadonlySet<RelayPhase> = new Set([
+  'awaiting-clarification',
+  'refused',
+  'ready',
+  'closed',
+  'exhausted',
+]);
 
 export const READY_FOR_REVIEW_LIMITATION =
   'Jinn has independently evaluated this exact revision and the recorded checks\n'
@@ -291,6 +299,9 @@ export function renderRelayIssueComment(
     'Closing the issue or removing `engine:marketplace` requests soft cancellation. '
       + 'Already-funded marketplace work cannot be withdrawn on-chain.',
     '',
+    ...(TERMINAL_ISSUE_PHASES.has(model.phase)
+      ? []
+      : [ACTIVE_ISSUE_MARKER, '']),
     marker,
   ];
   return lines.join('\n');

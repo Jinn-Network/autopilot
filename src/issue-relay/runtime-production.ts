@@ -471,7 +471,14 @@ function relaySnapshotMateriallyChanged(
 ): boolean {
   const withoutCaptureIdentity = (snapshot: IssueRelaySnapshotV1) => ({
     repository: snapshot.repository,
-    issue: snapshot.issue,
+    issue: {
+      number: snapshot.issue.number,
+      url: snapshot.issue.url,
+      title: snapshot.issue.title,
+      body: snapshot.issue.body,
+      authorLogin: snapshot.issue.authorLogin,
+      authorId: snapshot.issue.authorId,
+    },
     optIn: snapshot.optIn,
     language: snapshot.language,
     verificationProfile: snapshot.verificationProfile,
@@ -703,6 +710,7 @@ export function createIssueRelayProductionReconciliation(options: {
         )
         && nextSnapshot !== undefined
         && nextGeneration !== marker.record.generation
+        && Date.parse(nextSnapshot.capturedAt) > Date.parse(marker.record.updatedAt)
         && relaySnapshotMateriallyChanged(marker.record.snapshot, nextSnapshot)
       ) {
         return {
@@ -763,6 +771,9 @@ export function createIssueRelayProductionReconciliation(options: {
       if (
         marker.record.phase === 'evaluating'
         && latest?.verdict?.outcome === 'pass'
+        && candidate.facts.issue.open
+        && candidate.facts.issue.optedIn
+        && currentBaseOid === marker.record.snapshot.repository.baseOid
       ) {
         const readiness = await readReadiness(candidate);
         return {
@@ -2282,9 +2293,29 @@ export function createIssueRelayProductionReconciliation(options: {
               && action.reason === 'deadline'
               ? 'The durable generation deadline expired.'
               : 'The configured Relay round or spend bound was exhausted.';
+          const terminalPr = record.pr === undefined
+            ? undefined
+            : await options.githubAuthority.readPullRequest(record.pr.number);
+          if (
+            terminalPr !== undefined
+            && (
+              terminalPr.number !== record.pr?.number
+              || terminalPr.generation !== record.generation
+              || terminalPr.branch !== record.pr.branch
+              || terminalPr.head !== record.pr.head
+              || terminalPr.base !== options.config.targetBase
+            )
+          ) {
+            throw new Error(
+              'Relay terminal transition lost exact pull request authority',
+            );
+          }
           const proposed: RelayGenerationRecordV1 = {
             ...record,
             phase: terminal,
+            ...(record.pr === undefined || terminalPr === undefined
+              ? {}
+              : { pr: { ...record.pr, draft: terminalPr.draft } }),
             updatedAt: options.now().toISOString(),
           };
           if (record.pr !== undefined) {
@@ -2310,12 +2341,12 @@ export function createIssueRelayProductionReconciliation(options: {
               },
             });
           }
-          if (record.pr !== undefined) {
-            const pr = await options.githubAuthority.readPullRequest(record.pr.number);
-            if (pr.open) {
+          if (terminalPr !== undefined) {
+            if (terminalPr.open) {
               await options.githubWrite.closePullRequest({
-                prNumber: pr.number,
-                expectedHead: pr.head,
+                prNumber: terminalPr.number,
+                expectedHead: terminalPr.head,
+                expectedDraft: terminalPr.draft,
                 reason: action.kind === 'finish-cancellation'
                   ? 'Jinn Issue Relay generation cancelled'
                   : exhaustionDetail,

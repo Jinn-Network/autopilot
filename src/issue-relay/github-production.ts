@@ -19,7 +19,7 @@ import type {
 
 const DISCOVERY_QUERY =
   'repo:Jinn-Network/mono is:issue is:open label:"engine:marketplace"';
-const RECOVERY_MARKER = 'jinn-issue-relay:generation:v1';
+const RECOVERY_ACTIVE_MARKER = 'jinn-issue-relay:active:v1';
 const GITHUB_SEARCH_RESULT_CAP = 1000;
 const MAX_PAGES = 10;
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -683,7 +683,7 @@ export function createRelayGitHubProductionPorts(options: {
       const before = await readPr(input.prNumber);
       await assertPrAuthority(before, {
         expectedHead: input.expectedHead,
-        expectedDraft: true,
+        expectedDraft: input.expectedDraft,
         expectedOpen: true,
       });
       await request({
@@ -695,7 +695,7 @@ export function createRelayGitHubProductionPorts(options: {
       const after = await readPr(input.prNumber);
       await assertPrAuthority(after, {
         expectedHead: input.expectedHead,
-        expectedDraft: true,
+        expectedDraft: input.expectedDraft,
         expectedOpen: false,
       });
     },
@@ -709,7 +709,8 @@ export function createRelayGitHubProductionPorts(options: {
       let expectedTotal: number | undefined;
       const query =
         `repo:${options.config.repository} is:issue in:comments `
-        + `"${RECOVERY_MARKER}" commenter:"${options.config.relayBotLogin}"`;
+        + `"${RECOVERY_ACTIVE_MARKER}" `
+        + `commenter:"${options.config.relayBotLogin}"`;
       for (;;) {
         const path = '/search/issues';
         const response = await request({
@@ -1096,6 +1097,7 @@ export function createRelayGitHubProductionPorts(options: {
         await write.closePullRequest({
           prNumber: command.prNumber,
           expectedHead: command.expectedHead,
+          expectedDraft: command.expectedDraft,
           reason: command.reason,
         });
         return { kind: 'mutated' };

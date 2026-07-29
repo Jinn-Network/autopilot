@@ -753,19 +753,24 @@ function deriveDraftOpenAction(
   }
 }
 
-function deriveEvaluatingAction(
+function isReadyMutationRecovery(
   facts: RelayAuthoritativeFacts,
   round: RelayRoundRecordV1 | undefined,
-): RelayAction {
-  const readyMutationRecovery =
-    round?.verdict?.outcome === 'pass'
+): boolean {
+  return round?.verdict?.outcome === 'pass'
     && facts.currentPr?.open === true
     && facts.currentPr.draft === false
     && readinessMatchesRound({
       ...facts,
       currentPr: { ...facts.currentPr, draft: true },
     }, round);
-  if (readyMutationRecovery) {
+}
+
+function deriveEvaluatingAction(
+  facts: RelayAuthoritativeFacts,
+  round: RelayRoundRecordV1 | undefined,
+): RelayAction {
+  if (isReadyMutationRecovery(facts, round)) {
     return { kind: 'mark-ready' };
   }
   if (
@@ -920,6 +925,12 @@ export function deriveRelayAction(
     && record.phase !== 'solution-delivered'
   ) {
     return { kind: 'close-exhausted', reason: 'stale-base' };
+  }
+  if (
+    record.phase === 'evaluating'
+    && isReadyMutationRecovery(facts, round)
+  ) {
+    return { kind: 'mark-ready' };
   }
   if (nowMs >= deadlineMs) {
     return { kind: 'close-exhausted', reason: 'deadline' };
