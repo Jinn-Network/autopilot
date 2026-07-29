@@ -68,17 +68,27 @@ export interface RelayRoundRecordV1 {
   readonly adoption?: {
     readonly disposition: 'accepted' | 'rejected';
     readonly resultingHead?: string;
+    readonly prNumber?: number;
     readonly receiptDigest: `sha256:${string}`;
+    readonly recordedAt?: string;
   };
   readonly checks?: {
     readonly head: string;
     readonly status: 'pending' | 'passed' | 'failed';
     readonly digest: `sha256:${string}`;
+    readonly observedAt?: string;
+  };
+  readonly evaluation?: {
+    readonly head: string;
+    readonly anchorDigest: `sha256:${string}`;
+    readonly anchoredAt: string;
   };
   readonly verdict?: {
     readonly outcome: 'pass' | 'request-changes' | 'human' | 'unresolved';
     readonly evaluatedHead: string;
+    readonly evaluatorSafe?: string;
     readonly envelopeCid: string;
+    readonly observedAt?: string;
   };
 }
 
@@ -308,6 +318,22 @@ function durableShapeIsConsistent(record: RelayGenerationRecordV1): boolean {
     if (round.solution !== undefined && round.task === undefined) return false;
     if (round.adoption !== undefined && round.solution === undefined) return false;
     if (
+      round.adoption?.recordedAt !== undefined
+      && canonicalUtcTimestamp(round.adoption.recordedAt) === undefined
+    ) {
+      return false;
+    }
+    if (
+      round.adoption?.prNumber !== undefined
+      && (
+        round.adoption.disposition !== 'accepted'
+        || !Number.isSafeInteger(round.adoption.prNumber)
+        || round.adoption.prNumber <= 0
+      )
+    ) {
+      return false;
+    }
+    if (
       round.adoption?.disposition === 'accepted'
       && round.adoption.resultingHead === undefined
     ) {
@@ -324,6 +350,21 @@ function durableShapeIsConsistent(record: RelayGenerationRecordV1): boolean {
       && (
         round.adoption?.disposition !== 'accepted'
         || round.adoption.resultingHead !== round.checks.head
+        || (
+          round.checks.observedAt !== undefined
+          && canonicalUtcTimestamp(round.checks.observedAt) === undefined
+        )
+      )
+    ) {
+      return false;
+    }
+    if (
+      round.evaluation !== undefined
+      && (
+        round.checks?.status !== 'passed'
+        || round.evaluation.head !== round.checks.head
+        || !/^sha256:[0-9a-f]{64}$/.test(round.evaluation.anchorDigest)
+        || canonicalUtcTimestamp(round.evaluation.anchoredAt) === undefined
       )
     ) {
       return false;
@@ -333,6 +374,14 @@ function durableShapeIsConsistent(record: RelayGenerationRecordV1): boolean {
       && (
         round.checks?.status !== 'passed'
         || round.verdict.evaluatedHead !== round.checks.head
+        || (
+          round.verdict.evaluatorSafe !== undefined
+          && !/^0x[0-9a-fA-F]{40}$/.test(round.verdict.evaluatorSafe)
+        )
+        || (
+          round.verdict.observedAt !== undefined
+          && canonicalUtcTimestamp(round.verdict.observedAt) === undefined
+        )
       )
     ) {
       return false;
