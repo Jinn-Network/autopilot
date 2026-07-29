@@ -1813,9 +1813,12 @@ export function createIssueRelayProductionReconciliation(options: {
           });
           const timestamp = options.now().toISOString();
           if (adoption.status === 'rejected') {
+            const settlingCancellation =
+              record.cancellation !== undefined
+              && adoption.receipt.reason === 'cancelled';
             const proposed: RelayGenerationRecordV1 = {
               ...record,
-              phase: 'closed',
+              phase: settlingCancellation ? 'cancelling' : 'closed',
               rounds: record.rounds.map((entry) => entry.round === action.round
                 ? {
                   ...entry,
@@ -1834,8 +1837,12 @@ export function createIssueRelayProductionReconciliation(options: {
             await replaceMarker(
               candidate,
               proposed,
-              `Round ${action.round} patch was rejected by host validation.`,
-              'No repository mutation was accepted.',
+              settlingCancellation
+                ? `Round ${action.round} settled without adoption after cancellation.`
+                : `Round ${action.round} patch was rejected by host validation.`,
+              settlingCancellation
+                ? 'Closing the existing draft without further marketplace work.'
+                : 'No repository mutation was accepted.',
             );
             return { outcome: 'refused', detail: adoption.receipt.reason };
           }
@@ -2202,18 +2209,6 @@ export function createIssueRelayProductionReconciliation(options: {
           if (record === undefined) {
             throw new Error('Relay terminal transition lacks durable authority');
           }
-          if (record.pr !== undefined) {
-            const pr = await options.githubAuthority.readPullRequest(record.pr.number);
-            if (pr.open) {
-              await options.githubWrite.closePullRequest({
-                prNumber: pr.number,
-                expectedHead: pr.head,
-                reason: action.kind === 'finish-cancellation'
-                  ? 'Jinn Issue Relay generation cancelled'
-                  : 'Jinn Issue Relay budget or deadline exhausted',
-              });
-            }
-          }
           const terminal = action.kind === 'finish-cancellation'
             ? 'closed'
             : 'exhausted';
@@ -2244,6 +2239,18 @@ export function createIssueRelayProductionReconciliation(options: {
                 technicalEvidence: [],
               },
             });
+          }
+          if (record.pr !== undefined) {
+            const pr = await options.githubAuthority.readPullRequest(record.pr.number);
+            if (pr.open) {
+              await options.githubWrite.closePullRequest({
+                prNumber: pr.number,
+                expectedHead: pr.head,
+                reason: action.kind === 'finish-cancellation'
+                  ? 'Jinn Issue Relay generation cancelled'
+                  : 'Jinn Issue Relay budget or deadline exhausted',
+              });
+            }
           }
           await replaceMarker(
             candidate,
@@ -2724,19 +2731,25 @@ export async function runIssueRelayProductionFromEnvironment(options: {
 }, dependencies: IssueRelayProductionEnvironmentDependencies =
 productionEnvironmentDependencies): Promise<void> {
   const configPath = options.environment.JINN_ISSUE_RELAY_CONFIG;
+  const configuredJinnBinary =
+    options.environment.JINN_ISSUE_RELAY_JINN_BINARY;
   const token = options.environment.JINN_ISSUE_RELAY_GITHUB_TOKEN;
   const stateDirectory =
     options.environment.JINN_ISSUE_RELAY_STATE_DIRECTORY;
   if (
     configPath === undefined
     || !isAbsolute(configPath)
+    || (
+      configuredJinnBinary !== undefined
+      && !isAbsolute(configuredJinnBinary)
+    )
     || token === undefined
     || token.length === 0
     || stateDirectory === undefined
     || !isAbsolute(stateDirectory)
   ) {
     throw new Error(
-      'Issue Relay requires absolute config/state paths and a GitHub token',
+      'Issue Relay requires absolute config/state/binary paths and a GitHub token',
     );
   }
   const config = parseIssueRelayConfig(dependencies.readConfig(configPath));
@@ -2745,7 +2758,8 @@ productionEnvironmentDependencies): Promise<void> {
     ? createRelayReadOnlyArtifactStore(stateDirectory)
     : createRelayDurableArtifactStore(stateDirectory, { deferCreation: true });
   const github = createRelayGitHubProductionPorts({ config, token });
-  const jinnBinary = dependencies.resolveJinnBinary();
+  const jinnBinary =
+    configuredJinnBinary ?? dependencies.resolveJinnBinary();
   const marketplace = new IssueRelayMarketplaceCli({
     jinnBinary,
     environment: options.environment,

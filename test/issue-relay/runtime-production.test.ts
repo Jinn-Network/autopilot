@@ -546,6 +546,7 @@ describe('production Relay cadence', () => {
           PATH: process.env.PATH,
           JINN_ISSUE_RELAY_CONFIG: join(parent, 'config.json'),
           JINN_ISSUE_RELAY_GITHUB_TOKEN: 'test-token',
+          JINN_ISSUE_RELAY_JINN_BINARY: join(parent, 'reviewed-jinn'),
           JINN_ISSUE_RELAY_STATE_DIRECTORY: state,
         },
       }, {
@@ -558,7 +559,9 @@ describe('production Relay cadence', () => {
               raw.budget.maxGlobalSpendWeiPerUtcDay.toString(),
           },
         }),
-        resolveJinnBinary: () => '/installed/jinn',
+        resolveJinnBinary: () => {
+          throw new Error('registry Jinn client must not be resolved');
+        },
       });
     } catch (error) {
       failure = error;

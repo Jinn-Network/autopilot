@@ -16,6 +16,7 @@ dirty primary checkout.
 ```sh
 export AUTOPILOT_WORKTREE=/absolute/path/to/autopilot-issue-relay-worktree
 export JINN_MONO_WORKTREE=/absolute/path/to/jinn-mono-issue-relay-worktree
+export JINN_MONO_COMMIT=<reviewed-40-character-companion-commit>
 export RELAY_CONFIG=/absolute/private/path/jinn-issue-relay.json
 export RELAY_STATE_DIRECTORY=/absolute/private/path/jinn-issue-relay-state
 
@@ -28,6 +29,11 @@ test -d "$AUTOPILOT_WORKTREE/.git" -o -f "$AUTOPILOT_WORKTREE/.git"
 test -d "$JINN_MONO_WORKTREE/.git" -o -f "$JINN_MONO_WORKTREE/.git"
 test -z "$(git -C "$AUTOPILOT_WORKTREE" status --short)"
 test -z "$(git -C "$JINN_MONO_WORKTREE" status --short)"
+test "$(git -C "$JINN_MONO_WORKTREE" rev-parse HEAD)" = "$JINN_MONO_COMMIT"
+test "${#JINN_MONO_COMMIT}" -eq 40
+case "$JINN_MONO_COMMIT" in
+  *[!0-9a-f]*) echo "invalid reviewed Jinn commit" >&2; exit 1 ;;
+esac
 test "$(node --version | cut -d. -f1)" = v22
 ```
 
@@ -46,7 +52,7 @@ yarn --cwd packages/sdk build
 yarn --cwd packages/sdk test
 yarn --cwd packages/sdk typecheck
 yarn --cwd client install --immutable
-yarn --cwd client build
+JINN_BUILD_COMMIT="$JINN_MONO_COMMIT" yarn --cwd client build
 yarn --cwd client vitest run \
   test/issue-relay \
   test/harnesses/jinn-repo-evaluator \
@@ -54,10 +60,32 @@ yarn --cwd client vitest run \
 yarn --cwd client typecheck
 ```
 
-The Relay resolves the installed `@jinn-network/client` package from the
-Autopilot worktree and executes its declared `jinn` binary. Confirm that the
-installed package is the reviewed Issue Relay-capable build and that its
-`dist/bin/jinn.js` is executable.
+Pin the Relay to that reviewed worktree build, never to Autopilot's registry
+`@jinn-network/client` dependency:
+
+```sh
+export JINN_ISSUE_RELAY_JINN_BINARY="$JINN_MONO_WORKTREE/client/dist/bin/jinn.js"
+test -x "$JINN_ISSUE_RELAY_JINN_BINARY"
+rg -q 'observe-issue-relay-delivery' "$JINN_ISSUE_RELAY_JINN_BINARY"
+node -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const meta = JSON.parse(fs.readFileSync(
+    path.join(process.env.JINN_MONO_WORKTREE, "client/dist/build-meta.json"),
+    "utf8",
+  ));
+  if (meta.commit !== process.env.JINN_MONO_COMMIT) process.exit(1);
+'
+export JINN_ISSUE_RELAY_JINN_BINARY_SHA256="$(
+  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
+)"
+test "${#JINN_ISSUE_RELAY_JINN_BINARY_SHA256}" -eq 64
+```
+
+Record the companion commit, absolute binary path, and SHA-256 in the rollout
+approval and retained evidence. Stop if any differs after preflight. The
+runtime consumes `JINN_ISSUE_RELAY_JINN_BINARY`; the SHA-256 is an operator
+pin checked before every approved pass.
 
 The SDK contract bytes must agree before rollout:
 
@@ -109,12 +137,13 @@ Both Wei placeholders must be replaced by positive decimal integers before
 the config is used. The managed fork must be public, distinct from the target,
 owned by `relayBotLogin`, and have the target repository as its parent.
 
-Set the three Relay variables. Keep the GitHub token in the process secret
+Set the four Relay variables. Keep the GitHub token in the process secret
 store, not the config or state directory:
 
 ```sh
 export JINN_ISSUE_RELAY_CONFIG="$RELAY_CONFIG"
 export JINN_ISSUE_RELAY_STATE_DIRECTORY="$RELAY_STATE_DIRECTORY"
+export JINN_ISSUE_RELAY_JINN_BINARY="$JINN_MONO_WORKTREE/client/dist/bin/jinn.js"
 export JINN_ISSUE_RELAY_GITHUB_TOKEN='<bot token from the secret store>'
 ```
 
@@ -158,8 +187,17 @@ state directory, and marketplace environment.
 
 ```sh
 cd "$AUTOPILOT_WORKTREE"
+test "$(
+  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
+)" = "$JINN_ISSUE_RELAY_JINN_BINARY_SHA256"
 yarn issue-relay --mode observe --once
+test "$(
+  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
+)" = "$JINN_ISSUE_RELAY_JINN_BINARY_SHA256"
 yarn issue-relay --mode recover --once
+test "$(
+  shasum -a 256 "$JINN_ISSUE_RELAY_JINN_BINARY" | cut -d' ' -f1
+)" = "$JINN_ISSUE_RELAY_JINN_BINARY_SHA256"
 yarn issue-relay --mode active --once
 ```
 
@@ -248,7 +286,8 @@ logs. Stop before another pass if the remaining daily or generation allowance
 cannot cover the next reviewed round.
 
 For the first successful loop retain, without secrets: issue URL and label
-event; snapshot and generation; config commit/digest; Task keys, IDs/CIDs,
+event; snapshot and generation; config commit/digest; reviewed Jinn companion
+commit, resolved binary path, build metadata, and SHA-256; Task keys, IDs/CIDs,
 creation transactions, blocks, SolverNet manifest, and spends; Solution and
 Verdict observation files/digests; branch and PR URL; every head/base/check
 digest; every receipt and anchor; READY assurance; mode command timestamps;
