@@ -25,7 +25,7 @@ import {
   sep,
 } from 'node:path';
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import type { IssueRelayConfig } from './config.js';
 import { parseIssueRelayConfig } from './config.js';
 import {
@@ -41,6 +41,10 @@ import {
   parseRelayIssueCommentMarker,
   renderRelayIssueComment,
 } from './report.js';
+import {
+  formatRelayIssueMarker,
+  prepareRelayIssueMarkerUpdate,
+} from './markers.js';
 import {
   persistRelayCancellation,
   type RelayGenerationRecordV1,
@@ -826,10 +830,128 @@ export function createIssueRelayProductionReconciliation(options: {
       }) ?? []),
   });
 
+  const rereadFundingCandidate = async (
+    scanned: RelayReconciliationCandidate,
+  ): Promise<RelayReconciliationCandidate> => {
+    const issue = await options.githubRead.readIssue(scanned.issueNumber);
+    const owned = (await options.githubAuthority.listIssueComments(
+      scanned.issueNumber,
+    ))
+      .filter(({ authorLogin }) => sameName(
+        authorLogin,
+        options.config.relayBotLogin,
+      ))
+      .map((comment) => ({
+        ...comment,
+        record: parseRelayIssueCommentMarker(
+          comment.body,
+          comment.authorLogin,
+          options.config.relayBotLogin,
+        ),
+      }))
+      .filter((comment) => comment.record !== null);
+    const previous = scanned.facts.durable;
+    const expectedSnapshot = previous?.snapshot ?? scanned.production?.snapshot;
+    if (
+      expectedSnapshot === undefined
+      || !sameName(issue.repository.slug, options.config.repository)
+      || issue.repository.nodeId !== expectedSnapshot.repository.nodeId
+      || issue.issue.number !== scanned.issueNumber
+      || expectedSnapshot.issue.number !== scanned.issueNumber
+    ) {
+      throw new Error('Relay funding ledger live issue authority changed');
+    }
+    if (owned.length === 0 && previous === undefined) {
+      return {
+        ...scanned,
+        facts: {
+          ...scanned.facts,
+          issue: {
+            open: issue.issue.state === 'OPEN',
+            optedIn: issue.issue.labels.some((label) =>
+              sameName(label, options.config.label)),
+          },
+          now: options.now().toISOString(),
+        },
+      };
+    }
+    const marker = owned[0];
+    if (
+      owned.length !== 1
+      || marker === undefined
+      || marker.record === null
+      || marker.record.generation !== scanned.generation
+      || (
+        scanned.production?.issueCommentId !== undefined
+        && marker.id !== scanned.production.issueCommentId
+      )
+      || !sameName(marker.record.snapshot.repository.slug, options.config.repository)
+      || !isDeepStrictEqual(
+        marker.record.snapshot.repository,
+        expectedSnapshot.repository,
+      )
+      || marker.record.snapshot.issue.number !== expectedSnapshot.issue.number
+      || marker.record.snapshot.issue.number !== scanned.issueNumber
+    ) {
+      throw new Error('Relay funding ledger marker authority changed');
+    }
+    const proposedUpdatedAt = Date.parse(marker.record.updatedAt);
+    const previousUpdatedAt = previous === undefined
+      ? undefined
+      : Date.parse(previous.updatedAt);
+    const proposedForMonotonicCheck =
+      previousUpdatedAt !== undefined
+      && proposedUpdatedAt === previousUpdatedAt
+        ? {
+          ...marker.record,
+          updatedAt: new Date(proposedUpdatedAt + 1).toISOString(),
+        }
+        : marker.record;
+    if (
+      previous === undefined
+        ? !isDeepStrictEqual(
+          marker.record.snapshot,
+          scanned.production?.snapshot,
+        )
+        : (
+          !isDeepStrictEqual(previous, marker.record)
+          && prepareRelayIssueMarkerUpdate({
+            current: {
+              body: formatRelayIssueMarker(previous),
+              authorLogin: options.config.relayBotLogin,
+              expectedAuthorLogin: options.config.relayBotLogin,
+            },
+            proposed: proposedForMonotonicCheck,
+          }) === null
+        )
+    ) {
+      throw new Error('Relay funding ledger marker update is not monotonic');
+    }
+    return {
+      ...scanned,
+      transitionedAt: marker.record.updatedAt,
+      facts: {
+        durable: marker.record,
+        issue: {
+          open: issue.issue.state === 'OPEN',
+          optedIn: issue.issue.labels.some((label) =>
+            sameName(label, options.config.label)),
+        },
+        currentBaseOid: scanned.facts.currentBaseOid,
+        now: options.now().toISOString(),
+      },
+      production: {
+        issueCommentId: marker.id,
+        issueCommentBody: marker.body,
+        snapshot: marker.record.snapshot,
+      },
+    };
+  };
+
   const refreshFundingLedger = async (): Promise<RelaySpendLedger> => {
     const refreshed: RelayReconciliationCandidate[] = [];
     for (const scanned of lastScan) {
-      refreshed.push(await exactCurrent(scanned));
+      refreshed.push(await rereadFundingCandidate(scanned));
     }
     lastScan = refreshed;
     return fundingLedger();

@@ -1,6 +1,7 @@
 import {
   chmod,
   lstat,
+  mkdir,
   mkdtemp,
   symlink,
   writeFile,
@@ -870,6 +871,404 @@ describe('production Relay reconciliation composition', () => {
         parseRelayIssueCommentMarker(body, 'jinn-relay', 'jinn-relay')
           ?.phase === 'funding'),
     ).toHaveLength(1);
+  });
+
+  it('refreshes unrelated funding reservations without hydrating marketplace readiness', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'relay-state-'));
+    directories.push(parent);
+    const state = join(parent, 'state');
+    const durableArtifacts = createRelayDurableArtifactStore(state);
+    const artifactCalls: string[] = [];
+    const artifacts = {
+      installImmutable: vi.fn(async (input: {
+        readonly relativePath: string;
+        readonly bytes: Buffer;
+      }) => {
+        artifactCalls.push(`install:${input.relativePath}`);
+        return durableArtifacts.installImmutable(input);
+      }),
+      read: vi.fn(async (relativePath: string) => {
+        artifactCalls.push(`read:${relativePath}`);
+        return durableArtifacts.read(relativePath);
+      }),
+    };
+    const base = 'a'.repeat(40);
+    const head = 'b'.repeat(40);
+    const capturedAt = '2026-07-28T00:00:02.000Z';
+    const deadlineAt = '2026-07-29T00:00:02.000Z';
+    const snapshot = (number: number) => buildRelaySnapshot({
+      repository: {
+        slug: 'Jinn-Network/mono',
+        nodeId: 'R_target',
+        visibility: 'PUBLIC',
+        defaultBranch: 'main',
+        baseOid: base,
+      },
+      issue: {
+        number,
+        url: `https://github.com/Jinn-Network/mono/issues/${number}`,
+        title: `Isolated funding ledger ${number}`,
+        body: '- [ ] funding refresh remains read-only outside this generation',
+        authorLogin: `maintainer-${number}`,
+        authorId: `U_${number}`,
+        updatedAt: '2026-07-28T00:00:00.000Z',
+      },
+      optIn: {
+        label: 'engine:marketplace',
+        actorLogin: `maintainer-${number}`,
+        createdAt: '2026-07-28T00:00:01.000Z',
+        permission: 'MAINTAIN',
+      },
+      language: 'typescript',
+      verificationProfile: 'jinn-mono.v1',
+      acceptanceEvidence: ['funding refresh remains isolated'],
+      admissionPolicyVersion: 'jinn-issue-relay-admission.v1',
+      capturedAt,
+    });
+    const snapshotA = snapshot(17);
+    const snapshotB = snapshot(18);
+    const snapshotC = snapshot(19);
+    const recordA = {
+      schemaVersion: 'jinn-issue-relay-generation.v1' as const,
+      generation: relayGeneration(snapshotA),
+      snapshot: snapshotA,
+      phase: 'admitted' as const,
+      deadlineAt,
+      rounds: [],
+      updatedAt: capturedAt,
+    };
+    const maximumSpendWei = 2n;
+    const taskB = buildRelayTaskSpec({
+      snapshot: snapshotB,
+      round: 0,
+      purpose: 'initial',
+      workspaceRepository: snapshotB.repository.slug,
+      inputHead: base,
+      findings: [],
+    });
+    const roundB = join(
+      state,
+      'rounds',
+      '18',
+      snapshotB.snapshotDigest.slice('sha256:'.length),
+      '0',
+    );
+    await mkdir(roundB, { recursive: true, mode: 0o700 });
+    const preparedB = persistRelayMarketplaceRequest(
+      join(roundB, 'request.json'),
+      buildRelayMarketplaceRequest({
+        task: taskB,
+        solverNet: 'jinn-repo',
+        maximumSpendWei,
+        specPath: join(roundB, 'spec.json'),
+        createdAt: capturedAt,
+        submitBy: deadlineAt,
+      }),
+    );
+    const fundingIntentB = {
+      taskKey: taskB.spec.instance_id,
+      creatorSafe: `0x${'1'.repeat(40)}`,
+      solverNetManifestCid: 'manifest',
+      requestDigest: preparedB.requestDigest,
+      maximumSpendWei: maximumSpendWei.toString(),
+      spendWei: '1',
+      preparedAt: capturedAt,
+    };
+    const roundWithoutVerdict = {
+      round: 0,
+      purpose: 'initial' as const,
+      workspaceRepository: snapshotB.repository.slug,
+      inputHead: base,
+      findings: [],
+      fundingIntent: fundingIntentB,
+      task: {
+        taskKey: taskB.spec.instance_id,
+        taskId: 'task-b',
+        taskCid: 'bafy-task-b',
+        spendWei: '1',
+        fundedAt: capturedAt,
+      },
+      solution: {
+        envelopeCid: 'bafy-solution-b',
+        operatorSafe: `0x${'2'.repeat(40)}`,
+        observedAt: '2026-07-28T00:00:03.000Z',
+      },
+      adoption: {
+        disposition: 'accepted' as const,
+        resultingHead: head,
+        receiptDigest:
+          `sha256:${'3'.repeat(64)}` as const,
+      },
+      checks: {
+        head,
+        status: 'passed' as const,
+        digest: `sha256:${'4'.repeat(64)}` as const,
+      },
+    };
+    const recordB = {
+      schemaVersion: 'jinn-issue-relay-generation.v1' as const,
+      generation: relayGeneration(snapshotB),
+      snapshot: snapshotB,
+      phase: 'evaluating' as const,
+      deadlineAt,
+      rounds: [roundWithoutVerdict],
+      pr: {
+        number: 68,
+        branch: `issue-relay/${relayGeneration(snapshotB)}`,
+        head,
+        draft: true,
+      },
+      updatedAt: '2026-07-28T00:00:06.000Z',
+    };
+    const recordC = {
+      schemaVersion: 'jinn-issue-relay-generation.v1' as const,
+      generation: relayGeneration(snapshotC),
+      snapshot: snapshotC,
+      phase: 'admitted' as const,
+      deadlineAt,
+      rounds: [],
+      updatedAt: capturedAt,
+    };
+    const comments = new Map([
+      [17, {
+        id: 117,
+        authorLogin: 'jinn-relay',
+        body: renderRelayIssueComment({
+          record: recordA,
+          generation: recordA.generation,
+          phase: recordA.phase,
+          round: 0,
+          summary: 'Candidate A is admitted.',
+          nextAction: 'Reserve exact funding.',
+        }),
+      }],
+      [18, {
+        id: 118,
+        authorLogin: 'jinn-relay',
+        body: renderRelayIssueComment({
+          record: recordB,
+          generation: recordB.generation,
+          phase: recordB.phase,
+          prNumber: 68,
+          round: 0,
+          summary: 'Candidate B is evaluating.',
+          nextAction: 'Observe evaluator verdict.',
+        }),
+      }],
+      [19, {
+        id: 119,
+        authorLogin: 'jinn-relay',
+        body: renderRelayIssueComment({
+          record: recordC,
+          generation: recordC.generation,
+          phase: recordC.phase,
+          round: 0,
+          summary: 'Candidate C is admitted.',
+          nextAction: 'Respect the exact daily ledger.',
+        }),
+      }],
+    ]);
+    const issue = (number: number) => ({
+      repository: {
+        slug: 'Jinn-Network/mono',
+        nodeId: 'R_target',
+        visibility: 'PUBLIC' as const,
+        defaultBranch: 'main',
+      },
+      issue: {
+        number,
+        url: `https://github.com/Jinn-Network/mono/issues/${number}`,
+        title: `Isolated funding ledger ${number}`,
+        body: '- [ ] funding refresh remains read-only outside this generation',
+        authorLogin: `maintainer-${number}`,
+        authorId: `U_${number}`,
+        updatedAt: '2026-07-28T00:00:00.000Z',
+        state: 'OPEN' as const,
+        isPullRequest: false,
+        labels: ['engine:marketplace'],
+      },
+    });
+    const githubRead = {
+      searchOptedInIssues: vi.fn(async () => ({
+        issues: [issue(17), issue(18), issue(19), issue(20)],
+      })),
+      readIssue: vi.fn(async (number: number) => issue(number)),
+      listLabelEvents: vi.fn(async (number: number) => [{
+        action: 'labeled' as const,
+        label: 'engine:marketplace',
+        actorLogin: `maintainer-${number}`,
+        actorId: `U_${number}`,
+        createdAt: '2026-07-28T00:00:01.000Z',
+      }]),
+      readRepositoryPermission: vi.fn(async () => 'MAINTAIN' as const),
+      readDefaultBranchHead: vi.fn(async () => base),
+    };
+    const githubAuthority = {
+      listIssueNumbersForMarkerRecovery: vi.fn(async () => [17, 18, 19, 20]),
+      listIssueComments: vi.fn(async (number: number) => {
+        const comment = comments.get(number);
+        return comment === undefined ? [] : [comment];
+      }),
+      editIssueCommentExact: vi.fn(async (input: {
+        readonly issueNumber: number;
+        readonly commentId: number;
+        readonly expectedBody: string;
+        readonly body: string;
+      }) => {
+        expect(comments.get(input.issueNumber)).toMatchObject({
+          id: input.commentId,
+          body: input.expectedBody,
+        });
+        const comment = {
+          id: input.commentId,
+          authorLogin: 'jinn-relay',
+          body: input.body,
+        };
+        comments.set(input.issueNumber, comment);
+        return comment;
+      }),
+      readPullRequest: vi.fn(async () => ({
+        number: 68,
+        generation: recordB.generation,
+        branch: recordB.pr.branch,
+        head,
+        base: 'main',
+        open: true,
+        draft: true,
+      })),
+      readChecks: vi.fn(),
+      listAssuranceComments: vi.fn(),
+      editAssuranceCommentExact: vi.fn(),
+    };
+    const marketplace = {
+      dryRun: vi.fn(async (requestPath: string) => {
+        if (requestPath.includes('/18/')) {
+          throw new Error(
+            'unrelated evaluating generation reached marketplace during ledger refresh',
+          );
+        }
+        return {
+          id: 'candidate-a',
+          creatorSafe: `0x${'1'.repeat(40)}`,
+          solverNetManifestCid: 'manifest',
+          proposedSpendWei: 1n,
+        };
+      }),
+      submit: vi.fn(),
+      observe: vi.fn(),
+    };
+    const relayConfig = {
+      ...config(),
+      budget: {
+        ...config().budget,
+        maxGlobalSpendWeiPerUtcDay: 2n,
+      },
+    };
+    const reconciliation = createIssueRelayProductionReconciliation({
+      config: relayConfig,
+      stateDirectory: state,
+      githubRead,
+      githubWrite: {} as never,
+      githubAuthority: githubAuthority as never,
+      marketplace: marketplace as never,
+      adopter: {} as never,
+      artifacts,
+      now: () => new Date('2026-07-28T00:00:07.000Z'),
+    });
+    const ports = {
+      config: relayConfig,
+      githubRead,
+      githubWrite: {} as never,
+      marketplace: marketplace as never,
+      adopter: {} as never,
+      artifacts,
+      now: () => new Date('2026-07-28T00:00:07.000Z'),
+    };
+    const candidates = await reconciliation.scan({
+      discover: true,
+      recover: true,
+    });
+    const candidateA = candidates.find(({ issueNumber }) => issueNumber === 17);
+    const candidateC = candidates.find(({ issueNumber }) => issueNumber === 19);
+    expect(candidateA).toBeDefined();
+    expect(candidateC).toBeDefined();
+
+    const passedRecordB = {
+      ...recordB,
+      rounds: [{
+        ...roundWithoutVerdict,
+        verdict: {
+          outcome: 'pass' as const,
+          evaluatedHead: head,
+          envelopeCid: 'bafy-verdict-b',
+        },
+      }],
+      updatedAt: '2026-07-28T00:00:08.000Z',
+    };
+    comments.set(18, {
+      id: 118,
+      authorLogin: 'jinn-relay',
+      body: renderRelayIssueComment({
+        record: passedRecordB,
+        generation: passedRecordB.generation,
+        phase: passedRecordB.phase,
+        prNumber: 68,
+        round: 0,
+        summary: 'Candidate B has an evaluator pass.',
+        nextAction: 'Check exact readiness.',
+      }),
+    });
+    marketplace.dryRun.mockClear();
+    marketplace.submit.mockClear();
+    marketplace.observe.mockClear();
+    githubAuthority.readPullRequest.mockClear();
+    githubAuthority.readChecks.mockClear();
+    githubAuthority.listAssuranceComments.mockClear();
+    artifactCalls.length = 0;
+
+    await expect(reconciliation.execute({
+      candidate: candidateA!,
+      action: { kind: 'prepare-round', round: 0 },
+      ports,
+    })).resolves.toMatchObject({
+      outcome: 'completed',
+    });
+    await expect(reconciliation.execute({
+      candidate: candidateC!,
+      action: { kind: 'prepare-round', round: 0 },
+      ports,
+    })).resolves.toMatchObject({
+      outcome: 'refused',
+      detail: 'Funding intent deferred',
+    });
+
+    expect(marketplace.dryRun).toHaveBeenCalledTimes(2);
+    expect(marketplace.submit).not.toHaveBeenCalled();
+    expect(marketplace.observe).not.toHaveBeenCalled();
+    expect(githubAuthority.readPullRequest).not.toHaveBeenCalled();
+    expect(githubAuthority.readChecks).not.toHaveBeenCalled();
+    expect(githubAuthority.listAssuranceComments).not.toHaveBeenCalled();
+    expect(artifactCalls.filter((call) => call.includes('/18/'))).toEqual([]);
+    expect(parseRelayIssueCommentMarker(
+      comments.get(17)!.body,
+      'jinn-relay',
+      'jinn-relay',
+    )).toMatchObject({
+      phase: 'funding',
+      rounds: [{
+        fundingIntent: { spendWei: '1' },
+      }],
+    });
+    expect(parseRelayIssueCommentMarker(
+      comments.get(18)!.body,
+      'jinn-relay',
+      'jinn-relay',
+    )).toEqual(passedRecordB);
+    expect(parseRelayIssueCommentMarker(
+      comments.get(19)!.body,
+      'jinn-relay',
+      'jinn-relay',
+    )).toEqual(recordC);
   });
 
   it('rejects a bot marker copied onto a different live GitHub issue', async () => {
