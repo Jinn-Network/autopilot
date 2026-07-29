@@ -2,7 +2,10 @@ import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AcceptedRelayAdoption } from '../../src/issue-relay/adoption.js';
+import {
+  makeRelayAdoptionCoordinator,
+  type AcceptedRelayAdoption,
+} from '../../src/issue-relay/adoption.js';
 import type { IssueRelayConfig } from '../../src/issue-relay/config.js';
 import {
   IssueRelayAdoptionReceiptV1Schema,
@@ -11,10 +14,14 @@ import {
   type IssueRelayRoundV1,
 } from '../../src/issue-relay/contracts.js';
 import {
-  formatRelayAdoptionReceiptBlock,
+  createRelayGitPublisher,
+  parseRelayAdoptionReceiptBlocks,
+  type RelayGitCommand,
+  type RelayGitHubCommand,
   type RelayPullRequest,
 } from '../../src/issue-relay/git-publisher.js';
 import { relayBranch } from '../../src/issue-relay/identity.js';
+import { validateMarketplacePatch } from '../../src/lifecycle/marketplace-patch.js';
 import type {
   IssueRelayDeliveryExpectation,
 } from '../../src/issue-relay/marketplace-state.js';
@@ -34,13 +41,13 @@ import {
 const directories: string[] = [];
 const BASE = '1'.repeat(40);
 const HEADS = ['2'.repeat(40), '3'.repeat(40)] as const;
+const TREES = ['4'.repeat(40), '5'.repeat(40)] as const;
 const TARGET_REPOSITORY_ID = 'R_target';
 const FORK_REPOSITORY_ID = 'R_fork';
 const ISSUE_NUMBER = 1889;
 const SERVICE_LOGIN = 'jinn-relay';
 const EVALUATOR_SAFE = `0x${'b'.repeat(40)}`;
 const CREATOR_SAFE = `0x${'c'.repeat(40)}`;
-const ASSURANCE_MARKER = '<!-- jinn-issue-relay:assurance:v1 -->';
 const ADOPTION_MARKER = '<!-- jinn-issue-relay:adoption:v1 -->';
 const ANCHOR_MARKER = '<!-- jinn-issue-relay:evaluation-anchor:v1 -->';
 
@@ -107,7 +114,8 @@ async function canonicalFixtures(): Promise<{
 interface VerticalOptions {
   readonly verdicts: readonly ('request-changes' | 'pass')[];
   readonly crashAfterFirstForkPush?: boolean;
-  readonly cancelAfterInitialAdoption?: boolean;
+  readonly crashAfterTerminalMutations?: boolean;
+  readonly cancelAfterRepairFunding?: boolean;
 }
 
 async function createVerticalFixture(options: VerticalOptions) {
@@ -147,6 +155,10 @@ async function createVerticalFixture(options: VerticalOptions) {
   let forkHead: string | undefined;
   let clock = '2026-07-28T10:02:00.000Z';
   let crashPending = options.crashAfterFirstForkPush === true;
+  let terminalAssuranceCrashPending =
+    options.crashAfterTerminalMutations === true;
+  let terminalCloseCrashPending =
+    options.crashAfterTerminalMutations === true;
   const branchNames = new Set<string>();
   const fundedTaskCounts = new Map<number, number>();
   const submissions = new Map<number, {
@@ -238,6 +250,19 @@ async function createVerticalFixture(options: VerticalOptions) {
     }),
     listAssuranceComments: vi.fn(async (prNumber: number) => {
       expect(prNumber).toBe(42);
+      if (
+        terminalAssuranceCrashPending
+        && pullRequest?.open === true
+        && (
+          assuranceComment?.body.includes('# CANCELLED')
+          || assuranceComment?.body.includes('# EXHAUSTED')
+        )
+      ) {
+        terminalAssuranceCrashPending = false;
+        throw new Error(
+          'injected crash after terminal assurance edit before readback',
+        );
+      }
       return assuranceComment === undefined ? [] : [assuranceComment];
     }),
     editAssuranceCommentExact: vi.fn(async (input: {
@@ -247,6 +272,9 @@ async function createVerticalFixture(options: VerticalOptions) {
       readonly expectedBody: string;
       readonly body: string;
     }) => {
+      if (pullRequest?.open !== true) {
+        throw new Error('Relay assurance edit lost exact open head authority');
+      }
       expect(input).toMatchObject({
         prNumber: 42,
         commentId: assuranceComment?.id,
@@ -282,6 +310,10 @@ async function createVerticalFixture(options: VerticalOptions) {
         expectedHead: pullRequest?.head,
       });
       pullRequest = { ...pullRequest!, open: false };
+      if (terminalCloseCrashPending) {
+        terminalCloseCrashPending = false;
+        throw new Error('injected crash after terminal close before readback');
+      }
     }),
   };
 
@@ -387,109 +419,260 @@ async function createVerticalFixture(options: VerticalOptions) {
     }),
   };
 
-  const adopter = {
-    adopt: vi.fn(async (input: {
-      readonly authority: {
-        readonly generation: string;
-        readonly round: number;
-        readonly workspaceRepository: string;
-        readonly inputHead: string;
-        readonly branch: string;
-        readonly existingPrNumber?: number;
-      };
-      readonly observation: {
-        readonly task: { readonly taskId: string };
-        readonly attempt: {
-          readonly attemptIndex: number;
-          readonly requestId: string;
-          readonly operator: string;
-        };
-        readonly delivery: { readonly envelopeCid: string };
-        readonly round: IssueRelayRoundV1;
-      };
-      readonly snapshot: {
-        readonly snapshotDigest: `sha256:${string}`;
-        readonly issue: { readonly number: number };
-      };
-    }): Promise<AcceptedRelayAdoption> => {
-      const round = input.authority.round;
-      const resultingHead = HEADS[round]!;
-      branchNames.add(input.authority.branch);
-      forkHead = resultingHead;
-      if (round === 0 && crashPending) {
-        crashPending = false;
-        throw new Error('injected crash after fork push before PR readback');
+  const localHeads = new Map<string, string>();
+  const appliedTrees = new Map<string, string>();
+  const commits = new Map<string, {
+    readonly tree: string;
+    readonly parent: string;
+    readonly message: string;
+  }>();
+  let pushMutations = 0;
+
+  const captureReceipts = (body: string) => {
+    for (const receipt of parseRelayAdoptionReceiptBlocks(body)) {
+      if (receipt.disposition === 'accepted') {
+        adoptionReceipts.set(receipt.correlation.round, receipt);
       }
-      if (pullRequest === undefined) {
-        pullRequestCreations += 1;
-        pullRequest = {
-          number: 42,
-          generation: input.authority.generation,
+    }
+  };
+  const roundForWorktree = (path: string): number => {
+    const match = /worktree-(\d+)$/.exec(path);
+    if (match?.[1] === undefined) {
+      throw new Error(`Unexpected Relay worktree path ${path}`);
+    }
+    return Number(match[1]);
+  };
+
+  const publisher = createRelayGitPublisher({
+    git: vi.fn(async (command: RelayGitCommand) => {
+      switch (command.kind) {
+        case 'read-applied-tree':
+          return {
+            kind: 'applied-tree' as const,
+            head: localHeads.get(command.worktreePath) ?? command.inputHead,
+            tree: appliedTrees.get(command.worktreePath)
+              ?? TREES[roundForWorktree(command.worktreePath)]!,
+            exact: true,
+          };
+        case 'read-local-head':
+          return {
+            kind: 'local-head' as const,
+            head: localHeads.get(command.worktreePath) ?? BASE,
+          };
+        case 'create-commit': {
+          const round = roundForWorktree(command.worktreePath);
+          const head = HEADS[round]!;
+          expect(command.expectedTree).toBe(TREES[round]);
+          localHeads.set(command.worktreePath, head);
+          commits.set(head, {
+            tree: command.expectedTree,
+            parent: command.expectedHead,
+            message: command.message,
+          });
+          return { kind: 'mutated' as const };
+        }
+        case 'read-commit':
+        case 'read-fork-commit': {
+          const commit = commits.get(command.head);
+          if (commit === undefined) {
+            throw new Error(`Missing hermetic commit ${command.head}`);
+          }
+          return {
+            kind: 'commit' as const,
+            head: command.head,
+            tree: commit.tree,
+            parents: [commit.parent],
+            message: commit.message,
+          };
+        }
+        case 'read-fork-ref':
+          return { kind: 'fork-ref' as const, head: forkHead };
+        case 'push-fork':
+          expect(forkHead).toBe(command.expectedOldHead);
+          pushMutations += 1;
+          branchNames.add(command.branch);
+          forkHead = command.newHead;
+          if (pullRequest !== undefined) {
+            pullRequest = { ...pullRequest, head: command.newHead };
+          }
+          return { kind: 'mutated' as const };
+        default: {
+          const exhaustive: never = command;
+          throw new Error(`Unhandled hermetic Git command ${JSON.stringify(exhaustive)}`);
+        }
+      }
+    }),
+    github: vi.fn(async (command: RelayGitHubCommand) => {
+      switch (command.kind) {
+        case 'list-pull-requests':
+          if (
+            crashPending
+            && forkHead === HEADS[0]
+            && pullRequest === undefined
+          ) {
+            crashPending = false;
+            throw new Error('injected crash after fork push before PR readback');
+          }
+          return {
+            kind: 'pull-requests' as const,
+            pullRequests: pullRequest === undefined ? [] : [pullRequest],
+          };
+        case 'create-draft-pull-request': {
+          if (forkHead === undefined) {
+            throw new Error('Cannot create the draft before fork publication');
+          }
+          const record = issueComment === undefined
+            ? null
+            : parseRelayIssueCommentMarker(
+              issueComment.body,
+              issueComment.authorLogin,
+              SERVICE_LOGIN,
+            );
+          if (record === null) {
+            throw new Error('Draft creation lacks durable generation authority');
+          }
+          pullRequestCreations += 1;
+          pullRequest = {
+            number: 42,
+            generation: record.generation,
+            targetRepositoryId: TARGET_REPOSITORY_ID,
+            forkRepositoryId: FORK_REPOSITORY_ID,
+            forkParentRepositoryId: TARGET_REPOSITORY_ID,
+            branch: relayBranch(record.generation),
+            head: forkHead,
+            base: 'main',
+            open: true,
+            draft: true,
+          };
+          return { kind: 'mutated' as const };
+        }
+        case 'read-pull-request':
+          if (
+            pullRequest === undefined
+            || command.prNumber !== pullRequest.number
+          ) {
+            throw new Error('Hermetic pull request is missing');
+          }
+          return {
+            kind: 'pull-request' as const,
+            pullRequest,
+          };
+        case 'close-pull-request':
+          if (
+            pullRequest === undefined
+            || pullRequest.head !== command.expectedHead
+            || !pullRequest.open
+          ) {
+            throw new Error('Hermetic close lost exact open head authority');
+          }
+          pullRequest = { ...pullRequest, open: false };
+          return { kind: 'mutated' as const };
+        case 'list-assurance-comments':
+          return {
+            kind: 'assurance-comments' as const,
+            comments: assuranceComment === undefined ? [] : [assuranceComment],
+          };
+        case 'create-assurance-comment':
+          if (
+            pullRequest?.open !== true
+            || pullRequest.head !== command.expectedHead
+            || assuranceComment !== undefined
+          ) {
+            throw new Error('Hermetic assurance create lost exact open head authority');
+          }
+          assuranceCommentCreations += 1;
+          assuranceComment = {
+            id: 81,
+            authorLogin: SERVICE_LOGIN,
+            body: command.body,
+          };
+          captureReceipts(command.body);
+          return { kind: 'mutated' as const };
+        case 'edit-assurance-comment':
+          if (
+            pullRequest?.open !== true
+            || pullRequest.head !== command.expectedHead
+            || assuranceComment?.id !== command.commentId
+          ) {
+            throw new Error('Hermetic assurance edit lost exact open head authority');
+          }
+          assuranceComment = { ...assuranceComment, body: command.body };
+          captureReceipts(command.body);
+          return { kind: 'mutated' as const };
+        default: {
+          const exhaustive: never = command;
+          throw new Error(
+            `Unhandled hermetic GitHub command ${JSON.stringify(exhaustive)}`,
+          );
+        }
+      }
+    }),
+  });
+
+  const adopter = makeRelayAdoptionCoordinator({
+    authority: {
+      readExact: vi.fn(async ({ authority, snapshot }) => {
+        const worktreePath = join(root, `worktree-${authority.round}`);
+        return {
+          generation: authority.generation,
+          round: authority.round,
+          snapshotDigest: snapshot.snapshotDigest,
+          targetRepository: authority.targetRepository,
+          workspaceRepository: authority.workspaceRepository,
+          inputHead: authority.inputHead,
+          forkRepository: authority.forkRepository,
+          branch: authority.branch,
+          taskId: submissions.get(authority.round)!.taskId,
+          solutionOperator: contracts.adoption.solutionSafe,
+          issueNumber: ISSUE_NUMBER,
+          defaultBranch: 'main',
           targetRepositoryId: TARGET_REPOSITORY_ID,
           forkRepositoryId: FORK_REPOSITORY_ID,
           forkParentRepositoryId: TARGET_REPOSITORY_ID,
-          branch: relayBranch(input.authority.generation),
-          head: resultingHead,
-          base: 'main',
-          open: true,
-          draft: true,
+          ...(forkHead === undefined ? {} : { expectedForkHead: forkHead }),
+          cancellationRequested: authority.cancellationRequested,
+          serviceLogin: SERVICE_LOGIN,
+          adoptionDeadline: '2026-07-29T10:02:00.000Z',
+          worktree: {
+            manifestPath: join(root, `manifest-${authority.round}.json`),
+            path: worktreePath,
+          },
+          ...(pullRequest === undefined ? {} : { pr: pullRequest }),
         };
-      } else {
-        expect(input.authority.existingPrNumber).toBe(pullRequest.number);
-        expect(input.authority.workspaceRepository).toBe('jinn-relay/mono');
-        expect(input.authority.inputHead).toBe(pullRequest.head);
-        pullRequest = { ...pullRequest, head: resultingHead };
-      }
-      const receipt = IssueRelayAdoptionReceiptV1Schema.parse({
-        schemaVersion: 'jinn-issue-relay-adoption.v1',
-        disposition: 'accepted',
-        correlation: {
-          generation: input.authority.generation,
-          round,
-          snapshotDigest: input.snapshot.snapshotDigest,
-          taskId: input.observation.task.taskId,
-          attemptIndex: input.observation.attempt.attemptIndex,
-          requestId: input.observation.attempt.requestId,
-          deliveryEnvelopeCid: input.observation.delivery.envelopeCid,
-        },
-        targetRepository: 'Jinn-Network/mono',
-        workspaceRepository: input.authority.workspaceRepository,
-        issueNumber: input.snapshot.issue.number,
-        prNumber: pullRequest.number,
-        headRef: input.authority.branch,
-        inputHead: input.authority.inputHead,
-        resultingHead,
-        patchDigest: `sha256:${String(round + 8).repeat(64)}`,
-        solutionSafe: input.observation.attempt.operator,
-        adoptedAt: '2026-07-28T10:02:00.000Z',
-      }) as IssueRelayAdoptionReceiptV1;
-      if (receipt.disposition !== 'accepted') {
-        throw new Error('Vertical fixture produced a rejected receipt');
-      }
-      adoptionReceipts.set(round, receipt);
-      const receiptBlock = formatRelayAdoptionReceiptBlock(receipt);
-      if (assuranceComment === undefined) {
-        assuranceCommentCreations += 1;
-        assuranceComment = {
-          id: 81,
-          authorLogin: SERVICE_LOGIN,
-          body: `${ASSURANCE_MARKER}\n\nIN PROGRESS\n\n${receiptBlock}`,
+      }),
+    },
+    worktrees: {
+      prepareExact: vi.fn(async (input) => {
+        localHeads.set(input.worktreePath, input.expectedHead);
+        return {
+          manifestPath: input.manifestPath,
+          path: input.worktreePath,
+          expectedHead: input.expectedHead,
         };
-      } else if (!assuranceComment.body.includes(receiptBlock)) {
-        assuranceComment = {
-          ...assuranceComment,
-          body: `${assuranceComment.body.trimEnd()}\n\n${receiptBlock}`,
-        };
-      }
-      return {
-        status: 'accepted',
-        receipt,
-        branch: input.authority.branch,
-        resultingHead,
-        prNumber: pullRequest.number,
-      };
+      }),
+    },
+    applyPatch: vi.fn(async (input) => {
+      const patch = validateMarketplacePatch(input.artifact);
+      appliedTrees.set(
+        input.worktreePath,
+        TREES[roundForWorktree(input.worktreePath)]!,
+      );
+      return patch;
     }),
-  };
+    verification: {
+      preflight: vi.fn(async () => ({ ok: true })),
+      verify: vi.fn(async (input) => ({
+        profile: input.profile,
+        artifactDigest: input.artifactDigest,
+        expectedTree: input.expectedTree,
+        planDigest: `sha256:${'9'.repeat(64)}`,
+        commands: [],
+        verifiedAt: clock,
+      })),
+    },
+    publisher,
+    now: () => new Date(clock),
+  });
 
   const now = () => new Date(clock);
   const reconciliation = createIssueRelayProductionReconciliation({
@@ -527,9 +710,12 @@ async function createVerticalFixture(options: VerticalOptions) {
             issueComment.authorLogin,
             SERVICE_LOGIN,
           );
+        const latest = record?.rounds.at(-1);
         if (
-          options.cancelAfterInitialAdoption === true
-          && record?.phase === 'draft-open'
+          options.cancelAfterRepairFunding === true
+          && latest?.round === 1
+          && latest.task !== undefined
+          && latest.solution === undefined
           && issue.issue.labels.length > 0
         ) {
           issue.issue.labels.splice(0);
@@ -565,6 +751,7 @@ async function createVerticalFixture(options: VerticalOptions) {
       issueCommentCreations,
       assuranceCommentCreations,
       pullRequestCreations,
+      pushMutations,
     }),
   };
 }
@@ -620,6 +807,7 @@ describe('Jinn mono Issue Relay vertical', () => {
       issueCommentCreations: 1,
       assuranceCommentCreations: 1,
       pullRequestCreations: 1,
+      pushMutations: 2,
     });
     expect(fixture.adoptionReceipts.size).toBe(2);
     expect(fixture.assuranceBody()?.match(new RegExp(ADOPTION_MARKER, 'g')))
@@ -632,10 +820,11 @@ describe('Jinn mono Issue Relay vertical', () => {
     expect(fixture.assuranceBody()).toContain('Round 1');
   });
 
-  it('settles the funded round fairly after cancellation and closes the draft', async () => {
+  it('settles the already-funded repair after cancellation and closes the draft', async () => {
     const fixture = await createVerticalFixture({
-      verdicts: ['pass'],
-      cancelAfterInitialAdoption: true,
+      verdicts: ['request-changes', 'pass'],
+      crashAfterTerminalMutations: true,
+      cancelAfterRepairFunding: true,
     });
 
     const reports = await fixture.runUntilTerminal();
@@ -651,6 +840,9 @@ describe('Jinn mono Issue Relay vertical', () => {
         outcome: 'completed',
       }),
     ]));
+    expect(actions.filter(({ action, outcome }) =>
+      action === 'finish-cancellation' && outcome === 'failed'
+    )).toHaveLength(2);
     expect(actions).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ action: 'mark-ready' }),
     ]));
@@ -659,13 +851,21 @@ describe('Jinn mono Issue Relay vertical', () => {
       cancellation: {
         reason: 'label-removed',
       },
-      rounds: [{
-        round: 0,
-        task: { taskId: '1' },
-        adoption: { disposition: 'accepted' },
-      }],
+      rounds: [
+        {
+          round: 0,
+          task: { taskId: '1' },
+          adoption: { disposition: 'accepted' },
+        },
+        {
+          round: 1,
+          task: { taskId: '2' },
+          solution: { envelopeCid: cid('5') },
+          adoption: { disposition: 'rejected' },
+        },
+      ],
     });
-    expect(fixture.fundedTaskCounts).toEqual(new Map([[0, 1]]));
+    expect(fixture.fundedTaskCounts).toEqual(new Map([[0, 1], [1, 1]]));
     expect(fixture.pullRequest()).toMatchObject({
       number: 42,
       open: false,
@@ -675,7 +875,9 @@ describe('Jinn mono Issue Relay vertical', () => {
       issueCommentCreations: 1,
       assuranceCommentCreations: 1,
       pullRequestCreations: 1,
+      pushMutations: 1,
     });
+    expect(fixture.assuranceBody()).toContain('# CANCELLED');
   });
 
   it('stops funding after repeated actionable failures and reports EXHAUSTED', async () => {
