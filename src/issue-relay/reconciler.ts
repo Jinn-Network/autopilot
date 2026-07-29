@@ -204,6 +204,7 @@ export async function runIssueRelayCycle(
       continue;
     }
 
+    let attemptedAction: RelayAction['kind'] = 'none';
     try {
       const current = await deps.reconciliation.reread(scannedCandidate);
       if (!exactCandidate(scannedCandidate, current)) {
@@ -213,6 +214,7 @@ export async function runIssueRelayCycle(
         maxRoundsPerGeneration: deps.config.budget.maxRoundsPerGeneration,
         generationDeadlineMs: deps.config.budget.generationDeadlineMs,
       });
+      attemptedAction = action.kind;
       if (action.kind === 'none') {
         actions.push({
           generation: current.generation,
@@ -254,9 +256,7 @@ export async function runIssueRelayCycle(
     } catch (error) {
       actions.push({
         generation: scannedCandidate.generation,
-        action: actions.at(-1)?.generation === scannedCandidate.generation
-          ? actions.at(-1)!.action
-          : 'none',
+        action: attemptedAction,
         outcome: 'failed',
         detail: safeFailure(error),
       });

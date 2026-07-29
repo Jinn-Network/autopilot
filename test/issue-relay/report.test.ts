@@ -931,6 +931,7 @@ describe('Relay PR assurance rendering', () => {
 
       ## Assurance for exact revision \`3333333333333333333333333333333333333333\`
 
+      - Readiness: ready for human review.
       - Recorded verdict: passed at \`3333333333333333333333333333333333333333\`.
       - Solution operator: \`0x1111111111111111111111111111111111111111\`.
       - Separate evaluator: \`0x2222222222222222222222222222222222222222\`.

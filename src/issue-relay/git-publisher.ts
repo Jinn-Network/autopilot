@@ -367,38 +367,69 @@ export function formatRelayAdoptionReceiptBlock(
 export function parseRelayAdoptionReceiptBlock(
   body: string,
 ): IssueRelayAdoptionReceiptV1 | null {
-  const first = body.indexOf(ADOPTION_MARKER);
-  if (first === -1) return null;
-  if (body.indexOf(ADOPTION_MARKER, first + ADOPTION_MARKER.length) !== -1) {
+  const receipts = parseRelayAdoptionReceiptBlocks(body);
+  if (receipts.length === 0) return null;
+  if (receipts.length !== 1) {
     throw new RelayGitPublisherError(
       'receipt-contradiction',
       'Relay assurance comment contains multiple adoption receipt markers',
     );
   }
-  const block = body.slice(first);
-  const match = /^<!-- jinn-issue-relay:adoption:v1 -->\n\n```json\n([^\r\n]+)\n```(?:\n|$)/.exec(block);
-  if (match?.[1] === undefined) {
-    throw new RelayGitPublisherError(
-      'receipt-contradiction',
-      'Relay adoption receipt marker is malformed',
-    );
-  }
-  try {
-    const parsed = IssueRelayAdoptionReceiptV1Schema.parse(
-      JSON.parse(match[1]) as unknown,
-    ) as IssueRelayAdoptionReceiptV1;
-    if (JSON.stringify(parsed) !== match[1]) {
-      throw new Error('noncanonical receipt JSON');
+  return receipts[0]!;
+}
+
+export function parseRelayAdoptionReceiptBlocks(
+  body: string,
+): readonly IssueRelayAdoptionReceiptV1[] {
+  const receipts: IssueRelayAdoptionReceiptV1[] = [];
+  const correlations = new Set<string>();
+  let cursor = 0;
+  while (true) {
+    const marker = body.indexOf(ADOPTION_MARKER, cursor);
+    if (marker === -1) return receipts;
+    const match =
+      /^<!-- jinn-issue-relay:adoption:v1 -->\n\n```json\n([^\r\n]+)\n```(?:\n|$)/
+        .exec(body.slice(marker));
+    if (match?.[1] === undefined) {
+      throw new RelayGitPublisherError(
+        'receipt-contradiction',
+        'Relay adoption receipt marker is malformed',
+      );
     }
-    return parsed;
-  } catch (error) {
-    if (error instanceof RelayGitPublisherError) throw error;
-    throw new RelayGitPublisherError(
-      'receipt-contradiction',
-      'Relay adoption receipt marker does not contain a canonical receipt',
-      error,
-    );
+    try {
+      const parsed = IssueRelayAdoptionReceiptV1Schema.parse(
+        JSON.parse(match[1]) as unknown,
+      ) as IssueRelayAdoptionReceiptV1;
+      if (JSON.stringify(parsed) !== match[1]) {
+        throw new Error('noncanonical receipt JSON');
+      }
+      const key = JSON.stringify(parsed.correlation);
+      if (correlations.has(key)) {
+        throw new RelayGitPublisherError(
+          'receipt-contradiction',
+          'Relay assurance comment duplicates an adoption receipt correlation',
+        );
+      }
+      correlations.add(key);
+      receipts.push(parsed);
+    } catch (error) {
+      if (error instanceof RelayGitPublisherError) throw error;
+      throw new RelayGitPublisherError(
+        'receipt-contradiction',
+        'Relay adoption receipt marker does not contain a canonical receipt',
+        error,
+      );
+    }
+    cursor = marker + match[0].length;
   }
+}
+
+export function findRelayAdoptionReceiptBlock(
+  body: string,
+  correlation: IssueRelayAdoptionReceiptV1['correlation'],
+): IssueRelayAdoptionReceiptV1 | null {
+  return parseRelayAdoptionReceiptBlocks(body).find((receipt) =>
+    exactReceiptCorrelation(receipt.correlation, correlation)) ?? null;
 }
 
 function exactPr(
@@ -587,7 +618,10 @@ export function createRelayGitPublisher(options: {
         input.serviceLogin,
       );
       if (comment === undefined) return undefined;
-      const receipt = parseRelayAdoptionReceiptBlock(comment.body);
+      const receipt = findRelayAdoptionReceiptBlock(
+        comment.body,
+        input.correlation,
+      );
       if (receipt === null) return undefined;
       if (
         receipt.disposition !== 'accepted'
@@ -950,7 +984,10 @@ export function createRelayGitPublisher(options: {
       const block = formatRelayAdoptionReceiptBlock(canonical);
       let alreadyPublished = false;
       if (existing !== undefined) {
-        const prior = parseRelayAdoptionReceiptBlock(existing.body);
+        const prior = findRelayAdoptionReceiptBlock(
+          existing.body,
+          canonical.correlation,
+        );
         if (prior !== null) {
           if (isDeepStrictEqual(prior, canonical)) {
             alreadyPublished = true;
@@ -1015,7 +1052,10 @@ export function createRelayGitPublisher(options: {
           'Relay assurance comment did not read back exactly',
         );
       }
-      const parsed = parseRelayAdoptionReceiptBlock(readback.body);
+      const parsed = findRelayAdoptionReceiptBlock(
+        readback.body,
+        canonical.correlation,
+      );
       if (parsed === null || !isDeepStrictEqual(parsed, canonical)) {
         throw new RelayGitPublisherError(
           'receipt-contradiction',
