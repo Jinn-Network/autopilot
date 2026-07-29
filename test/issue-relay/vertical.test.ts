@@ -33,6 +33,10 @@ import {
   createRelayDurableArtifactStore,
 } from '../../src/issue-relay/runtime-production.js';
 import {
+  createRelayGitHubProductionPorts,
+  type RelayGitHubApiRequest,
+} from '../../src/issue-relay/github-production.js';
+import {
   runIssueRelayCycle,
   type IssueRelayRuntimePorts,
   type RelayCycleReport,
@@ -116,6 +120,10 @@ interface VerticalOptions {
   readonly crashAfterFirstForkPush?: boolean;
   readonly crashAfterTerminalMutations?: boolean;
   readonly cancelAfterRepairFunding?: boolean;
+  readonly crashAfterReadyMutation?:
+    | 'deadline'
+    | 'stale-base'
+    | 'cancellation';
 }
 
 async function createVerticalFixture(options: VerticalOptions) {
@@ -154,6 +162,10 @@ async function createVerticalFixture(options: VerticalOptions) {
   let pullRequest: RelayPullRequest | undefined;
   let forkHead: string | undefined;
   let clock = '2026-07-28T10:02:00.000Z';
+  let currentBase = BASE;
+  let readyCrashIssueBody: string | undefined;
+  let readyMutationCrashPending =
+    options.crashAfterReadyMutation !== undefined;
   let crashPending = options.crashAfterFirstForkPush === true;
   let terminalAssuranceCrashPending =
     options.crashAfterTerminalMutations === true;
@@ -185,7 +197,7 @@ async function createVerticalFixture(options: VerticalOptions) {
       createdAt: '2026-07-28T10:01:00.000Z',
     }]),
     readRepositoryPermission: vi.fn(async () => 'MAINTAIN' as const),
-    readDefaultBranchHead: vi.fn(async () => BASE),
+    readDefaultBranchHead: vi.fn(async () => currentBase),
   };
 
   const githubAuthority = {
@@ -290,26 +302,123 @@ async function createVerticalFixture(options: VerticalOptions) {
     }),
   };
 
+  const targetRepository = {
+    full_name: 'Jinn-Network/mono',
+    node_id: TARGET_REPOSITORY_ID,
+    visibility: 'public',
+    private: false,
+    default_branch: 'main',
+    owner: { login: 'Jinn-Network' },
+    parent: null,
+  };
+  const forkRepository = {
+    ...targetRepository,
+    full_name: 'jinn-relay/mono',
+    node_id: FORK_REPOSITORY_ID,
+    owner: { login: SERVICE_LOGIN },
+    parent: targetRepository,
+  };
+  const productionGitHub = createRelayGitHubProductionPorts({
+    config,
+    token: 'vertical-test-token',
+    request: vi.fn(async (input: RelayGitHubApiRequest) => {
+      if (input.path === '/repos/Jinn-Network/mono') {
+        return { status: 200, headers: {}, body: targetRepository };
+      }
+      if (input.path === '/repos/jinn-relay/mono') {
+        return { status: 200, headers: {}, body: forkRepository };
+      }
+      if (input.path === '/repos/Jinn-Network/mono/pulls/42') {
+        if (pullRequest === undefined) {
+          throw new Error('Production writer read a missing pull request');
+        }
+        if (input.method === 'PATCH') {
+          expect(input.body).toEqual({ state: 'closed' });
+          pullRequest = { ...pullRequest, open: false };
+        }
+        return {
+          status: 200,
+          headers: {},
+          body: {
+            number: pullRequest.number,
+            node_id: 'PR_42',
+            state: pullRequest.open ? 'open' : 'closed',
+            draft: pullRequest.draft,
+            user: { login: SERVICE_LOGIN },
+            head: {
+              ref: pullRequest.branch,
+              sha: pullRequest.head,
+              repo: {
+                full_name: forkRepository.full_name,
+                node_id: forkRepository.node_id,
+              },
+            },
+            base: {
+              ref: pullRequest.base,
+              repo: {
+                full_name: targetRepository.full_name,
+                node_id: targetRepository.node_id,
+              },
+            },
+            body: '<!-- jinn-issue-relay:pull-request:v1 -->',
+          },
+        };
+      }
+      if (input.path === '/graphql') {
+        if (pullRequest === undefined || !pullRequest.draft) {
+          throw new Error('Production writer cannot mark this pull request ready');
+        }
+        pullRequest = { ...pullRequest, draft: false };
+        return {
+          status: 200,
+          headers: {},
+          body: {
+            data: {
+              markPullRequestReadyForReview: {
+                pullRequest: { id: 'PR_42', isDraft: false },
+              },
+            },
+          },
+        };
+      }
+      throw new Error(
+        `Unexpected production writer request ${input.method} ${input.path}`,
+      );
+    }),
+  });
+
   const githubWrite = {
     markPullRequestReady: vi.fn(async (input: {
       readonly prNumber: number;
       readonly expectedHead: string;
     }) => {
-      expect(input).toEqual({
-        prNumber: pullRequest?.number,
-        expectedHead: pullRequest?.head,
-      });
-      pullRequest = { ...pullRequest!, draft: false };
+      await productionGitHub.write.markPullRequestReady(input);
+      if (readyMutationCrashPending) {
+        readyMutationCrashPending = false;
+        readyCrashIssueBody = issueComment?.body;
+        switch (options.crashAfterReadyMutation) {
+          case 'deadline':
+            clock = '2026-07-29T10:02:00.000Z';
+            break;
+          case 'stale-base':
+            currentBase = '9'.repeat(40);
+            break;
+          case 'cancellation':
+            issue.issue.labels.splice(0);
+            clock = '2026-07-28T10:04:00.000Z';
+            break;
+          case undefined:
+            break;
+        }
+        throw new Error(
+          'injected crash after mark-ready mutation before durable marker',
+        );
+      }
     }),
-    closePullRequest: vi.fn(async (input: {
-      readonly prNumber: number;
-      readonly expectedHead: string;
-    }) => {
-      expect(input).toMatchObject({
-        prNumber: pullRequest?.number,
-        expectedHead: pullRequest?.head,
-      });
-      pullRequest = { ...pullRequest!, open: false };
+    closePullRequest: vi.fn(async (input: Parameters<
+      typeof productionGitHub.write.closePullRequest
+    >[0]) => {
+      await productionGitHub.write.closePullRequest(input);
       if (terminalCloseCrashPending) {
         terminalCloseCrashPending = false;
         throw new Error('injected crash after terminal close before readback');
@@ -742,6 +851,8 @@ async function createVerticalFixture(options: VerticalOptions) {
         SERVICE_LOGIN,
       ),
     assuranceBody: () => assuranceComment?.body,
+    issueBody: () => issueComment?.body,
+    readyCrashIssueBody: () => readyCrashIssueBody,
     pullRequest: () => pullRequest,
     forkHead: () => forkHead,
     branchNames,
@@ -757,6 +868,92 @@ async function createVerticalFixture(options: VerticalOptions) {
 }
 
 describe('Jinn mono Issue Relay vertical', () => {
+  it.each([
+    {
+      trigger: 'deadline' as const,
+      phase: 'ready' as const,
+      terminalAction: 'mark-ready',
+      assurance: 'READY FOR HUMAN REVIEW',
+      open: true,
+    },
+    {
+      trigger: 'stale-base' as const,
+      phase: 'exhausted' as const,
+      terminalAction: 'close-exhausted',
+      assurance: '# EXHAUSTED',
+      open: false,
+    },
+    {
+      trigger: 'cancellation' as const,
+      phase: 'closed' as const,
+      terminalAction: 'finish-cancellation',
+      assurance: '# CANCELLED',
+      open: false,
+    },
+  ])(
+    'converges a live non-draft crash replay under $trigger authority',
+    async ({ trigger, phase, terminalAction, assurance, open }) => {
+      const fixture = await createVerticalFixture({
+        verdicts: ['pass'],
+        crashAfterReadyMutation: trigger,
+      });
+
+      const reports = await fixture.runUntilTerminal();
+      const actions = reports.flatMap(({ actions: passActions }) => passActions);
+
+      expect(actions.filter(({ action, outcome }) =>
+        action === 'mark-ready' && outcome === 'failed'
+      )).toHaveLength(1);
+      expect(
+        actions.filter(({ outcome }) => outcome === 'failed'),
+        JSON.stringify(actions),
+      )
+        .toHaveLength(1);
+      expect(actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          action: terminalAction,
+          outcome: 'completed',
+        }),
+      ]));
+      if (trigger !== 'deadline') {
+        expect(actions).not.toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            action: 'mark-ready',
+            outcome: 'completed',
+          }),
+        ]));
+      }
+      if (trigger === 'cancellation') {
+        expect(actions).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            action: 'record-cancellation',
+            outcome: 'completed',
+          }),
+        ]));
+      }
+      expect(fixture.record()).toMatchObject({
+        phase,
+        pr: { number: 42, head: HEADS[0], draft: false },
+      });
+      expect(fixture.pullRequest()).toMatchObject({
+        number: 42,
+        head: HEADS[0],
+        open,
+        draft: false,
+      });
+      expect(fixture.assuranceBody()).toContain(assurance);
+      expect(fixture.readyCrashIssueBody())
+        .toContain('<!-- jinn-issue-relay:active:v1 -->');
+      expect(fixture.issueBody())
+        .not.toContain('<!-- jinn-issue-relay:active:v1 -->');
+      if (trigger !== 'deadline') {
+        expect(fixture.assuranceBody())
+          .not.toContain('READY FOR HUMAN REVIEW');
+      }
+      expect(fixture.fundedTaskCounts).toEqual(new Map([[0, 1]]));
+    },
+  );
+
   it('recovers a post-push crash and retains both funded rounds in one ready PR', async () => {
     const fixture = await createVerticalFixture({
       verdicts: ['request-changes', 'pass'],

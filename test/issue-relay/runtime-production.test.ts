@@ -531,7 +531,7 @@ describe('production Relay cadence', () => {
                   ? { sha: 'a'.repeat(40) }
                 : url.pathname === '/search/issues'
                   ? url.searchParams.get('q')?.includes(
-                    'jinn-issue-relay:generation:v1',
+                    'jinn-issue-relay:active:v1',
                   )
                     ? {
                         total_count: 0,
@@ -627,6 +627,263 @@ describe('production Relay cadence', () => {
 });
 
 describe('production Relay reconciliation composition', () => {
+  it.each(['ready', 'exhausted'] as const)(
+    'does not mint another generation from Relay-driven issue timestamps after %s',
+    async (phase) => {
+      const parent = await mkdtemp(join(tmpdir(), 'relay-generation-loop-'));
+      directories.push(parent);
+      const state = join(parent, 'state');
+      const artifacts = createRelayDurableArtifactStore(state);
+      const base = 'a'.repeat(40);
+      const head = 'b'.repeat(40);
+      const snapshot = buildRelaySnapshot({
+        repository: {
+          slug: 'Jinn-Network/mono',
+          nodeId: 'R_target',
+          visibility: 'PUBLIC',
+          defaultBranch: 'main',
+          baseOid: base,
+        },
+        issue: {
+          number: 17,
+          url: 'https://github.com/Jinn-Network/mono/issues/17',
+          title: 'Do not loop after a terminal Relay generation',
+          body: '## Acceptance\n\n- [ ] one maintainer request funds at most once',
+          authorLogin: 'maintainer',
+          authorId: 'U_maintainer',
+          updatedAt: '2026-07-28T10:00:00.000Z',
+        },
+        optIn: {
+          label: 'engine:marketplace',
+          actorLogin: 'maintainer',
+          createdAt: '2026-07-28T10:01:00.000Z',
+          permission: 'MAINTAIN',
+        },
+        language: 'typescript',
+        verificationProfile: 'jinn-mono.v1',
+        acceptanceEvidence: ['one maintainer request funds at most once'],
+        admissionPolicyVersion: 'jinn-issue-relay-admission.v1',
+        capturedAt: '2026-07-28T10:02:00.000Z',
+      });
+      const generation = relayGeneration(snapshot);
+      const completedRound = {
+        round: 0,
+        purpose: 'initial' as const,
+        workspaceRepository: snapshot.repository.slug,
+        inputHead: base,
+        task: {
+          taskKey: relayTaskKey(generation, 0),
+          taskId: '1',
+          taskCid: 'bafy-task',
+          spendWei: '1',
+          fundedAt: '2026-07-28T10:03:00.000Z',
+        },
+        solution: {
+          envelopeCid: 'bafy-solution',
+          operatorSafe: `0x${'1'.repeat(40)}`,
+          observedAt: '2026-07-28T10:04:00.000Z',
+        },
+        adoption: {
+          disposition: 'accepted' as const,
+          resultingHead: head,
+          prNumber: 68,
+          receiptDigest: `sha256:${'2'.repeat(64)}` as const,
+          recordedAt: '2026-07-28T10:05:00.000Z',
+        },
+        checks: {
+          head,
+          status: 'passed' as const,
+          digest: `sha256:${'3'.repeat(64)}` as const,
+          observedAt: '2026-07-28T10:06:00.000Z',
+        },
+        verdict: {
+          outcome: 'pass' as const,
+          evaluatedHead: head,
+          evaluatorSafe: `0x${'4'.repeat(40)}`,
+          envelopeCid: 'bafy-verdict',
+          observedAt: '2026-07-28T10:07:00.000Z',
+        },
+      };
+      const record = {
+        schemaVersion: 'jinn-issue-relay-generation.v1' as const,
+        generation,
+        snapshot,
+        phase,
+        deadlineAt: '2026-07-29T10:02:00.000Z',
+        rounds: phase === 'ready' ? [completedRound] : [],
+        ...(phase === 'ready'
+          ? {
+              pr: {
+                number: 68,
+                branch: 'jinn/issue-relay/terminal',
+                head,
+                draft: false,
+              },
+            }
+          : {}),
+        updatedAt: '2026-07-28T10:08:00.000Z',
+      };
+      const comment = {
+        id: 91,
+        authorLogin: 'jinn-relay',
+        body: renderRelayIssueComment({
+          record,
+          generation,
+          phase,
+          ...(phase === 'ready' ? { prNumber: 68 } : {}),
+          round: 0,
+          summary: 'The Relay generation is terminal.',
+          nextAction: 'No further marketplace work.',
+        }),
+      };
+      const issue = {
+        repository: {
+          slug: 'Jinn-Network/mono',
+          nodeId: 'R_target',
+          visibility: 'PUBLIC' as const,
+          defaultBranch: 'main',
+        },
+        issue: {
+          number: 17,
+          url: snapshot.issue.url,
+          title: snapshot.issue.title,
+          body: snapshot.issue.body,
+          authorLogin: snapshot.issue.authorLogin,
+          authorId: snapshot.issue.authorId,
+          // GitHub advances this when Relay edits its owned status comment.
+          updatedAt: '2026-07-28T10:09:00.000Z',
+          state: 'OPEN' as const,
+          isPullRequest: false,
+          labels: ['engine:marketplace'],
+        },
+      };
+      let currentBase = base;
+      let currentOptInAt = snapshot.optIn.createdAt;
+      const githubRead = {
+        searchOptedInIssues: vi.fn(async () => ({ issues: [issue] })),
+        readIssue: vi.fn(async () => issue),
+        listLabelEvents: vi.fn(async () => [{
+          action: 'labeled' as const,
+          label: 'engine:marketplace',
+          actorLogin: 'maintainer',
+          actorId: 'U_maintainer',
+          createdAt: currentOptInAt,
+        }]),
+        readRepositoryPermission: vi.fn(async () => 'MAINTAIN' as const),
+        readDefaultBranchHead: vi.fn(async () => currentBase),
+      };
+      const githubAuthority = {
+        listIssueNumbersForMarkerRecovery: vi.fn(async () => [17]),
+        listIssueComments: vi.fn(async () => [comment]),
+        readPullRequest: vi.fn(async () => ({
+          number: 68,
+          generation,
+          targetRepositoryId: 'R_target',
+          forkRepositoryId: 'R_fork',
+          forkParentRepositoryId: 'R_target',
+          branch: 'jinn/issue-relay/terminal',
+          base: 'main',
+          head,
+          open: true,
+          draft: false,
+        })),
+      };
+      const marketplace = {
+        dryRun: vi.fn(),
+        submit: vi.fn(),
+        observe: vi.fn(),
+      };
+      const githubWrite = {
+        createDraftPullRequest: vi.fn(),
+        markPullRequestReady: vi.fn(),
+      };
+      const relayConfig = config();
+      const reconciliation = createIssueRelayProductionReconciliation({
+        config: relayConfig,
+        stateDirectory: state,
+        githubRead,
+        githubWrite: githubWrite as never,
+        githubAuthority: githubAuthority as never,
+        marketplace: marketplace as never,
+        adopter: {} as never,
+        artifacts,
+        now: () => new Date('2026-07-28T10:10:00.000Z'),
+      });
+
+      const report = await runIssueRelayCycle({
+        mode: 'active',
+        config: relayConfig,
+        githubRead,
+        githubWrite: githubWrite as never,
+        marketplace: marketplace as never,
+        adopter: {} as never,
+        artifacts,
+        reconciliation,
+        now: () => new Date('2026-07-28T10:10:00.000Z'),
+      });
+
+      expect(report.actions).toEqual([expect.objectContaining({
+        generation,
+        action: 'none',
+        outcome: 'pending',
+      })]);
+      expect(marketplace.dryRun).not.toHaveBeenCalled();
+      expect(marketplace.submit).not.toHaveBeenCalled();
+      expect(githubWrite.createDraftPullRequest).not.toHaveBeenCalled();
+      expect(githubWrite.markPullRequestReady).not.toHaveBeenCalled();
+
+      if (phase === 'ready') {
+        const originalTitle = issue.issue.title;
+        const originalBody = issue.issue.body;
+        const changes = [
+          ['title', () => {
+            issue.issue.title = `${originalTitle} with a maintainer edit`;
+          }],
+          ['body', () => {
+            issue.issue.body =
+              '## Acceptance\n\n- [ ] the maintainer changed the request';
+          }],
+          ['opt-in event', () => {
+            currentOptInAt = '2026-07-28T10:09:30.000Z';
+          }],
+          ['base', () => {
+            currentBase = 'c'.repeat(40);
+          }],
+        ] as const;
+        for (const [label, change] of changes) {
+          issue.issue.title = originalTitle;
+          issue.issue.body = originalBody;
+          currentOptInAt = snapshot.optIn.createdAt;
+          currentBase = base;
+          change();
+
+          const candidates = await reconciliation.scan({
+            discover: true,
+            recover: true,
+          });
+
+          expect(candidates, label).toHaveLength(1);
+          expect(candidates[0], label).toMatchObject({
+            issueNumber: 17,
+            authority: 'github',
+            production: {
+              snapshot: {
+                repository: { baseOid: currentBase },
+                issue: {
+                  title: issue.issue.title,
+                  body: issue.issue.body,
+                },
+                optIn: { createdAt: currentOptInAt },
+              },
+            },
+          });
+          expect(candidates[0]!.facts.durable, label).toBeUndefined();
+          expect(candidates[0]!.generation, label).not.toBe(generation);
+        }
+      }
+    },
+  );
+
   it('publishes one durable snapshot then pins funding intent on a later pass', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'relay-state-'));
     directories.push(parent);
@@ -2057,7 +2314,7 @@ describe('bounded production GitHub ports', () => {
       });
   });
 
-  it('recovers a later marked generation without enumerating more than 1000 repository records', async () => {
+  it('finds a late active generation despite more than 1000 terminal Relay issues', async () => {
     const requests: RelayGitHubApiRequest[] = [];
     const request = vi.fn(async (
       input: RelayGitHubApiRequest,
@@ -2071,6 +2328,18 @@ describe('bounded production GitHub ports', () => {
         return { status: 200, headers: {}, body: repository };
       }
       if (input.path === '/search/issues') {
+        const query = input.query?.q ?? '';
+        if (!query.includes('jinn-issue-relay:active:v1')) {
+          return {
+            status: 200,
+            headers: {},
+            body: {
+              total_count: 1002,
+              incomplete_results: false,
+              items: [],
+            },
+          };
+        }
         return {
           status: 200,
           headers: {},
@@ -2097,8 +2366,9 @@ describe('bounded production GitHub ports', () => {
       .resolves.toEqual([1501]);
     expect(requests.some(({ path }) =>
       path === '/repos/Jinn-Network/mono/issues')).toBe(false);
-    expect(requests.find(({ path }) => path === '/search/issues')?.query?.q)
-      .toContain('jinn-issue-relay:generation:v1');
+    const query = requests.find(({ path }) => path === '/search/issues')?.query?.q;
+    expect(query).toContain('jinn-issue-relay:active:v1');
+    expect(query).not.toContain('jinn-issue-relay:generation:v1');
   });
 
   it.each([
@@ -2111,7 +2381,7 @@ describe('bounded production GitHub ports', () => {
       },
     ],
     [
-      'matching-generation cap',
+      'matching-active cap',
       {
         total_count: 1001,
         incomplete_results: false,
@@ -2220,6 +2490,74 @@ describe('bounded production GitHub ports', () => {
       },
     });
   });
+
+  it.each([true, false])(
+    'closes the exact open Relay pull request when draft=%s',
+    async (draft) => {
+      const calls: RelayGitHubApiRequest[] = [];
+      let open = true;
+      const pull = () => ({
+        number: 68,
+        node_id: 'PR_68',
+        state: open ? 'open' : 'closed',
+        draft,
+        user: { login: 'jinn-relay' },
+        head: {
+          ref: 'issue-relay/abc',
+          sha: 'a'.repeat(40),
+          repo: { full_name: 'jinn-relay/mono', node_id: 'R_fork' },
+        },
+        base: {
+          ref: 'main',
+          repo: { full_name: 'Jinn-Network/mono', node_id: 'R_target' },
+        },
+        body: '<!-- jinn-issue-relay:pull-request:v1 -->',
+      });
+      const request = vi.fn(async (input: RelayGitHubApiRequest) => {
+        calls.push(input);
+        if (input.path === '/repos/Jinn-Network/mono') {
+          return { status: 200, headers: {}, body: repository };
+        }
+        if (input.path === '/repos/jinn-relay/mono') {
+          return {
+            status: 200,
+            headers: {},
+            body: {
+              ...repository,
+              full_name: 'jinn-relay/mono',
+              node_id: 'R_fork',
+              owner: { login: 'jinn-relay' },
+              parent: repository,
+            },
+          };
+        }
+        if (input.path === '/repos/Jinn-Network/mono/pulls/68') {
+          if (input.method === 'PATCH') {
+            expect(input.body).toEqual({ state: 'closed' });
+            open = false;
+          }
+          return { status: 200, headers: {}, body: pull() };
+        }
+        throw new Error(`Unexpected path ${input.path}`);
+      });
+      const ports = createRelayGitHubProductionPorts({
+        config: config(),
+        token: 'test-token',
+        request,
+      });
+
+      await expect(ports.write.closePullRequest({
+        prNumber: 68,
+        expectedHead: 'a'.repeat(40),
+        expectedDraft: draft,
+        reason: 'Terminal Relay convergence',
+      })).resolves.toBeUndefined();
+
+      expect(calls.filter(({ method, path }) =>
+        method === 'PATCH'
+        && path === '/repos/Jinn-Network/mono/pulls/68')).toHaveLength(1);
+    },
+  );
 
   it('edits READY assurance on the exact open non-draft pull request', async () => {
     let body = 'before';

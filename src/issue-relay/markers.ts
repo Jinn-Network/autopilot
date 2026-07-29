@@ -588,7 +588,10 @@ function prDoesNotRegress(
       && proposed.rounds.at(-1)?.adoption?.resultingHead === proposed.pr.head;
   }
   return current.pr.draft === proposed.pr.draft
-    || (proposed.phase === 'ready' && !proposed.pr.draft);
+    || (
+      ['ready', 'closed', 'exhausted'].includes(proposed.phase)
+      && !proposed.pr.draft
+    );
 }
 
 function sameGenerationUpdateIsMonotonic(
