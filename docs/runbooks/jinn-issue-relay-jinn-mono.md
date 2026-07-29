@@ -101,6 +101,9 @@ cmp \
 cmp \
   "$JINN_MONO_WORKTREE/packages/sdk/fixtures/autopilot/issue-relay-adoption.v1.json" \
   "$AUTOPILOT_WORKTREE/test/fixtures/issue-relay-adoption.v1.json"
+cmp \
+  "$JINN_MONO_WORKTREE/packages/sdk/fixtures/autopilot/issue-relay-assurance.v1.md" \
+  "$AUTOPILOT_WORKTREE/test/fixtures/issue-relay-assurance.v1.md"
 ```
 
 V0 has a single-host, single-state-directory writer lease. Exactly one

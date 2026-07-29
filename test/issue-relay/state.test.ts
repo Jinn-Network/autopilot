@@ -539,17 +539,20 @@ describe('Relay state/action transition table', () => {
       .toEqual({ kind: 'submit-round', round: 0 });
   });
 
-  it('admitted with a stale snapshot base -> none', () => {
+  it('admitted with a stale snapshot base -> terminal supersede', () => {
     expect(deriveRelayAction(facts(durable('admitted'), {
       currentBaseOid: STALE,
-    }), policy)).toMatchObject({ kind: 'none' });
+    }), policy)).toEqual({
+      kind: 'close-exhausted',
+      reason: 'stale-base',
+    });
   });
 
   it('admitted with a zero-round budget -> close-exhausted', () => {
     expect(deriveRelayAction(facts(durable('admitted')), {
       ...policy,
       maxRoundsPerGeneration: 0,
-    })).toEqual({ kind: 'close-exhausted' });
+    })).toEqual({ kind: 'close-exhausted', reason: 'bounds' });
   });
 
   it('submitted with funded task evidence -> observe-solution', () => {
@@ -557,6 +560,25 @@ describe('Relay state/action transition table', () => {
 
     expect(deriveRelayAction(facts(record), policy))
       .toEqual({ kind: 'observe-solution', round: 0 });
+  });
+
+  it('keeps an already-funded initial round bound to its immutable snapshot after base advance', () => {
+    const record = durable('submitted', { rounds: [round({ task })] });
+
+    expect(deriveRelayAction(facts(record, {
+      currentBaseOid: STALE,
+    }), policy)).toEqual({ kind: 'observe-solution', round: 0 });
+  });
+
+  it('terminates a no-delivery round at its durable deadline', () => {
+    const record = durable('submitted', { rounds: [round({ task })] });
+
+    expect(deriveRelayAction(facts(record, {
+      now: record.deadlineAt,
+    }), policy)).toEqual({
+      kind: 'close-exhausted',
+      reason: 'deadline',
+    });
   });
 
   it('solution-delivered with authenticated delivery -> adopt-solution', () => {
@@ -644,12 +666,6 @@ describe('Relay state/action transition table', () => {
       adoption: { disposition: 'rejected', receiptDigest: DIGEST },
       checks: passedChecks,
     })],
-    ['failed checks', round({
-      task,
-      solution,
-      adoption,
-      checks: { ...passedChecks, status: 'failed' },
-    })],
   ])('draft-open with %s -> none', (_label, currentRound) => {
     const record = durable('draft-open', {
       rounds: [currentRound],
@@ -660,6 +676,110 @@ describe('Relay state/action transition table', () => {
       currentPr: livePr(),
     }), policy)).toMatchObject({ kind: 'none' });
   });
+
+  it('turns stable failed required checks into one bounded repair round', () => {
+    const record = durable('draft-open', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: { ...passedChecks, status: 'failed' },
+      })],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(),
+    }), policy)).toEqual({ kind: 'prepare-round', round: 1 });
+  });
+
+  it('exhausts stable failed checks instead of funding beyond the round limit', () => {
+    const record = durable('draft-open', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: { ...passedChecks, status: 'failed' },
+      })],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(),
+    }), {
+      ...policy,
+      maxRoundsPerGeneration: 1,
+    })).toEqual({ kind: 'close-exhausted', reason: 'bounds' });
+  });
+
+  it('does not fund a failed-check repair from a moved pull-request head', () => {
+    const record = durable('draft-open', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: { ...passedChecks, status: 'failed' },
+      })],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(STALE),
+    }), policy)).toMatchObject({ kind: 'none' });
+  });
+
+  it('terminates failed required checks at the durable deadline', () => {
+    const record = durable('draft-open', {
+      rounds: [round({
+        task,
+        solution,
+        adoption,
+        checks: { ...passedChecks, status: 'failed' },
+      })],
+      pr: { number: 68, branch: 'jinn/issue-relay/example', head: HEAD, draft: true },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      currentPr: livePr(),
+      now: record.deadlineAt,
+    }), policy)).toEqual({
+      kind: 'close-exhausted',
+      reason: 'deadline',
+    });
+  });
+
+  it.each(['human', 'unresolved'] as const)(
+    'terminates a durable %s verdict at the deadline',
+    (outcome) => {
+      const record = durable('evaluating', {
+        rounds: [round({
+          task,
+          solution,
+          adoption,
+          checks: passedChecks,
+          verdict: {
+            outcome,
+            evaluatedHead: HEAD,
+            envelopeCid: `f01551220${'9'.repeat(64)}`,
+          },
+        })],
+        pr: {
+          number: 68,
+          branch: 'jinn/issue-relay/example',
+          head: HEAD,
+          draft: true,
+        },
+      });
+
+      expect(deriveRelayAction(facts(record, {
+        currentPr: livePr(),
+        now: record.deadlineAt,
+      }), policy)).toEqual({
+        kind: 'close-exhausted',
+        reason: 'deadline',
+      });
+    },
+  );
 
   it.each([
     ['missing', round({ task, solution, adoption })],
@@ -889,7 +1009,7 @@ describe('Relay state/action transition table', () => {
     }), policy)).toMatchObject({ kind: 'none' });
   });
 
-  it('evaluating with pass after the base advances -> none', () => {
+  it('evaluating with pass after the base advances -> terminal supersede', () => {
     const record = durable('evaluating', {
       rounds: [round({
         task,
@@ -904,7 +1024,10 @@ describe('Relay state/action transition table', () => {
     expect(deriveRelayAction(facts(record, {
       currentBaseOid: STALE,
       currentPr: livePr(),
-    }), policy)).toMatchObject({ kind: 'none' });
+    }), policy)).toEqual({
+      kind: 'close-exhausted',
+      reason: 'stale-base',
+    });
   });
 
   it('repair-needed with request changes -> persist the next funding intent before submission', () => {
@@ -939,7 +1062,7 @@ describe('Relay state/action transition table', () => {
     expect(deriveRelayAction(facts(record, {
       currentPr: livePr(),
     }), { ...policy, maxRoundsPerGeneration: 1 }))
-      .toEqual({ kind: 'close-exhausted' });
+      .toEqual({ kind: 'close-exhausted', reason: 'bounds' });
   });
 
   it('repair-needed at its immutable deadline -> close-exhausted', () => {
@@ -957,7 +1080,7 @@ describe('Relay state/action transition table', () => {
     expect(deriveRelayAction(facts(record, {
       currentPr: livePr(),
       now: '2026-07-28T13:00:02.000Z',
-    }), policy)).toEqual({ kind: 'close-exhausted' });
+    }), policy)).toEqual({ kind: 'close-exhausted', reason: 'deadline' });
   });
 
   it('uses the durable deadline instead of recomputing it from policy on continuation', () => {
@@ -1103,6 +1226,20 @@ describe('Relay state/action transition table', () => {
 
     expect(deriveRelayAction(facts(record), policy))
       .toEqual({ kind: 'observe-solution', round: 0 });
+  });
+
+  it('finishes a persisted cancellation when its durable deadline expires', () => {
+    const record = durable('cancelling', {
+      rounds: [round({ task })],
+      cancellation: {
+        requestedAt: '2026-07-28T12:25:00.000Z',
+        reason: 'operator',
+      },
+    });
+
+    expect(deriveRelayAction(facts(record, {
+      now: record.deadlineAt,
+    }), policy)).toEqual({ kind: 'finish-cancellation' });
   });
 
   it('a persisted cancellation settles an already-delivered current round', () => {

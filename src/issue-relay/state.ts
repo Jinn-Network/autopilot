@@ -144,7 +144,10 @@ export type RelayAction =
   | { readonly kind: 'submit-repair'; readonly round: number }
   | { readonly kind: 'mark-ready' }
   | { readonly kind: 'finish-cancellation' }
-  | { readonly kind: 'close-exhausted' }
+  | {
+      readonly kind: 'close-exhausted';
+      readonly reason?: 'deadline' | 'stale-base' | 'bounds';
+    }
   | { readonly kind: 'none'; readonly reason: string };
 
 export interface RelayAuthoritativeFacts {
@@ -388,10 +391,16 @@ function durableShapeIsConsistent(record: RelayGenerationRecordV1): boolean {
     }
     return index === 0
       || (
-        record.rounds[index - 1]?.verdict?.outcome === 'request-changes'
-        && record.rounds[index - 1]?.verdict?.evaluatedHead === round.inputHead
-        && record.rounds[index - 1]?.adoption?.disposition === 'accepted'
+        record.rounds[index - 1]?.adoption?.disposition === 'accepted'
         && record.rounds[index - 1]?.adoption?.resultingHead === round.inputHead
+        && (
+          (
+            record.rounds[index - 1]?.verdict?.outcome === 'request-changes'
+            && record.rounds[index - 1]?.verdict?.evaluatedHead
+              === round.inputHead
+          )
+          || record.rounds[index - 1]?.checks?.status === 'failed'
+        )
       );
   });
 }
@@ -449,7 +458,7 @@ function roundInputIsCurrent(
 ): boolean {
   switch (round.purpose) {
     case 'initial':
-      return round.inputHead === facts.currentBaseOid;
+      return round.inputHead === facts.durable?.snapshot.repository.baseOid;
     case 'repair':
       return livePrMatchesDurable(facts)
         && facts.currentPr?.head === round.inputHead
@@ -657,7 +666,15 @@ export function deriveRelayReady(input: RelayReadyInput): RelayReadyDecision {
     || verdict.round.round !== receipt.correlation.round
     || verdict.round.snapshotDigest !== receipt.correlation.snapshotDigest
     || verdict.round.targetRepository !== receipt.targetRepository
-    || verdict.round.workspaceRepository !== receipt.workspaceRepository
+    || verdict.round.workspaceRepository !== (
+      verdict.round.purpose === 'repair'
+        ? receipt.workspaceRepository
+        : receipt.targetRepository
+    )
+    || (
+      verdict.round.purpose === 'repair'
+      && verdict.round.prNumber !== receipt.prNumber
+    )
     || verdict.round.inputHead !== receipt.inputHead
   ) {
     return notReady('verdict-failed');
@@ -712,6 +729,7 @@ function readinessMatchesRound(
 function deriveDraftOpenAction(
   facts: RelayAuthoritativeFacts,
   round: RelayRoundRecordV1 | undefined,
+  policy: RelayDerivationPolicy,
 ): RelayAction {
   if (round === undefined || !acceptedLiveHead(facts, round)) {
     return none('Accepted adoption and an exact live PR head are required');
@@ -722,8 +740,12 @@ function deriveDraftOpenAction(
       return { kind: 'publish-evaluation-anchor', round: round.round };
     case 'pending':
       return { kind: 'observe-checks', round: round.round };
-    case 'failed':
-      return none('Exact-head checks failed');
+    case 'failed': {
+      const nextRound = round.round + 1;
+      return nextRound >= policy.maxRoundsPerGeneration
+        ? { kind: 'close-exhausted', reason: 'bounds' }
+        : { kind: 'prepare-round', round: nextRound };
+    }
     case undefined:
       return { kind: 'observe-checks', round: round.round };
     default:
@@ -792,14 +814,20 @@ function deriveRepairAction(
   }
   const nextRound = round.round + 1;
   if (nextRound >= policy.maxRoundsPerGeneration || nowMs >= deadlineMs) {
-    return { kind: 'close-exhausted' };
+    return {
+      kind: 'close-exhausted',
+      reason: nowMs >= deadlineMs ? 'deadline' : 'bounds',
+    };
   }
   return { kind: 'prepare-round', round: nextRound };
 }
 
 function deriveCancellationSettlement(
   record: RelayGenerationRecordV1,
+  nowMs: number,
+  deadlineMs: number,
 ): RelayAction {
+  if (nowMs >= deadlineMs) return { kind: 'finish-cancellation' };
   const fundedRound = [...record.rounds].reverse()
     .find(({ task }) => task !== undefined);
   if (fundedRound?.task === undefined) {
@@ -877,23 +905,32 @@ export function deriveRelayAction(
     return { kind: 'record-cancellation', reason: cancellationReason };
   }
   if (record.phase === 'cancelling' || record.cancellation !== undefined) {
-    return deriveCancellationSettlement(record);
+    return deriveCancellationSettlement(record, nowMs, deadlineMs);
   }
   if (!facts.issue.open || !facts.issue.optedIn) {
     return none('Issue authority ended before funding');
   }
 
   const round = latestRound(record);
+  const baseAdvanced =
+    record.snapshot.repository.baseOid !== facts.currentBaseOid;
+  if (
+    baseAdvanced
+    && record.phase !== 'submitted'
+    && record.phase !== 'solution-delivered'
+  ) {
+    return { kind: 'close-exhausted', reason: 'stale-base' };
+  }
+  if (nowMs >= deadlineMs) {
+    return { kind: 'close-exhausted', reason: 'deadline' };
+  }
   switch (record.phase) {
     case 'admitted':
       if (record.rounds.length !== 0) {
         return none('Admitted generation has contradictory round evidence');
       }
-      if (record.snapshot.repository.baseOid !== facts.currentBaseOid) {
-        return none('Snapshot base head is stale');
-      }
-      return policy.maxRoundsPerGeneration === 0 || nowMs >= deadlineMs
-        ? { kind: 'close-exhausted' }
+      return policy.maxRoundsPerGeneration === 0
+        ? { kind: 'close-exhausted', reason: 'bounds' }
         : { kind: 'prepare-round', round: 0 };
     case 'funding':
       if (
@@ -924,7 +961,7 @@ export function deriveRelayAction(
       }
       return { kind: 'adopt-solution', round: round.round };
     case 'draft-open':
-      return deriveDraftOpenAction(facts, round);
+      return deriveDraftOpenAction(facts, round, policy);
     case 'evaluating':
       return deriveEvaluatingAction(facts, round);
     case 'repair-needed':

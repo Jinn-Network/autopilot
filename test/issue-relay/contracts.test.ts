@@ -13,6 +13,23 @@ const fixture = (name: string) => readFileSync(
   new URL(`../fixtures/${name}.json`, import.meta.url),
 );
 
+function canonicalJson(value: unknown): string {
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value as Record<string, unknown>).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(
+        (value as Record<string, unknown>)[key],
+      )}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalDigest(value: unknown): `sha256:${string}` {
+  return `sha256:${createHash('sha256').update(canonicalJson(value)).digest('hex')}`;
+}
+
 const digest = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const oid = '1111111111111111111111111111111111111111';
 const correlation = {
@@ -30,7 +47,7 @@ const repairRound = {
   round: 1,
   snapshotDigest: digest,
   targetRepository: 'Jinn-Network/mono',
-  workspaceRepository: 'Jinn-Network/mono',
+  workspaceRepository: 'jinn-relay/mono',
   inputHead: oid,
   purpose: 'repair' as const,
   findings: [{ code: 'test-failure', title: 'Test fails', detail: 'The test fails.' }],
@@ -41,7 +58,7 @@ const acceptedReceipt = {
   disposition: 'accepted' as const,
   correlation,
   targetRepository: 'Jinn-Network/mono',
-  workspaceRepository: 'Jinn-Network/mono',
+  workspaceRepository: 'jinn-relay/mono',
   issueNumber: 1889,
   prNumber: 42,
   headRef: 'relay/1889',
@@ -55,13 +72,13 @@ const anchor = {
   schemaVersion: 'jinn-issue-relay-evaluation-anchor.v1' as const,
   correlation,
   targetRepository: 'Jinn-Network/mono',
-  workspaceRepository: 'Jinn-Network/mono',
+  workspaceRepository: 'jinn-relay/mono',
   prNumber: 42,
   targetBase: 'main',
   baseOid: oid,
   headRef: 'relay/1889',
   evaluatedHead: '2222222222222222222222222222222222222222',
-  adoptionReceiptDigest: 'sha256:3dafed6b323a92e7d5aa1c011490270f24f853da52da2fd18aba43cfbdc398c3',
+  adoptionReceiptDigest: canonicalDigest(acceptedReceipt),
   checksDigest: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
   anchoredAt: '2026-07-28T12:01:00.000Z',
 };
@@ -81,7 +98,7 @@ const context = {
   correlation,
   reviewTarget: {
     targetRepository: 'Jinn-Network/mono',
-    workspaceRepository: 'Jinn-Network/mono',
+    workspaceRepository: 'jinn-relay/mono',
     issueNumber: 1889,
     prNumber: 42,
     targetBase: 'main',
@@ -102,9 +119,9 @@ describe('local Issue Relay wire mirrors', () => {
   it('decodes the canonical repair-round fixture and preserves its bytes', () => {
     const bytes = fixture('issue-relay-round.v1');
 
-    expect(bytes.length).toBe(583);
+    expect(bytes.length).toBe(581);
     expect(createHash('sha256').update(bytes).digest('hex'))
-      .toBe('c1452710d36c6c4bc674e43c1ffb689c4b784e7886e68a6650a6232602a038ed');
+      .toBe('df3b9f8cf8db25bc1a0273f5b4a02efb93623d3e356ea32a6b5da40877b845c6');
     expect(IssueRelayRoundV1Schema.parse(JSON.parse(bytes.toString('utf8'))))
       .toMatchObject({ purpose: 'repair', prNumber: 42 });
   });
@@ -112,9 +129,9 @@ describe('local Issue Relay wire mirrors', () => {
   it('decodes the canonical accepted-adoption fixture and preserves its bytes', () => {
     const bytes = fixture('issue-relay-adoption.v1');
 
-    expect(bytes.length).toBe(928);
+    expect(bytes.length).toBe(926);
     expect(createHash('sha256').update(bytes).digest('hex'))
-      .toBe('3967e7f0150718cbe1b65f9c801ba87ee9a74ce6af2536bc8fe26b3b738b1671');
+      .toBe('4f8a60bc5bf1a9f6c4cd67034fdc43b9e81b2405d401ed1efde10484b4d6c740');
     expect(IssueRelayAdoptionReceiptV1Schema.parse(JSON.parse(bytes.toString('utf8'))))
       .toMatchObject({ disposition: 'accepted', issueNumber: 1889 });
   });
@@ -132,6 +149,71 @@ describe('local Issue Relay wire mirrors', () => {
     expect(IssueRelayEvaluationContextV1Schema.safeParse({
       ...context,
       operators: { ...context.operators, evaluatorSafe: acceptedReceipt.solutionSafe },
+    }).success).toBe(false);
+  });
+
+  it('keeps an initial solver input upstream while reviewing the adopted managed-fork head', () => {
+    const managedFork = 'jinn-relay/mono';
+    const initialCorrelation = { ...correlation, round: 0 };
+    const initialReceipt = {
+      ...acceptedReceipt,
+      correlation: initialCorrelation,
+      workspaceRepository: managedFork,
+    };
+    const initialAnchor = {
+      ...anchor,
+      correlation: initialCorrelation,
+      workspaceRepository: managedFork,
+      adoptionReceiptDigest: canonicalDigest(initialReceipt),
+    };
+    const initialContext = {
+      ...context,
+      round: {
+        ...repairRound,
+        round: 0,
+        purpose: 'initial' as const,
+        findings: [],
+        prNumber: undefined,
+        workspaceRepository: acceptedReceipt.targetRepository,
+      },
+      correlation: initialCorrelation,
+      reviewTarget: {
+        ...context.reviewTarget,
+        workspaceRepository: managedFork,
+      },
+      adoptionReceipt: initialReceipt,
+      evaluationAnchor: initialAnchor,
+    };
+
+    expect(IssueRelayEvaluationContextV1Schema.safeParse(initialContext).success)
+      .toBe(true);
+  });
+
+  it('rejects initial findings and bounds evaluation collections', () => {
+    expect(IssueRelayRoundV1Schema.safeParse({
+      ...repairRound,
+      purpose: 'initial',
+      prNumber: undefined,
+    }).success).toBe(false);
+    expect(IssueRelayEvaluationContextV1Schema.safeParse({
+      ...context,
+      goal: {
+        ...context.goal,
+        acceptanceEvidence: Array.from(
+          { length: 51 },
+          (_, index) => `Acceptance item ${index}`,
+        ),
+      },
+    }).success).toBe(false);
+    expect(IssueRelayEvaluationContextV1Schema.safeParse({
+      ...context,
+      checks: {
+        ...context.checks,
+        required: Array.from(
+          { length: 101 },
+          (_, index) => ({ name: `required-${index}`, status: 'passed' as const }),
+        ),
+      },
     }).success).toBe(false);
   });
 

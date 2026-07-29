@@ -19,6 +19,8 @@ import type {
 
 const DISCOVERY_QUERY =
   'repo:Jinn-Network/mono is:issue is:open label:"engine:marketplace"';
+const RECOVERY_MARKER = 'jinn-issue-relay:generation:v1';
+const GITHUB_SEARCH_RESULT_CAP = 1000;
 const MAX_PAGES = 10;
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const OID = /^[0-9a-f]{40}$/;
@@ -100,6 +102,13 @@ function string(value: unknown, label: string): string {
 function positiveInteger(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) {
     throw new Error(`${label} returned a malformed positive integer`);
+  }
+  return value as number;
+}
+
+function nonNegativeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`${label} returned a malformed non-negative integer`);
   }
   return value as number;
 }
@@ -695,34 +704,75 @@ export function createRelayGitHubProductionPorts(options: {
   const authority: RelayGitHubProductionAuthorityPort = {
     async listIssueNumbersForMarkerRecovery() {
       const numbers: number[] = [];
+      const seen = new Set<number>();
       let page = 1;
+      let expectedTotal: number | undefined;
+      const query =
+        `repo:${options.config.repository} is:issue in:comments `
+        + `"${RECOVERY_MARKER}" commenter:"${options.config.relayBotLogin}"`;
       for (;;) {
-        const path = `/repos/${options.config.repository}/issues`;
+        const path = '/search/issues';
         const response = await request({
           method: 'GET',
           path,
           query: {
-            state: 'all',
-            sort: 'updated',
-            direction: 'desc',
+            q: query,
             per_page: '100',
             page: String(page),
           },
         });
-        if (!Array.isArray(response.body) || response.body.length > 100) {
-          throw new Error('GitHub recovery issue enumeration is malformed');
+        const body = object(response.body, 'GitHub recovery search');
+        const total = nonNegativeInteger(
+          body.total_count,
+          'GitHub recovery search total_count',
+        );
+        if (total > GITHUB_SEARCH_RESULT_CAP) {
+          throw new Error(
+            `GitHub recovery search exceeds its ${GITHUB_SEARCH_RESULT_CAP}-result cap`,
+          );
         }
-        for (const value of response.body) {
-          const issue = object(value, 'GitHub recovery issue');
-          if (issue.pull_request === undefined) {
-            numbers.push(positiveInteger(
-              issue.number,
-              'GitHub recovery issue number',
-            ));
+        if (body.incomplete_results !== false) {
+          throw new Error('GitHub recovery search is incomplete');
+        }
+        if (expectedTotal === undefined) {
+          expectedTotal = total;
+        } else if (expectedTotal !== total) {
+          throw new Error('GitHub recovery search total changed across pages');
+        }
+        if (!Array.isArray(body.items) || body.items.length > 100) {
+          throw new Error('GitHub recovery search items are malformed');
+        }
+        const repositoryUrl =
+          `https://api.github.com/repos/${options.config.repository}`;
+        for (const value of body.items) {
+          const issue = object(value, 'GitHub recovery search issue');
+          const number = positiveInteger(
+            issue.number,
+            'GitHub recovery issue number',
+          );
+          if (
+            issue.pull_request !== undefined
+            || issue.repository_url !== repositoryUrl
+            || issue.url !== `${repositoryUrl}/issues/${number}`
+            || seen.has(number)
+          ) {
+            throw new Error(
+              'GitHub recovery search returned a contradictory issue identity',
+            );
           }
+          seen.add(number);
+          numbers.push(number);
         }
         const following = nextPage(response, page, path);
-        if (following === undefined) return numbers;
+        if (following === undefined) {
+          if (numbers.length !== expectedTotal) {
+            throw new Error('GitHub recovery search result count is incomplete');
+          }
+          return numbers;
+        }
+        if (numbers.length >= expectedTotal) {
+          throw new Error('GitHub recovery search pagination is contradictory');
+        }
         page = following;
       }
     },

@@ -76,6 +76,7 @@ import {
 import {
   aggregateRelayChecks,
   createRelayEvaluationAnchorPublisher,
+  relayFailedCheckFindings,
   relayRequiredCheckStatus,
   type RelayCheckSummary,
 } from './checks.js';
@@ -464,6 +465,25 @@ function deadlineFromSnapshot(
   return new Date(deadline).toISOString();
 }
 
+function relaySnapshotMateriallyChanged(
+  current: IssueRelaySnapshotV1,
+  next: IssueRelaySnapshotV1,
+): boolean {
+  const withoutCaptureIdentity = (snapshot: IssueRelaySnapshotV1) => ({
+    repository: snapshot.repository,
+    issue: snapshot.issue,
+    optIn: snapshot.optIn,
+    language: snapshot.language,
+    verificationProfile: snapshot.verificationProfile,
+    acceptanceEvidence: snapshot.acceptanceEvidence,
+    admissionPolicyVersion: snapshot.admissionPolicyVersion,
+  });
+  return !isDeepStrictEqual(
+    withoutCaptureIdentity(current),
+    withoutCaptureIdentity(next),
+  );
+}
+
 function issueStatusBody(
   record: RelayGenerationRecordV1,
   summary: string,
@@ -683,6 +703,7 @@ export function createIssueRelayProductionReconciliation(options: {
         )
         && nextSnapshot !== undefined
         && nextGeneration !== marker.record.generation
+        && relaySnapshotMateriallyChanged(marker.record.snapshot, nextSnapshot)
       ) {
         return {
           generation: nextGeneration!,
@@ -1467,23 +1488,65 @@ export function createIssueRelayProductionReconciliation(options: {
             const previousRound = action.round - 1;
             if (
               record === undefined
-              || record.phase !== 'repair-needed'
               || record.pr === undefined
               || record.rounds.length !== action.round
             ) {
               throw new Error('Relay repair funding lost exact durable authority');
             }
-            const verdict = await observeExactVerdict(
-              current,
-              record,
-              previousRound,
-            );
-            if (verdict.status === 'pending') {
-              return { outcome: 'pending', detail: verdict.detail };
+            const previous = record.rounds[previousRound];
+            const repairSource = await (async (): Promise<
+              | {
+                  readonly status: 'ready';
+                  readonly findings: readonly {
+                    readonly code: string;
+                    readonly title: string;
+                    readonly detail: string;
+                    readonly path?: string;
+                  }[];
+                }
+              | { readonly status: 'pending'; readonly detail: string }
+            > => {
+              if (record.phase === 'repair-needed') {
+                const verdict = await observeExactVerdict(
+                  current,
+                  record,
+                  previousRound,
+                );
+                if (verdict.status === 'pending') {
+                  return { status: 'pending', detail: verdict.detail };
+                }
+                if (verdict.observation.payload.outcome !== 'request-changes') {
+                  throw new Error(
+                    'Relay repair requires an authenticated request-changes verdict',
+                  );
+                }
+                return {
+                  status: 'ready',
+                  findings: verdict.observation.payload.findings,
+                };
+              }
+              if (
+                record.phase === 'draft-open'
+                && previous?.checks?.status === 'failed'
+              ) {
+                const checks = await exactChecks(
+                  record,
+                  false,
+                  previous.checks.digest,
+                );
+                return {
+                  status: 'ready',
+                  findings: relayFailedCheckFindings(checks),
+                };
+              }
+              throw new Error(
+                'Relay repair requires exact failed checks or request-changes evidence',
+              );
+            })();
+            if (repairSource.status === 'pending') {
+              return { outcome: 'pending', detail: repairSource.detail };
             }
-            if (verdict.observation.payload.outcome !== 'request-changes') {
-              throw new Error('Relay repair requires an authenticated request-changes verdict');
-            }
+            const { findings } = repairSource;
             const pr = await options.githubAuthority.readPullRequest(record.pr.number);
             if (
               pr.head !== record.pr.head
@@ -1505,7 +1568,7 @@ export function createIssueRelayProductionReconciliation(options: {
               purpose: 'repair',
               workspaceRepository: options.config.managedForkRepository,
               inputHead: pr.head,
-              findings: verdict.observation.payload.findings,
+              findings,
               prNumber: pr.number,
               repairAuthority: {
                 managedFork: true,
@@ -1554,7 +1617,7 @@ export function createIssueRelayProductionReconciliation(options: {
                 purpose: 'repair',
                 workspaceRepository: options.config.managedForkRepository,
                 inputHead: pr.head,
-                findings: verdict.observation.payload.findings,
+                findings,
                 prNumber: pr.number,
                 fundingIntent: {
                   taskKey: task.spec.instance_id,
@@ -2212,6 +2275,13 @@ export function createIssueRelayProductionReconciliation(options: {
           const terminal = action.kind === 'finish-cancellation'
             ? 'closed'
             : 'exhausted';
+          const exhaustionDetail = action.kind === 'close-exhausted'
+            && action.reason === 'stale-base'
+            ? 'The target base advanced, so this generation was superseded.'
+            : action.kind === 'close-exhausted'
+              && action.reason === 'deadline'
+              ? 'The durable generation deadline expired.'
+              : 'The configured Relay round or spend bound was exhausted.';
           const proposed: RelayGenerationRecordV1 = {
             ...record,
             phase: terminal,
@@ -2234,7 +2304,7 @@ export function createIssueRelayProductionReconciliation(options: {
                 limitations: [
                   terminal === 'closed'
                     ? 'Soft cancellation prevents a ready transition.'
-                    : 'The configured Relay round, spend, or deadline bound was exhausted.',
+                    : exhaustionDetail,
                 ],
                 technicalEvidence: [],
               },
@@ -2248,7 +2318,7 @@ export function createIssueRelayProductionReconciliation(options: {
                 expectedHead: pr.head,
                 reason: action.kind === 'finish-cancellation'
                   ? 'Jinn Issue Relay generation cancelled'
-                  : 'Jinn Issue Relay budget or deadline exhausted',
+                  : exhaustionDetail,
               });
             }
           }
@@ -2257,7 +2327,7 @@ export function createIssueRelayProductionReconciliation(options: {
             proposed,
             terminal === 'closed'
               ? 'Relay work was cancelled.'
-              : 'Relay budget, rounds, or deadline were exhausted.',
+              : exhaustionDetail,
             'No further marketplace work will be funded.',
           );
           return {

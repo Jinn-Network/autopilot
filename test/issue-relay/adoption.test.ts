@@ -177,7 +177,7 @@ IssueRelayAdoptionReceiptV1,
       deliveryEnvelopeCid: ENVELOPE,
     },
     targetRepository: 'Jinn-Network/mono',
-    workspaceRepository: 'Jinn-Network/mono',
+    workspaceRepository: 'Jinn-Network/mono-relay',
     issueNumber: 42,
     prNumber: 68,
     headRef: relayBranch(generation),
@@ -621,6 +621,7 @@ describe('Relay solution adoption policy', () => {
       prNumber: 68,
       receipt: {
         disposition: 'accepted',
+        workspaceRepository: 'Jinn-Network/mono-relay',
         patchDigest:
           'sha256:b934bd8ff982ee635e1f0fc491acb8489a35c2cfe3230c785ebf3996c2f80580',
       },

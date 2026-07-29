@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import {
+  ISSUE_RELAY_MAX_ACCEPTANCE_ITEMS,
+  ISSUE_RELAY_MAX_CHECKS,
   ISSUE_RELAY_MAX_FINDINGS,
   ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
   ISSUE_RELAY_MAX_FINDING_LABEL_BYTES,
@@ -83,7 +85,7 @@ const roundCommonFields = {
 const InitialIssueRelayRoundV1Schema = z.object({
   ...roundCommonFields,
   purpose: z.literal('initial'),
-  findings: z.array(IssueRelayFindingV1Schema).max(ISSUE_RELAY_MAX_FINDINGS),
+  findings: z.array(IssueRelayFindingV1Schema).length(0),
   prNumber: z.never().optional(),
 }).strict();
 
@@ -324,7 +326,7 @@ export const IssueRelayEvaluationContextV1Schema = z.object({
     acceptanceEvidence: z.array(boundedText(
       ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
       'Acceptance evidence',
-    )),
+    )).max(ISSUE_RELAY_MAX_ACCEPTANCE_ITEMS),
     verificationProfile: z.literal('jinn-mono.v1'),
   }).strict(),
   operators: z.object({
@@ -354,12 +356,12 @@ export const IssueRelayEvaluationContextV1Schema = z.object({
       name: CheckNameSchema,
       status: z.literal('passed'),
       url: OptionalCheckUrlSchema,
-    }).strict()),
+    }).strict()).max(ISSUE_RELAY_MAX_CHECKS),
     optional: z.array(z.object({
       name: CheckNameSchema,
       status: z.enum(['passed', 'failed', 'pending']),
       url: OptionalCheckUrlSchema,
-    }).strict()),
+    }).strict()).max(ISSUE_RELAY_MAX_CHECKS),
   }).strict(),
 }).strict().superRefine((value, ctx) => {
   const reject = (path: Array<string | number>, message: string): void => {
@@ -392,10 +394,24 @@ export const IssueRelayEvaluationContextV1Schema = z.object({
   }
   const roundBindings: Array<[unknown, unknown, Array<string | number>, string]> = [
     [reviewTarget.targetRepository, round.targetRepository, ['reviewTarget', 'targetRepository'], 'target repository'],
-    [reviewTarget.workspaceRepository, round.workspaceRepository, ['reviewTarget', 'workspaceRepository'], 'workspace repository'],
-    [reviewTarget.prNumber, round.prNumber, ['reviewTarget', 'prNumber'], 'PR number'],
     [adoptionReceipt.inputHead, round.inputHead, ['adoptionReceipt', 'inputHead'], 'input head'],
   ];
+  if (round.purpose === 'repair') {
+    roundBindings.push(
+      [
+        reviewTarget.workspaceRepository,
+        round.workspaceRepository,
+        ['reviewTarget', 'workspaceRepository'],
+        'workspace repository',
+      ],
+      [
+        reviewTarget.prNumber,
+        round.prNumber,
+        ['reviewTarget', 'prNumber'],
+        'PR number',
+      ],
+    );
+  }
   for (const [actual, expected, path, label] of roundBindings) {
     if (actual !== expected) reject(path, `Evaluation ${label} must match round`);
   }

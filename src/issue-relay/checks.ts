@@ -3,8 +3,13 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   IssueRelayAdoptionReceiptV1Schema,
   IssueRelayEvaluationAnchorV1Schema,
+  type IssueRelayFindingV1,
   type IssueRelayEvaluationAnchorV1,
 } from './contracts.js';
+import {
+  ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+  ISSUE_RELAY_MAX_FINDINGS,
+} from './limits.js';
 import type { AcceptedRelayAdoption } from './adoption.js';
 import {
   findRelayAdoptionReceiptBlock,
@@ -31,6 +36,46 @@ export interface RelayCheckSummary {
   readonly required: readonly RelayCheck[];
   readonly optional: readonly RelayCheck[];
   readonly digest: `sha256:${string}`;
+}
+
+function boundedFailureName(name: string): string {
+  const maximumNameBytes = ISSUE_RELAY_MAX_FINDING_BODY_BYTES - 256;
+  const encoded = new TextEncoder().encode(name);
+  if (encoded.byteLength <= maximumNameBytes) return name;
+  return `${new TextDecoder().decode(encoded.slice(0, maximumNameBytes - 3))}...`;
+}
+
+export function relayFailedCheckFindings(
+  summary: RelayCheckSummary,
+): readonly IssueRelayFindingV1[] {
+  verifyRelayCheckSummary(summary);
+  const failed = summary.required.filter(({ status }) => status === 'failed');
+  if (failed.length === 0) {
+    throw new Error('Relay check repair requires a failed required check');
+  }
+  const direct = failed.slice(
+    0,
+    failed.length > ISSUE_RELAY_MAX_FINDINGS
+      ? ISSUE_RELAY_MAX_FINDINGS - 1
+      : ISSUE_RELAY_MAX_FINDINGS,
+  );
+  const findings: IssueRelayFindingV1[] = direct.map((check, index) => ({
+    code: `required-check-failed-${index + 1}`,
+    title: 'Required repository check failed',
+    detail:
+      `Required check "${boundedFailureName(check.name)}" failed on exact head `
+      + `${summary.head}. Repair the underlying regression and make this check pass.`,
+  }));
+  if (failed.length > direct.length) {
+    findings.push({
+      code: 'required-check-failure-overflow',
+      title: 'Additional required repository checks failed',
+      detail:
+        `${failed.length - direct.length} additional required checks failed on `
+        + `exact head ${summary.head}. Repair the remaining required checks.`,
+    });
+  }
+  return findings;
 }
 
 type RelayCheckRunConclusion =

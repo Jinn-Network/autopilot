@@ -361,7 +361,7 @@ function acceptedReplayMatches(input: {
   const { receipt, authority, observation, snapshot, patch } = input;
   return isDeepStrictEqual(receipt.correlation, observationCorrelation(observation))
     && receipt.targetRepository === authority.targetRepository
-    && receipt.workspaceRepository === authority.workspaceRepository
+    && receipt.workspaceRepository === authority.forkRepository
     && receipt.issueNumber === snapshot.issue.number
     && receipt.headRef === authority.branch
     && receipt.inputHead === authority.inputHead
@@ -413,7 +413,7 @@ function acceptedReceipt(input: {
     disposition: 'accepted',
     correlation: observationCorrelation(input.observation),
     targetRepository: input.authority.targetRepository,
-    workspaceRepository: input.authority.workspaceRepository,
+    workspaceRepository: input.authority.forkRepository,
     issueNumber: input.snapshot.issue.number,
     prNumber: input.prNumber,
     headRef: input.authority.branch,
