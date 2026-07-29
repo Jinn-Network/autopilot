@@ -21,7 +21,11 @@ import {
   parseRelayIssueCommentMarker,
   renderRelayIssueComment,
 } from '../../src/issue-relay/report.js';
-import { relayGeneration, relayTaskKey } from '../../src/issue-relay/identity.js';
+import {
+  relayBranch,
+  relayGeneration,
+  relayTaskKey,
+} from '../../src/issue-relay/identity.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
 import {
   buildRelayMarketplaceRequest,
@@ -32,6 +36,7 @@ import {
   createRelayGitHubProductionPorts,
   type RelayGitHubApiRequest,
 } from '../../src/issue-relay/github-production.js';
+import { aggregateRelayChecks } from '../../src/issue-relay/checks.js';
 import type { IssueRelayConfig } from '../../src/issue-relay/config.js';
 import { digestIssueRelayJinnDistribution } from '../../src/issue-relay/jinn-distribution.js';
 
@@ -525,7 +530,15 @@ describe('production Relay cadence', () => {
                 : url.pathname.endsWith('/commits/main')
                   ? { sha: 'a'.repeat(40) }
                 : url.pathname === '/search/issues'
-                  ? { items: [] }
+                  ? url.searchParams.get('q')?.includes(
+                    'jinn-issue-relay:generation:v1',
+                  )
+                    ? {
+                        total_count: 0,
+                        incomplete_results: false,
+                        items: [],
+                      }
+                    : { items: [] }
                   : url.pathname === '/repos/Jinn-Network/mono/issues'
                     ? []
                     : (() => {
@@ -1313,6 +1326,283 @@ describe('production Relay reconciliation composition', () => {
     )).toEqual(recordC);
   });
 
+  it('funds a repair round from stable failed required checks on the exact draft head', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'relay-failed-checks-'));
+    directories.push(parent);
+    const state = join(parent, 'state');
+    const artifacts = createRelayDurableArtifactStore(state);
+    const base = 'a'.repeat(40);
+    const head = 'b'.repeat(40);
+    const snapshot = buildRelaySnapshot({
+      repository: {
+        slug: 'Jinn-Network/mono',
+        nodeId: 'R_target',
+        visibility: 'PUBLIC',
+        defaultBranch: 'main',
+        baseOid: base,
+      },
+      issue: {
+        number: 17,
+        url: 'https://github.com/Jinn-Network/mono/issues/17',
+        title: 'Repair a failed required check',
+        body: '- [ ] preserve the exact failed-check evidence',
+        authorLogin: 'maintainer',
+        authorId: 'U_maintainer',
+        updatedAt: '2026-07-28T00:00:00.000Z',
+      },
+      optIn: {
+        label: 'engine:marketplace',
+        actorLogin: 'maintainer',
+        createdAt: '2026-07-28T00:00:01.000Z',
+        permission: 'MAINTAIN',
+      },
+      language: 'typescript',
+      verificationProfile: 'jinn-mono.v1',
+      acceptanceEvidence: ['the failed required check becomes a repair task'],
+      admissionPolicyVersion: 'jinn-issue-relay-admission.v1',
+      capturedAt: '2026-07-28T00:00:02.000Z',
+    });
+    const generation = relayGeneration(snapshot);
+    const branch = relayBranch(generation);
+    const checkFacts = {
+      branchRequiredChecks: [{ name: 'test', appId: 101 }],
+      checks: [{
+        kind: 'check-run' as const,
+        name: 'test',
+        appId: 101,
+        head,
+        status: 'completed' as const,
+        conclusion: 'failure' as const,
+        url: 'https://github.com/Jinn-Network/mono/actions/runs/17',
+      }],
+    };
+    const failedChecks = aggregateRelayChecks({
+      head,
+      ...checkFacts,
+      profile: {
+        name: 'jinn-mono.v1',
+        requiredChecks: ['test'],
+      },
+    });
+    expect(failedChecks.required).toMatchObject([
+      { name: 'test', status: 'failed' },
+    ]);
+    const expectedFinding = {
+      code: 'required-check-failed-1',
+      title: 'Required repository check failed',
+      detail:
+        `Required check "test" failed on exact head ${head}. `
+        + 'Repair the underlying regression and make this check pass.',
+    };
+    const record = {
+      schemaVersion: 'jinn-issue-relay-generation.v1' as const,
+      generation,
+      snapshot,
+      phase: 'draft-open' as const,
+      deadlineAt: '2026-07-29T00:00:02.000Z',
+      rounds: [{
+        round: 0,
+        purpose: 'initial' as const,
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: base,
+        findings: [],
+        task: {
+          taskKey: relayTaskKey(generation, 0),
+          taskId: '1',
+          taskCid: `f01551220${'1'.repeat(64)}`,
+          spendWei: '1',
+          fundedAt: '2026-07-28T00:05:00.000Z',
+        },
+        solution: {
+          envelopeCid: `f01551220${'2'.repeat(64)}`,
+          operatorSafe: `0x${'1'.repeat(40)}`,
+          observedAt: '2026-07-28T00:10:00.000Z',
+        },
+        adoption: {
+          disposition: 'accepted' as const,
+          resultingHead: head,
+          prNumber: 68,
+          receiptDigest: `sha256:${'3'.repeat(64)}` as const,
+          recordedAt: '2026-07-28T00:15:00.000Z',
+        },
+        checks: {
+          head,
+          status: 'failed' as const,
+          digest: failedChecks.digest,
+          observedAt: '2026-07-28T00:16:00.000Z',
+        },
+      }],
+      pr: {
+        number: 68,
+        branch,
+        head,
+        draft: true,
+        targetRepository: 'Jinn-Network/mono',
+        targetRepositoryId: 'R_target',
+        forkRepository: 'jinn-relay/mono',
+        forkRepositoryId: 'R_fork',
+        forkParentRepositoryId: 'R_target',
+        visibility: 'PUBLIC' as const,
+        managedFork: true as const,
+      },
+      updatedAt: '2026-07-28T00:16:00.000Z',
+    };
+    let comment = {
+      id: 117,
+      authorLogin: 'jinn-relay',
+      body: renderRelayIssueComment({
+        record,
+        generation,
+        phase: record.phase,
+        prNumber: 68,
+        round: 0,
+        summary: 'The exact required check failed.',
+        nextAction: 'Fund a bounded repair round.',
+      }),
+    };
+    const issue = {
+      repository: {
+        slug: 'Jinn-Network/mono',
+        nodeId: 'R_target',
+        visibility: 'PUBLIC' as const,
+        defaultBranch: 'main',
+      },
+      issue: {
+        number: 17,
+        url: snapshot.issue.url,
+        title: snapshot.issue.title,
+        body: snapshot.issue.body,
+        authorLogin: snapshot.issue.authorLogin,
+        authorId: snapshot.issue.authorId,
+        updatedAt: snapshot.issue.updatedAt,
+        state: 'OPEN' as const,
+        isPullRequest: false,
+        labels: ['engine:marketplace'],
+      },
+    };
+    const pullRequest = {
+      number: 68,
+      generation,
+      targetRepositoryId: 'R_target',
+      forkRepositoryId: 'R_fork',
+      forkParentRepositoryId: 'R_target',
+      branch,
+      base: 'main',
+      head,
+      open: true,
+      draft: true,
+    };
+    const githubRead = {
+      searchOptedInIssues: vi.fn(async () => ({ issues: [issue] })),
+      readIssue: vi.fn(async () => issue),
+      listLabelEvents: vi.fn(async () => [{
+        action: 'labeled' as const,
+        label: 'engine:marketplace',
+        actorLogin: 'maintainer',
+        actorId: 'U_maintainer',
+        createdAt: '2026-07-28T00:00:01.000Z',
+      }]),
+      readRepositoryPermission: vi.fn(async () => 'MAINTAIN' as const),
+      readDefaultBranchHead: vi.fn(async () => base),
+    };
+    const githubAuthority = {
+      listIssueNumbersForMarkerRecovery: vi.fn(async () => [17]),
+      listIssueComments: vi.fn(async () => [comment]),
+      editIssueCommentExact: vi.fn(async (input: {
+        readonly commentId: number;
+        readonly expectedBody: string;
+        readonly body: string;
+      }) => {
+        expect(input).toMatchObject({
+          commentId: comment.id,
+          expectedBody: comment.body,
+        });
+        comment = { ...comment, body: input.body };
+        return comment;
+      }),
+      readPullRequest: vi.fn(async () => pullRequest),
+      readChecks: vi.fn(async () => checkFacts),
+    };
+    const marketplace = {
+      dryRun: vi.fn(async () => ({
+        id: relayTaskKey(generation, 1),
+        creatorSafe: `0x${'4'.repeat(40)}`,
+        solverNetManifestCid: 'manifest',
+        proposedSpendWei: 1n,
+      })),
+      submit: vi.fn(),
+      observe: vi.fn(),
+    };
+    const relayConfig = config();
+    const reconciliation = createIssueRelayProductionReconciliation({
+      config: relayConfig,
+      stateDirectory: state,
+      githubRead,
+      githubWrite: {} as never,
+      githubAuthority: githubAuthority as never,
+      marketplace: marketplace as never,
+      adopter: {} as never,
+      artifacts,
+      now: () => new Date('2026-07-28T00:30:00.000Z'),
+    });
+
+    const report = await runIssueRelayCycle({
+      mode: 'active',
+      config: relayConfig,
+      githubRead,
+      githubWrite: {} as never,
+      marketplace: marketplace as never,
+      adopter: {} as never,
+      artifacts,
+      reconciliation,
+      now: () => new Date('2026-07-28T00:30:00.000Z'),
+    });
+
+    expect(report.actions).toMatchObject([
+      { action: 'prepare-round', outcome: 'completed' },
+    ]);
+    expect(marketplace.dryRun).toHaveBeenCalledTimes(1);
+    const repaired = parseRelayIssueCommentMarker(
+      comment.body,
+      'jinn-relay',
+      'jinn-relay',
+    );
+    expect(repaired).toMatchObject({
+      phase: 'funding',
+      rounds: [
+        { round: 0, checks: { status: 'failed', digest: failedChecks.digest } },
+        {
+          round: 1,
+          purpose: 'repair',
+          workspaceRepository: 'jinn-relay/mono',
+          inputHead: head,
+          findings: [expectedFinding],
+          prNumber: 68,
+          fundingIntent: {
+            taskKey: relayTaskKey(generation, 1),
+            spendWei: '1',
+          },
+        },
+      ],
+    });
+    const repairSpecBytes = await artifacts.read(
+      `rounds/17/${snapshot.snapshotDigest.slice('sha256:'.length)}/1/spec.json`,
+    );
+    if (repairSpecBytes === null) {
+      throw new Error('Expected the failed-check repair spec to be durable');
+    }
+    const repairSpec = JSON.parse(repairSpecBytes.toString('utf8')) as {
+      readonly relay: {
+        readonly inputHead: string;
+        readonly findings: readonly unknown[];
+      };
+    };
+    expect(repairSpec.relay).toMatchObject({
+      inputHead: head,
+      findings: [expectedFinding],
+    });
+  });
+
   it('rejects a bot marker copied onto a different live GitHub issue', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'relay-state-'));
     directories.push(parent);
@@ -1765,6 +2055,87 @@ describe('bounded production GitHub ports', () => {
         per_page: '100',
         page: '1',
       });
+  });
+
+  it('recovers a later marked generation without enumerating more than 1000 repository records', async () => {
+    const requests: RelayGitHubApiRequest[] = [];
+    const request = vi.fn(async (
+      input: RelayGitHubApiRequest,
+    ): Promise<{
+      status: number;
+      headers: Readonly<Record<string, string>>;
+      body: unknown;
+    }> => {
+      requests.push(input);
+      if (input.path === '/repos/Jinn-Network/mono') {
+        return { status: 200, headers: {}, body: repository };
+      }
+      if (input.path === '/search/issues') {
+        return {
+          status: 200,
+          headers: {},
+          body: {
+            total_count: 1,
+            incomplete_results: false,
+            items: [{
+              number: 1501,
+              repository_url: 'https://api.github.com/repos/Jinn-Network/mono',
+              url: 'https://api.github.com/repos/Jinn-Network/mono/issues/1501',
+            }],
+          },
+        };
+      }
+      throw new Error(`unexpected recovery request ${input.path}`);
+    });
+    const ports = createRelayGitHubProductionPorts({
+      config: config(),
+      token: 'test-token',
+      request,
+    });
+
+    await expect(ports.authority.listIssueNumbersForMarkerRecovery())
+      .resolves.toEqual([1501]);
+    expect(requests.some(({ path }) =>
+      path === '/repos/Jinn-Network/mono/issues')).toBe(false);
+    expect(requests.find(({ path }) => path === '/search/issues')?.query?.q)
+      .toContain('jinn-issue-relay:generation:v1');
+  });
+
+  it.each([
+    [
+      'incomplete search',
+      {
+        total_count: 1,
+        incomplete_results: true,
+        items: [],
+      },
+    ],
+    [
+      'matching-generation cap',
+      {
+        total_count: 1001,
+        incomplete_results: false,
+        items: [],
+      },
+    ],
+  ])('fails closed on %s during marker-qualified recovery', async (
+    _label,
+    searchBody,
+  ) => {
+    const request = vi.fn(async (input: RelayGitHubApiRequest) => {
+      if (input.path === '/repos/Jinn-Network/mono') {
+        return { status: 200, headers: {}, body: repository };
+      }
+      return { status: 200, headers: {}, body: searchBody };
+    });
+    const ports = createRelayGitHubProductionPorts({
+      config: config(),
+      token: 'test-token',
+      request,
+    });
+
+    await expect(ports.authority.listIssueNumbersForMarkerRecovery())
+      .rejects.toThrow(/incomplete|cap|bound|1000/i);
   });
 
   it('reads back exact PR authority immediately around mark-ready', async () => {

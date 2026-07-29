@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   aggregateRelayChecks,
@@ -101,7 +102,8 @@ const receipt = {
   headRef: 'jinn/issue-relay/example',
   inputHead: HEAD_1,
   resultingHead: HEAD_2,
-  patchDigest: DIGEST,
+  patchDigest:
+    'sha256:f9a7048057393d0fc2ea04f9ee55851600c8aa00503f98cd2d25849ecdc980ba',
   solutionSafe: `0x${'1'.repeat(40)}`,
   adoptedAt: '2026-07-28T10:10:00.000Z',
 } as const;
@@ -419,7 +421,7 @@ const initialReceipt = {
     requestId: `0x${'c'.repeat(64)}`,
     deliveryEnvelopeCid: `f01551220${'0'.repeat(64)}`,
   },
-  workspaceRepository: snapshot.repository.slug,
+  workspaceRepository: receipt.workspaceRepository,
   inputHead: BASE,
   resultingHead: HEAD_1,
   patchDigest: `sha256:${'c'.repeat(64)}`,
@@ -460,7 +462,7 @@ const initialChecks = aggregateRelayChecks({
 const initialAnchor = {
   ...anchor,
   correlation: initialReceipt.correlation,
-  workspaceRepository: snapshot.repository.slug,
+  workspaceRepository: receipt.workspaceRepository,
   evaluatedHead: HEAD_1,
   adoptionReceiptDigest: relayAdoptionReceiptDigest(initialAdoption),
   checksDigest: initialChecks.digest,
@@ -1768,6 +1770,51 @@ describe('Relay PR assurance rendering', () => {
 });
 
 describe('owned Relay report edits', () => {
+  it('publishes the multi-round cross-repository assurance fixture byte-for-byte', async () => {
+    let body = [
+      '<!-- jinn-issue-relay:assurance:v1 -->',
+      '',
+      'IN PROGRESS',
+      '',
+      formatRelayAdoptionReceiptBlock(initialReceipt),
+      '',
+      formatRelayAdoptionReceiptBlock(receipt),
+      '',
+      formatRelayEvaluationAnchorBlock(initialAnchor),
+      '',
+      formatRelayEvaluationAnchorBlock(anchor),
+    ].join('\n');
+    const port: RelayOwnedCommentPort = {
+      async listIssueComments() {
+        return [];
+      },
+      async editIssueComment() {
+        throw new Error('not used');
+      },
+      async listAssuranceComments() {
+        return [{ id: 9, authorLogin: 'jinn-relay[bot]', body }];
+      },
+      async editAssuranceComment(input) {
+        body = input.body;
+      },
+    };
+
+    const published = await createRelayReportPublisher({ port })
+      .publishAssurance({
+        repository: 'Jinn-Network/mono',
+        prNumber: 68,
+        expectedHead: HEAD_2,
+        serviceLogin: 'jinn-relay[bot]',
+        model: readyModel,
+      });
+
+    const expected = readFileSync(
+      new URL('../fixtures/issue-relay-assurance.v1.md', import.meta.url),
+      'utf8',
+    );
+    expect(`${published}\n`).toBe(expected);
+  });
+
   it('edits and reads back the one existing issue comment without a create port', async () => {
     let body = `Visible old status\n\n${formatRelayIssueMarker(record)}`;
     const edits: Array<{ readonly id: number; readonly body: string }> = [];

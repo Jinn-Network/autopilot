@@ -459,7 +459,15 @@ function validateVerdictBindings(input: {
     || solutionExpectation.round.round !== correlation.round
     || solutionExpectation.round.snapshotDigest !== correlation.snapshotDigest
     || solutionExpectation.round.targetRepository !== receipt.targetRepository
-    || solutionExpectation.round.workspaceRepository !== receipt.workspaceRepository
+    || solutionExpectation.round.workspaceRepository !== (
+      solutionExpectation.round.purpose === 'repair'
+        ? receipt.workspaceRepository
+        : receipt.targetRepository
+    )
+    || (
+      solutionExpectation.round.purpose === 'repair'
+      && solutionExpectation.round.prNumber !== receipt.prNumber
+    )
     || solutionExpectation.round.inputHead !== receipt.inputHead
     || receipt.solutionSafe.toLocaleLowerCase('en-US')
       !== input.adoption.receipt.solutionSafe.toLocaleLowerCase('en-US')

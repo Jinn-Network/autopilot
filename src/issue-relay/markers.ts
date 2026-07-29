@@ -289,10 +289,16 @@ function hasValidRoundSequence(record: RelayGenerationRecordV1): boolean {
     && (
       index === 0
       || (
-        record.rounds[index - 1]?.verdict?.outcome === 'request-changes'
-        && record.rounds[index - 1]?.verdict?.evaluatedHead === round.inputHead
-        && record.rounds[index - 1]?.adoption?.disposition === 'accepted'
+        record.rounds[index - 1]?.adoption?.disposition === 'accepted'
         && record.rounds[index - 1]?.adoption?.resultingHead === round.inputHead
+        && (
+          (
+            record.rounds[index - 1]?.verdict?.outcome === 'request-changes'
+            && record.rounds[index - 1]?.verdict?.evaluatedHead
+              === round.inputHead
+          )
+          || record.rounds[index - 1]?.checks?.status === 'failed'
+        )
       )
     )
   ));
@@ -464,11 +470,19 @@ function relayPhaseCanAdvance(
       return ['solution-delivered', 'cancelling', 'closed', 'exhausted']
         .includes(proposed);
     case 'solution-delivered':
-      return ['draft-open', 'cancelling', 'closed'].includes(proposed);
+      return ['draft-open', 'cancelling', 'closed', 'exhausted']
+        .includes(proposed);
     case 'draft-open':
-      return ['evaluating', 'cancelling', 'closed'].includes(proposed);
+      return ['funding', 'evaluating', 'cancelling', 'closed', 'exhausted']
+        .includes(proposed);
     case 'evaluating':
-      return ['repair-needed', 'ready', 'cancelling', 'closed'].includes(proposed);
+      return [
+        'repair-needed',
+        'ready',
+        'cancelling',
+        'closed',
+        'exhausted',
+      ].includes(proposed);
     case 'repair-needed':
       return ['funding', 'cancelling', 'closed', 'exhausted'].includes(proposed);
     case 'cancelling':

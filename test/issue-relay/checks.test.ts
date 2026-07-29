@@ -4,6 +4,7 @@ import {
   aggregateRelayChecks,
   createRelayEvaluationAnchorPublisher,
   parseRelayEvaluationAnchorBlock,
+  relayFailedCheckFindings,
   type RelayEvaluationAnchorPort,
   type RelayGitHubCheckFact,
 } from '../../src/issue-relay/checks.js';
@@ -74,6 +75,33 @@ function aggregate(
 }
 
 describe('exact-head Relay check aggregation', () => {
+  it('turns stable failed required checks into bounded exact-head repair findings', () => {
+    const summary = aggregate([
+      { ...success, conclusion: 'failure' },
+      {
+        kind: 'status-context',
+        name: 'relay/typecheck',
+        head: HEAD,
+        state: 'failure',
+      },
+    ]);
+
+    expect(relayFailedCheckFindings(summary)).toEqual([
+      {
+        code: 'required-check-failed-1',
+        title: 'Required repository check failed',
+        detail: expect.stringContaining(`"build" failed on exact head ${HEAD}`),
+      },
+      {
+        code: 'required-check-failed-2',
+        title: 'Required repository check failed',
+        detail: expect.stringContaining(
+          `"relay/typecheck" failed on exact head ${HEAD}`,
+        ),
+      },
+    ]);
+  });
+
   it('keeps case-distinct check names as different identities', () => {
     const summary = aggregate([{
       ...success,

@@ -550,6 +550,7 @@ function validateReadyAssurance(
     || evidence.record.pr.visibility !== evidence.currentPr.visibility
     || evidence.record.pr.managedFork !== evidence.currentPr.managedFork
     || evidence.currentPr.number !== receipt.prNumber
+    || evidence.currentPr.forkRepository !== receipt.workspaceRepository
     || evidence.currentPr.branch !== receipt.headRef
     || evidence.currentPr.head !== receipt.resultingHead
     || evidence.currentPr.base !== evidence.evaluationAnchor.targetBase
@@ -570,7 +571,6 @@ function validateReadyAssurance(
     || durableRound?.round !== receipt.correlation.round
     || durableRound.round !== evidence.verdict.round.round
     || durableRound.purpose !== evidence.verdict.round.purpose
-    || durableRound.workspaceRepository !== receipt.workspaceRepository
     || durableRound.workspaceRepository
       !== evidence.verdict.round.workspaceRepository
     || durableRound.inputHead !== receipt.inputHead
@@ -579,9 +579,9 @@ function validateReadyAssurance(
       durableRound.purpose === 'initial'
       && (
         durableRound.workspaceRepository !== receipt.targetRepository
-        || receipt.workspaceRepository !== receipt.targetRepository
+        || receipt.workspaceRepository !== currentPr.forkRepository
         || evidence.evaluationAnchor.workspaceRepository
-          !== receipt.targetRepository
+          !== currentPr.forkRepository
         || evidence.verdict.round.workspaceRepository
           !== receipt.targetRepository
         || durableRound.inputHead
@@ -593,6 +593,7 @@ function validateReadyAssurance(
       durableRound.purpose === 'repair'
       && (
         durableRound.workspaceRepository === receipt.targetRepository
+        || durableRound.workspaceRepository !== receipt.workspaceRepository
         || currentPr.forkRepository !== receipt.workspaceRepository
         || currentPr.forkRepository
           !== evidence.evaluationAnchor.workspaceRepository
