@@ -18,7 +18,9 @@ this repository.
 - Authenticated Hermes with the Jinn plugin installed and enabled
 - An organization-owned public GitHub repository where you have admin rights
 - An implementation GitHub token (`AUTOPILOT_GITHUB_IMPLEMENT_TOKEN`), and
-  optionally a distinct review token (`AUTOPILOT_GITHUB_REVIEW_TOKEN`)
+  optionally a distinct review token (`AUTOPILOT_GITHUB_REVIEW_TOKEN`) — only
+  when credentials are not already stored under `~/.autopilot/` (see
+  [Where state lives](#where-state-lives))
 
 ## Install from this clone
 
@@ -27,9 +29,22 @@ cd /path/to/autopilot
 yarn install
 yarn build
 node dist/autopilot.js --help
-yarn link
-# or: alias autopilot="node /path/to/autopilot/dist/autopilot.js"
 ```
+
+Invoke from any directory with the built bundle (this is the proven local path):
+
+```text
+node /path/to/autopilot/dist/autopilot.js --help
+```
+
+Optional: add a shell alias so the examples below can use `autopilot`:
+
+```text
+alias autopilot="node /path/to/autopilot/dist/autopilot.js"
+```
+
+Yarn 4 (`yarn link`) does not put `autopilot` on your PATH; use
+`node /path/to/autopilot/dist/autopilot.js` or the alias above.
 
 ## Initialize a target repository
 
@@ -38,6 +53,7 @@ product repo unless that is intentional.
 
 ```text
 cd /path/to/target-repo
+# skip exports when credentials already live in ~/.autopilot/
 export AUTOPILOT_GITHUB_IMPLEMENT_TOKEN=...
 # optional: export AUTOPILOT_GITHUB_REVIEW_TOKEN=...
 autopilot init
