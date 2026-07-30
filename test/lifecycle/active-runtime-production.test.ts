@@ -193,6 +193,12 @@ describe('production active runtime preflight', () => {
         submit: vi.fn(),
         recover: vi.fn(),
       },
+      marketplaceObservationHelp: vi.fn(async () => ({
+        exitCode: 0,
+        stdout: 'tasks observe-autopilot-delivery',
+        stderr: '',
+      })),
+      marketplaceVerificationPreflight: vi.fn(async () => ({ ok: true })),
       now: () => NOW,
       nextId: () => ids.shift()!,
     });
@@ -428,6 +434,37 @@ describe('production active runtime preflight', () => {
     expect(readReviewSnapshot).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
     expect(trackAttemptChild).not.toHaveBeenCalled();
+  });
+
+  it('exposes a marketplace adoption factory bound to runtime authority inputs', () => {
+    const readSnapshot = vi.fn(async () => ({ snapshotComplete: true }));
+    const factory = vi.fn(() => ({
+      adopt: vi.fn(async () => ({ status: 'recoverable', stage: 'test', detail: 'noop' })),
+    }));
+    const active = marketplaceRuntime({
+      readImplementationSnapshot: readSnapshot,
+      makeMarketplaceMutationAdoptionCoordinator: factory,
+    });
+
+    expect(active.makeMarketplaceMutationAdoptionCoordinator).toBeTypeOf('function');
+    const coordinator = active.makeMarketplaceMutationAdoptionCoordinator!({
+      manifestPath: '/attempt/marketplace-manifest.json',
+      readSnapshot,
+    });
+    expect(factory).toHaveBeenCalledWith(expect.objectContaining({
+      originManifestPath: '/attempt/marketplace-manifest.json',
+      repositoryPath: '/repo',
+      worktreeBase: '/tmp/autopilot-marketplace-preflight-test',
+      runnerId: 'runner-a',
+      readSnapshot,
+      staleAfterMs: 60_000,
+    }));
+    expect(coordinator.adopt).toBeTypeOf('function');
+  });
+
+  it('does not expose a marketplace adoption factory in local mode', () => {
+    const active = marketplaceRuntime({ executionBackend: 'local' });
+    expect(active.makeMarketplaceMutationAdoptionCoordinator).toBeUndefined();
   });
 
   it('returns one stable unavailable result per marketplace review before local capacity or quota reads', async () => {

@@ -21,6 +21,9 @@ import {
   MarketplaceTaskCliAdapter,
   MarketplaceTaskCliFailure,
   MarketplaceTaskCliProtocolError,
+  MARKETPLACE_LANGUAGE,
+  MARKETPLACE_REPOSITORY,
+  MARKETPLACE_VERIFICATION_PROFILE,
   persistMarketplaceTaskRequest,
   resolveInstalledJinnBinary,
   verifyMarketplaceTaskRequest,
@@ -176,6 +179,12 @@ function buildInput(
 }
 
 describe('marketplace Task request builder', () => {
+  it('uses the plan-mandated public fixed marketplace profile literals', () => {
+    expect(MARKETPLACE_REPOSITORY).toBe('Jinn-Network/mono');
+    expect(MARKETPLACE_LANGUAGE).toBe('typescript');
+    expect(MARKETPLACE_VERIFICATION_PROFILE).toBe('jinn-mono.v1');
+  });
+
   it('builds the fixed implementation profile and default one-shot timing policy through SDK contracts', () => {
     const built = buildMarketplaceTaskRequest(buildInput());
 

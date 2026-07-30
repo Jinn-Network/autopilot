@@ -94,6 +94,9 @@ export interface LifecycleControllerDeps {
    * reconciliation, or claim work. Active capability preflight runs first.
    */
   readonly recoverMarketplaceAttempts?: () => Promise<void>;
+  readonly recoverPreparedMarketplaceSubmissions?: () => Promise<void>;
+  readonly recoverSubmittedMarketplaceAdoptions?: () => Promise<void>;
+  readonly onLifecyclePhase?: (phase: string) => void;
   readonly writer?: ReconciliationWriter;
   readonly writerForSnapshot?: (snapshot: GitHubLifecycleSnapshot) => ReconciliationWriter;
   readonly now: () => Date;
@@ -1226,6 +1229,10 @@ export async function runLifecycleCycle(
   deps: LifecycleControllerDeps,
 ): Promise<LifecycleCycleReport> {
   deps.resetGitHubUsage?.();
+  const emitPhase = (phase: string): void => {
+    deps.onLifecyclePhase?.(phase);
+  };
+  emitPhase('initialize');
   if (mode === 'active' && deps.active === undefined) {
     return {
       status: 'rejected',
@@ -1272,7 +1279,21 @@ export async function runLifecycleCycle(
     }
   }
   if (mode === 'active' || mode === 'recover') {
-    await deps.recoverMarketplaceAttempts?.();
+    if (
+      deps.recoverPreparedMarketplaceSubmissions !== undefined
+      || deps.recoverSubmittedMarketplaceAdoptions !== undefined
+    ) {
+      if (deps.recoverPreparedMarketplaceSubmissions !== undefined) {
+        emitPhase('recover-prepared-submissions');
+        await deps.recoverPreparedMarketplaceSubmissions();
+      }
+      if (deps.recoverSubmittedMarketplaceAdoptions !== undefined) {
+        emitPhase('recover-submitted-adoptions');
+        await deps.recoverSubmittedMarketplaceAdoptions();
+      }
+    } else {
+      await deps.recoverMarketplaceAttempts?.();
+    }
   }
   const rateLimitFloor = Math.max(DEFAULT_FLOOR, deps.rateLimitFloor ?? DEFAULT_FLOOR);
   let scopedCycleId: string | undefined;
@@ -1313,6 +1334,7 @@ export async function runLifecycleCycle(
   }
   let snapshot: GitHubLifecycleSnapshot;
   try {
+    emitPhase('read-snapshot');
     snapshot = await deps.readSnapshot(rateLimitFloor);
   } catch (error) {
     if (scopedPass !== undefined) {
@@ -1454,6 +1476,7 @@ export async function runLifecycleCycle(
   };
   const now = deps.now();
   if (mode === 'active') {
+    emitPhase('dispatch');
     const activePass = await executeActivePass(snapshot, deps, cycleId, now);
     const combinedReconciliation = scopedPass === undefined
       ? activePass.reconciliation
@@ -1481,6 +1504,7 @@ export async function runLifecycleCycle(
       reconciliation: combinedReconciliation,
     });
   }
+  emitPhase('dispatch');
   const view = deriveLifecycle(snapshot.lifecycle, now, deps.staleAfterMs);
   const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
   const plan = planProjection(context);

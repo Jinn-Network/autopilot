@@ -25,6 +25,7 @@ import {
 import {
   MarketplaceSessionExecutionBackend,
   recoverPreparedMarketplaceAttempts,
+  recoverSubmittedMarketplaceAttempts,
 } from '../src/lifecycle/session-execution-backend.js';
 import {
   MARKETPLACE_LANGUAGE,
@@ -33,7 +34,14 @@ import {
 } from '../src/lifecycle/marketplace-task.js';
 import {
   assertMarketplaceRuntimeProfile,
+  makeMarketplaceRecoveryReadSnapshot,
+  makeProductionMarketplaceAdoptionRecoveryCoordinator,
 } from '../src/lifecycle/active-runtime-production.js';
+import { releaseMarketplaceReviewAnchor } from '../src/lifecycle/marketplace-review-anchor.js';
+import type { MarketplaceReviewAnchorEvidence } from '../src/lifecycle/marketplace-execution-state.js';
+import type { ReviewSessionPort } from '../src/lifecycle/review-session.js';
+import { makeProductionReviewSessionPort } from '../src/lifecycle/review-session-production.js';
+import type { GitHubLifecycleSnapshot } from '../src/lifecycle/snapshot.js';
 import type { SpawnFn } from '../src/dispatcher/coordinator-session.js';
 import {
   paintBoardOptionsFromConfig,
@@ -274,6 +282,36 @@ export function makeMarketplaceRecoveryCredentialResolver(
       );
     }
     return selection.credential;
+  };
+}
+
+export function makeMarketplaceReviewAnchorRelease(input: {
+  readonly runner: CommandRunner;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly now?: () => Date;
+  readonly makeReviewPort?: (options: {
+    readonly runner: CommandRunner;
+    readonly environment: NodeJS.ProcessEnv;
+  }) => ReviewSessionPort;
+  readonly release?: (
+    anchor: MarketplaceReviewAnchorEvidence,
+    port: ReviewSessionPort,
+    now: () => Date,
+  ) => Promise<void>;
+}): (anchor: MarketplaceReviewAnchorEvidence) => Promise<void> {
+  const makeReviewPort =
+    input.makeReviewPort ?? makeProductionReviewSessionPort;
+  const release = input.release ?? releaseMarketplaceReviewAnchor;
+  const now = input.now ?? (() => new Date());
+  return async (anchor): Promise<void> => {
+    const reviewPort = makeReviewPort({
+      runner: input.runner,
+      environment: {
+        ...input.environment,
+        JINN_AUTOPILOT_SESSION_MANIFEST: anchor.manifestPath,
+      },
+    });
+    await release(anchor, reviewPort, now);
   };
 }
 
@@ -635,7 +673,7 @@ export async function runAutopilotV2(
         adapter: marketplaceTaskAdapter,
         now: () => new Date(),
       });
-  const recoverMarketplaceAttempts =
+  const recoverPreparedMarketplaceSubmissions =
     marketplaceExecutionBackend === undefined
       ? undefined
       : makeMarketplaceRecoveryCallback({
@@ -654,6 +692,54 @@ export async function runAutopilotV2(
             );
           },
         });
+  const makeRecoveryReadSnapshot = (
+    manifestPath: string,
+  ): (() => Promise<GitHubLifecycleSnapshot>) =>
+    makeMarketplaceRecoveryReadSnapshot({
+      manifestPath,
+      readCycleSnapshot,
+      readTargetedPullRequestSnapshot: async (cycleSnapshot, prNumber) =>
+        targetedAuthoritySnapshot(
+          await targeted.readPullRequest(cycleSnapshot, prNumber),
+        ),
+    });
+  const recoverSubmittedMarketplaceAdoptions =
+    marketplaceExecutionBackend === undefined
+      ? undefined
+      : async (): Promise<void> => {
+          assertMarketplaceRuntimeProfile({
+            repository: loaded.config.repository.slug,
+            language: MARKETPLACE_LANGUAGE,
+            verificationProfile: MARKETPLACE_VERIFICATION_PROFILE,
+          });
+          const releaseReviewAnchor = makeMarketplaceReviewAnchorRelease({
+            runner,
+            environment: runtimeEnvironment,
+          });
+          const result = await recoverSubmittedMarketplaceAttempts({
+            v2Base: v2AttemptsBase,
+            recoverPrepared: async () => [],
+            makeAdopter: (manifestPath) =>
+              makeProductionMarketplaceAdoptionRecoveryCoordinator({
+                manifestPath,
+                repositoryPath,
+                worktreeBase,
+                runnerId,
+                credentials: credentials!,
+                staleAfterMs,
+                runner,
+                environment: runtimeEnvironment,
+                readRecoverySnapshot: makeRecoveryReadSnapshot(manifestPath),
+              }),
+            releaseReviewAnchor,
+            isPidAlive: childIsAlive,
+          });
+          if (!result.ok) {
+            throw new Error(
+              result.detail ?? 'submitted marketplace adoption recovery failed',
+            );
+          }
+        };
   const cleanupEnabled = options.mode === 'active'
     && activeCleanupEnabled(
       env.JINN_AUTOPILOT_CLEANUP_ENABLED,
@@ -779,9 +865,12 @@ export async function runAutopilotV2(
         readGitHubUsage: () => reader.githubUsage(),
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
         ...(active === undefined ? {} : { active }),
-        ...(recoverMarketplaceAttempts === undefined
+        ...(recoverPreparedMarketplaceSubmissions === undefined
           ? {}
-          : { recoverMarketplaceAttempts }),
+          : { recoverPreparedMarketplaceSubmissions }),
+        ...(recoverSubmittedMarketplaceAdoptions === undefined
+          ? {}
+          : { recoverSubmittedMarketplaceAdoptions }),
         now: () => new Date(),
         staleAfterMs,
         runnerId,

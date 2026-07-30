@@ -31,6 +31,11 @@ function claim(overrides: Partial<BranchClaim> = {}): BranchClaim {
   };
 }
 
+function initialClaimWithoutPr(): BranchClaim {
+  const { prNumber: _prNumber, ...initial } = claim();
+  return initial;
+}
+
 function manifest(expectedHead: GitOid = CLAIM): AttemptManifest {
   return {
     version: 2,
@@ -224,6 +229,37 @@ function harness(options: {
 }
 
 describe('implementation session protocol', () => {
+  it('owns the exact initial implement claim created before its PR', async () => {
+    const h = harness({
+      latestClaim: initialClaimWithoutPr(),
+      latestClaimOid: CLAIM,
+      remoteHead: CLAIM,
+      localHead: WORK,
+    });
+
+    await expect(h.protocol.checkpoint(h.manifest)).resolves.toEqual({
+      status: 'published',
+      head: WORK,
+    });
+    expect(h.events).toEqual([
+      `push:${CLAIM}->${WORK}`,
+      `manifest:${CLAIM}->${WORK}`,
+    ]);
+  });
+
+  it('rejects an explicit wrong PR on the exact initial claim', async () => {
+    const h = harness({
+      latestClaim: claim({ prNumber: 85 }),
+      latestClaimOid: CLAIM,
+      remoteHead: CLAIM,
+      localHead: WORK,
+    });
+
+    await expect(h.protocol.checkpoint(h.manifest))
+      .rejects.toThrow(/no longer owns the latest claim/i);
+    expect(h.events).toEqual([]);
+  });
+
   it('checkpoints one real tree change through the exact expected-head lease', async () => {
     const h = harness();
 

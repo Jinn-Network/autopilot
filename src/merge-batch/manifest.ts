@@ -1,4 +1,5 @@
 import { planMergeBatchWaves } from './waves.js';
+import { JINN_MONO_REPOSITORY } from '../runtime-profile.js';
 import type {
   MergeBatchManifest,
   MergeBatchPr,
@@ -32,7 +33,7 @@ export function createMergeBatchManifest(input: CreateManifestInput): MergeBatch
 
   return {
     schemaVersion: 1,
-    repo: 'Jinn-Network/mono',
+    repo: JINN_MONO_REPOSITORY,
     baseBranch: 'next',
     baseNextSha: input.baseNextSha,
     createdAt: input.createdAt,

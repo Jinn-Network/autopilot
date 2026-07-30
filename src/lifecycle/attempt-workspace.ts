@@ -27,7 +27,7 @@ import {
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
-import { gitOid, gitRefName, isoTimestamp } from './types.js';
+import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
   persistMarketplaceTaskRequest,
   verifyMarketplaceTaskRequest,
@@ -40,6 +40,15 @@ import {
   sanitizedGitHubCommandOverlay,
   type SelectedCredential,
 } from './credentials.js';
+import {
+  MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION,
+  MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION,
+  decodeMarketplaceEvaluatorLegExecutionState,
+  decodeMarketplaceExecutionV3State,
+  type MarketplaceEvaluatorLegExecutionState,
+  type MarketplaceExecutionV3State,
+  type MarketplaceReviewAnchorEvidence,
+} from './marketplace-execution-state.js';
 
 export type AttemptPhase = 'implement' | 'review';
 export type AttemptProcessState = 'preparing' | 'running' | 'exited';
@@ -47,7 +56,7 @@ export type ReviewApprovalPolicy = 'approve-eligible' | 'human-codeowner';
 export const MARKETPLACE_EXECUTION_SCHEMA_VERSION = 'marketplace-execution-v1';
 export const MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION = 'marketplace-execution-v2';
 
-interface MarketplacePreparedExecutionFields {
+export interface MarketplacePreparedExecutionFields {
   readonly requestPath: string;
   readonly requestDigest: string;
   readonly solverNetSelectionPath: string;
@@ -85,7 +94,9 @@ export type MarketplaceExecutionState =
       readonly status: 'cancelled';
       readonly cancelledAt: string;
       readonly reason: string;
-    } & MarketplacePreparedExecutionFields);
+    } & MarketplacePreparedExecutionFields)
+  | MarketplaceExecutionV3State
+  | MarketplaceEvaluatorLegExecutionState;
 
 export type AttemptExecution =
   | { readonly backend: 'local' }
@@ -294,7 +305,7 @@ function exactKeys(
   if (missing !== undefined) throw new Error(`Missing ${name} field: ${missing}`);
 }
 
-function decodeMarketplaceExecutionState(value: unknown): MarketplaceExecutionState {
+function decodeMarketplaceExecutionState(value: unknown, attemptDir: string): MarketplaceExecutionState {
   const state = record(value, 'marketplace execution state');
   if (state.schemaVersion === MARKETPLACE_EXECUTION_SCHEMA_VERSION && state.status === 'unsubmitted') {
     exactKeys(state, [
@@ -328,6 +339,12 @@ function decodeMarketplaceExecutionState(value: unknown): MarketplaceExecutionSt
   }
   if (state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION) {
     return decodeMarketplaceExecutionV2State(state);
+  }
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) {
+    return decodeMarketplaceExecutionV3State(state, attemptDir);
+  }
+  if (state.schemaVersion === 'marketplace-evaluator-leg-v1') {
+    return decodeMarketplaceEvaluatorLegExecutionState(state, attemptDir);
   }
   if (
     state.schemaVersion !== MARKETPLACE_EXECUTION_SCHEMA_VERSION
@@ -459,7 +476,7 @@ function decodeMarketplaceExecutionV2State(
   throw new Error('Invalid marketplace execution status');
 }
 
-function decodeAttemptExecution(value: unknown): AttemptExecution {
+function decodeAttemptExecution(value: unknown, attemptDir: string): AttemptExecution {
   const execution = record(value, 'attempt execution');
   if (execution.backend === 'local') {
     exactKeys(execution, ['backend'], 'local attempt execution');
@@ -469,7 +486,7 @@ function decodeAttemptExecution(value: unknown): AttemptExecution {
     exactKeys(execution, ['backend', 'state'], 'marketplace attempt execution');
     return {
       backend: 'marketplace',
-      state: decodeMarketplaceExecutionState(execution.state),
+      state: decodeMarketplaceExecutionState(execution.state, attemptDir),
     };
   }
   throw new Error('Invalid attempt execution backend');
@@ -568,6 +585,116 @@ function processState(value: unknown): AttemptProcessState {
   return value;
 }
 
+function strictMarketplaceStateTimestamp(
+  execution: AttemptExecution,
+): string | undefined {
+  if (execution.backend !== 'marketplace') return undefined;
+  const state = execution.state;
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) {
+    switch (state.status) {
+      case 'prepared':
+        return state.preparedAt;
+      case 'submitted':
+        return state.submittedAt;
+      case 'solution-observed':
+        return state.delivery.observedAt;
+      case 'solution-verified':
+        return state.verification.verifiedAt;
+      case 'host-committed':
+        return state.hostCommit.createdAt;
+      case 'lifecycle-completed':
+        return state.completion.confirmedAt;
+      case 'review-anchored':
+        return state.reviewAnchor.anchoredAt;
+      case 'receipt-published':
+        return state.receipt.recordedAt;
+      case 'cancelled':
+        return state.cancelledAt;
+    }
+  }
+  if (state.schemaVersion === 'marketplace-evaluator-leg-v1') {
+    return state.status === 'released' ? state.releasedAt : state.anchoredAt;
+  }
+  return undefined;
+}
+
+function requireMarketplaceManifestAuthority(
+  execution: AttemptExecution,
+  authority: {
+    readonly attemptId: string;
+    readonly phase: AttemptPhase;
+    readonly prNumber?: number;
+    readonly branch: string;
+    readonly expectedHead: GitOid;
+    readonly claimOid: GitOid;
+    readonly reviewGeneration?: string;
+    readonly reviewRefOid?: GitOid;
+    readonly reviewApprovalPolicy?: ReviewApprovalPolicy;
+    readonly selectedLogin: string;
+  },
+): void {
+  if (execution.backend !== 'marketplace') return;
+  const state = execution.state;
+  if (state.schemaVersion === 'marketplace-evaluator-leg-v1') {
+    if (
+      authority.phase !== 'review'
+      || authority.reviewApprovalPolicy !== 'approve-eligible'
+      || state.prNumber !== authority.prNumber
+      || state.expectedHead !== authority.expectedHead
+      || state.generation !== authority.reviewGeneration
+      || state.reviewRefOid !== authority.reviewRefOid
+      || state.reviewer !== authority.selectedLogin
+    ) {
+      throw new Error('Marketplace evaluator contradicts review manifest authority');
+    }
+    return;
+  }
+  if (state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) return;
+  if ('submission' in state && state.submission.id !== `autopilot:${authority.attemptId}`) {
+    throw new Error('Marketplace execution contradicts manifest authority');
+  }
+  const progress = state.status === 'receipt-published'
+    ? state.progress
+    : 'delivery' in state
+      ? state
+      : undefined;
+  if (progress === undefined) return;
+  if (
+    progress.delivery.correlation.v2AttemptId !== authority.attemptId
+    || progress.delivery.correlation.prNumber !== authority.prNumber
+    || progress.delivery.correlation.claimOid !== authority.claimOid
+    // Delivery correlation binds the immutable head submitted to the
+    // marketplace. The outer manifest expectedHead remains equal to it until
+    // adoption creates a host commit, after which the dedicated publication
+    // CAS may advance expectedHead through checkpoint and completion heads.
+    || (
+      progress.delivery.correlation.expectedHead !== authority.expectedHead
+      && !('hostCommit' in progress)
+    )
+  ) {
+    throw new Error('Marketplace execution contradicts manifest authority');
+  }
+  const completion = progress.status === 'lifecycle-completed'
+    || progress.status === 'review-anchored'
+    ? progress.completion
+    : undefined;
+  if (
+    completion !== undefined
+    && (
+      completion.claimOid !== authority.claimOid
+      || (
+        completion.operation === 'implementation-complete'
+          ? completion.prNumber !== authority.prNumber
+            || completion.branch !== authority.branch
+          : completion.parentPrNumber !== authority.prNumber
+            || completion.parentBranch !== authority.branch
+      )
+    )
+  ) {
+    throw new Error('Marketplace execution contradicts manifest authority');
+  }
+}
+
 export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const manifest = record(value, 'attempt manifest');
   exactKeys(manifest, [
@@ -601,8 +728,9 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   if (phase !== 'implement' && phase !== 'review') {
     throw new Error('Invalid attempt phase');
   }
+  const paths = decodePaths(manifest.paths);
   const execution = Object.hasOwn(manifest, 'execution')
-    ? decodeAttemptExecution(manifest.execution)
+    ? decodeAttemptExecution(manifest.execution, paths.attemptDir)
     : { backend: 'local' } as const;
   const attemptId = uuid(stringField(manifest.attemptId, 'attempt ID'), 'attempt ID');
   const runnerId = safeComponent(stringField(manifest.runnerId, 'runner ID'), 'runner ID');
@@ -618,6 +746,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const expectedSubject = phase === 'implement' ? `issue-${issueNumber}` : `pr-${prNumber}`;
   if (subject !== expectedSubject) throw new Error('Attempt subject does not match phase identity');
   const expectedHead = gitOid(stringField(manifest.expectedHead, 'expected head'));
+  const branch = gitRefName(stringField(manifest.branch, 'branch'));
+  const targetBase = gitRefName(stringField(manifest.targetBase, 'target base'));
   const targetBaseOid = manifest.targetBaseOid === undefined
     ? undefined
     : gitOid(stringField(manifest.targetBaseOid, 'target base OID'));
@@ -625,12 +755,14 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     targetBaseOid !== undefined
     && !(
       execution.backend === 'marketplace'
-      && execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      && (execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+        || execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION)
     )
   ) {
     throw new Error('Target base OID is not valid for attempt manifests');
   }
   const claimOid = gitOid(stringField(manifest.claimOid, 'claim OID'));
+  const selectedLogin = stringField(manifest.selectedLogin, 'selected login');
   const reviewGeneration = manifest.reviewGeneration === undefined
     ? undefined
     : uuid(stringField(manifest.reviewGeneration, 'review generation'), 'review generation');
@@ -705,6 +837,29 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   ) {
     throw new Error('Marketplace cancelled timestamp postdates manifest updated timestamp');
   }
+  const strictMarketplaceTimestamp = strictMarketplaceStateTimestamp(execution);
+  if (
+    strictMarketplaceTimestamp !== undefined
+    && Date.parse(strictMarketplaceTimestamp) > Date.parse(timestamps.updatedAt)
+  ) {
+    throw new Error('Marketplace execution timestamp postdates manifest updated timestamp');
+  }
+  requireMarketplaceManifestAuthority(execution, {
+    attemptId,
+    phase,
+    ...(prNumber === undefined ? {} : { prNumber }),
+    branch,
+    expectedHead,
+    claimOid,
+    ...(reviewGeneration === undefined
+      ? {}
+      : {
+          reviewGeneration,
+          reviewRefOid: reviewRefOid!,
+          reviewApprovalPolicy: reviewApprovalPolicy!,
+        }),
+    selectedLogin,
+  });
   return {
     version: 2,
     attemptId,
@@ -715,8 +870,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     subject,
     issueNumber,
     ...(prNumber === undefined ? {} : { prNumber }),
-    branch: gitRefName(stringField(manifest.branch, 'branch')),
-    targetBase: gitRefName(stringField(manifest.targetBase, 'target base')),
+    branch,
+    targetBase,
     ...(targetBaseOid === undefined ? {} : { targetBaseOid }),
     expectedHead,
     claimOid,
@@ -727,12 +882,12 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
           reviewRefOid: reviewRefOid!,
           reviewApprovalPolicy: reviewApprovalPolicy!,
         }),
-    selectedLogin: stringField(manifest.selectedLogin, 'selected login'),
+    selectedLogin,
     repository: decodeRepositoryIdentity(manifest.repository),
     processState: decodedProcessState,
     pid,
     ...(terminalHead === undefined ? {} : { terminalHead }),
-    paths: decodePaths(manifest.paths),
+    paths,
     timestamps,
   };
 }
@@ -769,6 +924,202 @@ function writeManifestAtomic(path: string, manifest: AttemptManifest): void {
   }
 }
 
+export interface MarketplaceAttemptProcessClaimOptions {
+  readonly pid?: number;
+  readonly isPidAlive?: (pid: number) => boolean;
+  readonly now?: () => Date;
+}
+
+function marketplaceProcessPidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function assertMarketplaceProcessClaimable(manifest: AttemptManifest): void {
+  if (manifest.execution.backend !== 'marketplace') {
+    throw new Error('Only marketplace attempts may acquire a process lease');
+  }
+  const state = manifest.execution.state;
+  if (state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) {
+    if (state.status === 'anchored') return;
+    throw new Error('Terminal marketplace evaluator leg cannot acquire a process lease');
+  }
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION) {
+    if (state.status === 'submitted') return;
+    if (state.status === 'cancelled') {
+      throw new Error('Terminal marketplace attempt cannot acquire a process lease');
+    }
+    throw new Error('Only a submitted marketplace attempt may acquire a process lease');
+  }
+  if (state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION) {
+    switch (state.status) {
+      case 'submitted':
+      case 'solution-observed':
+      case 'solution-verified':
+      case 'host-committed':
+      case 'lifecycle-completed':
+      case 'review-anchored':
+        return;
+      case 'cancelled':
+      case 'receipt-published':
+        throw new Error('Terminal marketplace attempt cannot acquire a process lease');
+      case 'prepared':
+        throw new Error('Only a submitted marketplace attempt may acquire a process lease');
+    }
+  }
+  throw new Error('Unsupported marketplace attempt cannot acquire a process lease');
+}
+
+function withMarketplaceStateTransitionLock<T>(
+  path: string,
+  transition: () => T,
+): T {
+  const lockPath = `${path}.marketplace-state-transition.lock`;
+  let descriptor: number | undefined;
+  let acquired = false;
+  try {
+    try {
+      descriptor = openSync(lockPath, 'wx', 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('Marketplace state transition already in progress');
+      }
+      throw error;
+    }
+    acquired = true;
+    writeFileSync(
+      descriptor,
+      `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+      'utf8',
+    );
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    fsyncDirectory(dirname(path));
+    return transition();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    if (acquired && existsSync(lockPath)) {
+      rmSync(lockPath);
+      fsyncDirectory(dirname(path));
+    }
+  }
+}
+
+export function claimMarketplaceAttemptProcess(
+  manifestPath: string,
+  options: MarketplaceAttemptProcessClaimOptions = {},
+): AttemptManifest {
+  const claimantPid = positiveInteger(
+    options.pid ?? process.pid,
+    'marketplace process PID',
+  );
+  const isPidAlive = options.isPidAlive ?? marketplaceProcessPidIsAlive;
+  return withMarketplaceStateTransitionLock(manifestPath, () => {
+    const current = readAttemptManifest(manifestPath);
+    assertMarketplaceProcessClaimable(current);
+    if (current.processState === 'exited') {
+      throw new Error('Exited marketplace attempt cannot acquire a process lease');
+    }
+    if (current.processState === 'running' && current.pid === claimantPid) {
+      return current;
+    }
+    if (
+      current.processState === 'running'
+      && current.pid !== null
+      && isPidAlive(current.pid)
+    ) {
+      throw new Error('Marketplace attempt process lease is held by a live PID');
+    }
+    const timestamp = transitionTimestamp(options.now ?? (() => new Date()));
+    if (Date.parse(timestamp) < Date.parse(current.timestamps.updatedAt)) {
+      throw new Error('Marketplace process claim predates the manifest update');
+    }
+    const claimed = decodeAttemptManifest({
+      ...current,
+      processState: 'running',
+      pid: claimantPid,
+      timestamps: {
+        ...current.timestamps,
+        updatedAt: timestamp,
+        childStartedAt: timestamp,
+      },
+    });
+    writeManifestAtomic(manifestPath, claimed);
+    return claimed;
+  });
+}
+
+/** Dedicated internal boundary for strict marketplace state transitions. */
+export function replaceMarketplaceExecutionState(
+  path: string,
+  expectedState: MarketplaceExecutionState,
+  state: MarketplaceExecutionState,
+  updatedAt: string,
+): AttemptManifest {
+  return withMarketplaceStateTransitionLock(path, () => {
+    const current = readAttemptManifest(path);
+    if (current.execution.backend !== 'marketplace') {
+      throw new Error('Only marketplace attempts may replace marketplace execution state');
+    }
+    if (!isDeepStrictEqual(current.execution.state, expectedState)) {
+      throw new Error('Marketplace execution state changed before replacement');
+    }
+    const next = decodeAttemptManifest({
+      ...current,
+      execution: { backend: 'marketplace', state },
+      timestamps: {
+        ...current.timestamps,
+        updatedAt: Date.parse(current.timestamps.updatedAt) >= Date.parse(updatedAt)
+          ? current.timestamps.updatedAt : updatedAt,
+      },
+    });
+    if (!isDeepStrictEqual(current, next)) writeManifestAtomic(path, next);
+    return next;
+  });
+}
+
+/** Dedicated internal boundary for a marketplace branch-head publication. */
+export function advanceMarketplaceExecutionExpectedHead(
+  path: string,
+  expectedState: MarketplaceExecutionState,
+  expectedHead: string,
+  nextHead: string,
+  updatedAt: string,
+): AttemptManifest {
+  return withMarketplaceStateTransitionLock(path, () => {
+    const current = readAttemptManifest(path);
+    if (current.execution.backend !== 'marketplace') {
+      throw new Error('Only marketplace attempts may advance marketplace expected head');
+    }
+    if (!isDeepStrictEqual(current.execution.state, expectedState)) {
+      throw new Error('Marketplace execution state changed before expected-head advance');
+    }
+    const expected = gitOid(expectedHead);
+    const next = gitOid(nextHead);
+    if (current.expectedHead !== expected) {
+      throw new Error('Marketplace attempt expected head changed before progressive update');
+    }
+    if (Date.parse(updatedAt) < Date.parse(current.timestamps.updatedAt)) {
+      throw new Error('Marketplace expected-head advance predates manifest updated timestamp');
+    }
+    const advanced = decodeAttemptManifest({
+      ...current,
+      expectedHead: next,
+      timestamps: {
+        ...current.timestamps,
+        updatedAt,
+      },
+    });
+    writeManifestAtomic(path, advanced);
+    return advanced;
+  });
+}
+
 function fsyncDirectory(path: string): void {
   const descriptor = openSync(path, 'r');
   try {
@@ -797,7 +1148,9 @@ function sameRepositoryIdentity(
 function requireDedicatedMarketplaceExecutionTransition(manifest: AttemptManifest): void {
   if (
     manifest.execution.backend === 'marketplace'
-    && manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    && (manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      || manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+      || manifest.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1')
   ) {
     throw new Error('Marketplace execution v2 must use dedicated marketplace transition APIs');
   }
@@ -1176,7 +1529,10 @@ export function claimMarketplaceDispatchDecision(
     const manifest = readAttemptManifest(path);
     if (
       manifest.execution.backend !== 'marketplace'
-      || manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      || (
+        manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+        && manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+      )
       || manifest.execution.state.requestDigest !== expectedDigest
     ) {
       throw new Error('Marketplace dispatch decision does not match the attempt manifest');
@@ -1219,14 +1575,18 @@ export function claimMarketplaceDispatchDecision(
 
 function marketplaceStateForTerminalEvidence(
   state: MarketplacePreparedExecutionFields & {
-    readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+    readonly schemaVersion:
+      | typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      | typeof MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION;
   },
   evidence: MarketplaceTerminalEvidence,
 ): MarketplaceExecutionState {
   const prepared: MarketplacePreparedExecutionFields & {
-    readonly schemaVersion: typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION;
+    readonly schemaVersion:
+      | typeof MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      | typeof MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION;
   } = {
-    schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+    schemaVersion: state.schemaVersion,
     requestPath: state.requestPath,
     requestDigest: state.requestDigest,
     solverNetSelectionPath: state.solverNetSelectionPath,
@@ -1260,7 +1620,10 @@ function applyMarketplaceTerminalEvidence(
   const current = readAttemptManifest(path);
   if (
     current.execution.backend !== 'marketplace'
-    || current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || (
+      current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      && current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    )
     || current.execution.state.requestDigest !== expectedDigest
   ) {
     throw new Error('Marketplace terminal evidence does not match the attempt manifest');
@@ -1274,9 +1637,20 @@ function applyMarketplaceTerminalEvidence(
       && marketplaceSubmissionIdentityMatches(state.submission, evidence.submission)
     : state.status === 'cancelled'
       ? evidence.status === 'cancelled' && state.reason === evidence.reason
-      : true;
+      : state.status === 'prepared'
+        ? true
+        : evidence.status === 'submitted'
+          && 'submission' in state
+          && marketplaceSubmissionIdentityMatches(state.submission, evidence.submission);
   if (!persistedMatchesEvidence) {
     throw new Error('Marketplace terminal evidence contradicts persisted execution');
+  }
+  if (
+    state.status !== 'prepared'
+    && state.status !== 'submitted'
+    && state.status !== 'cancelled'
+  ) {
+    return current;
   }
   const terminalState = marketplaceStateForTerminalEvidence(state, evidence);
   const next = decodeAttemptManifest({
@@ -1301,7 +1675,10 @@ export function reconcileMarketplaceTerminalEvidence(path: string): AttemptManif
   const current = readAttemptManifest(path);
   if (
     current.execution.backend !== 'marketplace'
-    || current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || (
+      current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      && current.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    )
   ) {
     return current;
   }
@@ -1353,7 +1730,11 @@ export function transitionMarketplaceExecution(
       throw new Error('Only marketplace attempts may transition marketplace execution');
     }
     const state = previous.execution.state;
-    if (state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    if (
+      (
+        state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+        && state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+      )
       || state.requestDigest !== expectedDigest) {
       throw new Error('Marketplace request digest changed before execution transition');
     }
@@ -1520,23 +1901,58 @@ export function markAttemptExited(
   now: () => Date = () => new Date(),
   terminalHead?: string,
 ): AttemptManifest {
+  const current = readAttemptManifest(manifestPath);
+  if (
+    current.execution.backend === 'marketplace'
+    && (
+      current.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+      || current.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1'
+    )
+  ) {
+    return markMarketplaceAttemptExited(manifestPath, now, terminalHead);
+  }
   const timestamp = transitionTimestamp(now);
   const validTerminalHead = terminalHead === undefined ? undefined : gitOid(terminalHead);
-  return updateAttemptManifest(manifestPath, (current) => {
-    if (current.processState !== 'running') {
+  return updateAttemptManifest(manifestPath, (manifest) => {
+    if (manifest.processState !== 'running') {
       throw new Error('Only a running attempt may transition to exited');
     }
     return {
-      ...current,
+      ...manifest,
       processState: 'exited',
       ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
       timestamps: {
-        ...current.timestamps,
+        ...manifest.timestamps,
         updatedAt: timestamp,
         childExitedAt: timestamp,
       },
     };
   });
+}
+
+export function markMarketplaceAttemptExited(
+  manifestPath: string,
+  now: () => Date = () => new Date(),
+  terminalHead?: string,
+): AttemptManifest {
+  const timestamp = transitionTimestamp(now);
+  const validTerminalHead = terminalHead === undefined ? undefined : gitOid(terminalHead);
+  const current = readAttemptManifest(manifestPath);
+  if (current.processState !== 'running') {
+    throw new Error('Only a running attempt may transition to exited');
+  }
+  const next = decodeAttemptManifest({
+    ...current,
+    processState: 'exited',
+    ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
+    timestamps: {
+      ...current.timestamps,
+      updatedAt: timestamp,
+      childExitedAt: timestamp,
+    },
+  });
+  writeManifestAtomic(manifestPath, next);
+  return next;
 }
 
 export interface TrackableAttemptChild {
@@ -1891,8 +2307,10 @@ function assertMarketplaceJournalCorrelation(
   const { manifest, request } = journal;
   if (
     manifest.execution.backend !== 'marketplace'
-    || manifest.execution.state.schemaVersion
-      !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || (
+      manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      && manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    )
     || manifest.execution.state.status !== 'prepared'
     || manifest.phase !== 'implement'
     || manifest.prNumber === undefined
@@ -2240,12 +2658,13 @@ function classifyMarketplaceJournalManifest(
   const actualExecution = current.execution;
   if (
     expectedExecution.backend !== 'marketplace'
-    || expectedExecution.state.schemaVersion
-      !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || (
+      expectedExecution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      && expectedExecution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    )
     || expectedExecution.state.status !== 'prepared'
     || actualExecution.backend !== 'marketplace'
-    || actualExecution.state.schemaVersion
-      !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || actualExecution.state.schemaVersion !== expectedExecution.state.schemaVersion
     || (
       actualExecution.state.status !== 'submitted'
       && actualExecution.state.status !== 'cancelled'
@@ -2374,18 +2793,18 @@ async function resolveMarketplaceInitialization(
     ?? verifyMarketplaceTaskRequest;
   const persisted = persistRequest(
     manifest.execution.backend === 'marketplace'
+      && 'requestPath' in manifest.execution.state
       ? manifest.execution.state.requestPath
       : '',
     request,
   );
   if (
     manifest.execution.backend !== 'marketplace'
-    || manifest.execution.state.schemaVersion
-      !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+    || (manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      && manifest.execution.state.schemaVersion !== MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION)
     || persisted.requestPath !== manifest.execution.state.requestPath
     || persisted.requestDigest !== manifest.execution.state.requestDigest
-    || persisted.solverNetSelectionPath
-      !== manifest.execution.state.solverNetSelectionPath
+    || persisted.solverNetSelectionPath !== manifest.execution.state.solverNetSelectionPath
   ) {
     throw new Error('Marketplace request persistence did not match its journal');
   }
@@ -2550,7 +2969,7 @@ export async function createAttemptWorkspace(
         return buildManifest({
           backend: 'marketplace',
           state: {
-            schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+            schemaVersion: MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION,
             status: 'prepared',
             requestPath,
             requestDigest: canonical.digest,
@@ -2663,11 +3082,138 @@ export async function createAttemptWorkspace(
   return manifest;
 }
 
+function sameManifestPath(left: string, right: string): boolean {
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return left === right;
+  }
+}
+
 function directories(path: string): string[] {
   if (!existsSync(path)) return [];
   return readdirSync(path, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => join(path, entry.name));
+}
+
+export interface MarketplaceEvaluatorLegReviewCriteria {
+  readonly originManifestPath: string;
+  readonly originV2AttemptId: string;
+  readonly originRequestDigest: string;
+  readonly prNumber: number;
+  readonly expectedHead: GitOid;
+}
+
+export function buildEvaluatorLegReviewPreparedExecution(
+  attemptDir: string,
+  originRequestDigest: string,
+  now: () => Date = () => new Date(),
+): AttemptExecution {
+  const preparedAt = now().toISOString();
+  isoTimestamp(preparedAt);
+  const agentSoftDeadline = new Date(Date.parse(preparedAt) + 3_600_000).toISOString();
+  const adoptionDeadline = new Date(Date.parse(preparedAt) + 7_200_000).toISOString();
+  isoTimestamp(agentSoftDeadline);
+  isoTimestamp(adoptionDeadline);
+  return {
+    backend: 'marketplace',
+    state: {
+      schemaVersion: MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION,
+      status: 'prepared',
+      requestPath: join(attemptDir, 'evaluator-leg.request.json'),
+      requestDigest: originRequestDigest,
+      solverNetSelectionPath: join(attemptDir, 'evaluator-leg.solvernet-selection.json'),
+      preparedAt,
+      agentSoftDeadline,
+      adoptionDeadline,
+    },
+  };
+}
+
+export function findMarketplaceEvaluatorLegReviews(
+  v2Base: string,
+  criteria: MarketplaceEvaluatorLegReviewCriteria,
+): AttemptManifest[] {
+  const matches: AttemptManifest[] = [];
+  if (!existsSync(v2Base)) return matches;
+  for (const runnerDir of directories(v2Base)) {
+    const reviewDir = join(runnerDir, 'review');
+    for (const attemptDir of directories(reviewDir)) {
+      const manifestPath = join(attemptDir, 'manifest.json');
+      try {
+        const manifest = readAttemptManifest(manifestPath);
+        if (
+          manifest.phase !== 'review'
+          || manifest.execution.backend !== 'marketplace'
+        ) continue;
+        const state = manifest.execution.state;
+        if (state.schemaVersion !== MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) continue;
+        if (state.status === 'released') continue;
+        if (
+          state.originV2AttemptId === criteria.originV2AttemptId
+          && state.originRequestDigest === criteria.originRequestDigest
+          && state.prNumber === criteria.prNumber
+          && state.expectedHead === criteria.expectedHead
+          && (
+            state.originManifestPath === criteria.originManifestPath
+            || sameManifestPath(state.originManifestPath, criteria.originManifestPath)
+          )
+        ) {
+          matches.push(manifest);
+        }
+      } catch {
+        // Malformed manifests cannot prove a linked evaluator leg.
+      }
+    }
+  }
+  return matches;
+}
+
+export function findMarketplaceEvaluatorReviewByAttemptId(
+  v2Base: string,
+  attemptId: string,
+): AttemptManifest | null {
+  if (!existsSync(v2Base)) return null;
+  for (const runnerDir of directories(v2Base)) {
+    const reviewDir = join(runnerDir, 'review');
+    for (const attemptDir of directories(reviewDir)) {
+      const manifestPath = join(attemptDir, 'manifest.json');
+      try {
+        const manifest = readAttemptManifest(manifestPath);
+        if (manifest.attemptId === attemptId && manifest.phase === 'review') {
+          return manifest;
+        }
+      } catch {
+        // Malformed manifests cannot prove a linked evaluator review.
+      }
+    }
+  }
+  return null;
+}
+
+export function anchorEvidenceFromEvaluatorManifest(
+  manifest: AttemptManifest,
+): MarketplaceReviewAnchorEvidence {
+  if (
+    manifest.execution.backend !== 'marketplace'
+    || manifest.execution.state.schemaVersion !== MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION
+    || manifest.execution.state.status !== 'anchored'
+    || manifest.reviewGeneration === undefined
+    || manifest.reviewRefOid === undefined
+  ) {
+    throw new Error('Evaluator review manifest is not anchored');
+  }
+  const state = manifest.execution.state;
+  return {
+    attemptId: manifest.attemptId,
+    manifestPath: manifest.paths.manifest,
+    head: state.expectedHead,
+    generation: state.generation,
+    refOid: state.reviewRefOid,
+    reviewer: state.reviewer,
+    anchoredAt: state.anchoredAt,
+  };
 }
 
 export function countRunnerLiveAttempts(
@@ -2710,19 +3256,32 @@ function isRunnerLiveAttempt(
   manifest: AttemptManifest,
   isPidAlive: (pid: number) => boolean,
 ): boolean {
-  if (
-    manifest.execution.backend === 'marketplace'
-    && manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
-  ) {
-    return manifest.execution.state.status === 'prepared'
-      || manifest.execution.state.status === 'submitted';
+  const processRunningWithLivePid = manifest.processState === 'running'
+    && manifest.pid !== null
+    && isPidAlive(manifest.pid);
+  if (manifest.execution.backend === 'marketplace') {
+    const state = manifest.execution.state;
+    if (state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) {
+      return state.status === 'anchored' && processRunningWithLivePid;
+    }
+    if (
+      state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
+      || state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+    ) {
+      if (state.status === 'prepared' || state.status === 'submitted') {
+        return true;
+      }
+      if (
+        state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
+        && state.status !== 'receipt-published'
+        && state.status !== 'cancelled'
+      ) {
+        return processRunningWithLivePid;
+      }
+      return false;
+    }
   }
-  return manifest.processState === 'preparing'
-    || (
-      manifest.processState === 'running'
-      && manifest.pid !== null
-      && isPidAlive(manifest.pid)
-    );
+  return manifest.processState === 'preparing' || processRunningWithLivePid;
 }
 
 export type CleanupReasonCode =

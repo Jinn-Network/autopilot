@@ -1,4 +1,5 @@
 import { basename, dirname, join } from 'node:path';
+import { JINN_MONO_WORKTREES_DIR } from '../runtime-profile.js';
 import type { ReadyIssue, DispatcherConfig, InFlightSession } from './types.js';
 import type { CommandRunner } from './issue-source.js';
 import { sessionSpawnEnv } from './identity.js';
@@ -46,10 +47,10 @@ export const REPO_ROOT = RUNTIME_REPO_ROOT;
  */
 function computeWorktreesBase(repoRoot: string): string {
   const parent = dirname(repoRoot);
-  if (basename(parent) === 'jinn-mono_worktrees') {
+  if (basename(parent) === JINN_MONO_WORKTREES_DIR) {
     return parent;
   }
-  return join(repoRoot, '..', 'jinn-mono_worktrees');
+  return join(repoRoot, '..', JINN_MONO_WORKTREES_DIR);
 }
 export const WORKTREES_BASE = computeWorktreesBase(REPO_ROOT);
 

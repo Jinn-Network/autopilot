@@ -6,6 +6,7 @@ import {
   readAttemptManifest,
   type AttemptManifest,
 } from './attempt-workspace.js';
+import { advanceMarketplaceAdoptionExpectedHead } from './marketplace-adoption-state.js';
 import {
   decodeBranchClaimTrailers,
   encodeBranchClaimTrailers,
@@ -324,8 +325,22 @@ export function makeProductionImplementationSessionPort(
       });
     },
 
-    advanceManifestHead: (path, expectedHead, nextHead) =>
-      advanceAttemptExpectedHead(path, expectedHead, nextHead, options.now),
+    advanceManifestHead: (path, expectedHead, nextHead) => {
+      const manifest = readAttemptManifest(path);
+      if (
+        manifest.execution.backend === 'marketplace'
+        && manifest.execution.state.schemaVersion === 'marketplace-execution-v3'
+      ) {
+        return advanceMarketplaceAdoptionExpectedHead(
+          path,
+          manifest.execution.state.requestDigest,
+          expectedHead,
+          nextHead,
+          options.now,
+        );
+      }
+      return advanceAttemptExpectedHead(path, expectedHead, nextHead, options.now);
+    },
 
     async createCompletionCommit({ manifest, parent, completionClaim, summary }) {
       const tree = gitOid((await runGit(manifest, [
