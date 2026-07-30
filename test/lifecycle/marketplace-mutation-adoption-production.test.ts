@@ -2,6 +2,7 @@ import {
   mkdtempSync,
   mkdirSync,
   rmSync,
+  readFileSync,
   readlinkSync,
   symlinkSync,
   writeFileSync,
@@ -27,6 +28,8 @@ import {
   secureMarketplaceAdoptionGitHubRunner,
   shouldExcludeWorktreeVerificationCopyPath,
   copyWorktreeForVerification,
+  MARKETPLACE_VERIFICATION_OVERLAY_RELATIVE_PATHS,
+  prepareWorktreeForMarketplaceVerification,
 } from '../../src/lifecycle/marketplace-mutation-adoption-production.js';
 import {
   runMarketplacePatchGit,
@@ -746,6 +749,36 @@ describe('production worktree verification copy filter', () => {
 
     expect(readlinkSync(join(workspace, '.codex', 'skills', 'runtime')))
       .toBe('../../.claude/skills/runtime');
+  });
+
+  it('overlays verify-only client suite fixes without touching the source worktree', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'jinn-adoption-overlay-'));
+    const source = join(root, 'source');
+    const workspace = join(root, 'workspace');
+    const overlayDir = join(root, 'overlay');
+    directories.push(root);
+    mkdirSync(join(source, 'client', 'test', 'cli', 'commands'), { recursive: true });
+    mkdirSync(join(source, 'client', 'src', 'api'), { recursive: true });
+    writeFileSync(join(source, 'client', 'vitest.config.ts'), 'export default { exclude: [] }\n');
+    writeFileSync(join(source, 'client', 'test', 'cli', 'commands', 'create.test.ts'), 'baseline\n');
+    writeFileSync(join(source, 'client', 'src', 'api', 'loop-completion-build.ts'), 'baseline\n');
+    mkdirSync(join(overlayDir, 'client', 'test', 'cli', 'commands'), { recursive: true });
+    mkdirSync(join(overlayDir, 'client', 'src', 'api'), { recursive: true });
+    writeFileSync(join(overlayDir, 'client', 'vitest.config.ts'), 'export default { exclude: ["acceptance"] }\n');
+    writeFileSync(join(overlayDir, 'client', 'test', 'cli', 'commands', 'create.test.ts'), 'overlay\n');
+    writeFileSync(join(overlayDir, 'client', 'src', 'api', 'loop-completion-build.ts'), 'overlay\n');
+
+    await prepareWorktreeForMarketplaceVerification({
+      sourcePath: source,
+      workspacePath: workspace,
+      overlayDir,
+    });
+
+    expect(readFileSync(join(source, 'client', 'vitest.config.ts'), 'utf8'))
+      .toBe('export default { exclude: [] }\n');
+    expect(readFileSync(join(workspace, 'client', 'vitest.config.ts'), 'utf8'))
+      .toBe('export default { exclude: ["acceptance"] }\n');
+    expect(MARKETPLACE_VERIFICATION_OVERLAY_RELATIVE_PATHS).toHaveLength(3);
   });
 });
 
