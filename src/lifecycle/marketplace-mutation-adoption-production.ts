@@ -557,6 +557,47 @@ function makeWorktreeProofPort(
   };
 }
 
+export const MARKETPLACE_VERIFICATION_OVERLAY_RELATIVE_PATHS = [
+  'client/vitest.config.ts',
+  'client/test/cli/commands/create.test.ts',
+  'client/src/api/loop-completion-build.ts',
+] as const;
+
+export function marketplaceVerificationOverlayDir(
+  environment: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const raw = environment.JINN_AUTOPILOT_VERIFY_OVERLAY_DIR;
+  if (raw === undefined || raw.trim() === '') return undefined;
+  return raw.trim();
+}
+
+export async function overlayMarketplaceVerificationWorkspace(
+  overlayDir: string,
+  workspacePath: string,
+): Promise<void> {
+  for (const relativePath of MARKETPLACE_VERIFICATION_OVERLAY_RELATIVE_PATHS) {
+    await cp(
+      join(overlayDir, relativePath),
+      join(workspacePath, relativePath),
+      { force: true },
+    );
+  }
+}
+
+export async function prepareWorktreeForMarketplaceVerification(input: {
+  readonly sourcePath: string;
+  readonly workspacePath: string;
+  readonly overlayDir?: string;
+}): Promise<void> {
+  await copyWorktreeForVerification(input.sourcePath, input.workspacePath);
+  if (input.overlayDir !== undefined) {
+    await overlayMarketplaceVerificationWorkspace(
+      input.overlayDir,
+      input.workspacePath,
+    );
+  }
+}
+
 export async function copyWorktreeForVerification(
   sourcePath: string,
   workspacePath: string,
@@ -639,7 +680,11 @@ export function makeProductionMarketplaceMutationAdoptionCoordinator(
       dockerInspector: dockerSandbox!.dockerInspector,
       cleanup: dockerSandbox!.cleanup,
       prepareWorkspace: async ({ sourcePath, workspacePath }) => {
-        await copyWorktreeForVerification(sourcePath, workspacePath);
+        await prepareWorktreeForMarketplaceVerification({
+          sourcePath,
+          workspacePath,
+          overlayDir: marketplaceVerificationOverlayDir(ambient),
+        });
       },
       workspacePath: join(
         tmpdir(),
