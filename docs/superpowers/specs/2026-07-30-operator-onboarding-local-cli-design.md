@@ -110,39 +110,29 @@ surface documented above. Fix only what blocks that path.
 
 ### 2. First-class capability refresh
 
-Add a CLI command that re-runs the existing
-`ensureCapabilityAttestation` path against the loaded target config, e.g.:
+Add a single CLI flag on doctor that re-runs the existing
+`ensureCapabilityAttestation` path against the loaded target config:
 
 ```text
 autopilot doctor --refresh-capabilities
 ```
 
-or a dedicated:
-
-```text
-autopilot capabilities refresh
-```
-
-Preference: the smallest surface that makes doctor’s remedy actionable.
-Update the `git-ref-capabilities` doctor remedy string to name that command
-exactly.
+Then run the normal doctor checks (including `git-ref-capabilities`) and
+report the result. Update the `git-ref-capabilities` doctor remedy string to
+name exactly: `autopilot doctor --refresh-capabilities`.
 
 Do not invent a second probe implementation — reuse
-[`src/capability-setup.ts`](../../../src/capability-setup.ts).
+[`src/capability-setup.ts`](../../../../src/capability-setup.ts).
 
 ### 3. Disk floor honesty
 
-`init` defaults `safety.diskFloorGb` to `10`, which blocks typical laptops.
-Either:
+Keep `init`’s default `safety.diskFloorGb: 10` (fail-closed for claim work).
+README and the existing doctor remedy must say an operator may deliberately
+lower `safety.diskFloorGb` when the host has less free space.
 
-- lower the default to a still-safe value used by successful canaries (e.g. `1`), **or**
-- keep `10` but make README + doctor remedy explicitly tell the operator to
-  lower `safety.diskFloorGb` when intentional.
-
-Preference: document clearly and, if we change the default, keep it
-conservative enough that a nearly-full disk still fails closed for claim
-work — observe-mode smoke must not require 10 GB free if the machine has
-less.
+For the smoke target only: if disk is blocking, lower that target’s
+`safety.diskFloorGb` in its `.autopilot/config.json` (do not change the
+global init default in this work).
 
 ### 4. README rewrite
 
