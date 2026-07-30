@@ -19,6 +19,9 @@ export type DoctorRunner = (
   options?: { cwd?: string; env?: Record<string, string> },
 ) => Promise<string>;
 
+export const GIT_REF_CAPABILITIES_REMEDY =
+  'Run `autopilot doctor --refresh-capabilities`, then rerun `autopilot doctor`.';
+
 export interface DoctorCheck {
   readonly id: string;
   readonly status: 'pass' | 'degraded' | 'blocking';
@@ -506,7 +509,7 @@ export async function runDoctor(input: {
         });
         return 'repository-bound Git ref capability attestation is current';
       },
-      'Run the capability probe for this repository, then rerun `autopilot doctor`.',
+      GIT_REF_CAPABILITIES_REMEDY,
     ));
   }
 

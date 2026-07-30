@@ -336,6 +336,13 @@ async function main(): Promise<void> {
   const loaded = await loadedConfig();
   const entryPath = realpathSync(process.argv[1]!);
   if (command.kind === 'doctor') {
+    if (command.refreshCapabilities) {
+      await ensureCapabilityAttestation({
+        loaded,
+        environment: process.env,
+        runner: defaultRunner,
+      });
+    }
     const report = await doctorFor(loaded);
     process.stdout.write(command.json
       ? `${JSON.stringify(report, null, 2)}\n`
