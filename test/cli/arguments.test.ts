@@ -13,7 +13,18 @@ describe('public Autopilot CLI grammar', () => {
       nonInteractive: true,
       project: 'Octo-Labs/73',
     }],
-    [['doctor', '--json'], { kind: 'doctor', json: true }],
+    [['doctor'], { kind: 'doctor', json: false, refreshCapabilities: false }],
+    [['doctor', '--json'], { kind: 'doctor', json: true, refreshCapabilities: false }],
+    [['doctor', '--refresh-capabilities'], {
+      kind: 'doctor',
+      json: false,
+      refreshCapabilities: true,
+    }],
+    [['doctor', '--json', '--refresh-capabilities'], {
+      kind: 'doctor',
+      json: true,
+      refreshCapabilities: true,
+    }],
     [['start'], { kind: 'start', foreground: false }],
     [['start', '--foreground'], { kind: 'start', foreground: true }],
     [['stop', '--force'], { kind: 'stop', force: true }],
@@ -66,6 +77,8 @@ describe('public Autopilot CLI grammar', () => {
 
   it('rejects unknown options and invalid issue identifiers', () => {
     expect(() => parseAutopilotArguments(['doctor', '--repair']))
+      .toThrow(/unknown option/i);
+    expect(() => parseAutopilotArguments(['status', '--refresh-capabilities']))
       .toThrow(/unknown option/i);
     expect(() => parseAutopilotArguments([
       'issue', 'triage', '../42', '--input', 'x',

@@ -4,7 +4,7 @@ export type AutopilotCommand =
       readonly nonInteractive: boolean;
       readonly project?: string;
     }
-  | { readonly kind: 'doctor'; readonly json: boolean }
+  | { readonly kind: 'doctor'; readonly json: boolean; readonly refreshCapabilities: boolean }
   | { readonly kind: 'start'; readonly foreground: boolean }
   | { readonly kind: 'stop'; readonly force: boolean }
   | { readonly kind: 'status'; readonly json: boolean }
@@ -51,7 +51,7 @@ export type AutopilotCommand =
 
 export const AUTOPILOT_USAGE = `usage:
   autopilot init [--non-interactive] [--project <owner/number>]
-  autopilot doctor [--json]
+  autopilot doctor [--json] [--refresh-capabilities]
   autopilot start [--foreground]
   autopilot stop [--force]
   autopilot status [--json]
@@ -143,10 +143,19 @@ export function parseAutopilotArguments(args: readonly string[]): AutopilotComma
         : {}),
     };
   }
-  if (command === 'doctor' || command === 'status') {
+  if (command === 'doctor') {
+    const parsed = flags(tail, ['--json', '--refresh-capabilities']);
+    if (parsed.positionals.length > 0) throw new Error(`Unexpected doctor input; ${AUTOPILOT_USAGE}`);
+    return {
+      kind: 'doctor',
+      json: parsed.booleans.has('--json'),
+      refreshCapabilities: parsed.booleans.has('--refresh-capabilities'),
+    };
+  }
+  if (command === 'status') {
     const parsed = flags(tail, ['--json']);
-    if (parsed.positionals.length > 0) throw new Error(`Unexpected ${command} input; ${AUTOPILOT_USAGE}`);
-    return { kind: command, json: parsed.booleans.has('--json') };
+    if (parsed.positionals.length > 0) throw new Error(`Unexpected status input; ${AUTOPILOT_USAGE}`);
+    return { kind: 'status', json: parsed.booleans.has('--json') };
   }
   if (command === 'start') {
     const parsed = flags(tail, ['--foreground']);
