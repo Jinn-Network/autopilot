@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import fixture from './fixtures/non-jinn-autopilot-config.json';
 import {
+  GIT_REF_CAPABILITIES_REMEDY,
   runDoctor,
   type DoctorRunner,
 } from '../src/doctor.js';
@@ -132,6 +133,10 @@ afterEach(() => {
 });
 
 describe('autopilot doctor', () => {
+  it('names the product CLI capability refresh command in the remedy', () => {
+    expect(GIT_REF_CAPABILITIES_REMEDY).toContain('autopilot doctor --refresh-capabilities');
+  });
+
   it('returns a versioned check list and does not make degraded plugin health blocking', async () => {
     const paths = setup();
     const report = await runDoctor({
