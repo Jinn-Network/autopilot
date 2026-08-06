@@ -16,6 +16,7 @@ import {
 } from '../src/init.js';
 
 const roots: string[] = [];
+const INITIALIZATION_NOW = new Date('2026-07-28T12:00:00Z');
 
 function repository(): string {
   const root = mkdtempSync(join(tmpdir(), 'autopilot-init-'));
@@ -175,6 +176,7 @@ describe('autopilot init', () => {
       project: 'Octo-Labs/73',
       runner: compatibleRunner(calls),
       environment: {},
+      now: INITIALIZATION_NOW,
     });
 
     expect(result.status).toBe('initialized');
@@ -205,6 +207,7 @@ describe('autopilot init', () => {
       nonInteractive: true,
       runner: compatibleRunner(calls),
       environment: {},
+      now: INITIALIZATION_NOW,
     })).rejects.toThrow(/--project/);
     expect(calls).toEqual([]);
   });
@@ -259,6 +262,7 @@ describe('autopilot init', () => {
       runner,
       interactor,
       environment: {},
+      now: INITIALIZATION_NOW,
     });
 
     expect(result.project).toEqual({ owner: 'Octo-Labs', number: 73 });
@@ -340,6 +344,7 @@ describe('autopilot init', () => {
       runner,
       interactor,
       environment: {},
+      now: INITIALIZATION_NOW,
     });
 
     expect(created).toBe(true);
@@ -373,6 +378,7 @@ describe('autopilot init', () => {
       project: 'Octo-Labs/73',
       runner,
       environment: {},
+      now: INITIALIZATION_NOW,
     })).rejects.toThrow(/contradictory.*Priority.*P0/i);
     expect(existsSync(join(root, '.autopilot', 'config.json'))).toBe(false);
     expect(calls.some((call) => call.includes('field-create'))).toBe(false);
@@ -422,6 +428,7 @@ describe('autopilot init', () => {
       runner,
       interactor,
       environment: {},
+      now: INITIALIZATION_NOW,
     });
 
     expect(plans).toEqual([[
@@ -538,6 +545,7 @@ describe('autopilot init', () => {
       runner,
       interactor,
       environment: {},
+      now: INITIALIZATION_NOW,
     });
 
     expect(plans).toEqual([[
@@ -595,6 +603,7 @@ describe('autopilot init', () => {
       runner,
       interactor,
       environment: {},
+      now: INITIALIZATION_NOW,
     });
 
     expect(plans).toEqual([[
@@ -630,6 +639,7 @@ describe('autopilot init', () => {
         AUTOPILOT_GITHUB_IMPLEMENT_TOKEN: 'implementation-secret',
         AUTOPILOT_GITHUB_REVIEW_TOKEN: 'review-secret',
       },
+      now: INITIALIZATION_NOW,
     });
 
     const credentialPath = result.paths.credentials;
@@ -677,6 +687,7 @@ describe('autopilot init', () => {
       runner,
       interactor,
       environment: {},
+      now: INITIALIZATION_NOW,
     });
 
     expect(changes).toEqual([[

@@ -2,6 +2,19 @@ import { spawn } from 'node:child_process';
 import { accessSync, constants as fsConstants, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
+import {
+  ISSUE_RELAY_MAX_ENVELOPE_CID_BYTES,
+  ISSUE_RELAY_MAX_FINDINGS,
+  ISSUE_RELAY_MAX_FINDING_BODY_BYTES,
+  ISSUE_RELAY_MAX_FINDING_LABEL_BYTES,
+  ISSUE_RELAY_MAX_GENERATION_BYTES,
+  ISSUE_RELAY_MAX_OBSERVATION_DETAIL_BYTES,
+  ISSUE_RELAY_MAX_OBSERVATION_REASON_BYTES,
+  ISSUE_RELAY_MAX_PATCH_BYTES,
+  ISSUE_RELAY_MAX_REPOSITORY_BYTES,
+  ISSUE_RELAY_MAX_SPEC_BYTES,
+  ISSUE_RELAY_MAX_TASK_ID_DECIMAL_DIGITS,
+} from '../issue-relay/limits.js';
 import { isGitHubSecretEnvironmentKey } from './credentials.js';
 
 export interface MarketplaceMachineSubprocessResult {
@@ -13,7 +26,12 @@ export interface MarketplaceMachineSubprocessResult {
 export type MarketplaceMachineSubprocess = (
   command: string,
   args: readonly string[],
-  options: { readonly environment: NodeJS.ProcessEnv },
+  options: {
+    readonly environment: NodeJS.ProcessEnv;
+    readonly outputProfile?:
+      | 'issue-relay-dry-run'
+      | 'issue-relay-observation';
+  },
 ) => Promise<MarketplaceMachineSubprocessResult>;
 
 export type MarketplaceMachineCliFailureCode =
@@ -91,6 +109,44 @@ export function resolveInstalledJinnBinary(): string {
 
 export const MARKETPLACE_MACHINE_SUBPROCESS_TIMEOUT_MS = 300_000;
 export const MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES = 1024 * 1024;
+const JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION = 6;
+const ISSUE_RELAY_MACHINE_ENVELOPE_OVERHEAD_BYTES = 256 * 1024;
+const ISSUE_RELAY_MAX_ROUND_TEXT_BYTES =
+  ISSUE_RELAY_MAX_GENERATION_BYTES
+  + 2 * ISSUE_RELAY_MAX_REPOSITORY_BYTES
+  + ISSUE_RELAY_MAX_FINDINGS * (
+    2 * ISSUE_RELAY_MAX_FINDING_LABEL_BYTES
+    + 2 * ISSUE_RELAY_MAX_FINDING_BODY_BYTES
+  );
+const ISSUE_RELAY_MAX_CORRELATION_TEXT_BYTES =
+  ISSUE_RELAY_MAX_GENERATION_BYTES
+  + 3 * ISSUE_RELAY_MAX_FINDING_BODY_BYTES;
+const ISSUE_RELAY_MAX_VERDICT_TEXT_BYTES =
+  ISSUE_RELAY_MAX_CORRELATION_TEXT_BYTES
+  + ISSUE_RELAY_MAX_FINDING_BODY_BYTES
+  + ISSUE_RELAY_MAX_FINDINGS * (
+    2 * ISSUE_RELAY_MAX_FINDING_LABEL_BYTES
+    + 2 * ISSUE_RELAY_MAX_FINDING_BODY_BYTES
+  );
+const ISSUE_RELAY_MAX_OBSERVATION_COMMON_TEXT_BYTES =
+  ISSUE_RELAY_MAX_TASK_ID_DECIMAL_DIGITS
+  + ISSUE_RELAY_MAX_ENVELOPE_CID_BYTES;
+const ISSUE_RELAY_MAX_OBSERVATION_TEXT_BYTES = Math.max(
+  ISSUE_RELAY_MAX_OBSERVATION_REASON_BYTES
+    + ISSUE_RELAY_MAX_OBSERVATION_DETAIL_BYTES,
+  ISSUE_RELAY_MAX_OBSERVATION_COMMON_TEXT_BYTES
+    + ISSUE_RELAY_MAX_ROUND_TEXT_BYTES
+    + ISSUE_RELAY_MAX_PATCH_BYTES,
+  ISSUE_RELAY_MAX_OBSERVATION_COMMON_TEXT_BYTES
+    + ISSUE_RELAY_MAX_ROUND_TEXT_BYTES
+    + ISSUE_RELAY_MAX_VERDICT_TEXT_BYTES,
+);
+export const MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES =
+  ISSUE_RELAY_MAX_OBSERVATION_TEXT_BYTES * JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION
+  + ISSUE_RELAY_MACHINE_ENVELOPE_OVERHEAD_BYTES;
+const MARKETPLACE_MACHINE_RELAY_DRY_RUN_OUTPUT_LIMIT_BYTES =
+  ISSUE_RELAY_MAX_SPEC_BYTES * JSON_MAX_SINGLE_BYTE_ESCAPE_EXPANSION
+  + ISSUE_RELAY_MACHINE_ENVELOPE_OVERHEAD_BYTES;
 
 export class MarketplaceMachineSubprocessPolicyError extends Error {
   readonly reason: 'timeout' | 'output-limit';
@@ -107,6 +163,11 @@ export const runMarketplaceMachineSubprocess: MarketplaceMachineSubprocess = (
   args,
   options,
 ) => new Promise((resolve, reject) => {
+  const outputLimitBytes = options.outputProfile === 'issue-relay-observation'
+    ? MARKETPLACE_MACHINE_RELAY_OBSERVATION_OUTPUT_LIMIT_BYTES
+    : options.outputProfile === 'issue-relay-dry-run'
+      ? MARKETPLACE_MACHINE_RELAY_DRY_RUN_OUTPUT_LIMIT_BYTES
+      : MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES;
   const child = spawn(command, [...args], {
     env: options.environment,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -131,7 +192,7 @@ export const runMarketplaceMachineSubprocess: MarketplaceMachineSubprocess = (
   const collect = (target: Buffer[], chunk: Buffer): void => {
     if (settled) return;
     outputBytes += chunk.byteLength;
-    if (outputBytes > MARKETPLACE_MACHINE_SUBPROCESS_OUTPUT_LIMIT_BYTES) {
+    if (outputBytes > outputLimitBytes) {
       stop('output');
       return;
     }

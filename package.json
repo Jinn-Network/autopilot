@@ -32,6 +32,7 @@
     "pressure": "tsx scripts/run-pressure-suite.ts",
     "autopilot": "tsx scripts/run-autopilot-v2.ts",
     "autopilot:v2": "tsx scripts/run-autopilot-v2.ts",
+    "issue-relay": "tsx scripts/run-jinn-issue-relay.ts",
     "autopilot:capability-probe": "tsx scripts/probe-autopilot-v2-capabilities.ts",
     "paint-board": "tsx scripts/paint-board.ts"
   },
