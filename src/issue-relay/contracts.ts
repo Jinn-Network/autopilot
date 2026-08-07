@@ -494,3 +494,51 @@ export const IssueRelayVerdictV1Schema = z.union([
     findings: z.array(IssueRelayFindingV1Schema).length(0),
   }).strict(),
 ]);
+
+// Portable V2 marketplace and decision objects are canonical in the Jinn SDK.
+// Keep the locally mirrored V1 contracts frozen until all V1 generations are
+// terminal; Autopilot owns only host-internal V2 state and GitHub policy.
+export {
+  IssueRelayAutomatedEvidenceV1Schema,
+  IssueRelayDecisionOptionV1Schema,
+  IssueRelayDecisionProposalV1Schema,
+  IssueRelayDecisionRequestV1Schema,
+  IssueRelayEvaluationBundleV2Schema,
+  IssueRelayEvaluationContextV2Schema,
+  IssueRelayEvaluationLaneSchema,
+  IssueRelayHumanDecisionReceiptV1Schema,
+  IssueRelayImplementationPolicySchema,
+  IssueRelayLaneAttestationV1Schema,
+  IssueRelayLaneFailureV1Schema,
+  IssueRelayLaneFindingV1Schema,
+  IssueRelayPublicEvidenceDescriptorV1Schema,
+  IssueRelayPullRequestMetadataV1Schema,
+  IssueRelayRoundV2Schema,
+  IssueRelaySolutionV2Schema,
+  issueRelayCanonicalDigest,
+  issueRelayDecisionKey,
+  issueRelayDecisionRequestDigest,
+  issueRelayEvaluationContextV2Digest,
+  issueRelayHumanDecisionReceiptDigest,
+  issueRelayPullRequestMetadataDigest,
+  formatIssueRelayDecisionRequestComment,
+  formatIssueRelayHumanDecisionReceiptComment,
+} from '@jinn-network/sdk/solvernets/jinn-repo';
+export type {
+  IssueRelayAutomatedEvidenceV1,
+  IssueRelayDecisionOptionV1,
+  IssueRelayDecisionProposalV1,
+  IssueRelayDecisionRequestV1,
+  IssueRelayEvaluationBundleV2,
+  IssueRelayEvaluationContextV2,
+  IssueRelayEvaluationLane,
+  IssueRelayHumanDecisionReceiptV1,
+  IssueRelayImplementationPolicy,
+  IssueRelayLaneAttestationV1,
+  IssueRelayLaneFailureV1,
+  IssueRelayLaneFindingV1,
+  IssueRelayPublicEvidenceDescriptorV1,
+  IssueRelayPullRequestMetadataV1,
+  IssueRelayRoundV2,
+  IssueRelaySolutionV2,
+} from '@jinn-network/sdk/solvernets/jinn-repo';

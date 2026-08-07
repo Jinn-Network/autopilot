@@ -128,4 +128,42 @@ describe('parseIssueRelayConfig', () => {
       },
     })).toThrow(/config/i);
   });
+
+  it('decodes the feature-gated V2 lane, decision, retry, and spend bounds', () => {
+    const base = validConfig();
+    const value = parseIssueRelayConfig({
+      ...base,
+      schemaVersion: 2,
+      generationProtocol: 'v2',
+      dualLaneEvaluationEnabled: true,
+      humanDecisionCommandsEnabled: true,
+      decisionImplementationEnabled: true,
+      laneSpecifications: {
+        security: `sha256:${'a'.repeat(64)}`,
+        quality: `sha256:${'b'.repeat(64)}`,
+      },
+      safePreimplementationReasonCodes: ['compatibility-choice'],
+      budget: {
+        ...(base.budget as Record<string, unknown>),
+        maxEvaluationAttemptsPerLanePerHead: 2,
+        maxEvaluationRetrySpendWei: '1000',
+        maxDecisionRequestsPerGeneration: 3,
+        maxDecisionImplementationRoundsPerGeneration: 2,
+        maxDecisionImplementationSpendWei: '2000',
+        humanDecisionTtlMs: 1_209_600_000,
+        maxHumanDeferrals: 1,
+        humanDeferralExtensionMs: 1_209_600_000,
+        decisionContinuationDeadlineMs: 86_400_000,
+      },
+    });
+    expect(value).toMatchObject({
+      schemaVersion: 2,
+      generationProtocol: 'v2',
+      budget: {
+        maxEvaluationAttemptsPerLanePerHead: 2,
+        maxEvaluationRetrySpendWei: 1000n,
+        maxDecisionImplementationSpendWei: 2000n,
+      },
+    });
+  });
 });

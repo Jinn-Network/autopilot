@@ -13,10 +13,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { relayGeneration, relayTaskKey } from '../../src/issue-relay/identity.js';
+import { issueRelayCanonicalDigest } from '../../src/issue-relay/contracts.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
 import {
   buildRelayMarketplaceRequest,
   buildRelayTaskSpec,
+  buildRelayTaskSpecV2,
   persistRelayMarketplaceRequest,
   verifyRelayMarketplaceRequest,
   type RelayTaskSpec,
@@ -176,6 +178,60 @@ describe('Relay jinn-repo task construction', () => {
     expect(built.spec.problem_statement).toContain(
       '> Persist the task before submitting it.',
     );
+  });
+
+  it('builds one V2 combined repair with retained security and quality attribution', () => {
+    const generation = relayGeneration(snapshot);
+    const findings = [
+      { findingId: 's1', lane: 'security' as const, code: 'auth', severity: 'high' as const, title: 'Authorization gap', publicDetail: 'Close the gap.', sensitivity: 'public' as const },
+      { findingId: 'q1', lane: 'quality' as const, code: 'regression', severity: 'medium' as const, title: 'Regression', publicDetail: 'Restore expected behavior.', sensitivity: 'public' as const },
+    ];
+    const built = buildRelayTaskSpecV2({
+      snapshot,
+      round: {
+        schemaVersion: 'jinn-issue-relay-round.v2', generation, round: 1,
+        snapshotDigest: snapshot.snapshotDigest, targetRepository: 'Jinn-Network/mono',
+        workspaceRepository: 'Jinn-Network/mono-relay', inputHead: repairHead,
+        purpose: 'repair', findings, prNumber: 314,
+      },
+      hostAuthority: {
+        managedFork: true, workspaceRepository: 'Jinn-Network/mono-relay',
+        visibility: 'PUBLIC', prNumber: 314, currentHead: repairHead,
+      },
+    });
+    expect(built.spec.relay.findings).toEqual(findings);
+    expect(built.spec.problem_statement).toContain('lane: security');
+    expect(built.spec.problem_statement).toContain('lane: quality');
+  });
+
+  it('freezes a bounded decision implementation without disguising it as repair', () => {
+    const generation = relayGeneration(snapshot);
+    const binding = {
+      decisionKey: `sha256:${'a'.repeat(64)}` as const,
+      proposalDigest: issueRelayCanonicalDigest({ proposal: 'compatibility' }),
+      requestDigest: `sha256:${'b'.repeat(64)}` as const,
+      optionId: 'preserve-compatibility',
+      authorization: 'human-option-intent' as const,
+      sourceHead: repairHead,
+      frozenImplementationBrief: 'Add a forwarding wrapper and focused tests.',
+    };
+    const built = buildRelayTaskSpecV2({
+      snapshot,
+      round: {
+        schemaVersion: 'jinn-issue-relay-round.v2', generation, round: 2,
+        snapshotDigest: snapshot.snapshotDigest, targetRepository: 'Jinn-Network/mono',
+        workspaceRepository: 'Jinn-Network/mono-relay', inputHead: repairHead,
+        purpose: 'decision-implementation', findings: [], prNumber: 314,
+        decisionBinding: binding,
+      },
+      hostAuthority: {
+        managedFork: true, workspaceRepository: 'Jinn-Network/mono-relay',
+        visibility: 'PUBLIC', prNumber: 314, currentHead: repairHead,
+      },
+    });
+    expect(built.spec.relay).toMatchObject({ purpose: 'decision-implementation', decisionBinding: binding });
+    expect(built.spec.problem_statement).toContain('Implement exactly the authorized maintainer decision');
+    expect(built.spec.problem_statement).not.toContain('Repair findings');
   });
 
   it('rejects stale or cross-purpose round bindings before constructing a task', () => {
@@ -377,6 +433,41 @@ function taskAtCanonicalSpecBytes(targetBytes: number): RelayTaskSpec {
 }
 
 describe('Relay marketplace request persistence', () => {
+  it('persists and re-verifies a canonical V2 task request', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-v2-'));
+    temporaryDirectories.push(directory);
+    const task = buildRelayTaskSpecV2({
+      snapshot,
+      round: {
+        schemaVersion: 'jinn-issue-relay-round.v2',
+        generation: relayGeneration(snapshot),
+        round: 0,
+        snapshotDigest: snapshot.snapshotDigest,
+        targetRepository: 'Jinn-Network/mono',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: base,
+        purpose: 'initial',
+        findings: [],
+      },
+    });
+    const request = buildRelayMarketplaceRequest({
+      task,
+      solverNet: 'jinn-repo',
+      maximumSpendWei: 100n,
+      specPath: join(directory, 'spec.json'),
+      createdAt: '2026-07-28T10:03:00.000Z',
+      submitBy: '2026-07-28T10:18:00.000Z',
+    });
+    const installed = persistRelayMarketplaceRequest(
+      join(directory, 'request.json'),
+      request,
+    );
+    expect(verifyRelayMarketplaceRequest(
+      installed.requestPath,
+      installed.requestDigest,
+    )).toEqual(request);
+  });
+
   it('accepts an exact 2 MiB canonical Relay spec and rejects one additional byte', () => {
     const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-task-'));
     temporaryDirectories.push(directory);

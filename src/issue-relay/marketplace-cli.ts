@@ -15,9 +15,15 @@ import {
 import { isGitHubSecretEnvironmentKey } from '../lifecycle/credentials.js';
 import {
   IssueRelayRoundV1Schema,
+  IssueRelayRoundV2Schema,
+  IssueRelayEvaluationBundleV2Schema,
+  IssueRelaySolutionV2Schema,
   IssueRelayVerdictV1Schema,
+  type IssueRelayEvaluationBundleV2,
   type IssueRelayRoundV1,
+  type IssueRelayRoundV2,
   type IssueRelayVerdictV1,
+  type IssueRelaySolutionV2,
 } from './contracts.js';
 import {
   ISSUE_RELAY_MAX_ENVELOPE_CID_BYTES,
@@ -71,6 +77,12 @@ export interface VerifiedIssueRelaySolutionObservation {
   };
 }
 
+export interface VerifiedIssueRelaySolutionObservationV2
+  extends Omit<VerifiedIssueRelaySolutionObservation, 'round' | 'payload'> {
+  readonly round: IssueRelayRoundV2;
+  readonly payload: IssueRelaySolutionV2;
+}
+
 export interface VerifiedIssueRelayVerdictObservation {
   readonly status: 'verified';
   readonly role: 'verdict';
@@ -92,6 +104,16 @@ export interface VerifiedIssueRelayVerdictObservation {
   readonly payload: IssueRelayVerdictV1;
 }
 
+export interface VerifiedIssueRelayEvaluationBundleObservation {
+  readonly status: 'verified';
+  readonly role: 'verdict';
+  readonly task: VerifiedIssueRelayVerdictObservation['task'];
+  readonly attempt: VerifiedIssueRelayVerdictObservation['attempt'];
+  readonly delivery: VerifiedIssueRelayVerdictObservation['delivery'];
+  readonly round: IssueRelayRoundV2;
+  readonly payload: IssueRelayEvaluationBundleV2;
+}
+
 export type IssueRelayDeliveryObservation =
   | {
       readonly status: 'pending';
@@ -104,7 +126,43 @@ export type IssueRelayDeliveryObservation =
       readonly detail: string;
     }
   | VerifiedIssueRelaySolutionObservation
-  | VerifiedIssueRelayVerdictObservation;
+  | VerifiedIssueRelaySolutionObservationV2
+  | VerifiedIssueRelayVerdictObservation
+  | VerifiedIssueRelayEvaluationBundleObservation;
+
+export function isVerifiedIssueRelaySolutionV1(
+  observation: IssueRelayDeliveryObservation,
+): observation is VerifiedIssueRelaySolutionObservation {
+  return observation.status === 'verified'
+    && observation.role === 'solution'
+    && observation.round.schemaVersion === 'jinn-issue-relay-round.v1';
+}
+
+export function isVerifiedIssueRelaySolutionV2(
+  observation: IssueRelayDeliveryObservation,
+): observation is VerifiedIssueRelaySolutionObservationV2 {
+  return observation.status === 'verified'
+    && observation.role === 'solution'
+    && observation.round.schemaVersion === 'jinn-issue-relay-round.v2';
+}
+
+export function isVerifiedIssueRelayVerdictV1(
+  observation: IssueRelayDeliveryObservation,
+): observation is VerifiedIssueRelayVerdictObservation {
+  return observation.status === 'verified'
+    && observation.role === 'verdict'
+    && observation.round.schemaVersion === 'jinn-issue-relay-round.v1'
+    && observation.payload.schemaVersion === 'jinn-issue-relay-verdict.v1';
+}
+
+export function isVerifiedIssueRelayEvaluationBundleV2(
+  observation: IssueRelayDeliveryObservation,
+): observation is VerifiedIssueRelayEvaluationBundleObservation {
+  return observation.status === 'verified'
+    && observation.role === 'verdict'
+    && observation.round.schemaVersion === 'jinn-issue-relay-round.v2'
+    && observation.payload.schemaVersion === 'jinn-issue-relay-evaluation-bundle.v2';
+}
 
 export interface IssueRelayMarketplaceCliOptions {
   readonly jinnBinary?: string;
@@ -440,6 +498,33 @@ const observationDetail = boundedText(
   'Issue Relay observation detail',
 );
 const nonNegativeInteger = z.number().int().safe().nonnegative();
+const relayRoundV1 = z.custom<IssueRelayRoundV1>(
+  (value) => IssueRelayRoundV1Schema.safeParse(value).success,
+  'Invalid Issue Relay V1 round',
+);
+const relayRoundV2 = z.custom<IssueRelayRoundV2>(
+  (value) => IssueRelayRoundV2Schema.safeParse(value).success,
+  'Invalid Issue Relay V2 round',
+);
+const relayVerdictV1 = z.custom<IssueRelayVerdictV1>(
+  (value) => IssueRelayVerdictV1Schema.safeParse(value).success,
+  'Invalid Issue Relay V1 verdict',
+);
+const relayEvaluationBundleV2 = z.custom<IssueRelayEvaluationBundleV2>(
+  (value) => IssueRelayEvaluationBundleV2Schema.safeParse(value).success,
+  'Invalid Issue Relay V2 evaluation bundle',
+);
+const solutionPayload = z.object({
+  schemaVersion: z.literal('jinn-repo-solution.v1'),
+  patch: nonEmpty.refine(
+    (value) => new TextEncoder().encode(value).byteLength <= ISSUE_RELAY_MAX_PATCH_BYTES,
+    'Issue Relay patch exceeds 2 MiB',
+  ),
+}).strict();
+const solutionPayloadV2 = z.custom<IssueRelaySolutionV2>(
+  (value) => IssueRelaySolutionV2Schema.safeParse(value).success,
+  'Invalid Issue Relay V2 solution',
+);
 const observationCommon = {
   status: z.literal('verified'),
   task: z.object({ taskId, taskCid }).strict(),
@@ -453,7 +538,6 @@ const observationCommon = {
     transactionHash: hex32,
     blockNumber: nonNegativeInteger,
   }).strict(),
-  round: IssueRelayRoundV1Schema,
 };
 const observationSchema = z.union([
   z.object({
@@ -469,20 +553,26 @@ const observationSchema = z.union([
   z.object({
     ...observationCommon,
     role: z.literal('solution'),
-    payload: z.object({
-      schemaVersion: z.literal('jinn-repo-solution.v1'),
-      patch: nonEmpty.refine(
-        (value) =>
-          new TextEncoder().encode(value).byteLength
-          <= ISSUE_RELAY_MAX_PATCH_BYTES,
-        'Issue Relay patch exceeds 2 MiB',
-      ),
-    }).strict(),
+    round: relayRoundV1,
+    payload: solutionPayload,
+  }).strict(),
+  z.object({
+    ...observationCommon,
+    role: z.literal('solution'),
+    round: relayRoundV2,
+    payload: solutionPayloadV2,
   }).strict(),
   z.object({
     ...observationCommon,
     role: z.literal('verdict'),
-    payload: IssueRelayVerdictV1Schema,
+    round: relayRoundV1,
+    payload: relayVerdictV1,
+  }).strict(),
+  z.object({
+    ...observationCommon,
+    role: z.literal('verdict'),
+    round: relayRoundV2,
+    payload: relayEvaluationBundleV2,
   }).strict(),
 ]);
 const observationEnvelopeSchema = z.object({

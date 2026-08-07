@@ -36,6 +36,8 @@ export interface RelayRepositoryAuthority {
 
 export interface RelayPullRequest extends RelayRepositoryAuthority {
   readonly number: number;
+  readonly title: string;
+  readonly body: string;
   readonly branch: string;
   readonly head: string;
   readonly base: string;
@@ -137,6 +139,19 @@ export type RelayGitHubCommand = RelayRepositoryAuthority & (
       readonly prNumber: number;
     }
   | {
+      readonly kind: 'update-draft-pull-request';
+      readonly repository: string;
+      readonly prNumber: number;
+      readonly expectedGeneration: string;
+      readonly expectedBranch: string;
+      readonly expectedHead: string;
+      readonly expectedBase: string;
+      readonly expectedTitle: string;
+      readonly expectedBody: string;
+      readonly title: string;
+      readonly body: string;
+    }
+  | {
       readonly kind: 'close-pull-request';
       readonly repository: string;
       readonly prNumber: number;
@@ -215,6 +230,8 @@ export interface RelayDraftPullRequestInput extends RelayRepositoryAuthority {
   readonly resultingHead: string;
   readonly defaultBranch: string;
   readonly issueNumber: number;
+  readonly title: string;
+  readonly body: string;
   readonly existingPrNumber?: number;
 }
 
@@ -334,10 +351,25 @@ export function formatRelayPullRequestMarker(generation: string): string {
   return `${PR_MARKER}\n\n\`\`\`json\n${JSON.stringify({ generation })}\n\`\`\``;
 }
 
+export function formatRelayPullRequestBody(
+  body: string,
+  generation: string,
+): string {
+  const visible = body.trim();
+  if (visible.length === 0 || visible.includes(PR_MARKER) || visible.includes('\u0000')) {
+    throw new RelayGitPublisherError(
+      'pr-contradiction',
+      'Relay pull request description is empty or contains reserved marker content',
+    );
+  }
+  return `${visible}\n\n${formatRelayPullRequestMarker(generation)}`;
+}
+
 export function parseRelayPullRequestMarker(body: string): string | null {
-  const marker = /^<!-- jinn-issue-relay:pull-request:v1 -->\n\n```json\n([^\r\n]+)\n```$/;
+  const marker = /(?:^|\n\n)<!-- jinn-issue-relay:pull-request:v1 -->\n\n```json\n([^\r\n]+)\n```$/;
   const match = marker.exec(body);
   if (match?.[1] === undefined) return null;
+  if (body.indexOf(PR_MARKER) !== body.lastIndexOf(PR_MARKER)) return null;
   try {
     const value: unknown = JSON.parse(match[1]);
     if (
@@ -445,6 +477,8 @@ function exactPr(
     && candidate.base === input.defaultBranch
     && candidate.open
     && candidate.draft
+    && candidate.title === input.title
+    && candidate.body === formatRelayPullRequestBody(input.body, input.generation)
     && (
       input.existingPrNumber === undefined
       || candidate.number === input.existingPrNumber
@@ -464,7 +498,9 @@ function sameExactPrIdentity(
     && left.head === right.head
     && left.base === right.base
     && left.open === right.open
-    && left.draft === right.draft;
+    && left.draft === right.draft
+    && left.title === right.title
+    && left.body === right.body;
 }
 
 function assertExactPr(
@@ -872,8 +908,8 @@ export function createRelayGitPublisher(options: {
             forkRepositoryId: input.forkRepositoryId,
             forkParentRepositoryId: input.forkParentRepositoryId,
             repository: input.targetRepository,
-            title: `Jinn Issue Relay: #${input.issueNumber}`,
-            body: formatRelayPullRequestMarker(input.generation),
+            title: input.title,
+            body: formatRelayPullRequestBody(input.body, input.generation),
             head: `${forkOwner}:${input.branch}`,
             base: input.defaultBranch,
             draft: true,
@@ -890,7 +926,46 @@ export function createRelayGitPublisher(options: {
           'Relay generation does not own exactly one pull request',
         );
       }
-      const listed = assertExactPr(candidates[0]!, input);
+      let listed = candidates[0]!;
+      const desiredBody = formatRelayPullRequestBody(input.body, input.generation);
+      if (listed.title !== input.title || listed.body !== desiredBody) {
+        if (
+          listed.generation !== input.generation
+          || listed.branch !== input.branch
+          || listed.head !== input.resultingHead
+          || listed.base !== input.defaultBranch
+          || !listed.open
+          || !listed.draft
+        ) {
+          throw new RelayGitPublisherError(
+            'pr-contradiction',
+            'Relay cannot update metadata without exact open draft authority',
+          );
+        }
+        try {
+          await github({
+            kind: 'update-draft-pull-request',
+            targetRepositoryId: input.targetRepositoryId,
+            forkRepositoryId: input.forkRepositoryId,
+            forkParentRepositoryId: input.forkParentRepositoryId,
+            repository: input.targetRepository,
+            prNumber: listed.number,
+            expectedGeneration: input.generation,
+            expectedBranch: input.branch,
+            expectedHead: input.resultingHead,
+            expectedBase: input.defaultBranch,
+            expectedTitle: listed.title,
+            expectedBody: listed.body,
+            title: input.title,
+            body: desiredBody,
+          });
+        } catch {
+          // A metadata update may succeed before a transport error. The exact
+          // readback below is the authority.
+        }
+        listed = await readPr(input, input.targetRepository, listed.number);
+      }
+      listed = assertExactPr(listed, input);
       const readback = await readPr(input, input.targetRepository, listed.number);
       return assertExactPr(readback, input);
     },

@@ -4,6 +4,7 @@ import {
   RelayGitPublisherError,
   createRelayGitPublisher,
   formatRelayAdoptionReceiptBlock,
+  formatRelayPullRequestBody,
   formatRelayPullRequestMarker,
   parseRelayAdoptionReceiptBlock,
   parseRelayPullRequestMarker,
@@ -20,6 +21,8 @@ const INPUT = '1'.repeat(40);
 const TREE = '2'.repeat(40);
 const RESULT = '3'.repeat(40);
 const PATCH_DIGEST = `sha256:${'4'.repeat(64)}` as const;
+const PR_TITLE = 'Fix the Relay issue';
+const PR_BODY = '## Summary\n\nFixes the Relay issue.\n\n## Testing\n\n- yarn test';
 const REPOSITORY_AUTHORITY = {
   targetRepositoryId: 'R_target',
   forkRepositoryId: 'R_fork',
@@ -60,6 +63,8 @@ function pullRequest(
 ): RelayPullRequest {
   return {
     number: 68,
+    title: PR_TITLE,
+    body: formatRelayPullRequestBody(PR_BODY, GENERATION),
     branch: BRANCH,
     head: RESULT,
     base: 'main',
@@ -133,8 +138,14 @@ function publisherFixture(input: {
           return { kind: 'pull-requests', pullRequests: prs };
         case 'create-draft-pull-request':
           githubMutations.push(command);
-          prs = [pullRequest()];
+          prs = [pullRequest({ title: command.title, body: command.body })];
           if (input.createPrThrows === true) throw new Error('ambiguous create');
+          return { kind: 'mutated' };
+        case 'update-draft-pull-request':
+          githubMutations.push(command);
+          prs = prs.map((pr) => pr.number === command.prNumber
+            ? { ...pr, title: command.title, body: command.body }
+            : pr);
           return { kind: 'mutated' };
         case 'read-pull-request': {
           const pr = prs.find(({ number }) => number === command.prNumber);
@@ -348,6 +359,8 @@ describe('managed-fork Relay Git publisher', () => {
       resultingHead: RESULT,
       defaultBranch: 'main',
       issueNumber: 42,
+      title: PR_TITLE,
+      body: PR_BODY,
     });
     await fixture.publisher.publishAdoptionReceipt({
       targetRepository: 'Jinn-Network/mono',
@@ -403,6 +416,8 @@ describe('managed-fork Relay Git publisher', () => {
       resultingHead: RESULT,
       defaultBranch: 'main',
       issueNumber: 42,
+      title: PR_TITLE,
+      body: PR_BODY,
     });
     const replay = await fixture.publisher.ensureDraftPullRequest({
       ...REPOSITORY_AUTHORITY,
@@ -413,6 +428,8 @@ describe('managed-fork Relay Git publisher', () => {
       resultingHead: RESULT,
       defaultBranch: 'main',
       issueNumber: 42,
+      title: PR_TITLE,
+      body: PR_BODY,
     });
 
     expect(created).toEqual(pullRequest());
@@ -425,7 +442,7 @@ describe('managed-fork Relay Git publisher', () => {
       draft: true,
       base: 'main',
       head: `Jinn-Network:${BRANCH}`,
-      body: formatRelayPullRequestMarker(GENERATION),
+      body: formatRelayPullRequestBody(PR_BODY, GENERATION),
     });
   });
 
@@ -444,9 +461,45 @@ describe('managed-fork Relay Git publisher', () => {
       resultingHead: RESULT,
       defaultBranch: 'main',
       issueNumber: 42,
+      title: PR_TITLE,
+      body: PR_BODY,
       existingPrNumber: 68,
     })).resolves.toEqual(pullRequest());
     expect(fixture.githubMutations).toEqual([]);
+  });
+
+  it('updates solver-authored PR metadata under exact open-draft authority', async () => {
+    const stale = pullRequest({
+      title: 'Old title',
+      body: formatRelayPullRequestBody('Old description', GENERATION),
+    });
+    const fixture = publisherFixture({
+      forkHead: RESULT,
+      pullRequests: [stale],
+    });
+
+    await expect(fixture.publisher.ensureDraftPullRequest({
+      ...REPOSITORY_AUTHORITY,
+      generation: GENERATION,
+      targetRepository: 'Jinn-Network/mono',
+      forkRepository: 'Jinn-Network/mono-relay',
+      branch: BRANCH,
+      resultingHead: RESULT,
+      defaultBranch: 'main',
+      issueNumber: 42,
+      title: PR_TITLE,
+      body: PR_BODY,
+      existingPrNumber: 68,
+    })).resolves.toEqual(pullRequest());
+
+    expect(fixture.githubMutations).toContainEqual(expect.objectContaining({
+      kind: 'update-draft-pull-request',
+      prNumber: 68,
+      expectedHead: RESULT,
+      expectedTitle: 'Old title',
+      title: PR_TITLE,
+      body: formatRelayPullRequestBody(PR_BODY, GENERATION),
+    }));
   });
 
   it.each([
@@ -469,6 +522,8 @@ describe('managed-fork Relay Git publisher', () => {
       resultingHead: RESULT,
       defaultBranch: 'main',
       issueNumber: 42,
+      title: PR_TITLE,
+      body: PR_BODY,
       existingPrNumber: 68,
     })).rejects.toBeInstanceOf(RelayGitPublisherError);
     expect(fixture.githubMutations).toEqual([]);

@@ -2416,6 +2416,7 @@ describe('bounded production GitHub ports', () => {
       node_id: 'PR_68',
       state: 'open',
       draft,
+      title: 'Bounded change',
       user: { login: 'jinn-relay' },
       head: {
         ref: 'issue-relay/abc',
@@ -2501,6 +2502,7 @@ describe('bounded production GitHub ports', () => {
         node_id: 'PR_68',
         state: open ? 'open' : 'closed',
         draft,
+        title: 'Bounded change',
         user: { login: 'jinn-relay' },
         head: {
           ref: 'issue-relay/abc',
@@ -2572,6 +2574,7 @@ describe('bounded production GitHub ports', () => {
       node_id: 'PR_68',
       state: 'open',
       draft: false,
+      title: 'Bounded change',
       user: { login: 'jinn-relay' },
       head: {
         ref: 'issue-relay/abc',

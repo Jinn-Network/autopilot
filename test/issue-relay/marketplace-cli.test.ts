@@ -518,6 +518,45 @@ describe('Issue Relay marketplace CLI submission', () => {
 });
 
 describe('Issue Relay marketplace CLI observation', () => {
+  it('accepts the canonical V2 bundle only with a V2 round', () => {
+    const payload = JSON.parse(readFileSync(
+      new URL('../fixtures/issue-relay-evaluation-bundle.v2.json', import.meta.url),
+      'utf8',
+    )) as Record<string, unknown>;
+    const correlation = payload['correlation'] as {
+      generation: string;
+      round: number;
+      snapshotDigest: string;
+    };
+    const roundV2 = {
+      schemaVersion: 'jinn-issue-relay-round.v2',
+      generation: correlation.generation,
+      round: correlation.round,
+      snapshotDigest: correlation.snapshotDigest,
+      targetRepository: 'Jinn-Network/mono',
+      workspaceRepository: 'Jinn-Network/mono',
+      inputHead: base,
+      purpose: 'initial',
+      findings: [],
+    };
+    const observation = {
+      status: 'verified', role: 'verdict', task: { taskId: '501', taskCid },
+      attempt: { attemptIndex: 0, requestId: `0x${'3'.repeat(64)}`, operator: `0x${'e'.repeat(40)}` },
+      delivery: { envelopeCid, transactionHash: `0x${'f'.repeat(64)}`, blockNumber: 120 },
+      round: roundV2,
+      payload,
+    };
+    expect(parseIssueRelayDeliveryObservation(observation)).toMatchObject({
+      role: 'verdict',
+      round: { schemaVersion: 'jinn-issue-relay-round.v2' },
+      payload: { schemaVersion: 'jinn-issue-relay-evaluation-bundle.v2' },
+    });
+    expect(() => parseIssueRelayDeliveryObservation({
+      ...observation,
+      round: task.spec.relay,
+    })).toThrow();
+  });
+
   it('accepts a 2 MiB UTF-8 patch and rejects the next byte', () => {
     const common = {
       status: 'verified' as const,
