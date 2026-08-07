@@ -12,11 +12,17 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { relayGeneration, relayTaskKey } from '../../src/issue-relay/identity.js';
 import {
   buildRelayVerdictExpectation,
+  buildRelayEvaluationBundleExpectationV2,
   buildRelaySolutionExpectation,
+  buildRelaySolutionExpectationV2,
+  installVerifiedRelayEvaluationBundleV2,
+  installVerifiedRelaySolutionObservationV2,
   observeAndInstallRelayVerdict,
   persistRelayVerdictExpectation,
+  persistRelayEvaluationBundleExpectationV2,
   installVerifiedRelayObservation,
   persistRelaySolutionExpectation,
+  persistRelaySolutionExpectationV2,
   persistRelaySubmissionEvidence,
   readVerifiedRelayVerdictObservation,
   readVerifiedRelayObservation,
@@ -28,11 +34,20 @@ import {
   relayAdoptionReceiptDigest,
 } from '../../src/issue-relay/checks.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
-import { buildRelayTaskSpec } from '../../src/issue-relay/task.js';
+import {
+  buildRelayTaskSpec,
+  buildRelayTaskSpecV2,
+} from '../../src/issue-relay/task.js';
 import type { AcceptedRelayAdoption } from '../../src/issue-relay/adoption.js';
 import type {
   IssueRelayEvaluationAnchorV1,
+  IssueRelayEvaluationBundleV2,
+  IssueRelayRoundV2,
   IssueRelayVerdictV1,
+} from '../../src/issue-relay/contracts.js';
+import {
+  issueRelayCanonicalDigest,
+  issueRelayPullRequestMetadataDigest,
 } from '../../src/issue-relay/contracts.js';
 import type {
   IssueRelayDeliveryObservation,
@@ -41,6 +56,14 @@ import type {
 
 const temporaryDirectories: string[] = [];
 const base = '1'.repeat(40);
+const evaluation = {
+  relayBotLogin: 'jinn-relay',
+  requiredChecks: ['ci/typecheck'],
+  laneSpecifications: {
+    security: `sha256:${'a'.repeat(64)}` as const,
+    quality: `sha256:${'b'.repeat(64)}` as const,
+  },
+};
 const snapshot = buildRelaySnapshot({
   repository: {
     slug: 'Jinn-Network/mono',
@@ -518,5 +541,154 @@ describe('Relay authenticated verdict state', () => {
       checks,
     })).rejects.toThrow(/receipt/i);
     expect(calls).toBe(0);
+  });
+
+  it('persists and installs an exact V2 dual-lane bundle without trusting its projection', () => {
+    const paths = statePaths();
+    const roundV2: IssueRelayRoundV2 = {
+      schemaVersion: 'jinn-issue-relay-round.v2',
+      generation: round.generation,
+      round: round.round,
+      snapshotDigest: round.snapshotDigest,
+      targetRepository: round.targetRepository,
+      workspaceRepository: round.workspaceRepository,
+      inputHead: round.inputHead,
+      purpose: 'initial',
+      findings: [],
+    };
+    const solutionExpectation = buildRelaySolutionExpectationV2({
+      submission,
+      taskSpec: buildRelayTaskSpecV2({
+        snapshot,
+        evaluation,
+        round: roundV2,
+      }).spec,
+    });
+    const persistedSolution = persistRelaySolutionExpectationV2(
+      paths.expectationPath,
+      solutionExpectation,
+    );
+    const solutionObservation = {
+      ...observation,
+      round: roundV2,
+      payload: {
+        schemaVersion: 'jinn-issue-relay-solution.v2',
+        patch: observation.payload.patch,
+        pullRequest: {
+          title: 'Fix the Relay issue',
+          body: '## Summary\n\nFixes the Relay issue.\n\n## Testing\n\n- yarn test',
+        },
+      },
+    } as IssueRelayDeliveryObservation;
+    const installedSolution = installVerifiedRelaySolutionObservationV2({
+      observationPath: paths.observationPath,
+      expectationPath: persistedSolution.path,
+      expectationDigest: persistedSolution.digest,
+      observation: solutionObservation,
+    });
+    expect(JSON.parse(readFileSync(installedSolution.path, 'utf8')))
+      .toEqual(solutionObservation);
+    const expected = buildRelayEvaluationBundleExpectationV2({
+      solutionExpectation,
+      adoption,
+      evaluationAnchor: anchor,
+      checks,
+    });
+    const persisted = persistRelayEvaluationBundleExpectationV2(
+      paths.verdictExpectationPath,
+      expected,
+    );
+    const contextDigest = `sha256:${'6'.repeat(64)}` as const;
+    const pullRequestMetadata = {
+      title: 'Fix the Relay issue',
+      body: '## Summary\n\nFixes the Relay issue.\n\n## Testing\n\n- yarn test',
+    };
+    const pullRequestMetadataDigest = issueRelayPullRequestMetadataDigest(
+      pullRequestMetadata,
+    );
+    const lane = (name: 'security' | 'quality') => ({
+      schemaVersion: 'jinn-issue-relay-lane-attestation.v1' as const,
+      lane: name,
+      correlation: adoption.receipt.correlation,
+      evaluatedHead: resultingHead,
+      evaluationContextDigest: contextDigest,
+      evaluationAnchorDigest: issueRelayCanonicalDigest(anchor),
+      adoptionReceiptDigest: anchor.adoptionReceiptDigest,
+      checksDigest: checks.digest,
+      pullRequestMetadataDigest,
+      evaluationSpecificationDigest: name === 'security'
+        ? `sha256:${'7'.repeat(64)}` as const
+        : `sha256:${'8'.repeat(64)}` as const,
+      outcome: { kind: 'pass' as const, findings: [] },
+      publicSummary: `${name} passed the exact head.`,
+    });
+    const bundle: IssueRelayEvaluationBundleV2 = {
+      schemaVersion: 'jinn-issue-relay-evaluation-bundle.v2',
+      correlation: adoption.receipt.correlation,
+      evaluatedHead: resultingHead,
+      evaluationContextDigest: contextDigest,
+      lanes: { security: lane('security'), quality: lane('quality') },
+      overallProjection: 'pass',
+    };
+    const bundleObservation: IssueRelayDeliveryObservation = {
+      ...verdictObservation,
+      round: roundV2,
+      payload: bundle,
+    };
+    const installed = installVerifiedRelayEvaluationBundleV2({
+      observationPath: paths.verdictObservationPath,
+      expectationPath: paths.verdictExpectationPath,
+      expectationDigest: persisted.digest,
+      observation: bundleObservation,
+      adoption,
+      evaluationAnchor: anchor,
+      checks,
+      pullRequestMetadata,
+      laneSpecifications: {
+        security: `sha256:${'7'.repeat(64)}`,
+        quality: `sha256:${'8'.repeat(64)}`,
+      },
+    });
+    expect(JSON.parse(readFileSync(installed.path, 'utf8'))).toEqual(bundleObservation);
+
+    const tampered = {
+      ...bundleObservation,
+      payload: {
+        ...bundle,
+        lanes: {
+          ...bundle.lanes,
+          security: { ...bundle.lanes.security, checksDigest: `sha256:${'9'.repeat(64)}` },
+        },
+      },
+    } as IssueRelayDeliveryObservation;
+    expect(() => installVerifiedRelayEvaluationBundleV2({
+      observationPath: join(paths.verdictObservationPath, 'tampered'),
+      expectationPath: paths.verdictExpectationPath,
+      expectationDigest: persisted.digest,
+      observation: tampered,
+      adoption,
+      evaluationAnchor: anchor,
+      checks,
+      pullRequestMetadata,
+      laneSpecifications: {
+        security: `sha256:${'7'.repeat(64)}`,
+        quality: `sha256:${'8'.repeat(64)}`,
+      },
+    })).toThrow(/bundle|pin/i);
+
+    expect(() => installVerifiedRelayEvaluationBundleV2({
+      observationPath: join(paths.verdictObservationPath, 'wrong-specification'),
+      expectationPath: paths.verdictExpectationPath,
+      expectationDigest: persisted.digest,
+      observation: bundleObservation,
+      adoption,
+      evaluationAnchor: anchor,
+      checks,
+      pullRequestMetadata,
+      laneSpecifications: {
+        security: `sha256:${'9'.repeat(64)}`,
+        quality: `sha256:${'8'.repeat(64)}`,
+      },
+    })).toThrow(/bundle|pin/i);
   });
 });

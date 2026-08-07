@@ -5,8 +5,11 @@ import {
 } from './contracts.js';
 import { relayBranch, relayGeneration } from './identity.js';
 import {
+  isVerifiedIssueRelaySolutionV1,
+  isVerifiedIssueRelaySolutionV2,
   parseIssueRelayDeliveryObservation,
-  type IssueRelayDeliveryObservation,
+  type VerifiedIssueRelaySolutionObservation,
+  type VerifiedIssueRelaySolutionObservationV2,
 } from './marketplace-cli.js';
 import type { IssueRelaySnapshotV1 } from './snapshot.js';
 import {
@@ -56,16 +59,9 @@ export interface RejectedRelayAdoption {
   >;
 }
 
-export type VerifiedRelaySolutionObservation = Omit<
-  Extract<IssueRelayDeliveryObservation, { readonly status: 'verified' }>,
-  'role' | 'payload'
-> & {
-  readonly role: 'solution';
-  readonly payload: {
-    readonly schemaVersion: 'jinn-repo-solution.v1';
-    readonly patch: string;
-  };
-};
+export type VerifiedRelaySolutionObservation =
+  | VerifiedIssueRelaySolutionObservation
+  | VerifiedIssueRelaySolutionObservationV2;
 
 export interface RelayAdoptionCoordinator {
   adopt(input: {
@@ -179,7 +175,7 @@ function observationCorrelation(
   return {
     generation: observation.round.generation,
     round: observation.round.round,
-    snapshotDigest: observation.round.snapshotDigest,
+    snapshotDigest: observation.round.snapshotDigest as `sha256:${string}`,
     taskId: observation.task.taskId,
     attemptIndex: observation.attempt.attemptIndex,
     requestId: observation.attempt.requestId,
@@ -434,10 +430,13 @@ export function makeRelayAdoptionCoordinator(
       let observation: VerifiedRelaySolutionObservation;
       try {
         const parsed = parseIssueRelayDeliveryObservation(input.observation);
-        if (parsed.status !== 'verified' || parsed.role !== 'solution') {
+        if (
+          !isVerifiedIssueRelaySolutionV1(parsed)
+          && !isVerifiedIssueRelaySolutionV2(parsed)
+        ) {
           throw new Error('Relay observation is not an authenticated solution');
         }
-        observation = parsed;
+        observation = parsed as VerifiedRelaySolutionObservation;
       } catch {
         return rejection(
           input.observation,
@@ -876,6 +875,12 @@ export function makeRelayAdoptionCoordinator(
         resultingHead: published.resultingHead,
         defaultBranch: afterPush.defaultBranch,
         issueNumber: input.snapshot.issue.number,
+        title: isVerifiedIssueRelaySolutionV2(observation)
+          ? observation.payload.pullRequest.title
+          : `Jinn Issue Relay: #${input.snapshot.issue.number}`,
+        body: isVerifiedIssueRelaySolutionV2(observation)
+          ? observation.payload.pullRequest.body
+          : `Implements #${input.snapshot.issue.number}.`,
         existingPrNumber: expectedPrNumber,
       });
       if (!exactPublishedPr({

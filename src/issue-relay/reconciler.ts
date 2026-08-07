@@ -170,6 +170,9 @@ function phaseCounts(
 export async function runIssueRelayCycle(
   deps: IssueRelayRuntimePorts,
 ): Promise<RelayCycleReport> {
+  if (deps.config.schemaVersion !== 1) {
+    throw new Error('Relay generation.v2 must use the dedicated V2 reconciliation composition');
+  }
   if (deps.reconciliation === undefined) {
     throw new Error('Issue Relay reconciliation composition is unavailable');
   }

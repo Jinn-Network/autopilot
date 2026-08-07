@@ -15,7 +15,16 @@ import {
 
 const OID = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
-const RELAY_COMMAND = 'observe-issue-relay-delivery';
+const RELAY_COMMANDS = [
+  {
+    relativePath: 'cli/commands/tasks-observe-issue-relay.js',
+    command: 'observe-issue-relay-delivery',
+  },
+  {
+    relativePath: 'cli/commands/tasks-observe-application.js',
+    command: 'observe-application-delivery',
+  },
+] as const;
 
 function distributionRoot(binaryPath: string): string {
   if (!isAbsolute(binaryPath)) {
@@ -113,15 +122,19 @@ export function verifyIssueRelayJinnDistribution(input: {
   ) {
     throw new Error('Issue Relay Jinn build metadata commit is not reviewed');
   }
-  for (const relativePath of [
-    'cli/commands/tasks.js',
-    'cli/commands/tasks-observe-issue-relay.js',
-  ]) {
-    const path = join(root, relativePath);
+  const tasksPath = join(root, 'cli/commands/tasks.js');
+  const tasksStat = lstatSync(tasksPath);
+  const tasksSource = readFileSync(tasksPath, 'utf8');
+  if (!tasksStat.isFile()) {
+    throw new Error('Issue Relay Jinn distribution lacks its Task command router');
+  }
+  for (const required of RELAY_COMMANDS) {
+    const path = join(root, required.relativePath);
     const stat = lstatSync(path);
     if (
       !stat.isFile()
-      || !readFileSync(path, 'utf8').includes(RELAY_COMMAND)
+      || !readFileSync(path, 'utf8').includes(required.command)
+      || !tasksSource.includes(required.command)
     ) {
       throw new Error(
         'Issue Relay Jinn distribution lacks the delivery observation command',

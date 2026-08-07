@@ -344,6 +344,7 @@ async function createVerticalFixture(options: VerticalOptions) {
             node_id: 'PR_42',
             state: pullRequest.open ? 'open' : 'closed',
             draft: pullRequest.draft,
+            title: pullRequest.title,
             user: { login: SERVICE_LOGIN },
             head: {
               ref: pullRequest.branch,
@@ -360,7 +361,7 @@ async function createVerticalFixture(options: VerticalOptions) {
                 node_id: targetRepository.node_id,
               },
             },
-            body: '<!-- jinn-issue-relay:pull-request:v1 -->',
+            body: pullRequest.body,
           },
         };
       }
@@ -643,6 +644,8 @@ async function createVerticalFixture(options: VerticalOptions) {
           pullRequestCreations += 1;
           pullRequest = {
             number: 42,
+            title: command.title,
+            body: command.body,
             generation: record.generation,
             targetRepositoryId: TARGET_REPOSITORY_ID,
             forkRepositoryId: FORK_REPOSITORY_ID,
@@ -655,6 +658,27 @@ async function createVerticalFixture(options: VerticalOptions) {
           };
           return { kind: 'mutated' as const };
         }
+        case 'update-draft-pull-request':
+          if (
+            pullRequest === undefined
+            || pullRequest.number !== command.prNumber
+            || pullRequest.generation !== command.expectedGeneration
+            || pullRequest.branch !== command.expectedBranch
+            || pullRequest.head !== command.expectedHead
+            || pullRequest.base !== command.expectedBase
+            || pullRequest.title !== command.expectedTitle
+            || pullRequest.body !== command.expectedBody
+            || !pullRequest.open
+            || !pullRequest.draft
+          ) {
+            throw new Error('Hermetic metadata update lost exact draft authority');
+          }
+          pullRequest = {
+            ...pullRequest,
+            title: command.title,
+            body: command.body,
+          };
+          return { kind: 'mutated' as const };
         case 'read-pull-request':
           if (
             pullRequest === undefined

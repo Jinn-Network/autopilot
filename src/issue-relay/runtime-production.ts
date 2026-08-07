@@ -26,7 +26,7 @@ import {
 } from 'node:path';
 import { execFile } from 'node:child_process';
 import { isDeepStrictEqual, promisify } from 'node:util';
-import type { IssueRelayConfig } from './config.js';
+import type { IssueRelayConfig, IssueRelayConfigV2 } from './config.js';
 import { parseIssueRelayConfig } from './config.js';
 import {
   createRelayGitHubProductionPorts,
@@ -56,6 +56,7 @@ import {
 import {
   buildRelayMarketplaceRequest,
   buildRelayTaskSpec,
+  buildRelayTaskSpecV2,
   persistRelayMarketplaceRequest,
   verifyRelayMarketplaceRequest,
 } from './task.js';
@@ -71,6 +72,8 @@ import {
 } from './marketplace-state.js';
 import {
   IssueRelayMarketplaceCli,
+  isVerifiedIssueRelaySolutionV1,
+  isVerifiedIssueRelayVerdictV1,
   type VerifiedIssueRelaySolutionObservation,
 } from './marketplace-cli.js';
 import {
@@ -104,6 +107,7 @@ import { makeRelayAdoptionCoordinator } from './adoption.js';
 import type {
   IssueRelayEvaluationAnchorV1,
 } from './contracts.js';
+import { IssueRelayRoundV2Schema } from './contracts.js';
 import { verifyIssueRelayJinnDistribution } from './jinn-distribution.js';
 import {
   createMarketplaceVerificationDockerSandbox,
@@ -121,6 +125,11 @@ import type {
   RelayReconciliationPort,
 } from './reconciler.js';
 import { runIssueRelayCycle } from './reconciler.js';
+import {
+  runIssueRelayCycleV2,
+  type RelayV2CycleReport,
+} from './reconciler-v2.js';
+import { createIssueRelayProductionReconciliationV2 } from './runtime-production-v2.js';
 import { gitOid } from '../lifecycle/types.js';
 import type {
   RelayGitHubReadPort,
@@ -1165,8 +1174,8 @@ export function createIssueRelayProductionReconciliation(options: {
       artifact.path,
       artifact.digest,
     );
-    if (readback.role !== 'solution') {
-      throw new Error('Relay persisted observation is not a solution');
+    if (!isVerifiedIssueRelaySolutionV1(readback)) {
+      throw new Error('Relay V1 persisted observation is not a V1 solution');
     }
     return { status: 'verified', observation: readback };
   };
@@ -1351,8 +1360,8 @@ export function createIssueRelayProductionReconciliation(options: {
       installed.observation.path,
       installed.observation.digest,
     );
-    if (observation.role !== 'verdict') {
-      throw new Error('Relay persisted observation is not a verdict');
+    if (!isVerifiedIssueRelayVerdictV1(observation)) {
+      throw new Error('Relay V1 persisted observation is not a V1 verdict');
     }
     return {
       status: 'verified' as const,
@@ -2437,16 +2446,16 @@ export async function preflightIssueRelayProduction(
   };
 }
 
-export async function runIssueRelayRuntime(options: {
+export async function runIssueRelayRuntime<Report = RelayCycleReport>(options: {
   readonly mode: 'observe' | 'recover' | 'active';
   readonly once: boolean;
   readonly pollSeconds: number;
   readonly acquireWriterLease?: () => IssueRelayRuntimeLease;
   readonly preflight: () => Promise<void>;
-  readonly cycle: () => Promise<RelayCycleReport>;
+  readonly cycle: () => Promise<Report>;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly signal?: AbortSignal;
-}): Promise<readonly RelayCycleReport[]> {
+}): Promise<readonly Report[]> {
   if (
     !Number.isSafeInteger(options.pollSeconds)
     || options.pollSeconds <= 0
@@ -2458,7 +2467,7 @@ export async function runIssueRelayRuntime(options: {
     : options.acquireWriterLease?.();
   try {
     await options.preflight();
-    const reports: RelayCycleReport[] = [];
+    const reports: Report[] = [];
     const sleep = options.sleep ?? ((milliseconds) =>
       new Promise((resolve) => setTimeout(resolve, milliseconds)));
     do {
@@ -2861,6 +2870,9 @@ productionEnvironmentDependencies): Promise<void> {
     expectedDigest: configuredJinnDistributionSha256,
   });
   const config = parseIssueRelayConfig(dependencies.readConfig(configPath));
+  const configV2 = config.schemaVersion === 2
+    ? config as IssueRelayConfigV2
+    : undefined;
   const now = () => new Date();
   const artifacts = options.mode === 'observe'
     ? createRelayReadOnlyArtifactStore(stateDirectory)
@@ -2979,18 +2991,33 @@ productionEnvironmentDependencies): Promise<void> {
     publisher,
     now,
   });
-  const reconciliation = createIssueRelayProductionReconciliation({
-    config,
-    stateDirectory,
-    githubRead: github.read,
-    githubWrite: github.write,
-    githubAuthority: github.authority,
-    marketplace,
-    adopter,
-    artifacts,
-    now,
-  });
-  await runIssueRelayRuntime({
+  const reconciliationV1 = config.schemaVersion === 1
+    ? createIssueRelayProductionReconciliation({
+        config,
+        stateDirectory,
+        githubRead: github.read,
+        githubWrite: github.write,
+        githubAuthority: github.authority,
+        marketplace,
+        adopter,
+        artifacts,
+        now,
+      })
+    : undefined;
+  const reconciliationV2 = configV2 !== undefined
+    ? createIssueRelayProductionReconciliationV2({
+        config: configV2,
+        stateDirectory,
+        githubRead: github.read,
+        githubWrite: github.write,
+        githubAuthority: github.authority,
+        marketplace,
+        adopter,
+        artifacts,
+        now,
+      })
+    : undefined;
+  await runIssueRelayRuntime<RelayCycleReport | RelayV2CycleReport>({
     mode: options.mode,
     once: options.once,
     pollSeconds: config.pollSeconds,
@@ -3059,14 +3086,34 @@ productionEnvironmentDependencies): Promise<void> {
             admissionPolicyVersion: 'jinn-issue-relay-admission.v1',
             capturedAt,
           });
-          const task = buildRelayTaskSpec({
-            snapshot,
-            round: 0,
-            purpose: 'initial',
-            workspaceRepository: config.repository,
-            inputHead: baseOid,
-            findings: [],
-          });
+          const task = config.schemaVersion === 2
+            ? buildRelayTaskSpecV2({
+                snapshot,
+                evaluation: {
+                  relayBotLogin: config.relayBotLogin,
+                  requiredChecks: config.requiredChecks,
+                  laneSpecifications: (config as IssueRelayConfigV2).laneSpecifications,
+                },
+                round: IssueRelayRoundV2Schema.parse({
+                  schemaVersion: 'jinn-issue-relay-round.v2',
+                  generation: relayGeneration(snapshot),
+                  round: 0,
+                  snapshotDigest: snapshot.snapshotDigest,
+                  targetRepository: config.repository,
+                  workspaceRepository: config.repository,
+                  inputHead: baseOid,
+                  purpose: 'initial',
+                  findings: [],
+                }),
+              })
+            : buildRelayTaskSpec({
+                snapshot,
+                round: 0,
+                purpose: 'initial',
+                workspaceRepository: config.repository,
+                inputHead: baseOid,
+                findings: [],
+              });
           const directory = await mkdtemp(
             join(tmpdir(), 'jinn-issue-relay-preflight-'),
           );
@@ -3102,16 +3149,22 @@ productionEnvironmentDependencies): Promise<void> {
         verificationRuntime: async () => (await verification.preflight()).ok,
       });
     },
-    cycle: () => runIssueRelayCycle({
-      mode: options.mode,
-      config,
-      githubRead: github.read,
-      githubWrite: github.write,
-      marketplace,
-      adopter,
-      artifacts,
-      now,
-      reconciliation,
-    }),
+    cycle: () => configV2 !== undefined
+      ? runIssueRelayCycleV2({
+          mode: options.mode,
+          config: configV2,
+          reconciliation: reconciliationV2!,
+        })
+      : runIssueRelayCycle({
+          mode: options.mode,
+          config,
+          githubRead: github.read,
+          githubWrite: github.write,
+          marketplace,
+          adopter,
+          artifacts,
+          now,
+          reconciliation: reconciliationV1!,
+        }),
   });
 }

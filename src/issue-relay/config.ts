@@ -27,8 +27,7 @@ const budgetSchema = z.object({
   generationDeadlineMs: positiveInteger,
 }).strict();
 
-const configSchema = z.object({
-  schemaVersion: z.literal(1),
+const commonConfigFields = {
   repository: z.literal('Jinn-Network/mono'),
   label: z.literal('engine:marketplace'),
   relayBotLogin: githubName,
@@ -39,8 +38,43 @@ const configSchema = z.object({
   verificationProfile: z.literal('jinn-mono.v1'),
   requiredChecks: z.array(safeName).max(100),
   pollSeconds: positiveInteger,
+};
+
+const configV1Schema = z.object({
+  schemaVersion: z.literal(1),
+  ...commonConfigFields,
   budget: budgetSchema,
-}).strict().superRefine((config, context) => {
+}).strict();
+
+const configV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  ...commonConfigFields,
+  generationProtocol: z.literal('v2'),
+  dualLaneEvaluationEnabled: z.boolean(),
+  humanDecisionCommandsEnabled: z.boolean(),
+  decisionImplementationEnabled: z.boolean(),
+  laneSpecifications: z.object({
+    security: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    quality: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  }).strict(),
+  safePreimplementationReasonCodes: z.array(safeName).max(100),
+  budget: budgetSchema.extend({
+    maxEvaluationAttemptsPerLanePerHead: positiveInteger,
+    maxEvaluationRetrySpendWei: canonicalWei,
+    maxDecisionRequestsPerGeneration: positiveInteger,
+    maxDecisionImplementationRoundsPerGeneration: positiveInteger,
+    maxDecisionImplementationSpendWei: canonicalWei,
+    humanDecisionTtlMs: positiveInteger,
+    maxHumanDeferrals: z.number().int().safe().nonnegative(),
+    humanDeferralExtensionMs: positiveInteger,
+    decisionContinuationDeadlineMs: positiveInteger,
+  }).strict(),
+}).strict();
+
+const configSchema = z.discriminatedUnion('schemaVersion', [
+  configV1Schema,
+  configV2Schema,
+]).superRefine((config, context) => {
   const [forkOwner] = config.managedForkRepository.split('/');
   if (
     forkOwner?.toLocaleLowerCase('en-US')
@@ -90,12 +124,61 @@ export interface IssueRelayConfigFileV1 {
   };
 }
 
-export interface IssueRelayConfig
+export interface IssueRelayConfigV1
   extends Omit<IssueRelayConfigFileV1, 'budget'> {
   readonly budget: RelayBudgetPolicy;
 }
 
-export function parseIssueRelayConfig(input: unknown): IssueRelayConfig {
+/** Common runtime surface retained for V1 production composition. */
+export interface IssueRelayConfig
+  extends Omit<IssueRelayConfigFileV1, 'schemaVersion' | 'budget'> {
+  readonly schemaVersion: 1 | 2;
+  readonly budget: RelayBudgetPolicy;
+}
+
+export interface IssueRelayConfigFileV2
+  extends Omit<IssueRelayConfigFileV1, 'schemaVersion' | 'budget'> {
+  readonly schemaVersion: 2;
+  readonly generationProtocol: 'v2';
+  readonly dualLaneEvaluationEnabled: boolean;
+  readonly humanDecisionCommandsEnabled: boolean;
+  readonly decisionImplementationEnabled: boolean;
+  readonly laneSpecifications: {
+    readonly security: `sha256:${string}`;
+    readonly quality: `sha256:${string}`;
+  };
+  readonly safePreimplementationReasonCodes: readonly string[];
+  readonly budget: IssueRelayConfigFileV1['budget'] & {
+    readonly maxEvaluationAttemptsPerLanePerHead: number;
+    readonly maxEvaluationRetrySpendWei: string;
+    readonly maxDecisionRequestsPerGeneration: number;
+    readonly maxDecisionImplementationRoundsPerGeneration: number;
+    readonly maxDecisionImplementationSpendWei: string;
+    readonly humanDecisionTtlMs: number;
+    readonly maxHumanDeferrals: number;
+    readonly humanDeferralExtensionMs: number;
+    readonly decisionContinuationDeadlineMs: number;
+  };
+}
+
+export interface IssueRelayConfigV2
+  extends Omit<IssueRelayConfigFileV2, 'budget'> {
+  readonly budget: RelayBudgetPolicy & {
+    readonly maxEvaluationAttemptsPerLanePerHead: number;
+    readonly maxEvaluationRetrySpendWei: bigint;
+    readonly maxDecisionRequestsPerGeneration: number;
+    readonly maxDecisionImplementationRoundsPerGeneration: number;
+    readonly maxDecisionImplementationSpendWei: bigint;
+    readonly humanDecisionTtlMs: number;
+    readonly maxHumanDeferrals: number;
+    readonly humanDeferralExtensionMs: number;
+    readonly decisionContinuationDeadlineMs: number;
+  };
+}
+
+export type AnyIssueRelayConfig = IssueRelayConfigV1 | IssueRelayConfigV2;
+
+export function parseIssueRelayConfig(input: unknown): IssueRelayConfig | IssueRelayConfigV2 {
   const parsed = configSchema.safeParse(input);
   if (!parsed.success) {
     throw new TypeError('Invalid Jinn Issue Relay config', {
@@ -103,6 +186,20 @@ export function parseIssueRelayConfig(input: unknown): IssueRelayConfig {
     });
   }
   const config = parsed.data;
+  if (config.schemaVersion === 2) {
+    return {
+      ...config,
+      requiredChecks: [...config.requiredChecks],
+      safePreimplementationReasonCodes: [...config.safePreimplementationReasonCodes],
+      budget: {
+        ...config.budget,
+        maxGenerationSpendWei: BigInt(config.budget.maxGenerationSpendWei),
+        maxGlobalSpendWeiPerUtcDay: BigInt(config.budget.maxGlobalSpendWeiPerUtcDay),
+        maxEvaluationRetrySpendWei: BigInt(config.budget.maxEvaluationRetrySpendWei),
+        maxDecisionImplementationSpendWei: BigInt(config.budget.maxDecisionImplementationSpendWei),
+      },
+    } as IssueRelayConfigV2;
+  }
   return {
     ...config,
     requiredChecks: [...config.requiredChecks],

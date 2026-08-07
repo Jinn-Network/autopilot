@@ -10,7 +10,7 @@
   },
   "bin": "./dist/autopilot.js",
   "files": [
-    "dist/autopilot.js",
+    "dist/",
     "assets",
     "schemas",
     "templates",

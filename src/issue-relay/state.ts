@@ -10,6 +10,7 @@ import {
   type IssueRelayFindingV1,
 } from './contracts.js';
 import {
+  isVerifiedIssueRelayVerdictV1,
   parseIssueRelayDeliveryObservation,
   type VerifiedIssueRelayVerdictObservation,
 } from './marketplace-cli.js';
@@ -568,10 +569,7 @@ export function deriveRelayReady(input: RelayReadyInput): RelayReadyDecision {
       const observation = parseIssueRelayDeliveryObservation(input.verdict);
       if (observation.status === 'pending') {
         verdictState = 'pending';
-      } else if (
-        observation.status === 'verified'
-        && observation.role === 'verdict'
-      ) {
+      } else if (isVerifiedIssueRelayVerdictV1(observation)) {
         verdict = observation;
         verdictState = 'verified';
       }

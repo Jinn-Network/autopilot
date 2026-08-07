@@ -29,6 +29,12 @@ async function fixture(): Promise<{
     'commands',
     'tasks-observe-issue-relay.js',
   );
+  const applicationCommandPath = join(
+    dist,
+    'cli',
+    'commands',
+    'tasks-observe-application.js',
+  );
   await mkdir(join(dist, 'bin'), { recursive: true });
   await mkdir(join(dist, 'cli', 'commands'), { recursive: true });
   await writeFile(binaryPath, '#!/usr/bin/env node\nimport "../cli/index.js";\n');
@@ -39,11 +45,15 @@ async function fixture(): Promise<{
   );
   await writeFile(
     join(dist, 'cli', 'commands', 'tasks.js'),
-    'const command = "observe-issue-relay-delivery";\n',
+    'const commands = ["observe-issue-relay-delivery", "observe-application-delivery"];\n',
   );
   await writeFile(
     commandPath,
     'const command = "observe-issue-relay-delivery";\n',
+  );
+  await writeFile(
+    applicationCommandPath,
+    'const command = "observe-application-delivery";\n',
   );
   return { binaryPath, commandPath };
 }

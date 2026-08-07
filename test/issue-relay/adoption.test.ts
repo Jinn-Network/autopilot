@@ -5,8 +5,11 @@ import {
   type RelayAdoptionDependencies,
   type RelayAdoptionExactAuthority,
   type RelayAdoptionAuthority,
-  type VerifiedRelaySolutionObservation,
 } from '../../src/issue-relay/adoption.js';
+import type {
+  VerifiedIssueRelaySolutionObservation,
+  VerifiedIssueRelaySolutionObservationV2,
+} from '../../src/issue-relay/marketplace-cli.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
 import type { IssueRelayAdoptionReceiptV1 } from '../../src/issue-relay/contracts.js';
 
@@ -60,8 +63,8 @@ const patch = [
 ].join('\n');
 
 function observation(
-  overrides: Partial<VerifiedRelaySolutionObservation> = {},
-): VerifiedRelaySolutionObservation {
+  overrides: Partial<VerifiedIssueRelaySolutionObservation> = {},
+): VerifiedIssueRelaySolutionObservation {
   return {
     status: 'verified',
     role: 'solution',
@@ -147,6 +150,8 @@ function relayPr(
 ): NonNullable<RelayAdoptionExactAuthority['pr']> {
   return {
     number: 68,
+    title: 'Fix the Relay issue',
+    body: '## Summary\n\nFixes the Relay issue.',
     branch: relayBranch(generation),
     head: RESULT,
     base: 'main',
@@ -285,6 +290,40 @@ function dependencies(input: {
 }
 
 describe('Relay solution adoption policy', () => {
+  it('adopts a V2 solution capsule through the same host-only validation path', async () => {
+    const fixture = dependencies();
+    const v1 = observation();
+    const v2: VerifiedIssueRelaySolutionObservationV2 = {
+      ...v1,
+      round: {
+        schemaVersion: 'jinn-issue-relay-round.v2',
+        generation,
+        round: 0,
+        snapshotDigest: snapshot.snapshotDigest,
+        targetRepository: 'Jinn-Network/mono',
+        workspaceRepository: 'Jinn-Network/mono',
+        inputHead: BASE,
+        purpose: 'initial',
+        findings: [],
+      },
+      payload: {
+        schemaVersion: 'jinn-issue-relay-solution.v2',
+        patch,
+        pullRequest: {
+          title: 'Fix the Relay issue',
+          body: '## Summary\n\nFixes the Relay issue.\n\n## Testing\n\n- yarn test',
+        },
+      },
+    };
+    const result = await makeRelayAdoptionCoordinator(fixture.dependencies).adopt({
+      authority: authority(),
+      observation: v2,
+      snapshot,
+    });
+    expect(result.status).toBe('accepted');
+    expect(fixture.mutations).toContain('receipt');
+  });
+
   it.each([
     ['generation', observation({
       round: { ...observation().round, generation: 'wrong-generation' },

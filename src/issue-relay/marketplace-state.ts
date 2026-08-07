@@ -22,8 +22,11 @@ import {
   IssueRelayAdoptionReceiptV1Schema,
   IssueRelayEvaluationAnchorV1Schema,
   IssueRelayRoundV1Schema,
+  issueRelayCanonicalDigest,
+  issueRelayPullRequestMetadataDigest,
   type IssueRelayEvaluationAnchorV1,
   type IssueRelayRoundV1,
+  type IssueRelayRoundV2,
 } from './contracts.js';
 import type { AcceptedRelayAdoption } from './adoption.js';
 import {
@@ -34,6 +37,15 @@ import {
 } from './checks.js';
 import { relayTaskKey } from './identity.js';
 import {
+  ISSUE_RELAY_APPLICATION,
+  IssueRelayApplicationTaskExtensionSchema,
+} from './marketplace-application.js';
+import type { RelayTaskSpecV2 } from './task.js';
+import {
+  isVerifiedIssueRelaySolutionV1,
+  isVerifiedIssueRelaySolutionV2,
+  isVerifiedIssueRelayEvaluationBundleV2,
+  isVerifiedIssueRelayVerdictV1,
   parseIssueRelayDeliveryObservation,
   type IssueRelayDeliveryObservation,
   type RelaySubmissionEvidence,
@@ -52,6 +64,20 @@ export interface IssueRelayDeliveryExpectation {
   readonly taskCid: string;
   readonly creationBlockNumber: number;
   readonly round: IssueRelayRoundV1;
+  readonly attemptIndex?: number;
+  readonly requestId?: string;
+  readonly deliveryEnvelopeCid?: string;
+  readonly solutionOperatorSafe?: string;
+}
+
+export interface IssueRelayDeliveryExpectationV2 {
+  readonly schemaVersion: 'jinn-application-delivery-expectation.v1';
+  readonly role: 'solution' | 'verdict';
+  readonly taskId: string;
+  readonly taskCid: string;
+  readonly creationBlockNumber: number;
+  readonly application: typeof ISSUE_RELAY_APPLICATION;
+  readonly taskSpec: RelayTaskSpecV2['spec'];
   readonly attemptIndex?: number;
   readonly requestId?: string;
   readonly deliveryEnvelopeCid?: string;
@@ -300,15 +326,11 @@ function validateVerifiedSolution(
   observation: IssueRelayDeliveryObservation,
   expectation: IssueRelayDeliveryExpectation,
 ): Extract<IssueRelayDeliveryObservation, { readonly status: 'verified' }> {
-  if (
-    observation.status !== 'verified'
-    || observation.role !== 'solution'
-    || observation.payload.schemaVersion !== 'jinn-repo-solution.v1'
-  ) {
+  if (!isVerifiedIssueRelaySolutionV1(observation)) {
     throw new Error('Relay observation must be a verified solution');
   }
   const valid = parseIssueRelayDeliveryObservation(observation);
-  if (valid.status !== 'verified' || valid.role !== 'solution') {
+  if (!isVerifiedIssueRelaySolutionV1(valid)) {
     throw new Error('Relay observation must be a verified solution');
   }
   if (
@@ -574,11 +596,7 @@ IssueRelayDeliveryObservation,
   });
   const expectation = validateVerdictExpectation(input.expectation);
   const observation = parseIssueRelayDeliveryObservation(input.observation);
-  if (
-    observation.status !== 'verified'
-    || observation.role !== 'verdict'
-    || observation.payload.schemaVersion !== 'jinn-issue-relay-verdict.v1'
-  ) {
+  if (!isVerifiedIssueRelayVerdictV1(observation)) {
     throw new Error('Relay observation must be a verified verdict');
   }
   if (
@@ -686,4 +704,303 @@ export async function observeAndInstallRelayVerdict(input: {
     expectation: expectationArtifact,
     observation: observationArtifact,
   };
+}
+
+function validateV2Expectation(value: unknown): IssueRelayDeliveryExpectationV2 {
+  const record = object(value);
+  if (
+    record === undefined
+    || !exactKeys(record, record['role'] === 'solution'
+      ? ['schemaVersion', 'role', 'taskId', 'taskCid', 'creationBlockNumber',
+          'application', 'taskSpec']
+      : ['schemaVersion', 'role', 'taskId', 'taskCid', 'creationBlockNumber',
+          'application', 'taskSpec',
+          'attemptIndex', 'requestId', 'deliveryEnvelopeCid', 'solutionOperatorSafe'])
+    || record.schemaVersion !== 'jinn-application-delivery-expectation.v1'
+    || (record.role !== 'solution' && record.role !== 'verdict')
+    || typeof record.taskId !== 'string'
+    || !TASK_ID_PATTERN.test(record.taskId)
+    || typeof record.taskCid !== 'string'
+    || !TASK_CID_PATTERN.test(record.taskCid)
+    || !Number.isSafeInteger(record.creationBlockNumber)
+    || (record.creationBlockNumber as number) < 0
+  ) throw new Error('Relay V2 delivery expectation is invalid');
+  const taskSpec = object(record.taskSpec);
+  const application = object(record.application);
+  if (
+    taskSpec === undefined
+    || application === undefined
+    || application.id !== ISSUE_RELAY_APPLICATION.id
+    || application.version !== ISSUE_RELAY_APPLICATION.version
+  ) throw new Error('Relay V2 application expectation is invalid');
+  IssueRelayApplicationTaskExtensionSchema.parse(taskSpec.application);
+  if (
+    record.role === 'verdict'
+    && (
+      !Number.isSafeInteger(record.attemptIndex)
+      || (record.attemptIndex as number) < 0
+      || typeof record.requestId !== 'string'
+      || !HEX_32_PATTERN.test(record.requestId)
+      || typeof record.deliveryEnvelopeCid !== 'string'
+      || !TASK_CID_PATTERN.test(record.deliveryEnvelopeCid)
+      || typeof record.solutionOperatorSafe !== 'string'
+      || !SAFE_ADDRESS_PATTERN.test(record.solutionOperatorSafe)
+    )
+  ) throw new Error('Relay V2 evaluation expectation correlation is invalid');
+  return {
+    schemaVersion: 'jinn-application-delivery-expectation.v1',
+    role: record.role,
+    taskId: record.taskId,
+    taskCid: record.taskCid,
+    creationBlockNumber: record.creationBlockNumber as number,
+    application: ISSUE_RELAY_APPLICATION,
+    taskSpec: taskSpec as RelayTaskSpecV2['spec'],
+    ...(record.role === 'solution' ? {} : {
+      attemptIndex: record.attemptIndex as number,
+      requestId: record.requestId as string,
+      deliveryEnvelopeCid: record.deliveryEnvelopeCid as string,
+      solutionOperatorSafe: record.solutionOperatorSafe as string,
+    }),
+  };
+}
+
+function v2ExpectationRound(
+  expectation: IssueRelayDeliveryExpectationV2,
+): IssueRelayRoundV2 {
+  return IssueRelayApplicationTaskExtensionSchema.parse(
+    expectation.taskSpec.application,
+  ).payload.round;
+}
+
+export function buildRelaySolutionExpectationV2(input: {
+  readonly submission: RelaySubmissionEvidence;
+  readonly taskSpec: RelayTaskSpecV2['spec'];
+}): IssueRelayDeliveryExpectationV2 {
+  const submission = validateSubmissionEvidence(input.submission);
+  const extension = IssueRelayApplicationTaskExtensionSchema.parse(
+    input.taskSpec.application,
+  );
+  const round = extension.payload.round;
+  if (submission.id !== relayTaskKey(round.generation, round.round)) {
+    throw new Error('Relay V2 submission Task key does not match its round');
+  }
+  return validateV2Expectation({
+    schemaVersion: 'jinn-application-delivery-expectation.v1',
+    role: 'solution',
+    taskId: submission.taskId,
+    taskCid: submission.taskCid,
+    creationBlockNumber: submission.creationBlock,
+    application: ISSUE_RELAY_APPLICATION,
+    taskSpec: input.taskSpec,
+  });
+}
+
+export function persistRelaySolutionExpectationV2(
+  path: string,
+  expectation: IssueRelayDeliveryExpectationV2,
+): ImmutableRelayStateArtifact {
+  const valid = validateV2Expectation(expectation);
+  if (valid.role !== 'solution') {
+    throw new Error('Relay V2 Solution expectation is required');
+  }
+  return install(
+    path,
+    Buffer.from(`${JSON.stringify(valid, null, 2)}\n`),
+    'Relay V2 Solution expectation',
+  );
+}
+
+export function verifyRelaySolutionExpectationV2(
+  path: string,
+  expectedDigest: string,
+): IssueRelayDeliveryExpectationV2 {
+  if (!SHA256_PATTERN.test(expectedDigest)) {
+    throw new Error('Relay V2 Solution expectation digest is invalid');
+  }
+  assertPrivateRegular(path, 'Relay V2 Solution expectation');
+  const bytes = readFileSync(path);
+  if (digest(bytes) !== expectedDigest) {
+    throw new Error('Relay V2 Solution expectation digest mismatch');
+  }
+  const expected = validateV2Expectation(
+    parseJson(bytes, 'Relay V2 Solution expectation'),
+  );
+  if (expected.role !== 'solution') {
+    throw new Error('Relay V2 Solution expectation has the wrong role');
+  }
+  if (!Buffer.from(`${JSON.stringify(expected, null, 2)}\n`).equals(bytes)) {
+    throw new Error('Relay V2 Solution expectation bytes are not canonical');
+  }
+  return expected;
+}
+
+export function installVerifiedRelaySolutionObservationV2(input: {
+  readonly observationPath: string;
+  readonly expectationPath: string;
+  readonly expectationDigest: string;
+  readonly observation: IssueRelayDeliveryObservation;
+}): ImmutableRelayStateArtifact {
+  const expectation = verifyRelaySolutionExpectationV2(
+    input.expectationPath,
+    input.expectationDigest,
+  );
+  const observation = parseIssueRelayDeliveryObservation(input.observation);
+  if (
+    !isVerifiedIssueRelaySolutionV2(observation)
+    || observation.task.taskId !== expectation.taskId
+    || observation.task.taskCid !== expectation.taskCid
+    || !isDeepStrictEqual(observation.round, v2ExpectationRound(expectation))
+  ) {
+    throw new Error('Relay V2 Solution differs from exact expectation pins');
+  }
+  verifyRelaySolutionExpectationV2(
+    input.expectationPath,
+    input.expectationDigest,
+  );
+  return install(
+    input.observationPath,
+    Buffer.from(`${JSON.stringify(observation, null, 2)}\n`),
+    'Relay verified V2 Solution observation',
+  );
+}
+
+export function buildRelayEvaluationBundleExpectationV2(input: {
+  readonly solutionExpectation: IssueRelayDeliveryExpectationV2;
+  readonly adoption: AcceptedRelayAdoption;
+  readonly evaluationAnchor: IssueRelayEvaluationAnchorV1;
+  readonly checks: RelayCheckSummary;
+}): IssueRelayDeliveryExpectationV2 {
+  const solution = validateV2Expectation(input.solutionExpectation);
+  if (solution.role !== 'solution') throw new Error('Relay V2 Solution expectation is required');
+  const solutionRound = v2ExpectationRound(solution);
+  const receipt = IssueRelayAdoptionReceiptV1Schema.parse(input.adoption.receipt);
+  const anchor = IssueRelayEvaluationAnchorV1Schema.parse(input.evaluationAnchor);
+  verifyRelayCheckSummary(input.checks);
+  if (
+    receipt.disposition !== 'accepted'
+    || solution.taskId !== receipt.correlation.taskId
+    || solutionRound.generation !== receipt.correlation.generation
+    || solutionRound.round !== receipt.correlation.round
+    || solutionRound.snapshotDigest !== receipt.correlation.snapshotDigest
+    || solutionRound.targetRepository !== receipt.targetRepository
+    || solutionRound.inputHead !== receipt.inputHead
+    || (solutionRound.purpose !== 'initial' && solutionRound.workspaceRepository !== receipt.workspaceRepository)
+    || (solutionRound.purpose !== 'initial' && solutionRound.prNumber !== receipt.prNumber)
+    || !exactCorrelation(anchor.correlation, receipt.correlation)
+    || anchor.evaluatedHead !== receipt.resultingHead
+    || anchor.adoptionReceiptDigest !== relayAdoptionReceiptDigest(input.adoption)
+    || anchor.checksDigest !== input.checks.digest
+    || input.checks.head !== anchor.evaluatedHead
+    || relayRequiredCheckStatus(input.checks) !== 'passed'
+  ) throw new Error('Relay V2 evaluation expectation bindings are stale or contradictory');
+  return validateV2Expectation({
+    ...solution,
+    role: 'verdict',
+    attemptIndex: receipt.correlation.attemptIndex,
+    requestId: receipt.correlation.requestId,
+    deliveryEnvelopeCid: receipt.correlation.deliveryEnvelopeCid,
+    solutionOperatorSafe: receipt.solutionSafe,
+  });
+}
+
+export function persistRelayEvaluationBundleExpectationV2(
+  path: string,
+  expectation: IssueRelayDeliveryExpectationV2,
+): ImmutableRelayStateArtifact {
+  const valid = validateV2Expectation(expectation);
+  return install(
+    path,
+    Buffer.from(`${JSON.stringify(valid, null, 2)}\n`),
+    'Relay V2 evaluation-bundle expectation',
+  );
+}
+
+export function verifyRelayEvaluationBundleExpectationV2(
+  path: string,
+  expectedDigest: string,
+): IssueRelayDeliveryExpectationV2 {
+  if (!SHA256_PATTERN.test(expectedDigest)) throw new Error('Relay V2 expectation digest is invalid');
+  assertPrivateRegular(path, 'Relay V2 evaluation-bundle expectation');
+  const bytes = readFileSync(path);
+  if (digest(bytes) !== expectedDigest) throw new Error('Relay V2 expectation digest mismatch');
+  const expected = validateV2Expectation(parseJson(bytes, 'Relay V2 expectation'));
+  if (!Buffer.from(`${JSON.stringify(expected, null, 2)}\n`).equals(bytes)) {
+    throw new Error('Relay V2 expectation bytes are not canonical');
+  }
+  return expected;
+}
+
+export function installVerifiedRelayEvaluationBundleV2(input: {
+  readonly observationPath: string;
+  readonly expectationPath: string;
+  readonly expectationDigest: string;
+  readonly observation: IssueRelayDeliveryObservation;
+  readonly adoption: AcceptedRelayAdoption;
+  readonly evaluationAnchor: IssueRelayEvaluationAnchorV1;
+  readonly checks: RelayCheckSummary;
+  readonly pullRequestMetadata: {
+    readonly title: string;
+    readonly body: string;
+  };
+  readonly laneSpecifications: {
+    readonly security: `sha256:${string}`;
+    readonly quality: `sha256:${string}`;
+  };
+}): ImmutableRelayStateArtifact {
+  const expectation = verifyRelayEvaluationBundleExpectationV2(
+    input.expectationPath,
+    input.expectationDigest,
+  );
+  const observation = parseIssueRelayDeliveryObservation(input.observation);
+  if (!isVerifiedIssueRelayEvaluationBundleV2(observation)) {
+    throw new Error('Relay observation is not an authenticated V2 evaluation bundle');
+  }
+  const expected = buildRelayEvaluationBundleExpectationV2({
+    solutionExpectation: {
+      schemaVersion: expectation.schemaVersion,
+      role: 'solution',
+      taskId: expectation.taskId,
+      taskCid: expectation.taskCid,
+      creationBlockNumber: expectation.creationBlockNumber,
+      application: expectation.application,
+      taskSpec: expectation.taskSpec,
+    },
+    adoption: input.adoption,
+    evaluationAnchor: input.evaluationAnchor,
+    checks: input.checks,
+  });
+  if (
+    !isDeepStrictEqual(expectation, expected)
+    || observation.task.taskId !== expectation.taskId
+    || observation.task.taskCid !== expectation.taskCid
+    || !isDeepStrictEqual(observation.round, v2ExpectationRound(expectation))
+    || observation.attempt.attemptIndex !== expectation.attemptIndex
+    || observation.attempt.requestId !== expectation.requestId
+    || observation.attempt.operator.toLowerCase()
+      === expectation.solutionOperatorSafe?.toLowerCase()
+    || !exactCorrelation(observation.payload.correlation, input.evaluationAnchor.correlation)
+    || observation.payload.evaluatedHead !== input.evaluationAnchor.evaluatedHead
+    || (['security', 'quality'] as const).some((lane) =>
+      observation.payload.lanes[lane].pullRequestMetadataDigest
+        !== issueRelayPullRequestMetadataDigest(input.pullRequestMetadata))
+    || (['security', 'quality'] as const).some((lane) => {
+      const laneResult = observation.payload.lanes[lane];
+      return laneResult.schemaVersion === 'jinn-issue-relay-lane-attestation.v1'
+        && (
+          laneResult.evaluationAnchorDigest
+            !== issueRelayCanonicalDigest(input.evaluationAnchor)
+          || laneResult.adoptionReceiptDigest
+            !== input.evaluationAnchor.adoptionReceiptDigest
+          || laneResult.checksDigest !== input.checks.digest
+          || laneResult.evaluationSpecificationDigest
+            !== input.laneSpecifications[lane]
+        );
+    })
+  ) throw new Error('Relay V2 evaluation bundle differs from exact expectation pins');
+  verifyRelayEvaluationBundleExpectationV2(input.expectationPath, input.expectationDigest);
+  return install(
+    input.observationPath,
+    Buffer.from(`${JSON.stringify(observation, null, 2)}\n`),
+    'Relay verified V2 evaluation-bundle observation',
+  );
 }

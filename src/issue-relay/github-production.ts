@@ -4,6 +4,7 @@ import type {
   RelayGitHubWritePort,
   RelayIssueCandidateFacts,
   RelayLabelEvent,
+  RelayPullRequestCommentFacts,
 } from './github-port.js';
 import { IssueRelayRateLimitError } from './reconciler.js';
 import type { IssueRelayGitHubPreflight } from './runtime-production.js';
@@ -276,6 +277,7 @@ function pullRequest(value: unknown): {
   readonly base: string;
   readonly baseRepository: string;
   readonly baseRepositoryId: string;
+  readonly title: string;
   readonly body: string;
 } {
   const pr = object(value, 'GitHub pull request');
@@ -311,6 +313,7 @@ function pullRequest(value: unknown): {
       baseRepository.node_id,
       'GitHub pull request base repository ID',
     ),
+    title: string(pr.title, 'GitHub pull request title'),
     body: typeof pr.body === 'string' ? pr.body : '',
   };
 }
@@ -519,6 +522,45 @@ export function createRelayGitHubProductionPorts(options: {
           ? permission
           : 'NONE'
       ) as Awaited<ReturnType<RelayGitHubReadPort['readRepositoryPermission']>>;
+    },
+
+    async listPullRequestComments(prNumber) {
+      if (!Number.isSafeInteger(prNumber) || prNumber <= 0) {
+        throw new Error('Relay pull request number is invalid');
+      }
+      const comments: RelayPullRequestCommentFacts[] = [];
+      let page = 1;
+      for (;;) {
+        const path = `/repos/${options.config.repository}/issues/${prNumber}/comments`;
+        const response = await request({
+          method: 'GET',
+          path,
+          query: { per_page: '100', page: String(page), direction: 'asc' },
+        });
+        if (!Array.isArray(response.body) || response.body.length > 100) {
+          throw new Error('GitHub pull request comments are malformed or oversized');
+        }
+        for (const value of response.body) {
+          const comment = object(value, 'GitHub pull request comment');
+          const actor = object(comment.user, 'GitHub pull request comment actor');
+          const body = typeof comment.body === 'string' ? comment.body : undefined;
+          if (body === undefined || Buffer.byteLength(body, 'utf8') > MAX_BODY_BYTES) {
+            throw new Error('GitHub pull request comment body is malformed or oversized');
+          }
+          comments.push({
+            commentId: positiveInteger(comment.id, 'GitHub pull request comment ID'),
+            nodeId: string(comment.node_id, 'GitHub pull request comment node ID'),
+            actorLogin: string(actor.login, 'GitHub pull request comment actor login'),
+            actorUserId: string(actor.node_id, 'GitHub pull request comment actor ID'),
+            body,
+            createdAt: canonicalTimestamp(comment.created_at, 'GitHub pull request comment created time'),
+            updatedAt: canonicalTimestamp(comment.updated_at, 'GitHub pull request comment updated time'),
+          });
+        }
+        const following = nextPage(response, page, path);
+        if (following === undefined) return comments;
+        page = following;
+      }
     },
 
     async readDefaultBranchHead() {
@@ -885,6 +927,8 @@ export function createRelayGitHubProductionPorts(options: {
       }
       return {
         number: pr.number,
+        title: pr.title,
+        body: pr.body,
         generation,
         targetRepositoryId: target.nodeId,
         forkRepositoryId: fork.nodeId,
@@ -1050,6 +1094,8 @@ export function createRelayGitHubProductionPorts(options: {
             }
             return {
               number: parsed.number,
+              title: parsed.title,
+              body: parsed.body,
               branch: parsed.branch,
               head: parsed.head,
               base: parsed.base,
@@ -1082,6 +1128,27 @@ export function createRelayGitHubProductionPorts(options: {
           kind: 'pull-request',
           pullRequest: await authority.readPullRequest(command.prNumber),
         };
+      case 'update-draft-pull-request': {
+        const before = await authority.readPullRequest(command.prNumber);
+        if (
+          before.generation !== command.expectedGeneration
+          || before.branch !== command.expectedBranch
+          || before.head !== command.expectedHead
+          || before.base !== command.expectedBase
+          || before.title !== command.expectedTitle
+          || before.body !== command.expectedBody
+          || !before.open
+          || !before.draft
+        ) {
+          throw new Error('Relay metadata update lost exact pull request authority');
+        }
+        await request({
+          method: 'PATCH',
+          path: `/repos/${command.repository}/pulls/${command.prNumber}`,
+          body: { title: command.title, body: command.body },
+        });
+        return { kind: 'mutated' };
+      }
       case 'close-pull-request': {
         const before = await authority.readPullRequest(command.prNumber);
         if (

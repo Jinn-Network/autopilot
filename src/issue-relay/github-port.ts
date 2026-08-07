@@ -29,6 +29,16 @@ export interface RelayLabelEvent {
   readonly createdAt: string;
 }
 
+export interface RelayPullRequestCommentFacts {
+  readonly commentId: number;
+  readonly nodeId: string;
+  readonly actorLogin: string;
+  readonly actorUserId: string;
+  readonly body: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
 export interface RelayGitHubReadPort {
   searchOptedInIssues(input: {
     readonly repository: 'Jinn-Network/mono';
@@ -40,6 +50,9 @@ export interface RelayGitHubReadPort {
   }>;
   readIssue(number: number): Promise<RelayIssueCandidateFacts>;
   listLabelEvents(number: number): Promise<readonly RelayLabelEvent[]>;
+  listPullRequestComments?(
+    prNumber: number,
+  ): Promise<readonly RelayPullRequestCommentFacts[]>;
   readRepositoryPermission(login: string): Promise<
     'NONE' | 'READ' | 'TRIAGE' | 'WRITE' | 'MAINTAIN' | 'ADMIN'
   >;

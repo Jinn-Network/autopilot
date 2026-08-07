@@ -15,7 +15,9 @@ import {
 import { relayGeneration, relayTaskKey } from '../../src/issue-relay/identity.js';
 import {
   buildRelaySolutionExpectation,
+  buildRelaySolutionExpectationV2,
   persistRelaySolutionExpectation,
+  persistRelaySolutionExpectationV2,
 } from '../../src/issue-relay/marketplace-state.js';
 import {
   IssueRelayMarketplaceCli,
@@ -26,11 +28,20 @@ import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
 import {
   buildRelayMarketplaceRequest,
   buildRelayTaskSpec,
+  buildRelayTaskSpecV2,
   persistRelayMarketplaceRequest,
 } from '../../src/issue-relay/task.js';
 
 const temporaryDirectories: string[] = [];
 const base = '1'.repeat(40);
+const evaluation = {
+  relayBotLogin: 'jinn-relay',
+  requiredChecks: ['ci/typecheck'],
+  laneSpecifications: {
+    security: `sha256:${'a'.repeat(64)}` as const,
+    quality: `sha256:${'b'.repeat(64)}` as const,
+  },
+};
 const snapshot = buildRelaySnapshot({
   repository: {
     slug: 'Jinn-Network/mono',
@@ -518,6 +529,137 @@ describe('Issue Relay marketplace CLI submission', () => {
 });
 
 describe('Issue Relay marketplace CLI observation', () => {
+  it('uses generic application observation for a V2 Relay task and unwraps the owned result', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'autopilot-relay-cli-v2-'));
+    temporaryDirectories.push(directory);
+    const round = {
+      schemaVersion: 'jinn-issue-relay-round.v2' as const,
+      generation: relayGeneration(snapshot),
+      round: 0,
+      snapshotDigest: snapshot.snapshotDigest,
+      targetRepository: 'Jinn-Network/mono',
+      workspaceRepository: 'Jinn-Network/mono',
+      inputHead: base,
+      purpose: 'initial' as const,
+      findings: [],
+    };
+    const taskV2 = buildRelayTaskSpecV2({ snapshot, evaluation, round });
+    const persisted = persistRelaySolutionExpectationV2(
+      join(directory, 'expectation.json'),
+      buildRelaySolutionExpectationV2({
+        submission: {
+          id: submitted.id,
+          taskId: submitted.taskId,
+          taskCid: submitted.taskCid,
+          creationTx: submitted.creationTx,
+          creationBlock: submitted.creationBlock,
+          solverNetManifestCid: submitted.solverNetManifestCid,
+          idempotent: submitted.idempotent,
+        },
+        taskSpec: taskV2.spec,
+      }),
+    );
+    const solution = {
+      schemaVersion: 'jinn-issue-relay-solution.v2',
+      patch: 'diff --git a/a.ts b/a.ts\n',
+      pullRequest: {
+        title: 'Preserve exact Relay state',
+        body: '## Summary\n\nPreserves exact state.\n\n## Testing\n\n- yarn test',
+      },
+    };
+    const transportObservation = {
+      status: 'verified',
+      role: 'solution',
+      task: { taskId: '501', taskCid },
+      attempt: {
+        attemptIndex: 0,
+        requestId: `0x${'d'.repeat(64)}`,
+        operator: `0x${'e'.repeat(40)}`,
+      },
+      delivery: {
+        envelopeCid,
+        transactionHash: `0x${'f'.repeat(64)}`,
+        blockNumber: 120,
+      },
+      payload: {
+        schemaVersion: 'jinn-repo-application-payload.v1',
+        application: { id: 'autopilot.issue-relay', version: 'v2' },
+        role: 'solution',
+        payload: solution,
+      },
+    };
+    const run = vi.fn<IssueRelayMarketplaceSubprocess>(async () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        schemaVersion: 1,
+        generatedAt: '2026-07-28T10:07:00.000Z',
+        verb: 'tasks observe-application-delivery',
+        observation: transportObservation,
+      }),
+      stderr: '',
+    }));
+    const cli = new IssueRelayMarketplaceCli({
+      jinnBinary: '/installed/bin/jinn',
+      environment: { PATH: '/bin', GH_TOKEN: 'must-not-leak' },
+      run,
+    });
+
+    await expect(cli.observe(persisted.path, persisted.digest)).resolves.toEqual({
+      ...transportObservation,
+      round,
+      payload: solution,
+    });
+    expect(run).toHaveBeenCalledWith('/installed/bin/jinn', [
+      'tasks',
+      'observe-application-delivery',
+      '--expectation-file',
+      persisted.path,
+      '--json',
+    ], {
+      environment: { PATH: '/bin', NO_COLOR: '1' },
+      outputProfile: 'issue-relay-observation',
+    });
+  });
+
+  it('accepts the canonical V2 bundle only with a V2 round', () => {
+    const payload = JSON.parse(readFileSync(
+      new URL('../fixtures/issue-relay-evaluation-bundle.v2.json', import.meta.url),
+      'utf8',
+    )) as Record<string, unknown>;
+    const correlation = payload['correlation'] as {
+      generation: string;
+      round: number;
+      snapshotDigest: string;
+    };
+    const roundV2 = {
+      schemaVersion: 'jinn-issue-relay-round.v2',
+      generation: correlation.generation,
+      round: correlation.round,
+      snapshotDigest: correlation.snapshotDigest,
+      targetRepository: 'Jinn-Network/mono',
+      workspaceRepository: 'Jinn-Network/mono',
+      inputHead: base,
+      purpose: 'initial',
+      findings: [],
+    };
+    const observation = {
+      status: 'verified', role: 'verdict', task: { taskId: '501', taskCid },
+      attempt: { attemptIndex: 0, requestId: `0x${'3'.repeat(64)}`, operator: `0x${'e'.repeat(40)}` },
+      delivery: { envelopeCid, transactionHash: `0x${'f'.repeat(64)}`, blockNumber: 120 },
+      round: roundV2,
+      payload,
+    };
+    expect(parseIssueRelayDeliveryObservation(observation)).toMatchObject({
+      role: 'verdict',
+      round: { schemaVersion: 'jinn-issue-relay-round.v2' },
+      payload: { schemaVersion: 'jinn-issue-relay-evaluation-bundle.v2' },
+    });
+    expect(() => parseIssueRelayDeliveryObservation({
+      ...observation,
+      round: task.spec.relay,
+    })).toThrow();
+  });
+
   it('accepts a 2 MiB UTF-8 patch and rejects the next byte', () => {
     const common = {
       status: 'verified' as const,
