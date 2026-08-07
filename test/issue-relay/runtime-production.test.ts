@@ -562,7 +562,7 @@ describe('production Relay cadence', () => {
     );
     await writeFile(
       join(reviewedDist, 'cli', 'commands', 'tasks.js'),
-      'const command = "observe-issue-relay-delivery";\n',
+      'const commands = ["observe-issue-relay-delivery", "observe-application-delivery"];\n',
     );
     await writeFile(
       join(
@@ -572,6 +572,15 @@ describe('production Relay cadence', () => {
         'tasks-observe-issue-relay.js',
       ),
       'const command = "observe-issue-relay-delivery";\n',
+    );
+    await writeFile(
+      join(
+        reviewedDist,
+        'cli',
+        'commands',
+        'tasks-observe-application.js',
+      ),
+      'const command = "observe-application-delivery";\n',
     );
     const reviewedJinnSha256 =
       digestIssueRelayJinnDistribution(reviewedJinn);
