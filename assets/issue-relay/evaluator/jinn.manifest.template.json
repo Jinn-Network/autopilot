@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "1.0.0",
+  "name": "autopilot-issue-relay-evaluator",
+  "version": "0.1.0",
+  "description": "Autopilot-owned exact-head security and quality evaluator for Issue Relay.",
+  "supportedSolverTypes": ["jinn-repo.v1>=1.0.0"],
+  "entry": "./index.js",
+  "package": {
+    "cid": "bafy-REPLACE-DURING-RELEASE",
+    "hash": "sha256:REPLACE-DURING-RELEASE"
+  },
+  "capabilities": {
+    "secrets": [
+      {
+        "name": "ANTHROPIC_API_KEY",
+        "description": "Runs operator-provided, Task-digest-pinned Claude code-review and security-review skills plus schema-only adjudication.",
+        "required": true
+      },
+      {
+        "name": "SNYK_TOKEN",
+        "description": "Optional Snyk Code evidence for the security lane.",
+        "required": false
+      }
+    ]
+  },
+  "signature": {
+    "alg": "ed25519",
+    "publicKey": "REPLACE-DURING-RELEASE",
+    "sig": "REPLACE-DURING-RELEASE"
+  },
+  "author": {
+    "name": "Jinn Network",
+    "url": "https://github.com/Jinn-Network/autopilot"
+  },
+  "license": "MIT"
+}

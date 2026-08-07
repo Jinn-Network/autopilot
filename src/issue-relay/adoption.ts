@@ -875,10 +875,10 @@ export function makeRelayAdoptionCoordinator(
         resultingHead: published.resultingHead,
         defaultBranch: afterPush.defaultBranch,
         issueNumber: input.snapshot.issue.number,
-        title: observation.round.schemaVersion === 'jinn-issue-relay-round.v2'
+        title: isVerifiedIssueRelaySolutionV2(observation)
           ? observation.payload.pullRequest.title
           : `Jinn Issue Relay: #${input.snapshot.issue.number}`,
-        body: observation.round.schemaVersion === 'jinn-issue-relay-round.v2'
+        body: isVerifiedIssueRelaySolutionV2(observation)
           ? observation.payload.pullRequest.body
           : `Implements #${input.snapshot.issue.number}.`,
         existingPrNumber: expectedPrNumber,

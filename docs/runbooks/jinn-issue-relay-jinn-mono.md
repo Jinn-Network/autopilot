@@ -10,20 +10,27 @@ Docker-verifier infrastructure.
 
 This runbook exercises only the Relay V2 product contract. A V2 marketplace
 solution is not a patch-only artifact: it contains the complete patch, PR
-title, and PR description that the maintainer will review. The evaluator emits
-separate exact-head `security` and `quality` attestations in one signed bundle.
-The assurance comment must disclose that the same evaluator operator performed
-both lanes.
+title, and PR description that the maintainer will review. Autopilot's external
+evaluator harness emits separate exact-head `security` and `quality`
+attestations in one signed application bundle. The assurance comment must
+disclose that the same evaluator operator performed both lanes. Jinn
+authenticates and transports that opaque bundle; it does not define Relay's
+evaluation policy or decide whether the PR is ready.
 
 ## Landing order
 
-Relay V2's portable contracts are owned by the Jinn mono SDK. Publish the
-reviewed SDK release containing those contracts first, then update Autopilot's
-`@jinn-network/sdk` dependency and lockfile to that exact release. A local SDK
-tarball may be used while developing the two changes together, but it is not a
-deployable dependency and must not appear in the committed Autopilot manifest
-or lockfile. Do not enable V2 admission until a clean Autopilot install resolves
-the published SDK and the cross-repository fixture test passes.
+Autopilot owns the Relay V2 task, result, lane, decision, and readiness
+contracts. Jinn mono supplies only the generic marketplace boundary needed by
+that product: an opaque application Task/result envelope, authenticated source
+Task and Solution provenance for evaluation, generic settlement projection,
+and `observe-application-delivery`.
+
+Land and deploy the reviewed generic Jinn backend first. Then build and sign
+the Autopilot-owned external evaluator package and deploy the Autopilot host
+changes. Do not copy Relay V2 schemas or evaluator policy back into the Mono
+SDK or its built-in evaluator. Do not enable V2 admission until a clean
+Autopilot build, the reviewed Jinn client, and the signed external harness pass
+the cross-repository application-boundary tests.
 
 ## Scope and prerequisites
 
@@ -71,9 +78,9 @@ yarn --cwd packages/sdk typecheck
 yarn --cwd client install --immutable
 JINN_BUILD_COMMIT="$JINN_MONO_COMMIT" yarn --cwd client build
 yarn --cwd client vitest run \
-  test/issue-relay \
-  test/harnesses/jinn-repo-evaluator \
-  test/cli/commands/tasks-observe-issue-relay.test.ts
+  test/adapters/mech/adapter.test.ts \
+  test/application-delivery \
+  test/cli/tasks-observe-application.test.ts
 yarn --cwd client typecheck
 ```
 
@@ -83,7 +90,7 @@ Pin the Relay to that reviewed worktree build, never to Autopilot's registry
 ```sh
 export JINN_ISSUE_RELAY_JINN_BINARY="$JINN_MONO_WORKTREE/client/dist/bin/jinn.js"
 test -x "$JINN_ISSUE_RELAY_JINN_BINARY"
-rg -q 'observe-issue-relay-delivery' \
+rg -q 'observe-application-delivery' \
   "$JINN_MONO_WORKTREE/client/dist/cli/commands"
 node -e '
   const fs = require("node:fs");
@@ -109,7 +116,7 @@ after preflight. Runtime requires and verifies all three pins, including the
 build metadata and compiled Relay command modules, at process startup. The
 digest is also checked before every approved pass.
 
-The SDK contract bytes must agree before rollout:
+The existing V1 compatibility fixtures still agree before rollout:
 
 ```sh
 cmp \
@@ -121,10 +128,10 @@ cmp \
 cmp \
   "$JINN_MONO_WORKTREE/packages/sdk/fixtures/autopilot/issue-relay-assurance.v1.md" \
   "$AUTOPILOT_WORKTREE/test/fixtures/issue-relay-assurance.v1.md"
-cmp \
-  "$JINN_MONO_WORKTREE/packages/sdk/fixtures/autopilot/issue-relay-evaluation-bundle.v2.json" \
-  "$AUTOPILOT_WORKTREE/test/fixtures/issue-relay-evaluation-bundle.v2.json"
 ```
+
+There is deliberately no Mono copy of the V2 fixture. Validate it inside
+Autopilot and validate only its opaque outer application envelope in Mono.
 
 V0 has a single-host, single-state-directory writer lease. Exactly one
 `recover` or `active` process may use `RELAY_STATE_DIRECTORY`; another host,
@@ -201,21 +208,34 @@ QUALITY_SKILL_DIGEST="sha256:$(shasum -a 256 "$QUALITY_SKILL_PATH" | awk '{print
 SECURITY_SKILL_DIGEST="sha256:$(shasum -a 256 "$SECURITY_SKILL_PATH" | awk '{print $1}')"
 ```
 
-Configure the evaluator daemon with the same reviewed values as
-`JINN_ISSUE_RELAY_SECURITY_SPEC_DIGEST` and
-`JINN_ISSUE_RELAY_QUALITY_SPEC_DIGEST`. Autopilot rejects a signed lane
-attestation whose specification digest differs from its host configuration.
-The evaluator also verifies the command bytes against that digest before each
-review. It runs Claude Code in bare mode and therefore requires
-`ANTHROPIC_API_KEY`; OAuth/keychain state is intentionally unavailable.
+The Autopilot host places those exact digests in every application Task. The
+external evaluator verifies the configured command bytes against the Task
+digests before each review, and Autopilot rejects a signed lane attestation
+whose digest differs from its host configuration. It runs Claude Code in bare
+mode and therefore requires `ANTHROPIC_API_KEY`; OAuth/keychain state is
+intentionally unavailable.
 
 ```sh
 export JINN_ISSUE_RELAY_CLAUDE_CODE_REVIEW_SKILL_PATH="$QUALITY_SKILL_PATH"
 export JINN_ISSUE_RELAY_CLAUDE_SECURITY_REVIEW_SKILL_PATH="$SECURITY_SKILL_PATH"
-export JINN_ISSUE_RELAY_QUALITY_SPEC_DIGEST="$QUALITY_SKILL_DIGEST"
-export JINN_ISSUE_RELAY_SECURITY_SPEC_DIGEST="$SECURITY_SKILL_DIGEST"
 export ANTHROPIC_API_KEY='<evaluator key from the secret store>'
 ```
+
+Build `dist/issue-relay-evaluator` from the reviewed Autopilot commit. Replace
+the release placeholders in its manifest, compute the package hash/CID, sign
+the manifest with the trusted evaluator publisher, and install that directory
+through Jinn's `harnesses.externalImpls` mechanism. The operator trust store
+must contain that exact publisher key and the installed harness version must
+be pinned. The review skill files remain outside the package: the quality
+command is subject to Anthropic's commercial terms, and both files are loaded
+from the reviewed paths above and bound by their Task digests.
+
+Use a dedicated evaluator operator for the first canary. On that operator,
+include `jinn-repo-evaluator` in `harnesses.disabled` so registry first-match
+dispatch reaches `autopilot-issue-relay-evaluator`. Do not disable the built-in
+evaluator fleet-wide: ordinary `jinn-repo.v1` evaluation remains available
+from other operators. Confirm the external harness rejects every non-Relay
+application Task before the operator joins the canary.
 
 `/code-review` is normally GitHub-facing and skips draft PRs. Relay loads the
 reviewed command unchanged but supplies a credential-free, read-only local
@@ -287,8 +307,11 @@ Before the first write-capable pass, confirm:
 9. The solution operator and evaluator are separate Safes. Neither worker
    receives the bot token, creator key, repository secret, or upstream write
    authority.
-10. The pinned client resolves the reviewed security and quality evaluation
-   specifications and emits V2 bundles only for V2 task contexts.
+10. The dedicated evaluator disables only its local built-in
+    `jinn-repo-evaluator`; other operators remain available for normal tasks.
+11. The pinned client selects the signed Autopilot external evaluator for the
+    application Task, transports its opaque result, and never routes Relay V2
+    through Mono's built-in `jinn-repo` evaluator policy.
 
 Stop on any failed preflight. Do not bypass it by changing mode, using a local
 backend, lowering verification, or deleting durable evidence.

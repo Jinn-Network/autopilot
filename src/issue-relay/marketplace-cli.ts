@@ -33,6 +33,11 @@ import {
   ISSUE_RELAY_MAX_TASK_ID_DECIMAL_DIGITS,
 } from './limits.js';
 import { verifyRelayMarketplaceRequest } from './task.js';
+import {
+  IssueRelayApplicationSolutionSchema,
+  IssueRelayApplicationTaskExtensionSchema,
+  IssueRelayApplicationVerdictSchema,
+} from './marketplace-application.js';
 
 export type IssueRelayMarketplaceSubprocess = MarketplaceMachineSubprocess;
 
@@ -582,6 +587,31 @@ const observationEnvelopeSchema = z.object({
   observation: observationSchema,
 }).strict();
 
+const applicationObservationSchema = z.union([
+  z.object({
+    status: z.literal('pending'),
+    reason: observationReason,
+    detail: observationDetail.optional(),
+  }).strict(),
+  z.object({
+    status: z.literal('contradiction'),
+    reason: observationReason,
+    detail: observationDetail,
+  }).strict(),
+  z.object({
+    ...observationCommon,
+    role: z.enum(['solution', 'verdict']),
+    payload: z.unknown(),
+  }).strict(),
+]);
+
+const applicationObservationEnvelopeSchema = z.object({
+  schemaVersion: z.literal(1),
+  generatedAt: z.string().refine(canonicalTimestamp),
+  verb: z.literal('tasks observe-application-delivery'),
+  observation: applicationObservationSchema,
+}).strict();
+
 function parseObservation(
   result: MarketplaceMachineSubprocessResult,
 ): IssueRelayDeliveryObservation {
@@ -590,6 +620,39 @@ function parseObservation(
       parseMarketplaceMachineJson(result.stdout),
     ).observation,
   );
+}
+
+function parseApplicationObservation(
+  result: MarketplaceMachineSubprocessResult,
+  expectation: unknown,
+): IssueRelayDeliveryObservation {
+  const expected = z.object({
+    schemaVersion: z.literal('jinn-application-delivery-expectation.v1'),
+    taskSpec: z.object({ application: z.unknown() }).passthrough(),
+  }).passthrough().parse(expectation);
+  const round = IssueRelayApplicationTaskExtensionSchema.parse(
+    expected.taskSpec.application,
+  ).payload.round;
+  const parsed = applicationObservationEnvelopeSchema.parse(
+    parseMarketplaceMachineJson(result.stdout),
+  ).observation;
+  if (parsed.status !== 'verified') return parsed;
+  if (parsed.role === 'solution') {
+    const payload = IssueRelayApplicationSolutionSchema.parse(parsed.payload);
+    return {
+      ...parsed,
+      role: 'solution',
+      round,
+      payload: payload.payload,
+    };
+  }
+  const payload = IssueRelayApplicationVerdictSchema.parse(parsed.payload);
+  return {
+    ...parsed,
+    role: 'verdict',
+    round,
+    payload: payload.payload,
+  };
 }
 
 export function parseIssueRelayDeliveryObservation(
@@ -793,9 +856,17 @@ export class IssueRelayMarketplaceCli {
       expectationDigest,
       'Relay delivery expectation',
     );
+    const expectation = JSON.parse(readFileSync(expectationPath, 'utf8')) as unknown;
+    const applicationProtocol = expectation !== null
+      && typeof expectation === 'object'
+      && (expectation as Record<string, unknown>).schemaVersion
+        === 'jinn-application-delivery-expectation.v1';
+    const command = applicationProtocol
+      ? 'observe-application-delivery'
+      : 'observe-issue-relay-delivery';
     const result = await this.run(this.jinnBinary, [
       'tasks',
-      'observe-issue-relay-delivery',
+      command,
       '--expectation-file',
       expectationPath,
       '--json',
@@ -810,7 +881,9 @@ export class IssueRelayMarketplaceCli {
     );
     if (result.exitCode === 0 || result.exitCode === 30 || result.exitCode === 50) {
       try {
-        const observation = parseObservation(result);
+        const observation = applicationProtocol
+          ? parseApplicationObservation(result, expectation)
+          : parseObservation(result);
         if (
           (result.exitCode === 0 && observation.status !== 'verified')
           || (result.exitCode === 30 && observation.status !== 'pending')
@@ -824,7 +897,7 @@ export class IssueRelayMarketplaceCli {
           try {
             throwMarketplaceMachineFailure(
               result,
-              'jinn tasks observe-issue-relay-delivery',
+              `jinn tasks ${command}`,
             );
           } catch (failure) {
             if (!(failure instanceof MarketplaceMachineCliProtocolError)) {
@@ -833,7 +906,7 @@ export class IssueRelayMarketplaceCli {
           }
         }
         throw protocolError(
-          'jinn tasks observe-issue-relay-delivery returned malformed output',
+          `jinn tasks ${command} returned malformed output`,
           result,
           error,
         );
@@ -841,7 +914,7 @@ export class IssueRelayMarketplaceCli {
     }
     throwMarketplaceMachineFailure(
       result,
-      'jinn tasks observe-issue-relay-delivery',
+      `jinn tasks ${command}`,
     );
   }
 }

@@ -27,6 +27,14 @@ import {
 const temporaryDirectories: string[] = [];
 const base = '1'.repeat(40);
 const repairHead = '2'.repeat(40);
+const evaluation = {
+  relayBotLogin: 'jinn-relay',
+  requiredChecks: ['ci/typecheck'],
+  laneSpecifications: {
+    security: `sha256:${'a'.repeat(64)}` as const,
+    quality: `sha256:${'b'.repeat(64)}` as const,
+  },
+};
 
 const snapshot = buildRelaySnapshot({
   repository: {
@@ -188,6 +196,7 @@ describe('Relay jinn-repo task construction', () => {
     ];
     const built = buildRelayTaskSpecV2({
       snapshot,
+      evaluation,
       round: {
         schemaVersion: 'jinn-issue-relay-round.v2', generation, round: 1,
         snapshotDigest: snapshot.snapshotDigest, targetRepository: 'Jinn-Network/mono',
@@ -199,7 +208,7 @@ describe('Relay jinn-repo task construction', () => {
         visibility: 'PUBLIC', prNumber: 314, currentHead: repairHead,
       },
     });
-    expect(built.spec.relay.findings).toEqual(findings);
+    expect(built.spec.application.payload.round.findings).toEqual(findings);
     expect(built.spec.problem_statement).toContain('lane: security');
     expect(built.spec.problem_statement).toContain('lane: quality');
   });
@@ -217,6 +226,7 @@ describe('Relay jinn-repo task construction', () => {
     };
     const built = buildRelayTaskSpecV2({
       snapshot,
+      evaluation,
       round: {
         schemaVersion: 'jinn-issue-relay-round.v2', generation, round: 2,
         snapshotDigest: snapshot.snapshotDigest, targetRepository: 'Jinn-Network/mono',
@@ -229,7 +239,7 @@ describe('Relay jinn-repo task construction', () => {
         visibility: 'PUBLIC', prNumber: 314, currentHead: repairHead,
       },
     });
-    expect(built.spec.relay).toMatchObject({ purpose: 'decision-implementation', decisionBinding: binding });
+    expect(built.spec.application.payload.round).toMatchObject({ purpose: 'decision-implementation', decisionBinding: binding });
     expect(built.spec.problem_statement).toContain('Implement exactly the authorized maintainer decision');
     expect(built.spec.problem_statement).not.toContain('Repair findings');
   });
@@ -438,6 +448,7 @@ describe('Relay marketplace request persistence', () => {
     temporaryDirectories.push(directory);
     const task = buildRelayTaskSpecV2({
       snapshot,
+      evaluation,
       round: {
         schemaVersion: 'jinn-issue-relay-round.v2',
         generation: relayGeneration(snapshot),

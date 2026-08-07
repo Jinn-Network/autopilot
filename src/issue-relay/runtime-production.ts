@@ -3089,6 +3089,11 @@ productionEnvironmentDependencies): Promise<void> {
           const task = config.schemaVersion === 2
             ? buildRelayTaskSpecV2({
                 snapshot,
+                evaluation: {
+                  relayBotLogin: config.relayBotLogin,
+                  requiredChecks: config.requiredChecks,
+                  laneSpecifications: (config as IssueRelayConfigV2).laneSpecifications,
+                },
                 round: IssueRelayRoundV2Schema.parse({
                   schemaVersion: 'jinn-issue-relay-round.v2',
                   generation: relayGeneration(snapshot),

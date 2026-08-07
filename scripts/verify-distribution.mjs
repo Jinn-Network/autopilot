@@ -4,6 +4,14 @@ const packageRoot = new URL('../', import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL('package.json', packageRoot), 'utf8'));
 const bundlePath = new URL('dist/autopilot.js', packageRoot);
 if (!existsSync(bundlePath)) throw new Error('dist/autopilot.js is missing; run yarn build');
+for (const evaluatorFile of [
+  'dist/issue-relay-evaluator/index.js',
+  'dist/issue-relay-evaluator/jinn.manifest.template.json',
+]) {
+  if (!existsSync(new URL(evaluatorFile, packageRoot))) {
+    throw new Error(`Issue Relay evaluator asset is missing: ${evaluatorFile}`);
+  }
+}
 const bins = typeof manifest.bin === 'string'
   ? ['autopilot']
   : Object.keys(manifest.bin ?? {});

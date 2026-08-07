@@ -281,6 +281,11 @@ export function createIssueRelayProductionReconciliationV2(
   ): RelayTaskSpecV2 => buildRelayTaskSpecV2({
     snapshot: record.snapshot,
     round: relayRoundV2Capsule(record, round),
+    evaluation: {
+      relayBotLogin: options.config.relayBotLogin,
+      requiredChecks: options.config.requiredChecks,
+      laneSpecifications: options.config.laneSpecifications,
+    },
     ...(round.purpose === 'initial' ? {} : {
       hostAuthority: {
         managedFork: true,
@@ -375,7 +380,7 @@ export function createIssueRelayProductionReconciliationV2(
     const recovered = await recoverSubmission(candidate, record, roundNumber);
     const expectation = buildRelaySolutionExpectationV2({
       submission: recovered.submission,
-      round: recovered.task.spec.relay,
+      taskSpec: recovered.task.spec,
     });
     const expected = persistRelaySolutionExpectationV2(
       join(recovered.directory, 'solution-expectation-v2.json'),
@@ -492,7 +497,7 @@ export function createIssueRelayProductionReconciliationV2(
     const recovered = await recoverSubmission(candidate, record, roundNumber);
     const solutionExpectation = buildRelaySolutionExpectationV2({
       submission: recovered.submission,
-      round: recovered.task.spec.relay,
+      taskSpec: recovered.task.spec,
     });
     const evidence = await adoptionEvidence(record, roundNumber);
     const authority = await publicationAuthority(
@@ -738,6 +743,11 @@ export function createIssueRelayProductionReconciliationV2(
     const task = buildRelayTaskSpecV2({
       snapshot: record.snapshot,
       round: capsule,
+      evaluation: {
+        relayBotLogin: options.config.relayBotLogin,
+        requiredChecks: options.config.requiredChecks,
+        laneSpecifications: options.config.laneSpecifications,
+      },
       ...(capsule.purpose === 'initial' ? {} : {
         hostAuthority: {
           managedFork: true,

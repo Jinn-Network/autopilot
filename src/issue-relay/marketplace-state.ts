@@ -22,7 +22,6 @@ import {
   IssueRelayAdoptionReceiptV1Schema,
   IssueRelayEvaluationAnchorV1Schema,
   IssueRelayRoundV1Schema,
-  IssueRelayRoundV2Schema,
   issueRelayCanonicalDigest,
   issueRelayPullRequestMetadataDigest,
   type IssueRelayEvaluationAnchorV1,
@@ -37,6 +36,11 @@ import {
   type RelayCheckSummary,
 } from './checks.js';
 import { relayTaskKey } from './identity.js';
+import {
+  ISSUE_RELAY_APPLICATION,
+  IssueRelayApplicationTaskExtensionSchema,
+} from './marketplace-application.js';
+import type { RelayTaskSpecV2 } from './task.js';
 import {
   isVerifiedIssueRelaySolutionV1,
   isVerifiedIssueRelaySolutionV2,
@@ -66,9 +70,18 @@ export interface IssueRelayDeliveryExpectation {
   readonly solutionOperatorSafe?: string;
 }
 
-export interface IssueRelayDeliveryExpectationV2
-  extends Omit<IssueRelayDeliveryExpectation, 'round'> {
-  readonly round: IssueRelayRoundV2;
+export interface IssueRelayDeliveryExpectationV2 {
+  readonly schemaVersion: 'jinn-application-delivery-expectation.v1';
+  readonly role: 'solution' | 'verdict';
+  readonly taskId: string;
+  readonly taskCid: string;
+  readonly creationBlockNumber: number;
+  readonly application: typeof ISSUE_RELAY_APPLICATION;
+  readonly taskSpec: RelayTaskSpecV2['spec'];
+  readonly attemptIndex?: number;
+  readonly requestId?: string;
+  readonly deliveryEnvelopeCid?: string;
+  readonly solutionOperatorSafe?: string;
 }
 
 export interface ImmutableRelayStateArtifact {
@@ -698,10 +711,12 @@ function validateV2Expectation(value: unknown): IssueRelayDeliveryExpectationV2 
   if (
     record === undefined
     || !exactKeys(record, record['role'] === 'solution'
-      ? ['schemaVersion', 'role', 'taskId', 'taskCid', 'creationBlockNumber', 'round']
-      : ['schemaVersion', 'role', 'taskId', 'taskCid', 'creationBlockNumber', 'round',
+      ? ['schemaVersion', 'role', 'taskId', 'taskCid', 'creationBlockNumber',
+          'application', 'taskSpec']
+      : ['schemaVersion', 'role', 'taskId', 'taskCid', 'creationBlockNumber',
+          'application', 'taskSpec',
           'attemptIndex', 'requestId', 'deliveryEnvelopeCid', 'solutionOperatorSafe'])
-    || record.schemaVersion !== 'jinn-issue-relay-delivery-expectation.v1'
+    || record.schemaVersion !== 'jinn-application-delivery-expectation.v1'
     || (record.role !== 'solution' && record.role !== 'verdict')
     || typeof record.taskId !== 'string'
     || !TASK_ID_PATTERN.test(record.taskId)
@@ -710,7 +725,15 @@ function validateV2Expectation(value: unknown): IssueRelayDeliveryExpectationV2 
     || !Number.isSafeInteger(record.creationBlockNumber)
     || (record.creationBlockNumber as number) < 0
   ) throw new Error('Relay V2 delivery expectation is invalid');
-  const round = IssueRelayRoundV2Schema.parse(record.round) as IssueRelayRoundV2;
+  const taskSpec = object(record.taskSpec);
+  const application = object(record.application);
+  if (
+    taskSpec === undefined
+    || application === undefined
+    || application.id !== ISSUE_RELAY_APPLICATION.id
+    || application.version !== ISSUE_RELAY_APPLICATION.version
+  ) throw new Error('Relay V2 application expectation is invalid');
+  IssueRelayApplicationTaskExtensionSchema.parse(taskSpec.application);
   if (
     record.role === 'verdict'
     && (
@@ -725,12 +748,13 @@ function validateV2Expectation(value: unknown): IssueRelayDeliveryExpectationV2 
     )
   ) throw new Error('Relay V2 evaluation expectation correlation is invalid');
   return {
-    schemaVersion: 'jinn-issue-relay-delivery-expectation.v1',
+    schemaVersion: 'jinn-application-delivery-expectation.v1',
     role: record.role,
     taskId: record.taskId,
     taskCid: record.taskCid,
     creationBlockNumber: record.creationBlockNumber as number,
-    round,
+    application: ISSUE_RELAY_APPLICATION,
+    taskSpec: taskSpec as RelayTaskSpecV2['spec'],
     ...(record.role === 'solution' ? {} : {
       attemptIndex: record.attemptIndex as number,
       requestId: record.requestId as string,
@@ -740,22 +764,34 @@ function validateV2Expectation(value: unknown): IssueRelayDeliveryExpectationV2 
   };
 }
 
+function v2ExpectationRound(
+  expectation: IssueRelayDeliveryExpectationV2,
+): IssueRelayRoundV2 {
+  return IssueRelayApplicationTaskExtensionSchema.parse(
+    expectation.taskSpec.application,
+  ).payload.round;
+}
+
 export function buildRelaySolutionExpectationV2(input: {
   readonly submission: RelaySubmissionEvidence;
-  readonly round: IssueRelayRoundV2;
+  readonly taskSpec: RelayTaskSpecV2['spec'];
 }): IssueRelayDeliveryExpectationV2 {
   const submission = validateSubmissionEvidence(input.submission);
-  const round = IssueRelayRoundV2Schema.parse(input.round) as IssueRelayRoundV2;
+  const extension = IssueRelayApplicationTaskExtensionSchema.parse(
+    input.taskSpec.application,
+  );
+  const round = extension.payload.round;
   if (submission.id !== relayTaskKey(round.generation, round.round)) {
     throw new Error('Relay V2 submission Task key does not match its round');
   }
   return validateV2Expectation({
-    schemaVersion: 'jinn-issue-relay-delivery-expectation.v1',
+    schemaVersion: 'jinn-application-delivery-expectation.v1',
     role: 'solution',
     taskId: submission.taskId,
     taskCid: submission.taskCid,
     creationBlockNumber: submission.creationBlock,
-    round,
+    application: ISSUE_RELAY_APPLICATION,
+    taskSpec: input.taskSpec,
   });
 }
 
@@ -813,7 +849,7 @@ export function installVerifiedRelaySolutionObservationV2(input: {
     !isVerifiedIssueRelaySolutionV2(observation)
     || observation.task.taskId !== expectation.taskId
     || observation.task.taskCid !== expectation.taskCid
-    || !isDeepStrictEqual(observation.round, expectation.round)
+    || !isDeepStrictEqual(observation.round, v2ExpectationRound(expectation))
   ) {
     throw new Error('Relay V2 Solution differs from exact expectation pins');
   }
@@ -836,19 +872,20 @@ export function buildRelayEvaluationBundleExpectationV2(input: {
 }): IssueRelayDeliveryExpectationV2 {
   const solution = validateV2Expectation(input.solutionExpectation);
   if (solution.role !== 'solution') throw new Error('Relay V2 Solution expectation is required');
+  const solutionRound = v2ExpectationRound(solution);
   const receipt = IssueRelayAdoptionReceiptV1Schema.parse(input.adoption.receipt);
   const anchor = IssueRelayEvaluationAnchorV1Schema.parse(input.evaluationAnchor);
   verifyRelayCheckSummary(input.checks);
   if (
     receipt.disposition !== 'accepted'
     || solution.taskId !== receipt.correlation.taskId
-    || solution.round.generation !== receipt.correlation.generation
-    || solution.round.round !== receipt.correlation.round
-    || solution.round.snapshotDigest !== receipt.correlation.snapshotDigest
-    || solution.round.targetRepository !== receipt.targetRepository
-    || solution.round.inputHead !== receipt.inputHead
-    || (solution.round.purpose !== 'initial' && solution.round.workspaceRepository !== receipt.workspaceRepository)
-    || (solution.round.purpose !== 'initial' && solution.round.prNumber !== receipt.prNumber)
+    || solutionRound.generation !== receipt.correlation.generation
+    || solutionRound.round !== receipt.correlation.round
+    || solutionRound.snapshotDigest !== receipt.correlation.snapshotDigest
+    || solutionRound.targetRepository !== receipt.targetRepository
+    || solutionRound.inputHead !== receipt.inputHead
+    || (solutionRound.purpose !== 'initial' && solutionRound.workspaceRepository !== receipt.workspaceRepository)
+    || (solutionRound.purpose !== 'initial' && solutionRound.prNumber !== receipt.prNumber)
     || !exactCorrelation(anchor.correlation, receipt.correlation)
     || anchor.evaluatedHead !== receipt.resultingHead
     || anchor.adoptionReceiptDigest !== relayAdoptionReceiptDigest(input.adoption)
@@ -925,7 +962,8 @@ export function installVerifiedRelayEvaluationBundleV2(input: {
       taskId: expectation.taskId,
       taskCid: expectation.taskCid,
       creationBlockNumber: expectation.creationBlockNumber,
-      round: expectation.round,
+      application: expectation.application,
+      taskSpec: expectation.taskSpec,
     },
     adoption: input.adoption,
     evaluationAnchor: input.evaluationAnchor,
@@ -935,7 +973,7 @@ export function installVerifiedRelayEvaluationBundleV2(input: {
     !isDeepStrictEqual(expectation, expected)
     || observation.task.taskId !== expectation.taskId
     || observation.task.taskCid !== expectation.taskCid
-    || !isDeepStrictEqual(observation.round, expectation.round)
+    || !isDeepStrictEqual(observation.round, v2ExpectationRound(expectation))
     || observation.attempt.attemptIndex !== expectation.attemptIndex
     || observation.attempt.requestId !== expectation.requestId
     || observation.attempt.operator.toLowerCase()

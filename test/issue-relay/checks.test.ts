@@ -491,6 +491,8 @@ describe('Relay evaluation-anchor publication', () => {
       open: true,
       draft: true,
       generation: adoption.receipt.correlation.generation,
+      title: 'Relay draft',
+      body: 'Relay assurance body',
     };
     let body = [
       '<!-- jinn-issue-relay:assurance:v1 -->',

@@ -34,7 +34,10 @@ import {
   relayAdoptionReceiptDigest,
 } from '../../src/issue-relay/checks.js';
 import { buildRelaySnapshot } from '../../src/issue-relay/snapshot.js';
-import { buildRelayTaskSpec } from '../../src/issue-relay/task.js';
+import {
+  buildRelayTaskSpec,
+  buildRelayTaskSpecV2,
+} from '../../src/issue-relay/task.js';
 import type { AcceptedRelayAdoption } from '../../src/issue-relay/adoption.js';
 import type {
   IssueRelayEvaluationAnchorV1,
@@ -53,6 +56,14 @@ import type {
 
 const temporaryDirectories: string[] = [];
 const base = '1'.repeat(40);
+const evaluation = {
+  relayBotLogin: 'jinn-relay',
+  requiredChecks: ['ci/typecheck'],
+  laneSpecifications: {
+    security: `sha256:${'a'.repeat(64)}` as const,
+    quality: `sha256:${'b'.repeat(64)}` as const,
+  },
+};
 const snapshot = buildRelaySnapshot({
   repository: {
     slug: 'Jinn-Network/mono',
@@ -547,7 +558,11 @@ describe('Relay authenticated verdict state', () => {
     };
     const solutionExpectation = buildRelaySolutionExpectationV2({
       submission,
-      round: roundV2,
+      taskSpec: buildRelayTaskSpecV2({
+        snapshot,
+        evaluation,
+        round: roundV2,
+      }).spec,
     });
     const persistedSolution = persistRelaySolutionExpectationV2(
       paths.expectationPath,
