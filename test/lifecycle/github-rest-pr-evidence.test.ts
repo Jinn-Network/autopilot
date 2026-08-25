@@ -246,6 +246,30 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     await expect(unavailableProbe.changed(pr())).resolves.toBe(true);
   });
 
+  /**
+   * Queue membership is the one fact the enqueue stage acts on that can lapse
+   * with nothing else moving: an ejection changes no review, comment, check or
+   * label, so every other term of this predicate reads identical. Left out, a
+   * stale `enqueued: true` suppresses the re-enqueue forever.
+   */
+  it('refreshes a PR whose only change could be leaving the merge queue', async () => {
+    const context = probeWith(offMergePathBodies(), true);
+
+    await expect(context.probe.changed(pr({
+      ...OFF_MERGE_PATH,
+      mergeQueue: { enqueued: true, position: 1, state: 'QUEUED' },
+    }))).resolves.toBe(true);
+  });
+
+  it('does not refresh a PR that is merely not proven queued', async () => {
+    const context = probeWith(offMergePathBodies(), true);
+
+    await expect(context.probe.changed(pr({
+      ...OFF_MERGE_PATH,
+      mergeQueue: { enqueued: false },
+    }))).resolves.toBe(false);
+  });
+
   it('still fails closed on malformed evidence for a merge-path PR', async () => {
     const bodies = equalBodies();
     (bodies.detail as Record<string, unknown>).number = 999;
