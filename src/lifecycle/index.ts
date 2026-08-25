@@ -33,6 +33,7 @@ export * from './review-session.js';
 export * from './review-session-production.js';
 export * from './merge-executor.js';
 export * from './merge-executor-production.js';
+export * from './enqueue-record.js';
 export * from './child-issues.js';
 export * from './child-issues-production.js';
 export * from './integration-ladder.js';
