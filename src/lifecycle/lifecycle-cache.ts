@@ -362,6 +362,14 @@ const pullRequestSchema = z.object({
     runAttempt: z.number().int().positive().optional(),
   }).strict()),
   ciRerunRecorded: z.literal(true).optional(),
+  // Deprecated: no code threads this into a written cache entry any more
+  // (the `listEnqueueRecordedHeads` reader and its GitHubReader/snapshot
+  // threading were removed as dead plumbing -- review finding N2, nothing
+  // ever read the field back to make a decision). Kept accept-and-ignore
+  // because `pullRequestSchema` is `.strict()`: a v4 cache written before
+  // this change may still have `enqueueRecorded: true` on some PR entries,
+  // and dropping the key here would make `load()` reject that cache as
+  // corrupt instead of silently ignoring the stale value.
   enqueueRecorded: z.literal(true).optional(),
   reviews: z.array(z.object({
     reviewer: z.string(),

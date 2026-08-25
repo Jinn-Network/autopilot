@@ -13,7 +13,6 @@ const OPEN_HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const MERGED_HEAD = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const REVIEW_CLAIM_GLOB = 'refs/jinn-autopilot/review-claims/v1/*';
 const CI_RERUN_REF_GLOB = 'refs/jinn-autopilot/ci-reruns/v1/pr-*';
-const ENQUEUE_REF_GLOB = 'refs/jinn-autopilot/enqueues/v1/pr-*';
 const AUTOPILOT_BRANCH_GLOB = 'refs/heads/autopilot/*';
 
 /**
@@ -1832,7 +1831,6 @@ describe('GhLifecycleReader', () => {
         gitCalls.push(rest);
         if (rest[0] === 'ls-remote' && rest[2] === REVIEW_CLAIM_GLOB) return `${oid}\t${ref}\n`;
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
-        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_REF_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') return ''; // object already present locally
         if (rest[0] === 'cat-file' && rest[1] === '-p') return payload;
         throw new Error(`unexpected git call: ${rest.join(' ')}`);
@@ -1861,7 +1859,6 @@ describe('GhLifecycleReader', () => {
           return `${currentOid}\t${ref}\n`;
         }
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
-        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_REF_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') {
           if (localObjects.has(rest[2] ?? '')) return '';
           throw new Error('object not found locally');
@@ -1927,7 +1924,6 @@ describe('GhLifecycleReader', () => {
           return `${oid101}\t${ref101}\n${oid102}\t${ref102}\n`;
         }
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
-        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_REF_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') {
           if (localObjects.has(rest[2] ?? '')) return '';
           throw new Error('object not found locally');
@@ -2082,28 +2078,6 @@ describe('merge-queue snapshot evidence', () => {
       position: 3,
       state: 'QUEUED',
     });
-  });
-
-  it('marks a head whose CAS enqueue record exists', async () => {
-    const { run } = queueRun(queueAwarePr(), {
-      [ENQUEUE_REF_GLOB]:
-        `${'c'.repeat(40)}\trefs/jinn-autopilot/enqueues/v1/pr-101/${OPEN_HEAD}\n`,
-    });
-
-    const page = await new GhLifecycleReader(run).readPullRequests(null);
-
-    expect(page.nodes[0]?.enqueueRecorded).toBe(true);
-  });
-
-  it('leaves a head with no enqueue record unmarked', async () => {
-    const { run } = queueRun(queueAwarePr(), {
-      [ENQUEUE_REF_GLOB]:
-        `${'c'.repeat(40)}\trefs/jinn-autopilot/enqueues/v1/pr-101/${'9'.repeat(40)}\n`,
-    });
-
-    const page = await new GhLifecycleReader(run).readPullRequests(null);
-
-    expect(page.nodes[0]?.enqueueRecorded).toBeUndefined();
   });
 
   /**

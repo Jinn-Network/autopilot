@@ -211,7 +211,7 @@ export interface DispatcherConfig {
    * 2026-07-20-autopilot-marketplace-execution.md §"Generator"): `'local'`
    * dispatches ready issues to a local coordinator session (`dispatchIssue`,
    * unchanged). `'marketplace'` routes them to the marketplace instead
-   * (`routeToMarketplace` — see `./marketplace-route.js`): label + snapshot
+   * (`routeToMarketplace`, removed with the V1 dispatcher): label + snapshot
    * marker, no local session, no GitHub credential handed to a solver.
    * Default `'local'` — fail-safe. Source:
    * `JINN_EXECUTION_MODE` (`'marketplace'` arms it; anything else is `local`).

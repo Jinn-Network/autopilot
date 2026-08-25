@@ -253,18 +253,6 @@ export function childrenPathEnabled(
   return !['0', 'false', 'no', 'off'].includes(raw.toLowerCase());
 }
 
-/**
- * Env knob: approval carry-over after tier-0 update-branch.
- * Stage 4 default: unset/empty means on. Disable with 0/false/no/off.
- */
-export function carryoverEnabled(
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  const raw = env.JINN_AUTOPILOT_CARRYOVER;
-  if (raw === undefined || raw === '') return true;
-  return !['0', 'false', 'no', 'off'].includes(raw.toLowerCase());
-}
-
 export const RUNAWAY_CHILD_LIMIT = 3;
 
 /**

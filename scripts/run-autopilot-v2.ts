@@ -212,8 +212,6 @@ function configuredEnvironment(
       ?? String(product.scheduler.fullReconcileSeconds * 1_000),
     JINN_AUTOPILOT_CHILDREN:
       env.JINN_AUTOPILOT_CHILDREN ?? String(product.safety.children),
-    JINN_AUTOPILOT_CARRYOVER:
-      env.JINN_AUTOPILOT_CARRYOVER ?? String(product.safety.carryover),
     JINN_AUTOPILOT_CLEANUP_ENABLED:
       env.JINN_AUTOPILOT_CLEANUP_ENABLED ?? String(product.safety.cleanup),
     JINN_AUTOPILOT_DISK_FLOOR_GB:

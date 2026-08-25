@@ -3757,14 +3757,12 @@ describe('merge-queue evidence threading', () => {
       readPullRequests: async () => queuedPage({
         graphqlId: 'PR_kwDOABCD123',
         mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
-        enqueueRecorded: true,
       }),
     }), { authorAllowlist: new Set(['trusted']) });
 
     expect(snapshot.pullRequests.find((pr) => pr.number === 101)).toMatchObject({
       graphqlId: 'PR_kwDOABCD123',
       mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
-      enqueueRecorded: true,
     });
   });
 
@@ -3788,12 +3786,4 @@ describe('merge-queue evidence threading', () => {
     expect(item?.inMergeQueue).toBeUndefined();
   });
 
-  it('marks a recorded enqueue attempt on the lifecycle item', async () => {
-    const snapshot = await buildGitHubLifecycleSnapshot(reader({
-      readPullRequests: async () => queuedPage({ enqueueRecorded: true }),
-    }), { authorAllowlist: new Set(['trusted']) });
-
-    expect(snapshot.lifecycle.items.find((item) => item.prNumber === 101))
-      .toMatchObject({ enqueueRecorded: true });
-  });
 });
