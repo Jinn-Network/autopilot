@@ -1505,6 +1505,123 @@ describe('GhLifecycleReader', () => {
     });
   });
 
+  function checkContextNode(name: string) {
+    return {
+      __typename: 'CheckRun' as const,
+      name,
+      status: 'COMPLETED',
+      conclusion: 'SUCCESS',
+      databaseId: 900,
+      checkSuite: { workflowRun: { databaseId: 123 } },
+    };
+  }
+
+  /**
+   * One open PR whose check-context connection is served across `pages`
+   * pages of a single context each — the shape mono PR #2918 produces live
+   * (a dependabot bump that touches the workflows, fanning out to 144 check
+   * contexts behind GitHub's 100-node page cap). Records every follow-up
+   * context read's argv so the tests can assert the query is scoped to the
+   * one PR and carries the previous page's cursor.
+   */
+  function checkContextPages(
+    prNumber: number,
+    head: string,
+    pages: number,
+  ): { run: CommandRunner; followUps: string[][] } {
+    const followUps: string[][] = [];
+    const pageInfoFor = (index: number) => ({
+      hasNextPage: index < pages - 1,
+      endCursor: `cursor-${index}`,
+    });
+    const run: CommandRunner = async (command, args) => {
+      const stub = noReviewClaimRefs(command);
+      if (stub !== undefined) return stub;
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('contexts(first: 100, after: $cursor)')) {
+        followUps.push(args);
+        const cursor = args.find((arg) => arg.startsWith('cursor='))?.slice(7) ?? '';
+        const index = Number(cursor.slice('cursor-'.length)) + 1;
+        return JSON.stringify({
+          data: {
+            rateLimit: rateLimit(),
+            repository: {
+              pullRequest: {
+                statusCheckRollup: {
+                  contexts: {
+                    pageInfo: pageInfoFor(index),
+                    nodes: [checkContextNode(`check-${index}`)],
+                  },
+                },
+              },
+            },
+          },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [graphQlPr({
+                number: prNumber,
+                state: 'OPEN',
+                head,
+                statusCheckRollup: {
+                  contexts: {
+                    pageInfo: pageInfoFor(0),
+                    nodes: [checkContextNode('check-0')],
+                  },
+                },
+              })],
+            },
+          },
+        },
+      });
+    };
+    return { run, followUps };
+  }
+
+  it('paginates a PR check-context connection past the first 100-node page', async () => {
+    const { run, followUps } = checkContextPages(101, OPEN_HEAD, 3);
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(page.nodes[0]?.evidenceIncompleteReason).toBeUndefined();
+    expect(page.nodes[0]?.checks.map((check) => check.name))
+      .toEqual(['check-0', 'check-1', 'check-2']);
+    expect(followUps).toHaveLength(2);
+    expect(followUps[0]).toContain('number=101');
+    expect(followUps[0]).toContain('cursor=cursor-0');
+    expect(followUps[1]).toContain('cursor=cursor-1');
+    expect(followUps[0]?.find((arg) => arg.startsWith('query=')))
+      .toContain('pullRequest(number: $number)');
+  });
+
+  it('issues no follow-up context read when the first check-context page is complete', async () => {
+    const { run, followUps } = checkContextPages(103, 'f'.repeat(40), 1);
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(followUps).toEqual([]);
+    expect(page.nodes[0]?.evidenceIncompleteReason).toBeUndefined();
+    expect(page.nodes[0]?.checks.map((check) => check.name)).toEqual(['check-0']);
+  });
+
+  it('fails closed when a PR check-context connection outruns the pagination cap', async () => {
+    const { run, followUps } = checkContextPages(102, 'd'.repeat(40), 40);
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(followUps).toHaveLength(9);
+    expect(page.nodes[0]).toMatchObject({
+      number: 102,
+      checks: [],
+      evidenceIncompleteReason: expect.stringMatching(/checks.*truncated/i),
+    });
+  });
+
   it('does not synthesize Human authority from an undecodable audit comment', async () => {
     const hostile = graphQlPr({
       number: 201,
