@@ -49,6 +49,31 @@ const PR_PAGE_SIZE = 50;
 const MERGED_ISSUE_BATCH_SIZE = 20;
 const COMMIT_HISTORY_PAGE_SIZE = 100;
 const MAX_COMMIT_HISTORY_PAGES = 100;
+const CHECK_CONTEXT_PAGE_SIZE = 100;
+/**
+ * Total check-context pages one PR's status rollup may span, first page
+ * included — 1000 contexts. A workflow-touching change fans CI out well past
+ * the single 100-node page GitHub returns by default (mono PR #2918, a
+ * dependabot `actions/upload-artifact` bump, carries 144 contexts on its head
+ * commit), so a single page is not enough to call the check evidence complete.
+ * Past this cap the read still fails closed with the truncation error rather
+ * than paginating without bound.
+ */
+const MAX_CHECK_CONTEXT_PAGES = 10;
+
+const CHECK_CONTEXT_FIELDS = `
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              __typename
+              ... on CheckRun {
+                name
+                status
+                conclusion
+                databaseId
+                checkSuite { workflowRun { databaseId } }
+              }
+              ... on StatusContext { context state }
+            }`;
 
 const PR_FIELDS = `
         id number title body updatedAt baseRefName headRefName headRefOid isDraft state
@@ -87,21 +112,29 @@ const PR_FIELDS = `
           }
         }
         statusCheckRollup {
-          contexts(first: 100) {
-            pageInfo { hasNextPage }
-            nodes {
-              __typename
-              ... on CheckRun {
-                name
-                status
-                conclusion
-                databaseId
-                checkSuite { workflowRun { databaseId } }
-              }
-              ... on StatusContext { context state }
-            }
+          contexts(first: ${CHECK_CONTEXT_PAGE_SIZE}) {${CHECK_CONTEXT_FIELDS}
           }
         }`;
+
+/**
+ * Follow-up read for one PR's remaining check-context pages. Scoped to the
+ * single PR whose first page reported `hasNextPage`, so a 144-context outlier
+ * costs one extra targeted query instead of widening the batched page read for
+ * every PR. Runs through the same metered `gh api graphql` path as every other
+ * read, so its cost lands in the cycle's usage meter.
+ */
+const CHECK_CONTEXTS_PAGE_QUERY =
+  `query($owner: String!, $name: String!, $number: Int!, $cursor: String!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      statusCheckRollup {
+        contexts(first: ${CHECK_CONTEXT_PAGE_SIZE}, after: $cursor) {${CHECK_CONTEXT_FIELDS}
+        }
+      }
+    }
+  }
+}`;
 
 const MERGED_PR_FIELDS = `
         number title body baseRefName headRefName headRefOid isDraft state
@@ -493,22 +526,34 @@ interface GraphQlPr {
     }>;
   };
   statusCheckRollup: {
-    contexts: {
-      pageInfo: { hasNextPage: boolean };
-      nodes: Array<{
-        __typename: 'CheckRun' | 'StatusContext';
-        name?: string;
-        status?: string;
-        conclusion?: string | null;
-        databaseId?: number | null;
-        context?: string;
-        state?: string;
-        checkSuite?: {
-          workflowRun?: { databaseId?: number | null } | null;
-        } | null;
-      }>;
-    };
+    contexts: GraphQlCheckContexts;
   } | null;
+}
+
+interface GraphQlCheckContexts {
+  pageInfo: { hasNextPage: boolean; endCursor?: string | null };
+  nodes: Array<{
+    __typename: 'CheckRun' | 'StatusContext';
+    name?: string;
+    status?: string;
+    conclusion?: string | null;
+    databaseId?: number | null;
+    context?: string;
+    state?: string;
+    checkSuite?: {
+      workflowRun?: { databaseId?: number | null } | null;
+    } | null;
+  }>;
+}
+
+interface CheckContextsPageResponse {
+  data?: {
+    repository: {
+      pullRequest: {
+        statusCheckRollup: { contexts: GraphQlCheckContexts } | null;
+      } | null;
+    } | null;
+  };
 }
 
 interface GraphQlMergedPr {
@@ -595,7 +640,16 @@ export class PrEvidenceInconsistentError extends Error {
   }
 }
 
-function assertCompletePrNode(pr: GraphQlPr): void {
+/**
+ * `contexts` is the PR's check-context connection *after* pagination
+ * (`GhLifecycleReader.checkContexts`), not the raw first page off the node —
+ * a first page that reported `hasNextPage` is only truncated once the
+ * follow-up reads have run out of room.
+ */
+function assertCompletePrNode(
+  pr: GraphQlPr,
+  contexts: GraphQlCheckContexts | null,
+): void {
   if (pr.labels.pageInfo.hasNextPage) {
     throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} labels were truncated`);
   }
@@ -612,7 +666,7 @@ function assertCompletePrNode(pr: GraphQlPr): void {
   if (pr.timelineItems.pageInfo.hasPreviousPage) {
     throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} timeline was truncated`);
   }
-  if (pr.statusCheckRollup?.contexts.pageInfo.hasNextPage === true) {
+  if (contexts?.pageInfo.hasNextPage === true) {
     throw new PrEvidenceInconsistentError(pr.number, `PR #${pr.number} checks were truncated`);
   }
 }
@@ -792,8 +846,8 @@ function queueEligibleMergeState(
     && queueEligibleMergeStateStatus(mergeStateStatus);
 }
 
-function checks(pr: GraphQlPr): RawPullRequest['checks'] {
-  return (pr.statusCheckRollup?.contexts.nodes ?? []).map((node) => (
+function checks(contexts: GraphQlCheckContexts | null): RawPullRequest['checks'] {
+  return (contexts?.nodes ?? []).map((node) => (
     node.__typename === 'CheckRun'
       ? {
           name: node.name ?? '',
@@ -1304,6 +1358,58 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     throw new Error(`Branch ${headOid} ancestry pagination exceeded safety limit`);
   }
 
+  /**
+   * Completes one PR's check-context evidence when its rollup ran past the
+   * first page.
+   *
+   * The batched PR read asks for the first `CHECK_CONTEXT_PAGE_SIZE` contexts;
+   * a change that touches the workflows fans CI out beyond that (mono PR #2918
+   * carries 144 contexts), and a first page alone is *not* complete evidence —
+   * `assertCompletePrNode` rightly refuses it, which used to strand the whole
+   * snapshot as incomplete and, with no cache to fall back on, killed every
+   * bootstrap. So walk that one PR's remaining pages and merge them, rather
+   * than weaken the completeness invariant.
+   *
+   * Returns the node's own connection untouched when its first page already
+   * held every context, and `null` when the PR has no status rollup at all.
+   * Past `MAX_CHECK_CONTEXT_PAGES` the returned connection still reports
+   * `hasNextPage`, so the caller's truncation guard fires exactly as before —
+   * bounded work, fail-closed at the bound.
+   */
+  private async checkContexts(pr: GraphQlPr): Promise<GraphQlCheckContexts | null> {
+    const rollup = pr.statusCheckRollup ?? null;
+    if (rollup === null) return null;
+    if (!rollup.contexts.pageInfo.hasNextPage) return rollup.contexts;
+    const nodes = [...rollup.contexts.nodes];
+    let pageInfo = rollup.contexts.pageInfo;
+    for (let page = 1; page < MAX_CHECK_CONTEXT_PAGES; page += 1) {
+      const cursor = pageInfo.endCursor;
+      // A connection that claims a next page but hands back no cursor cannot
+      // be followed: leave `hasNextPage` set so the truncation guard fires.
+      if (typeof cursor !== 'string' || cursor.length === 0) break;
+      const raw = await this.run('gh', [
+        'api', 'graphql',
+        '-f', `query=${CHECK_CONTEXTS_PAGE_QUERY}`,
+        ...this.repositoryVariables(),
+        '-F', `number=${pr.number}`,
+        '-f', `cursor=${cursor}`,
+      ]);
+      const response = JSON.parse(raw) as CheckContextsPageResponse;
+      const contexts =
+        response.data?.repository?.pullRequest?.statusCheckRollup?.contexts;
+      if (contexts === undefined || contexts === null) {
+        throw new PrEvidenceInconsistentError(
+          pr.number,
+          `PR #${pr.number} checks were truncated`,
+        );
+      }
+      nodes.push(...contexts.nodes);
+      pageInfo = contexts.pageInfo;
+      if (!pageInfo.hasNextPage) break;
+    }
+    return { pageInfo, nodes };
+  }
+
   private async rawPullRequest(
     pr: GraphQlPr,
     includeReviewClaim: boolean,
@@ -1312,7 +1418,8 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     if (pr.state === 'CLOSED') {
       throw new Error(`Closed-unmerged PR #${pr.number} is not an active lifecycle item`);
     }
-    assertCompletePrNode(pr);
+    const contexts = await this.checkContexts(pr);
+    assertCompletePrNode(pr, contexts);
     const latest = pr.commits.nodes.at(-1)?.commit;
     if (latest === undefined || latest.oid !== pr.headRefOid) {
       throw new Error(`PR #${pr.number} is missing its exact current head commit`);
@@ -1456,7 +1563,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       closingIssueNumbers: pr.closingIssuesReferences.nodes.map((issue) => issue.number),
       mergeability: pr.mergeable,
       mergeStateStatus: pr.mergeStateStatus,
-      checks: checks(pr),
+      checks: checks(contexts),
       reviews,
       branchClaimTrailers: claimEvidence?.claimTrailers ?? null,
       implementationCompletionSummary: claimEvidence?.completionSummary ?? null,
