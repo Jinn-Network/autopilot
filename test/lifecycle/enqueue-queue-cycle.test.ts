@@ -1,4 +1,3 @@
-// @ts-nocheck — hand-built lifecycle fixtures for the enqueue acceptance suite.
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
@@ -11,8 +10,16 @@ import {
 } from '../../src/lifecycle/enqueue-record.js';
 import { phaseStatus } from '../../src/lifecycle/projection.js';
 import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
-import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
-import { gitOid, isoTimestamp } from '../../src/lifecycle/types.js';
+import { deriveMergeState } from '../../src/lifecycle/snapshot.js';
+import type {
+  CheckSummary,
+  GitHubLifecycleSnapshot,
+  MergeQueueSnapshot,
+  PullRequestSnapshot,
+} from '../../src/lifecycle/snapshot.js';
+import type { ChildKind } from '../../src/lifecycle/child-issues.js';
+import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
+import type { CompareStatus, GitOid } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
 const FORK_POINT = gitOid('3'.repeat(40));
@@ -97,7 +104,7 @@ const FIELD_LIST_JSON = JSON.stringify({
   ],
 });
 
-function green(names: readonly string[]) {
+function green(names: readonly string[]): readonly CheckSummary[] {
   return names.map((name) => ({
     source: 'check-run' as const,
     name,
@@ -107,15 +114,15 @@ function green(names: readonly string[]) {
 }
 
 interface Fixture {
-  readonly head?: string;
+  readonly head?: GitOid;
   readonly state?: 'OPEN' | 'MERGED';
-  readonly mergeQueue?: { readonly enqueued: boolean; readonly position?: number; readonly state?: string };
-  readonly checks?: readonly unknown[];
-  readonly compareStatus?: 'ahead' | 'behind' | 'diverged' | 'identical' | 'unknown';
-  readonly mergeability?: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+  readonly mergeQueue?: MergeQueueSnapshot;
+  readonly checks?: readonly CheckSummary[];
+  readonly compareStatus?: CompareStatus;
+  readonly mergeability?: PullRequestSnapshot['mergeability'];
   readonly mergeStateStatus?: string;
   readonly baseRefName?: string;
-  readonly openChildKinds?: readonly string[];
+  readonly openChildKinds?: readonly ChildKind[];
 }
 
 function snapshotFor(fixture: Fixture = {}): GitHubLifecycleSnapshot {
@@ -124,12 +131,54 @@ function snapshotFor(fixture: Fixture = {}): GitHubLifecycleSnapshot {
   const baseRefName = fixture.baseRefName ?? DEFAULT_BRANCH;
   const checks = fixture.checks ?? green(FAST_LANE_CONTEXTS);
   const merged = state === 'MERGED';
-  const mergeState = fixture.mergeability === 'CONFLICTING'
-    || fixture.mergeStateStatus === 'DIRTY'
-    ? 'conflict'
-    : fixture.compareStatus === 'behind' || fixture.compareStatus === 'diverged'
-      ? 'behind'
-      : 'clean';
+  const pullRequest: PullRequestSnapshot = {
+    number: 84,
+    title: 'feat: lifecycle',
+    body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+    author: 'implementation-bot',
+    baseRefName,
+    headRefName: 'autopilot/42',
+    headOid: head,
+    headCommittedAt: isoTimestamp('2026-07-20T11:00:00.000Z'),
+    graphqlId: GRAPHQL_ID,
+    isDraft: false,
+    state,
+    labels: ['engine:review'],
+    closingIssueNumbers: [42],
+    mergeability: fixture.mergeability ?? 'MERGEABLE',
+    mergeStateStatus: fixture.mergeStateStatus ?? 'CLEAN',
+    compareStatus: fixture.compareStatus ?? 'ahead',
+    checks,
+    reviews: [{
+      reviewer: REVIEWER,
+      state: 'APPROVED',
+      commitId: head,
+      body: `${marker(head)}\n\nApproved.`,
+      submittedAt: '2026-07-20T11:30:00.000Z',
+    }],
+    ...(fixture.mergeQueue === undefined ? {} : { mergeQueue: fixture.mergeQueue }),
+    branchClaim: {
+      kind: 'branch-claim',
+      protocolVersion: 2,
+      phase: 'implement',
+      phaseComplete: true,
+      issueNumber: 42,
+      prNumber: 84,
+      attempt: '11111111-1111-4111-8111-111111111111',
+      runner: 'runner-a',
+      login: 'implementation-bot',
+      expectedHead: head,
+      targetBase: gitRefName(baseRefName),
+      claimedAt: '2026-07-20T11:00:00.000Z',
+    },
+  };
+  // The projection under test, not a restatement of it. `deriveMergeState` is
+  // the production derivation `composeGitHubLifecycleSnapshot` runs, so a
+  // fixture that says MERGEABLE/BLOCKED reaches the scheduler through exactly
+  // the code path a live snapshot would — which is the whole point of an
+  // acceptance suite, and what a hand-rolled copy of this ladder silently
+  // stopped doing the moment the real one changed.
+  const mergeState = deriveMergeState(pullRequest);
   return {
     project: {
       items: [],
@@ -155,48 +204,9 @@ function snapshotFor(fixture: Fixture = {}): GitHubLifecycleSnapshot {
       restRequests: 0,
       restNotModified: 0,
       cacheHits: 0,
+      accountingComplete: true,
     },
-    pullRequests: [{
-      number: 84,
-      title: 'feat: lifecycle',
-      body: '<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
-      author: 'implementation-bot',
-      baseRefName,
-      headRefName: 'autopilot/42',
-      headOid: head,
-      headCommittedAt: isoTimestamp('2026-07-20T11:00:00.000Z'),
-      graphqlId: GRAPHQL_ID,
-      isDraft: false,
-      state,
-      labels: ['engine:review'],
-      closingIssueNumbers: [42],
-      mergeability: fixture.mergeability ?? 'MERGEABLE',
-      mergeStateStatus: fixture.mergeStateStatus ?? 'CLEAN',
-      compareStatus: fixture.compareStatus ?? 'ahead',
-      checks,
-      reviews: [{
-        reviewer: REVIEWER,
-        state: 'APPROVED',
-        commitId: head,
-        body: `${marker(head)}\n\nApproved.`,
-        submittedAt: '2026-07-20T11:30:00.000Z',
-      }],
-      ...(fixture.mergeQueue === undefined ? {} : { mergeQueue: fixture.mergeQueue }),
-      branchClaim: {
-        kind: 'branch-claim',
-        protocolVersion: 2,
-        phase: 'implement',
-        phaseComplete: true,
-        issueNumber: 42,
-        prNumber: 84,
-        attempt: '11111111-1111-4111-8111-111111111111',
-        runner: 'runner-a',
-        login: 'implementation-bot',
-        expectedHead: head,
-        targetBase: baseRefName,
-        claimedAt: '2026-07-20T11:00:00.000Z',
-      },
-    }],
+    pullRequests: [pullRequest],
     pullRequestMappings: [{
       status: 'resolved',
       prNumber: 84,
@@ -206,7 +216,7 @@ function snapshotFor(fixture: Fixture = {}): GitHubLifecycleSnapshot {
     }],
     lifecycle: {
       items: [{
-        kind: 'pull-request',
+        kind: 'pull-request' as const,
         issueNumber: 42,
         prNumber: 84,
         v2Marked: true,
@@ -245,7 +255,7 @@ function snapshotFor(fixture: Fixture = {}): GitHubLifecycleSnapshot {
         },
       }],
     },
-  } as unknown as GitHubLifecycleSnapshot;
+  };
 }
 
 function oidFor(value: string): string {
@@ -427,8 +437,11 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
   const executed: { action: unknown; result: unknown }[] = [];
   const instrumented = {
     ...runtime,
-    // The capability attestation is a separate concern with its own suite; this
-    // one is about what the enqueue stage does once the runtime is armed.
+    // Deliberate bypass, and the only one in this suite. The capability
+    // attestation is a separate concern with its own suite; this one is about
+    // what the enqueue stage does once the runtime is armed, and every layer
+    // below it — derivation, scheduling, the gate, the executor, the attempt
+    // ledger — is the real production code.
     preflight: async () => ({ ok: true }),
     executeAction: async (action: unknown, cycleSnapshot: unknown) => {
       const result = await runtime.executeAction(action as never, cycleSnapshot as never);
@@ -679,6 +692,44 @@ describe('enqueue queue cycle', () => {
 
     expect(report.items[0]).toMatchObject({ phase: 'ci-blocked' });
     expect(pending.enqueueMutations).toEqual([]);
+  });
+
+  /**
+   * Issue #82, end to end. GitHub reports BLOCKED for a pull request waiting on
+   * a required context — which includes every merge-group-only context, by
+   * construction — and for one already admitted to the queue. The fixture says
+   * MERGEABLE/BLOCKED and nothing else; the merge state that reaches the
+   * scheduler is derived from it by production code, so this asserts the real
+   * derivation, not a restatement of it.
+   */
+  it('enqueues a BLOCKED head that is approved and green', async () => {
+    const blocked = harness({ mergeStateStatus: 'BLOCKED' });
+    const report = await blocked.run();
+
+    expect(report.items[0]).toMatchObject({ phase: 'merge-ready' });
+    expect(blocked.executed[0]!.action).toMatchObject({ kind: 'enqueue', prNumber: 84 });
+    expect(blocked.enqueueMutations).toEqual([`expectedHeadOid=${HEAD}`]);
+  });
+
+  /**
+   * The one shape BLOCKED must not launder. The queue rebases its own
+   * candidate, so behind is fine and blocked-on-a-context is fine; a head that
+   * conflicts is a head it cannot build a candidate from at all, and the
+   * reconcile child still owns the next mutation.
+   */
+  it('files a reconcile child for a BLOCKED head that conflicts', async () => {
+    const conflicting = harness({
+      mergeStateStatus: 'BLOCKED',
+      mergeability: 'CONFLICTING',
+      compareStatus: 'diverged',
+    });
+    await conflicting.run();
+
+    expect(conflicting.enqueueMutations).toEqual([]);
+    expect(conflicting.executed[0]!.action).toMatchObject({
+      kind: 'file-reconcile-child',
+      prNumber: 84,
+    });
   });
 
   /**
