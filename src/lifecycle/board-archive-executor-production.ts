@@ -16,8 +16,7 @@ import { isoTimestamp } from './types.js';
 /**
  * Board-archive sweep production wiring (jinn-mono#1883). Same state
  * directory family the capability attestation and session logs use
- * (`~/.jinn-client/autopilot/`, see `capability-attestation.ts` /
- * `dispatcher/session-log.ts`).
+ * (`~/.jinn-client/autopilot/`, see `capability-attestation.ts`).
  */
 export const BOARD_ARCHIVE_STATE_DIR = join(homedir(), '.jinn-client', 'autopilot');
 export const BOARD_ARCHIVE_MARKER_FILE = 'board-archive-sweep.json';
