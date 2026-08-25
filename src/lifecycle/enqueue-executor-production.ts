@@ -145,6 +145,13 @@ interface RecordTransport {
   readonly repositoryUrl: string;
 }
 
+/**
+ * Resolve a ref on the canonical remote. Failures propagate on purpose: on the
+ * read path an unlistable ref is not an absent ref, and reading it as one
+ * degrades the flake policy to always-allow. The one caller that may swallow
+ * this is `publishEnqueueRecord`'s post-failure observation, which already
+ * degrades to `lost`, and it catches locally.
+ */
 async function remoteRefOid(
   transport: RecordTransport,
   ref: string,
@@ -153,26 +160,44 @@ async function remoteRefOid(
     ...gitPublicationArgs(transport.askpass, []),
     '-C', transport.repositoryPath,
     'ls-remote', transport.repositoryUrl, ref,
-  ], { env: transport.environment }).catch(() => '');
+  ], { env: transport.environment });
   const line = raw.trimEnd().split('\n').find((entry) => entry.endsWith(`\t${ref}`));
   if (line === undefined) return null;
   const oid = line.split('\t')[0];
   return oid === undefined || oid.length === 0 ? null : gitOid(oid);
 }
 
-async function readEnqueueRecord(
+/**
+ * Read the record commit an already-resolved ledger ref points at.
+ *
+ * The fetch is not an optimisation, it is the correctness of the read. The
+ * record commit is created and pushed by whichever clone ran the enqueue; every
+ * *other* clone — a second runner, a fresh checkout, this clone after a gc that
+ * dropped an unreferenced object — has never seen that object, so `cat-file`
+ * fails and the ledger reads as empty. Empty is the answer that licenses
+ * another enqueue, which is the opposite of what a hold is for, so the object
+ * is fetched first and no failure below is swallowed: an unreadable ledger
+ * surfaces as an error and the caller refuses to mutate on it.
+ *
+ * Takes the oid the caller already resolved rather than resolving it again —
+ * one network read of the ref per enqueue, and no window in which the two reads
+ * could disagree.
+ */
+async function readEnqueueRecordAt(
   transport: RecordTransport,
-  prNumber: number,
-  head: GitOid,
+  ref: string,
+  oid: GitOid,
 ): Promise<EnqueueRecord | null> {
-  const ref = enqueueRef(prNumber, head);
-  const oid = await remoteRefOid(transport, ref);
-  if (oid === null) return null;
+  await transport.run('git', [
+    ...gitPublicationArgs(transport.askpass, []),
+    '-C', transport.repositoryPath,
+    'fetch', '--no-tags', '--quiet', transport.repositoryUrl, ref,
+  ], { env: transport.environment });
   const raw = await transport.run('git', [
     ...gitPublicationArgs(transport.askpass, []),
     '-C', transport.repositoryPath,
     'cat-file', '-p', oid,
-  ], { env: transport.environment }).catch(() => '');
+  ], { env: transport.environment });
   const message = raw.split('\n\n').slice(1).join('\n\n').trim();
   return message.length === 0 ? null : decodeEnqueueRecord(message);
 }
@@ -205,7 +230,11 @@ async function publishEnqueueRecord(
     ], { env: transport.environment });
     return 'won';
   } catch {
-    const observed = await remoteRefOid(transport, ref);
+    // Best-effort disambiguation of a push that may still have landed. A failed
+    // observation is not evidence either way, and `lost` is already the honest
+    // answer for "cannot assert this head's attempt count", so it may be
+    // swallowed here — and only here.
+    const observed = await remoteRefOid(transport, ref).catch(() => null);
     return observed === published ? 'already-applied' : 'lost';
   }
 }
@@ -527,15 +556,20 @@ export function makeProductionEnqueueActionPort(
               environment,
               repositoryUrl: options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE,
             } satisfies RecordTransport;
-        // The attempt ledger for *this head*. No transport means no ledger, and
-        // an absent ledger reads as "no attempt recorded" — the flake policy
-        // degrades to always-allow, never to always-refuse.
+        // The attempt ledger for *this head*. No transport at all means no
+        // ledger was ever configured, and that absence reads as "no attempt
+        // recorded" — the flake policy degrades to always-allow rather than
+        // always-refuse. A ledger that *is* configured but cannot be read is a
+        // different thing entirely: `remoteRefOid` and `readEnqueueRecordAt`
+        // both throw, and the enqueue is abandoned rather than performed on an
+        // attempt count nobody proved.
+        const ledgerRef = enqueueRef(prNumber, head);
         const existingRef = transport === null
           ? null
-          : await remoteRefOid(transport, enqueueRef(prNumber, head));
-        const existing = transport === null
+          : await remoteRefOid(transport, ledgerRef);
+        const existing = transport === null || existingRef === null
           ? null
-          : await readEnqueueRecord(transport, prNumber, head);
+          : await readEnqueueRecordAt(transport, ledgerRef, existingRef);
         const decision = decideReEnqueue(existing);
         if (!decision.allow && transport !== null && existing !== null) {
           // A record that already names its issue is a hold that has *already*

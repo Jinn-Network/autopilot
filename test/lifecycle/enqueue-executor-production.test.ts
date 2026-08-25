@@ -15,6 +15,9 @@ import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
 import { resolveStructuredPullRequestMappings } from '../../src/lifecycle/pr-mapping.js';
 import { evaluateEnqueueGate } from '../../src/lifecycle/enqueue-executor.js';
 import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
+import {
+  CANONICAL_GITHUB_HTTPS_REMOTE,
+} from '../../src/lifecycle/implementation-executor.js';
 
 const HEAD = gitOid('1'.repeat(40));
 const OTHER_HEAD = gitOid('2'.repeat(40));
@@ -1131,6 +1134,8 @@ describe('enqueue mutation', () => {
     readonly view?: (call: number) => Promise<string>;
     readonly refs?: Record<string, string>;
     readonly catFile?: (oid: string) => string;
+    readonly lsRemoteFails?: boolean;
+    readonly fetchFails?: boolean;
     readonly pushFails?: boolean;
     readonly onPush?: (args: readonly string[]) => void;
     readonly childNumber?: number;
@@ -1151,8 +1156,13 @@ describe('enqueue mutation', () => {
       if (command === 'git') {
         const rest = args.slice(args.indexOf('-C') + 2);
         if (rest[0] === 'ls-remote') {
+          if (input.lsRemoteFails === true) throw new Error('could not read Username');
           const ref = rest[2] ?? '';
           return refs[ref] === undefined ? '' : `${refs[ref]}\t${ref}\n`;
+        }
+        if (rest[0] === 'fetch') {
+          if (input.fetchFails === true) throw new Error('couldn\'t find remote ref');
+          return '';
         }
         if (rest[0] === 'commit-tree') return `${'e'.repeat(40)}\n`;
         if (rest[0] === 'cat-file') return input.catFile?.(rest[2] ?? '') ?? '';
@@ -1472,6 +1482,82 @@ describe('enqueue mutation', () => {
     const harness = enqueuePort({ pushFails: true });
 
     await expect(enqueue(harness)).resolves.toMatchObject({ status: 'ambiguous' });
+  });
+
+  /**
+   * The attempt ledger is a remote ref. The record commit only exists in the
+   * clone that pushed it, so a read that goes straight to `cat-file` finds
+   * nothing on any other clone, after a gc, or on any transient failure — and
+   * "nothing" is precisely the answer that licenses another enqueue. An
+   * unreadable ledger is not an empty ledger, and must never be read as one.
+   */
+  describe('attempt ledger reads', () => {
+    const ledgerRef = `refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`;
+
+    function withRecord(
+      overrides: Partial<Parameters<typeof enqueuePort>[0]> = {},
+    ) {
+      return enqueuePort({
+        refs: { [ledgerRef]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=1 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+        ].join('\n'),
+        ...overrides,
+      });
+    }
+
+    it('fetches the record commit before reading it', async () => {
+      const harness = withRecord();
+
+      await enqueue(harness);
+
+      const git = harness.calls.filter((call) => call.command === 'git');
+      const fetched = git.findIndex((call) => call.args.includes('fetch'));
+      const read = git.findIndex((call) => call.args.includes('cat-file'));
+      expect(fetched).toBeGreaterThanOrEqual(0);
+      expect(read).toBeGreaterThan(fetched);
+      expect(git[fetched]!.args).toContain(ledgerRef);
+      expect(git[fetched]!.args).toContain(CANONICAL_GITHUB_HTTPS_REMOTE);
+    });
+
+    it('resolves the ledger ref once rather than twice', async () => {
+      const harness = withRecord();
+
+      await enqueue(harness);
+
+      const reads = harness.calls.filter((call) => (
+        call.command === 'git'
+        && call.args.includes('ls-remote')
+        && call.args.includes(ledgerRef)
+      ));
+      expect(reads).toHaveLength(1);
+    });
+
+    it.each([
+      ['the ref listing fails', { lsRemoteFails: true }],
+      ['the record commit cannot be fetched', { fetchFails: true }],
+      [
+        'the record commit cannot be read',
+        { catFile: (): string => { throw new Error('bad object'); } },
+      ],
+    ] as const)('refuses to read an absent ledger when %s', async (_name, overrides) => {
+      let mutations = 0;
+      const harness = withRecord({
+        ...overrides,
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({
+            data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+          });
+        },
+      });
+
+      await expect(enqueue(harness)).rejects.toThrow();
+      expect(mutations).toBe(0);
+    });
   });
 
   /**

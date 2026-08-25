@@ -355,10 +355,17 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
       const oid = remoteRefs.get(ref);
       return oid === undefined ? '' : `${oid}\t${ref}\n`;
     }
+    // The record commit lives on the remote; a clone that did not push it has
+    // to fetch the object before it can read it.
+    if (args.includes('fetch')) {
+      const ref = args.at(-1)!;
+      if (!remoteRefs.has(ref)) throw new Error(`couldn't find remote ref ${ref}`);
+      return '';
+    }
     if (args.includes('cat-file')) {
       const oid = args.at(-1)!;
       const message = objects.get(oid);
-      if (message === undefined) return '';
+      if (message === undefined) throw new Error(`bad object ${oid}`);
       return `tree ${'0'.repeat(40)}\n\n${message}\n`;
     }
     if (args.includes('commit-tree')) {
