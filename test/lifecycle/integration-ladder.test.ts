@@ -1,10 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   chooseIntegrationLadderAction,
-  decideApprovalCarryOver,
-  effectiveDiffsIdentical,
 } from '../../src/lifecycle/integration-ladder.js';
-import { gitOid } from '../../src/lifecycle/types.js';
 
 const base = {
   approved: true,
@@ -20,33 +17,28 @@ const base = {
 };
 
 describe('chooseIntegrationLadderAction', () => {
-  it('returns merge-ready when clean and ahead', () => {
-    expect(chooseIntegrationLadderAction(base)).toEqual({ kind: 'merge-ready' });
+  it('returns enqueue-ready when clean and ahead', () => {
+    expect(chooseIntegrationLadderAction(base)).toEqual({ kind: 'enqueue-ready' });
   });
 
-  it('update-branch when behind and children armed', () => {
-    expect(chooseIntegrationLadderAction({
-      ...base,
-      compareStatus: 'behind',
-      mergeStateStatus: 'BEHIND',
-    })).toEqual({ kind: 'update-branch' });
-  });
-
-  it('updates the branch when exact compare evidence is behind despite GraphQL CLEAN', () => {
-    expect(chooseIntegrationLadderAction({
-      ...base,
-      compareStatus: 'behind',
-      mergeStateStatus: 'CLEAN',
-    })).toEqual({ kind: 'update-branch' });
-  });
-
-  it('updates the branch when exact compare evidence is diverged despite GraphQL CLEAN', () => {
-    expect(chooseIntegrationLadderAction({
-      ...base,
-      compareStatus: 'diverged',
-      mergeStateStatus: 'CLEAN',
-    })).toEqual({ kind: 'update-branch' });
-  });
+  // BEHIND is what the merge queue *does*: it builds its candidate on top of
+  // the current base and runs the required checks against that. A behind head
+  // is therefore ordinary queue input, not a step on a ladder.
+  it.each([
+    ['BEHIND', 'behind'],
+    ['CLEAN', 'behind'],
+    ['CLEAN', 'diverged'],
+    ['BLOCKED', 'behind'],
+  ] as const)(
+    'is enqueue-ready at mergeStateStatus %s with a %s compare',
+    (mergeStateStatus, compareStatus) => {
+      expect(chooseIntegrationLadderAction({
+        ...base,
+        compareStatus,
+        mergeStateStatus,
+      })).toEqual({ kind: 'enqueue-ready' });
+    },
+  );
 
   it('blocks exact unknown compare evidence', () => {
     expect(chooseIntegrationLadderAction({
@@ -55,11 +47,30 @@ describe('chooseIntegrationLadderAction', () => {
     })).toEqual({ kind: 'blocked', reasons: ['mergeability'] });
   });
 
-  it('blocks when behind and children disarmed', () => {
+  it('blocks while GitHub has not finished computing mergeability', () => {
+    expect(chooseIntegrationLadderAction({
+      ...base,
+      mergeable: 'UNKNOWN',
+    })).toEqual({ kind: 'blocked', reasons: ['mergeability'] });
+  });
+
+  // Children arm the reconcile path and nothing else now. Disarming them used
+  // to block a behind PR, because the behind PR needed a child; it needs
+  // nothing at all today, so disarming children must not hold it back.
+  it('still enqueues a behind head when children are disarmed', () => {
     expect(chooseIntegrationLadderAction({
       ...base,
       compareStatus: 'behind',
       mergeStateStatus: 'BEHIND',
+      childrenEnabled: false,
+    })).toEqual({ kind: 'enqueue-ready' });
+  });
+
+  it('blocks a conflicting head when children are disarmed', () => {
+    expect(chooseIntegrationLadderAction({
+      ...base,
+      mergeable: 'CONFLICTING',
+      mergeStateStatus: 'DIRTY',
       childrenEnabled: false,
     })).toEqual({ kind: 'blocked', reasons: ['children-disarmed'] });
   });
@@ -93,75 +104,5 @@ describe('chooseIntegrationLadderAction', () => {
       .toEqual({ kind: 'blocked', reasons: ['not-approved'] });
     expect(chooseIntegrationLadderAction({ ...base, ciGreen: false }))
       .toEqual({ kind: 'blocked', reasons: ['ci'] });
-  });
-});
-
-describe('decideApprovalCarryOver', () => {
-  const before = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-  const after = gitOid('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
-  const diff = 'diff --git a/x b/x\n+one\n';
-
-  it('allows carryover by default (Stage 4) and rejects when explicitly disabled', () => {
-    expect(decideApprovalCarryOver({
-      env: {},
-      gatePerformedUpdateBranch: true,
-      beforeDiff: diff,
-      afterDiff: diff,
-      beforeHead: before,
-      afterHead: after,
-    })).toEqual({ allow: true, reason: 'effective-diff-identical' });
-    for (const raw of ['0', 'false', 'no', 'off'] as const) {
-      expect(decideApprovalCarryOver({
-        env: { JINN_AUTOPILOT_CARRYOVER: raw },
-        gatePerformedUpdateBranch: true,
-        beforeDiff: diff,
-        afterDiff: diff,
-        beforeHead: before,
-        afterHead: after,
-      })).toEqual({ allow: false, reason: 'carryover-disabled' });
-    }
-  });
-
-  it('allows identical effective diffs after gate-owned update', () => {
-    expect(decideApprovalCarryOver({
-      env: { JINN_AUTOPILOT_CARRYOVER: '1' },
-      gatePerformedUpdateBranch: true,
-      beforeDiff: diff,
-      afterDiff: diff,
-      beforeHead: before,
-      afterHead: after,
-    })).toEqual({ allow: true, reason: 'effective-diff-identical' });
-  });
-
-  it('rejects content change either direction', () => {
-    expect(decideApprovalCarryOver({
-      env: { JINN_AUTOPILOT_CARRYOVER: 'on' },
-      gatePerformedUpdateBranch: true,
-      beforeDiff: diff,
-      afterDiff: `${diff}+two\n`,
-      beforeHead: before,
-      afterHead: after,
-    })).toEqual({ allow: false, reason: 'effective-diff-changed' });
-    expect(effectiveDiffsIdentical(diff, diff)).toBe(true);
-    expect(effectiveDiffsIdentical(diff, '')).toBe(false);
-  });
-
-  it('rejects non-gate updates and unchanged heads', () => {
-    expect(decideApprovalCarryOver({
-      env: { JINN_AUTOPILOT_CARRYOVER: '1' },
-      gatePerformedUpdateBranch: false,
-      beforeDiff: diff,
-      afterDiff: diff,
-      beforeHead: before,
-      afterHead: after,
-    }).reason).toBe('not-gate-owned-update');
-    expect(decideApprovalCarryOver({
-      env: { JINN_AUTOPILOT_CARRYOVER: '1' },
-      gatePerformedUpdateBranch: true,
-      beforeDiff: diff,
-      afterDiff: diff,
-      beforeHead: before,
-      afterHead: before,
-    }).reason).toBe('head-unchanged');
   });
 });

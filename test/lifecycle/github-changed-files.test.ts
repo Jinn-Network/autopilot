@@ -371,7 +371,7 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
     );
   });
 
-  it('reaches the ladder and arms update-branch on that status', async () => {
+  it('reaches the ladder and reads that status as enqueue-ready', async () => {
     const status = await readExactCompareStatus({
       run: monoRun([]),
       prNumber: 2081,
@@ -394,7 +394,7 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       openReconcileChild: false,
       openFindingChild: false,
       childrenEnabled: true,
-    })).toEqual({ kind: 'update-branch' });
+    })).toEqual({ kind: 'enqueue-ready' });
   });
 
   /**
