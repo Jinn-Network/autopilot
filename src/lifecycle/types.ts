@@ -440,6 +440,18 @@ export type NewWorkAction =
       readonly prNumber: number;
       readonly head: GitOid;
       readonly expectedBaseRefName: GitRefName;
+    }
+  | {
+      /**
+       * Hand the exact head to GitHub's merge queue. The queue, not this
+       * engine, constructs and lands the merge commit, so nothing downstream of
+       * a successful enqueue may claim the change is merged.
+       */
+      readonly kind: 'enqueue';
+      readonly issueNumber: number;
+      readonly prNumber: number;
+      readonly head: GitOid;
+      readonly expectedBaseRefName: GitRefName;
     };
 
 export type RecoveryAction =

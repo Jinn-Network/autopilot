@@ -650,7 +650,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
       reviewSlots: 0,
       usableCredentialLanes: 1,
     }, 'active')).toEqual([{
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: 2084,
       prNumber: 84,
       head: HEAD,
@@ -1945,7 +1945,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
       usableCredentialLanes: 1,
     }, 'active');
     expect(mergeActions).toEqual([{
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: 2084,
       prNumber: 84,
       head: HEAD,

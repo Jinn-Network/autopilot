@@ -48,8 +48,9 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
+  // TODO(T6): rename to `enqueue` and narrow back to a single kind.
   merge(
-    action: Extract<NewWorkAction, { kind: 'merge' }>,
+    action: Extract<NewWorkAction, { kind: 'merge' | 'enqueue' }>,
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
@@ -199,7 +200,11 @@ export function makeActiveRuntime(
                   ? options.handlers.fileCiFailureChild === undefined
                     ? { status: 'skipped', detail: 'file-ci-failure-child handler unavailable' }
                     : await options.handlers.fileCiFailureChild(action, credentials, snapshot)
-              : action.kind === 'merge'
+              // TODO(T6): drop the `'merge'` spelling. `planCycle` already emits
+              // `'enqueue'`; the handler, the scheduler and the controller are
+              // renamed together in the next commit, and this arm collapses to
+              // the single `'enqueue'` test then.
+              : action.kind === 'merge' || action.kind === 'enqueue'
                 ? await options.handlers.merge(action, credentials, snapshot)
                 : {
                     status: 'skipped',

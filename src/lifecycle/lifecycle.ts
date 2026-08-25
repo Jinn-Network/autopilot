@@ -265,14 +265,26 @@ function underlyingPhase(item: LifecycleItem): Exclude<LifecyclePhase, 'human'> 
   if (item.approved && !item.needsReview) {
     if (!isCiGreen(item.checks ?? [])) return 'ci-blocked';
     // A native APPROVED that the engine did not sign at this exact head cannot
-    // pass the merge gate (`terminal-approval`), so calling it merge-ready
-    // strands the PR in a merge-ready -> merge -> ineligible loop with review
+    // pass the enqueue gate (`terminal-approval`), so calling it merge-ready
+    // strands the PR in a merge-ready -> enqueue -> ineligible loop with review
     // enrollment closed. Fall through to awaiting-review so it can be
     // re-reviewed at the head that actually exists.
-    if (item.mergeState === 'clean' && !engineApprovalLapsed(item)) return 'merge-ready';
-    // Behind / conflict: integration ladder owns the next mutation; view stays
-    // awaiting-review so review enrollment stays closed while the gate
-    // schedules update-branch / file-reconcile-child.
+    //
+    // `behind` joins `clean` because this stage no longer merges the head it
+    // pins. GitHub's merge queue builds its own candidate on top of the current
+    // base and runs the required checks against *that*, which is precisely what
+    // BEHIND describes — so an out-of-date head is the queue's ordinary input,
+    // not a hazard the engine has to fix first.
+    if (
+      (item.mergeState === 'clean' || item.mergeState === 'behind')
+      && !engineApprovalLapsed(item)
+    ) {
+      return 'merge-ready';
+    }
+    // Conflict (and the unknown-compare `blocked` projection): the queue cannot
+    // build a candidate from a head that does not merge, so the reconcile child
+    // still owns the next mutation. The view stays awaiting-review to keep
+    // review enrollment closed while that happens.
     return 'awaiting-review';
   }
   return 'awaiting-review';
@@ -595,8 +607,12 @@ export function planCycle(
   for (const candidate of view.items) {
     if (candidate.phase !== 'merge-ready' || candidate.item.kind !== 'pull-request') continue;
     if (candidate.item.expectedBaseRefName === undefined) continue;
+    // Proven queued. A second `enqueuePullRequest` at the same head is at best
+    // a no-op and at worst a churn loop, so membership — never its absence —
+    // is what suppresses the action.
+    if (candidate.item.inMergeQueue === true) continue;
     planned.push({
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: candidate.item.issueNumber,
       prNumber: candidate.item.prNumber,
       head: candidate.item.head,
