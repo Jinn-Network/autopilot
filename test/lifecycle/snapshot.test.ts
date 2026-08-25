@@ -3654,3 +3654,64 @@ describe('buildGitHubLifecycleSnapshot', () => {
     expect(snapshot.diagnostics).toEqual([]);
   });
 });
+
+/**
+ * Merge-queue evidence reaches the lifecycle view (#82). The integration stage
+ * enqueues rather than merges, so the view must be able to say "this head is
+ * already in the queue" — otherwise the ladder re-dispatches an enqueue for a
+ * PR GitHub is already processing.
+ */
+describe('merge-queue evidence threading', () => {
+  function queuedPage(overrides = {}): PullRequestPage {
+    const base = page('page-2');
+    return {
+      ...base,
+      nodes: base.nodes.map((node) => ({ ...node, ...overrides })),
+    };
+  }
+
+  it('carries the PR node id and queue evidence onto the PR snapshot', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage({
+        graphqlId: 'PR_kwDOABCD123',
+        mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
+        enqueueRecorded: true,
+      }),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    expect(snapshot.pullRequests.find((pr) => pr.number === 101)).toMatchObject({
+      graphqlId: 'PR_kwDOABCD123',
+      mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
+      enqueueRecorded: true,
+    });
+  });
+
+  it('projects queue membership onto the lifecycle PR item', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage({
+        mergeQueue: { enqueued: true, position: 1, state: 'AWAITING_CHECKS' },
+      }),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    expect(snapshot.lifecycle.items.find((item) => item.prNumber === 101))
+      .toMatchObject({ inMergeQueue: true });
+  });
+
+  it('omits queue membership when nothing proves the PR is queued', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage(),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    const item = snapshot.lifecycle.items.find((entry) => entry.prNumber === 101);
+    expect(item?.inMergeQueue).toBeUndefined();
+  });
+
+  it('marks a recorded enqueue attempt on the lifecycle item', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage({ enqueueRecorded: true }),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    expect(snapshot.lifecycle.items.find((item) => item.prNumber === 101))
+      .toMatchObject({ enqueueRecorded: true });
+  });
+});

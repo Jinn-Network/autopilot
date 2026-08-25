@@ -13,6 +13,7 @@ const OPEN_HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const MERGED_HEAD = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const REVIEW_CLAIM_GLOB = 'refs/jinn-autopilot/review-claims/v1/*';
 const CI_RERUN_REF_GLOB = 'refs/jinn-autopilot/ci-reruns/v1/pr-*';
+const ENQUEUE_REF_GLOB = 'refs/jinn-autopilot/enqueues/v1/pr-*';
 const AUTOPILOT_BRANCH_GLOB = 'refs/heads/autopilot/*';
 
 /**
@@ -1826,6 +1827,7 @@ describe('GhLifecycleReader', () => {
         gitCalls.push(rest);
         if (rest[0] === 'ls-remote' && rest[2] === REVIEW_CLAIM_GLOB) return `${oid}\t${ref}\n`;
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
+        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_REF_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') return ''; // object already present locally
         if (rest[0] === 'cat-file' && rest[1] === '-p') return payload;
         throw new Error(`unexpected git call: ${rest.join(' ')}`);
@@ -1854,6 +1856,7 @@ describe('GhLifecycleReader', () => {
           return `${currentOid}\t${ref}\n`;
         }
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
+        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_REF_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') {
           if (localObjects.has(rest[2] ?? '')) return '';
           throw new Error('object not found locally');
@@ -1919,6 +1922,7 @@ describe('GhLifecycleReader', () => {
           return `${oid101}\t${ref101}\n${oid102}\t${ref102}\n`;
         }
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
+        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_REF_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') {
           if (localObjects.has(rest[2] ?? '')) return '';
           throw new Error('object not found locally');
@@ -1986,5 +1990,114 @@ describe('GhLifecycleReader', () => {
       expect(page.nodes).toHaveLength(3);
       expect(listingCalls).toHaveLength(1);
     });
+  });
+});
+
+/**
+ * Merge-queue evidence (#82). The engine's integration stage enqueues into
+ * GitHub's merge queue instead of merging directly, so a snapshot must carry
+ * the PR node id the `enqueuePullRequest` mutation needs and the queue state
+ * that makes a re-enqueue a no-op.
+ */
+describe('merge-queue snapshot evidence', () => {
+  function queueAwarePr(overrides: Record<string, unknown> = {}) {
+    return {
+      ...graphQlPr({ number: 101, state: 'OPEN', head: OPEN_HEAD }),
+      id: 'PR_kwDOABCD123',
+      isInMergeQueue: false,
+      mergeQueueEntry: null,
+      ...overrides,
+    };
+  }
+
+  function queueRun(
+    node: ReturnType<typeof queueAwarePr>,
+    gitRefs: Readonly<Record<string, string>> = {},
+  ): { run: CommandRunner; queries: string[] } {
+    const queries: string[] = [];
+    const run: CommandRunner = async (command, args) => {
+      if (command === 'git') {
+        const rest = args.slice(2);
+        if (rest[0] === 'ls-remote') return gitRefs[rest[2] ?? ''] ?? '';
+        return '';
+      }
+      const query = args.find((arg) => arg.startsWith('query='));
+      if (query !== undefined) queries.push(query);
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [node],
+            },
+          },
+        },
+      });
+    };
+    return { run, queries };
+  }
+
+  it('asks GraphQL for the PR node id and merge-queue entry', async () => {
+    const { run, queries } = queueRun(queueAwarePr());
+
+    await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(queries[0]).toMatch(/\bisInMergeQueue\b/);
+    expect(queries[0]).toMatch(/mergeQueueEntry\s*\{[^}]*\bposition\b/);
+    expect(queries[0]).toMatch(/mergeQueueEntry\s*\{[^}]*\bstate\b/);
+    expect(queries[0]).toMatch(/mergeQueueEntry\s*\{[^}]*\benqueuedAt\b/);
+  });
+
+  it('surfaces the PR node id and an absent queue entry', async () => {
+    const { run } = queueRun(queueAwarePr());
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(page.nodes[0]).toMatchObject({
+      graphqlId: 'PR_kwDOABCD123',
+      mergeQueue: { enqueued: false },
+    });
+  });
+
+  it('surfaces the live queue position and state for an enqueued head', async () => {
+    const { run } = queueRun(queueAwarePr({
+      isInMergeQueue: true,
+      mergeQueueEntry: {
+        position: 3,
+        state: 'QUEUED',
+        enqueuedAt: '2026-07-20T11:00:00.000Z',
+      },
+    }));
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(page.nodes[0]?.mergeQueue).toEqual({
+      enqueued: true,
+      position: 3,
+      state: 'QUEUED',
+    });
+  });
+
+  it('marks a head whose CAS enqueue record exists', async () => {
+    const { run } = queueRun(queueAwarePr(), {
+      [ENQUEUE_REF_GLOB]:
+        `${'c'.repeat(40)}\trefs/jinn-autopilot/enqueues/v1/pr-101/${OPEN_HEAD}\n`,
+    });
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(page.nodes[0]?.enqueueRecorded).toBe(true);
+  });
+
+  it('leaves a head with no enqueue record unmarked', async () => {
+    const { run } = queueRun(queueAwarePr(), {
+      [ENQUEUE_REF_GLOB]:
+        `${'c'.repeat(40)}\trefs/jinn-autopilot/enqueues/v1/pr-101/${'9'.repeat(40)}\n`,
+    });
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(page.nodes[0]?.enqueueRecorded).toBeUndefined();
   });
 });

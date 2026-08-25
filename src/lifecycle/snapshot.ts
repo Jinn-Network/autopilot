@@ -110,6 +110,17 @@ export interface RawBranchClaim {
   readonly implementationCompletionSummary?: string | null;
 }
 
+/**
+ * Merge-queue membership for a PR head, read from GitHub's `isInMergeQueue` and
+ * `mergeQueueEntry`. Absent means *unknown*, never "not queued": a read that
+ * could not prove membership must not license a second enqueue.
+ */
+export interface MergeQueueSnapshot {
+  readonly enqueued: boolean;
+  readonly position?: number;
+  readonly state?: string;
+}
+
 export interface PullRequestSnapshot {
   readonly number: number;
   readonly title: string;
@@ -120,6 +131,12 @@ export interface PullRequestSnapshot {
   readonly headOid: GitOid;
   readonly headCommittedAt: string;
   readonly updatedAt?: string;
+  /**
+   * The PR's GraphQL node id, the `pullRequestId` argument of
+   * `enqueuePullRequest`. Absent whenever the read could not prove it.
+   */
+  readonly graphqlId?: string;
+  readonly mergeQueue?: MergeQueueSnapshot;
   readonly isDraft: boolean;
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
@@ -147,6 +164,8 @@ export interface PullRequestSnapshot {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
+  /** True when a CAS-fenced enqueue-attempt record exists for this PR head. */
+  readonly enqueueRecorded?: boolean;
   readonly reviews: readonly NativeReviewSnapshot[];
   /**
    * Non-comment PR evidence could not be read completely. This is a machine
@@ -190,6 +209,8 @@ export interface RawPullRequest {
   readonly headOid: string;
   readonly headCommittedAt: string;
   readonly updatedAt?: string;
+  readonly graphqlId?: string;
+  readonly mergeQueue?: MergeQueueSnapshot;
   readonly isDraft: boolean;
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
@@ -202,6 +223,7 @@ export interface RawPullRequest {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
+  readonly enqueueRecorded?: boolean;
   readonly reviews: readonly RawNativeReview[];
   readonly evidenceIncompleteReason?: string;
   readonly branchClaimTrailers: string | null;
@@ -444,6 +466,8 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       headOid,
       headCommittedAt: raw.headCommittedAt,
       ...(raw.updatedAt === undefined ? {} : { updatedAt: raw.updatedAt }),
+      ...(raw.graphqlId === undefined ? {} : { graphqlId: raw.graphqlId }),
+      ...(raw.mergeQueue === undefined ? {} : { mergeQueue: { ...raw.mergeQueue } }),
       isDraft: raw.isDraft,
       state: raw.state,
       labels: [...raw.labels],
@@ -464,6 +488,7 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
         : {}),
       checks: raw.checks.map((check) => ({ ...check })),
       ...(raw.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
+      ...(raw.enqueueRecorded === true ? { enqueueRecorded: true } : {}),
       reviews,
       ...(raw.evidenceIncompleteReason === undefined
         ? {}
@@ -769,6 +794,8 @@ function lifecyclePr(
     mergeState: mergeState(pr),
     checks: [...pr.checks],
     ...(pr.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
+    ...(pr.enqueueRecorded === true ? { enqueueRecorded: true } : {}),
+    ...(pr.mergeQueue?.enqueued === true ? { inMergeQueue: true } : {}),
     ...(openChildKinds.length === 0 ? {} : { openChildKinds: [...openChildKinds] }),
     ...(pr.branchClaim === undefined ? {} : { branchClaim: pr.branchClaim }),
     ...(pr.implementationCompletionSummary === undefined

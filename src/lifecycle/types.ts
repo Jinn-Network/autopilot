@@ -296,6 +296,14 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   readonly checks?: readonly CheckSummary[];
   /** True when a CAS-fenced CI rerun record exists for this PR head. */
   readonly ciRerunRecorded?: boolean;
+  /** True when a CAS-fenced enqueue-attempt record exists for this PR head. */
+  readonly enqueueRecorded?: boolean;
+  /**
+   * The PR is sitting in GitHub's merge queue. Absent means *not proven
+   * queued*, never "proven not queued": an unreadable membership must not
+   * license a second enqueue, and a proven one must not be enqueued again.
+   */
+  readonly inMergeQueue?: boolean;
   /** Open child issues targeting this PR (Stage 2 single-surface children). */
   readonly openChildKinds?: readonly ('review-finding' | 'reconcile' | 'ci-failure')[];
   readonly branchClaim?: BranchClaim;

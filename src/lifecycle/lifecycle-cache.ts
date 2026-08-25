@@ -52,13 +52,19 @@ export interface LifecycleSnapshotEvidence {
 
 export interface LifecycleDiscoveryState {
   /**
+   * Bumped to 4: version-3 caches predate the merge-queue read (#82), so their
+   * PR entries carry neither `graphqlId` nor `mergeQueue`. Absence there is
+   * indistinguishable from "read and proven not queued", and reading a stale
+   * cache that way either skips an enqueue that never happened or repeats one
+   * that did. The version bump discards them.
+   *
    * Bumped to 3: version-2 caches may carry `compareStatus` without the base
    * branch tip OID that determined it. Those values cannot be keyed for
    * freshness, so the version bump discards them — a version mismatch fails
    * `stateSchema`, which the incremental source quarantines and reseeds from a
    * full read.
    */
-  readonly version: 3;
+  readonly version: 4;
   readonly evidence: LifecycleSnapshotEvidence;
   /** Exact terminal proof retained only for the currently surviving implementation claim. */
   readonly terminalClaims: readonly TerminalClaimEvidence[];
@@ -330,6 +336,12 @@ const pullRequestSchema = z.object({
   headOid: oid,
   headCommittedAt: exactTimestamp,
   updatedAt: exactTimestamp.optional(),
+  graphqlId: z.string().min(1).optional(),
+  mergeQueue: z.object({
+    enqueued: z.boolean(),
+    position: nonNegativeInteger.optional(),
+    state: z.string().min(1).optional(),
+  }).strict().optional(),
   isDraft: z.boolean(),
   state: z.enum(['OPEN', 'MERGED']),
   labels: z.array(z.string()),
@@ -350,6 +362,7 @@ const pullRequestSchema = z.object({
     runAttempt: z.number().int().positive().optional(),
   }).strict()),
   ciRerunRecorded: z.literal(true).optional(),
+  enqueueRecorded: z.literal(true).optional(),
   reviews: z.array(z.object({
     reviewer: z.string(),
     state: z.enum(['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED', 'PENDING']),
@@ -495,7 +508,7 @@ const restCacheSchema = z.object({
 }).strict();
 
 const stateSchema = z.object({
-  version: z.literal(3),
+  version: z.literal(4),
   evidence: evidenceSchema,
   terminalClaims: z.array(terminalClaimSchema).default([]),
   openPullRequestEvidence: z.array(pullRequestSchema),
