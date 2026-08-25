@@ -120,6 +120,12 @@ export function classifyEnqueueFailure(text: string): EnqueueFailureClass {
   if (/not\s+mergeable|cannot\s+be\s+merged|merge\s+conflict/i.test(text)
     || /merge\s+queue\s+is\s+not\s+enabled|queue\s+is\s+not\s+enabled|no\s+merge\s+queue/i
       .test(text)
+    // GraphQL's answer when the `pullRequestId` names nothing it can see: a
+    // deleted PR, a repository the credential cannot read, or a node id from
+    // some other host. No retry resolves any of those, so it is durable —
+    // reading it as `undetermined` would re-send the same unresolvable id every
+    // cycle for as long as the PR stays open.
+    || /could\s+not\s+resolve\s+to\s+a\s+\w+/i.test(text)
     || /HTTP 40[134]/i.test(text)
     || /bad credentials|requires authentication|not authorized|unauthorized/i.test(text)
     || /resource not accessible|must have|permission|protected branch|forbidden/i.test(text)) {
@@ -313,7 +319,7 @@ export function makeProductionEnqueueActionPort(
       prNumber: pr.number,
       expectedHead: pr.headOid,
       expectedBaseRefName: expectedBase,
-      context: 'Merge',
+      context: 'Enqueue',
       repositorySlug,
     });
     const { baseRefName: compareBaseRefName, files } = changedFiles;
@@ -360,7 +366,7 @@ export function makeProductionEnqueueActionPort(
     }
     const codeownersRaw = JSON.parse(codeownersResponse) as { content?: unknown };
     if (typeof codeownersRaw.content !== 'string') {
-      throw new Error('Merge CODEOWNERS read was incomplete');
+      throw new Error('Enqueue CODEOWNERS read was incomplete');
     }
     // `baseOid` is the PR's pinned fork point. It never advances with the base
     // branch, so comparing against it can only ever yield `ahead`/`identical`

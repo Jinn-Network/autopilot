@@ -115,7 +115,7 @@ write to verify, race on, or reconcile.
 | CI-BLOCKED → MERGE-READY | gate | rerun passes ∧ integration ladder satisfied |
 | CI-BLOCKED → BLOCKED-BY-CHILD | scheduler | persistent failure after rerun, or external-only failure → file `ci-failure` child |
 | MERGE-READY → in the queue | deterministic gate | `enqueuePullRequest(expectedHeadOid)`; one attempt per head recorded on a CAS ref |
-| in the queue → MERGE-READY | derivation | the queue ejected the entry; one re-enqueue per head, then a `ci-failure` child explains the hold |
+| in the queue → MERGE-READY | derivation | the queue ejected the entry; one re-enqueue per head, then a `ci-failure` child explains the hold and sanctions exactly one further attempt; the third attempt at a head is terminal until a new commit resets the ledger |
 | in the queue → DONE | GitHub merge queue | the queue builds the merge commit and lands it; the engine reads the MERGED fact a cycle later |
 
 Session finalization is three PR-surface operations. The `pending: project`

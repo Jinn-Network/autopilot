@@ -376,7 +376,7 @@ describe('production head-pinned enqueue port', () => {
     expect(mutation?.env?.GITHUB_TOKEN).toBe('');
   });
 
-  it('rereads and rejects a retargeted base immediately before the merge PUT', async () => {
+  it('rereads and rejects a retargeted base immediately before the enqueue', async () => {
     let mergeCalls = 0;
     const runner = async (
       command: string,
@@ -1304,6 +1304,11 @@ describe('enqueue mutation', () => {
     ['a 502', 'gh: HTTP 502: Bad Gateway', 'undetermined'],
     ['a socket failure', 'dial tcp: ECONNRESET', 'undetermined'],
     ['a secondary rate limit', 'HTTP 403: You have exceeded a secondary rate limit', 'undetermined'],
+    [
+      'an unresolvable node id',
+      "GraphQL: Could not resolve to a node with the global id of 'PR_kwDOABCD84'",
+      'rejected',
+    ],
     ['nothing recognisable', 'gh: something nobody has seen before', 'undetermined'],
   ] as const)('classifies %s as %s', (_name, text, expected) => {
     expect(classifyEnqueueFailure(text)).toBe(expected);

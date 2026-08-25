@@ -167,8 +167,18 @@ export interface LifecycleStatusItem {
    * explanation says "ready to be enqueued" rather than asserting it is not.
    */
   readonly inMergeQueue?: boolean;
+  /**
+   * Kill switches that are *engaged* this cycle and would withhold the enqueue
+   * of a merge-ready pull request. Empty is the ordinary case and says exactly
+   * that: nothing is holding it back. Naming a switch that is not engaged reads
+   * to an operator as the reason their PR has not moved, which is the one thing
+   * the explanation must never invent.
+   */
+  readonly enqueueHolds?: readonly EnqueueHold[];
   readonly desiredActions: readonly ProjectionAction[];
 }
+
+export type EnqueueHold = 'enqueue-path-disarmed' | 'manual-merge-policy';
 
 export interface LifecycleOrphanBranchClaimStatus {
   readonly kind: 'orphan-branch-claim';
@@ -582,11 +592,26 @@ function progressAge(view: LifecycleViewItem, now: Date): number | undefined {
   return Math.max(0, now.getTime() - progressAt);
 }
 
+/**
+ * The switches that withhold an enqueue, read as they actually stand right now.
+ * Both are read once per cycle, next to each other, so the operator-facing
+ * explanation and the scheduler cannot disagree about which is engaged.
+ */
+function engagedEnqueueHolds(
+  mergePolicy: MergePolicy | undefined,
+): readonly EnqueueHold[] {
+  return [
+    ...(enqueuePathEnabled() ? [] : ['enqueue-path-disarmed' as const]),
+    ...((mergePolicy ?? 'manual') === 'manual' ? ['manual-merge-policy' as const] : []),
+  ];
+}
+
 function statusItems(
   view: ReturnType<typeof deriveLifecycle>,
   actions: readonly ProjectionAction[],
   now: Date,
   orphanBranchClaims: readonly OrphanBranchClaim[],
+  enqueueHolds: readonly EnqueueHold[] = [],
 ): LifecycleStatusItem[] {
   const orphanIssues = new Set(orphanBranchClaims.map((claim) => claim.issueNumber));
   return view.items
@@ -606,6 +631,7 @@ function statusItems(
               prNumber: item.prNumber,
               head: item.head,
               ...(item.inMergeQueue === true ? { inMergeQueue: true } : {}),
+              ...(enqueueHolds.length === 0 ? {} : { enqueueHolds }),
             }
           : {}),
         ...(claimGeneration === undefined ? {} : { claimGeneration }),
@@ -1108,7 +1134,13 @@ async function executeActivePass(
   );
   const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
   const plan = planProjection(context);
-  const items = statusItems(view, plan.actions, now, context.orphanBranchClaims);
+  const items = statusItems(
+    view,
+    plan.actions,
+    now,
+    context.orphanBranchClaims,
+    engagedEnqueueHolds(deps.mergePolicy),
+  );
   const orphanBranchClaims = orphanStatusItems(
     context.orphanBranchClaims,
     plan.actions,
@@ -1540,7 +1572,13 @@ export async function runLifecycleCycle(
   const view = deriveLifecycle(snapshot.lifecycle, now, deps.staleAfterMs);
   const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
   const plan = planProjection(context);
-  const items = statusItems(view, plan.actions, now, context.orphanBranchClaims);
+  const items = statusItems(
+    view,
+    plan.actions,
+    now,
+    context.orphanBranchClaims,
+    engagedEnqueueHolds(deps.mergePolicy),
+  );
   const orphanBranchClaims = orphanStatusItems(
     context.orphanBranchClaims,
     plan.actions,
@@ -1644,13 +1682,18 @@ function explanation(item: LifecycleStatusItem): string {
       return `${identity} is blocked by an open child issue before the lifecycle can continue.`;
     case 'ci-blocked':
       return `${identity} is blocked by CI before it can be handed to the merge queue.`;
-    case 'merge-ready':
-      return item.inMergeQueue === true
-        ? `${identity} is in GitHub's merge queue; the queue builds and lands the merge, `
-          + 'and Done arrives from a later cycle reading the merged fact.'
-        : `${identity} is ready to be enqueued into GitHub's merge queue. Two gates `
-          + 'withhold the enqueue: JINN_AUTOPILOT_ENQUEUE disarms the path entirely, '
-          + 'and a manual repository merge policy leaves the enqueue to a maintainer.';
+    case 'merge-ready': {
+      if (item.inMergeQueue === true) {
+        return `${identity} is in GitHub's merge queue; the queue builds and lands the merge, `
+          + 'and Done arrives from a later cycle reading the merged fact.';
+      }
+      const holds = item.enqueueHolds ?? [];
+      return holds.length === 0
+        ? `${identity} is ready to be enqueued into GitHub's merge queue, and nothing is `
+          + 'withholding the enqueue.'
+        : `${identity} is ready to be enqueued into GitHub's merge queue, but the enqueue is `
+          + `withheld: ${holds.map(enqueueHoldDetail).join('; ')}.`;
+    }
     case 'human':
       return `${identity} is blocked in Human: ${item.humanReason?.detail ?? 'explicit Human hold'}.`;
     case 'merged':
@@ -1658,6 +1701,12 @@ function explanation(item: LifecycleStatusItem): string {
     default:
       return assertNever(item.phase);
   }
+}
+
+function enqueueHoldDetail(hold: EnqueueHold): string {
+  return hold === 'enqueue-path-disarmed'
+    ? 'JINN_AUTOPILOT_ENQUEUE disarms the enqueue path entirely'
+    : 'the repository merge policy is manual, which leaves the enqueue to a maintainer';
 }
 
 function assertNever(phase: never): never {

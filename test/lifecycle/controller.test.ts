@@ -3049,7 +3049,7 @@ describe('enqueue stage scheduling', () => {
     });
   }
 
-  function cycle(item, prOverrides = {}) {
+  function cycle(item, prOverrides = {}, mergePolicy = 'safe-auto') {
     const actions: unknown[] = [];
     const noOpWriter = new Proxy({} as ReconciliationWriter, {
       get() {
@@ -3070,7 +3070,7 @@ describe('enqueue stage scheduling', () => {
       run: () => runLifecycleCycle('active', {
         ...deps(item, [], noOpWriter),
         readSnapshot: async () => built,
-        mergePolicy: 'safe-auto',
+        mergePolicy,
         active: {
           preflight: async () => ({ ok: true }),
           readLocalState: () => ({
@@ -3155,15 +3155,46 @@ describe('enqueue stage scheduling', () => {
     }]);
   });
 
-  it('explains merge-ready as an enqueue and names both gates that withhold it', async () => {
+  /**
+   * A kill switch is worth naming when it is holding the enqueue back and
+   * misleading when it is not. An operator reading "JINN_AUTOPILOT_ENQUEUE
+   * disarms the path" under a cycle that is about to enqueue has been handed a
+   * false lead, and the string is the only thing they have to go on.
+   */
+  it('explains merge-ready as an enqueue with no kill switch to blame', async () => {
     const harness = cycle(approved());
     const report = await harness.run();
     const explanation = explainPullRequest(report, 101);
 
     expect(explanation).toContain('merge queue');
-    expect(explanation).toContain('JINN_AUTOPILOT_ENQUEUE');
-    expect(explanation).toContain('manual');
+    expect(explanation).not.toContain('JINN_AUTOPILOT_ENQUEUE');
+    expect(explanation).not.toContain('manual');
     expect(explanation).not.toContain('native merge gate');
+  });
+
+  it('names the merge policy when it is what withholds the enqueue', async () => {
+    const harness = cycle(approved(), {}, 'manual');
+    const report = await harness.run();
+    const explanation = explainPullRequest(report, 101);
+
+    expect(explanation).toContain('manual');
+    expect(explanation).not.toContain('JINN_AUTOPILOT_ENQUEUE');
+  });
+
+  it('names the enqueue kill switch when it is what withholds the enqueue', async () => {
+    const previous = process.env.JINN_AUTOPILOT_ENQUEUE;
+    process.env.JINN_AUTOPILOT_ENQUEUE = '0';
+    try {
+      const harness = cycle(approved());
+      const report = await harness.run();
+      const explanation = explainPullRequest(report, 101);
+
+      expect(explanation).toContain('JINN_AUTOPILOT_ENQUEUE');
+      expect(explanation).not.toContain('manual');
+    } finally {
+      if (previous === undefined) delete process.env.JINN_AUTOPILOT_ENQUEUE;
+      else process.env.JINN_AUTOPILOT_ENQUEUE = previous;
+    }
   });
 
   it('explains a queued pull request as waiting on the queue, not on the engine', async () => {
