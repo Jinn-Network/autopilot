@@ -179,8 +179,6 @@ export const REVIEW_CLAIM_REF_PREFIX = 'refs/jinn-autopilot/review-claims/v1/';
 export const REVIEW_CLAIM_REF_GLOB = `${REVIEW_CLAIM_REF_PREFIX}*`;
 export const CI_RERUN_REF_PREFIX = 'refs/jinn-autopilot/ci-reruns/v1/pr-';
 export const CI_RERUN_REF_GLOB = `${CI_RERUN_REF_PREFIX}*`;
-export const ENQUEUE_REF_PREFIX = 'refs/jinn-autopilot/enqueues/v1/pr-';
-export const ENQUEUE_REF_GLOB = `${ENQUEUE_REF_PREFIX}*`;
 const AUTOPILOT_BRANCH_REF_PREFIX = 'refs/heads/autopilot/';
 export const AUTOPILOT_BRANCH_REF_GLOB = `${AUTOPILOT_BRANCH_REF_PREFIX}*`;
 
@@ -970,25 +968,6 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     return recorded;
   }
 
-  /**
-   * One `git ls-remote` listing of the enqueue-attempt CAS namespace per
-   * snapshot, keyed exactly like the CI-rerun listing above (`<pr>/<headOid>`).
-   * The refs are per-head, so a new commit resets the attempt count by
-   * construction — a missing entry is "no attempt recorded for *this* head".
-   */
-  private async listEnqueueRecordedHeads(): Promise<Set<string>> {
-    const raw = await this.gitRun(['ls-remote', this.remoteName, ENQUEUE_REF_GLOB]);
-    const trimmed = raw.trimEnd();
-    const recorded = new Set<string>();
-    if (trimmed.length === 0) return recorded;
-    for (const line of trimmed.split('\n')) {
-      const [, ref] = line.split('\t');
-      if (ref === undefined || !ref.startsWith(ENQUEUE_REF_PREFIX)) continue;
-      recorded.add(ref.slice(ENQUEUE_REF_PREFIX.length));
-    }
-    return recorded;
-  }
-
   async readBranchHeadForReconciliation(headRefName: string): Promise<GitOid | null> {
     const branch = gitRefName(headRefName);
     const ref = `refs/heads/${branch}`;
@@ -1722,7 +1701,6 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     // GraphQL ref read per PR.
     const reviewClaimListing = await this.listReviewClaimRefs();
     const ciRerunRecorded = await this.listCiRerunRecordedHeads();
-    const enqueueRecorded = await this.listEnqueueRecordedHeads();
     const openNodes = await Promise.all(connection.nodes.map((pr) => (
       this.rawPullRequest(pr, true, reviewClaimListing).catch((error: unknown) => {
         if (!(error instanceof PrEvidenceInconsistentError)) throw error;
@@ -1733,7 +1711,6 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       return {
         ...pr,
         ...(ciRerunRecorded.has(key) ? { ciRerunRecorded: true as const } : {}),
-        ...(enqueueRecorded.has(key) ? { enqueueRecorded: true as const } : {}),
       };
     }));
     const mergedOutcomes = cursor === null

@@ -297,14 +297,13 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
   });
 
-  it('round-trips merge-queue and enqueue-record evidence', async () => {
+  it('round-trips merge-queue evidence', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
     const base = state();
     const queueEvidence = {
       graphqlId: 'PR_kwDOABCD123',
       mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
-      enqueueRecorded: true,
     } as const;
     const withQueue: LifecycleDiscoveryState = {
       ...base,
@@ -320,6 +319,39 @@ describe('LifecycleDiscoveryCacheStore', () => {
 
     await expect(store.save(withQueue)).resolves.toBeUndefined();
     await expect(store.load()).resolves.toEqual(withQueue);
+  });
+
+  /**
+   * `enqueueRecorded` (review finding N2) is dead plumbing: nothing threads
+   * it into a written cache entry any more, and nothing ever read it back to
+   * make a decision. `pullRequestSchema` still tolerates the key so a v4
+   * cache written before this cleanup -- which may carry
+   * `enqueueRecorded: true` on some PR entries -- keeps loading instead of
+   * being rejected as corrupt.
+   */
+  it('tolerates a legacy stray enqueueRecorded field on a v4 cache entry', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    await chmod(directory, 0o700);
+    const base = state();
+    const legacy = {
+      ...base,
+      evidence: {
+        ...base.evidence,
+        pullRequests: [{ ...base.evidence.pullRequests[0]!, enqueueRecorded: true }],
+      },
+      openPullRequestEvidence: [{
+        ...base.openPullRequestEvidence[0]!,
+        enqueueRecorded: true,
+      }],
+    };
+    await writeFile(
+      join(directory, 'lifecycle-cache.json'),
+      JSON.stringify(legacy),
+      { mode: 0o600 },
+    );
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+
+    await expect(store.load()).resolves.toEqual(legacy);
   });
 
   it('loads a legacy cache without terminal claim evidence as an empty fail-closed ledger', async () => {

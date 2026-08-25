@@ -164,8 +164,6 @@ export interface PullRequestSnapshot {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
-  /** True when a CAS-fenced enqueue-attempt record exists for this PR head. */
-  readonly enqueueRecorded?: boolean;
   readonly reviews: readonly NativeReviewSnapshot[];
   /**
    * Non-comment PR evidence could not be read completely. This is a machine
@@ -223,7 +221,6 @@ export interface RawPullRequest {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
-  readonly enqueueRecorded?: boolean;
   readonly reviews: readonly RawNativeReview[];
   readonly evidenceIncompleteReason?: string;
   readonly branchClaimTrailers: string | null;
@@ -488,7 +485,6 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
         : {}),
       checks: raw.checks.map((check) => ({ ...check })),
       ...(raw.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
-      ...(raw.enqueueRecorded === true ? { enqueueRecorded: true } : {}),
       reviews,
       ...(raw.evidenceIncompleteReason === undefined
         ? {}
@@ -827,7 +823,6 @@ function lifecyclePr(
     mergeState: deriveMergeState(pr),
     checks: [...pr.checks],
     ...(pr.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
-    ...(pr.enqueueRecorded === true ? { enqueueRecorded: true } : {}),
     ...(pr.mergeQueue?.enqueued === true ? { inMergeQueue: true } : {}),
     ...(openChildKinds.length === 0 ? {} : { openChildKinds: [...openChildKinds] }),
     ...(pr.branchClaim === undefined ? {} : { branchClaim: pr.branchClaim }),
