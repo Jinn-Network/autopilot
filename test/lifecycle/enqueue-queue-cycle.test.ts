@@ -589,6 +589,27 @@ describe('enqueue queue cycle', () => {
     expect(explained.childIssueCreates).toEqual([]);
   });
 
+  /**
+   * The hold re-arms. A human closed the `ci-failure` child, the sanctioned
+   * retry went to the queue and was ejected again, so the record now reads
+   * three attempts at this head. Releasing on the linked issue a second time
+   * would re-enqueue on every cycle forever; the third attempt is terminal for
+   * this head, and pushing a fix is what resets it.
+   */
+  it('holds again when the issue-sanctioned retry also ejects', async () => {
+    const exhausted = harness({ mergeQueue: { enqueued: false } }, {
+      seedRecord: { attempts: 3, linkedIssue: 9001 },
+    });
+    await exhausted.run();
+
+    expect(exhausted.enqueueMutations).toEqual([]);
+    expect(exhausted.executed[0]!.result).toMatchObject({ outcome: 'flake-hold' });
+    // The issue that explains this head already exists; a second one would be
+    // noise, and an unbounded supply of it.
+    expect(exhausted.childIssueCreates).toEqual([]);
+    expect(recordAt(exhausted)).toContain('attempts=3');
+  });
+
   it('derives blocked-by-child while the ci-failure child is open', async () => {
     const blocked = harness({
       mergeQueue: { enqueued: false },

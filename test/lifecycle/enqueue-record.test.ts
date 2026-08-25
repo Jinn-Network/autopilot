@@ -91,26 +91,28 @@ describe('enqueue record codec', () => {
  * Flake policy. One retry at a head is a flake; a second failure at the same
  * head is a signal, and the engine must not keep feeding the queue until a
  * human-readable issue exists to explain why it stopped.
+ *
+ * The linked issue sanctions exactly *one* more enqueue, not an unbounded
+ * licence. Left open-ended, a head whose linked retry also ejects would be
+ * re-enqueued on every subsequent cycle forever, because the record that
+ * released the hold never stops being present. The third attempt is therefore
+ * terminal for this head — and a new commit is a new ref, so pushing a fix
+ * still resets everything.
  */
 describe('decideReEnqueue', () => {
-  it('allows the first enqueue at a head with no record', () => {
-    expect(decideReEnqueue(null)).toEqual({ allow: true });
-  });
-
-  it('allows one retry after a single recorded attempt', () => {
-    expect(decideReEnqueue(record({ attempts: 1 }))).toEqual({ allow: true });
-  });
-
-  it.each([2, 3, 9])('refuses at %i recorded attempts with no linked issue', (attempts) => {
-    expect(decideReEnqueue(record({ attempts }))).toEqual({
-      allow: false,
-      reason: 'flake-hold',
-    });
-  });
-
-  it('allows a re-enqueue once the flake is linked to an issue', () => {
-    expect(decideReEnqueue(record({ attempts: 2, linkedIssue: 4_242 })))
-      .toEqual({ allow: true });
+  it.each([
+    ['no record at all', null, true],
+    ['a first attempt with no linked issue', record({ attempts: 1 }), true],
+    ['a first attempt already carrying an issue', record({ attempts: 1, linkedIssue: 4_242 }), true],
+    ['a second attempt with no linked issue', record({ attempts: 2 }), false],
+    ['a second attempt sanctioned by an issue', record({ attempts: 2, linkedIssue: 4_242 }), true],
+    ['a third attempt with no linked issue', record({ attempts: 3 }), false],
+    ['a third attempt whose sanctioned retry also failed', record({ attempts: 3, linkedIssue: 4_242 }), false],
+    ['a ninth attempt however it is explained', record({ attempts: 9, linkedIssue: 4_242 }), false],
+  ] as const)('decides %s', (_name, value, allow) => {
+    expect(decideReEnqueue(value)).toEqual(
+      allow ? { allow: true } : { allow: false, reason: 'flake-hold' },
+    );
   });
 });
 

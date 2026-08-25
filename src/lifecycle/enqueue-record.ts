@@ -20,8 +20,9 @@ export interface EnqueueRecord {
   readonly enqueuedAt: string;
   /**
    * The `ci-failure` child issue filed when the second attempt at this head was
-   * refused. Its presence is what releases the hold: a human-readable
-   * explanation exists, so the engine may try the queue again.
+   * refused. Its presence sanctions exactly *one* more enqueue: a
+   * human-readable explanation exists, so the engine may try the queue once
+   * again — not forever. See `decideReEnqueue`.
    */
   readonly linkedIssue?: number;
 }
@@ -74,17 +75,30 @@ export type ReEnqueueDecision =
   | { readonly allow: true }
   | { readonly allow: false; readonly reason: 'flake-hold' };
 
+/** Attempts at one head after which no explanation releases the hold. */
+export const ENQUEUE_ATTEMPT_CEILING = 3;
+
 /**
  * One retry at a head is a flake; a second failure at the same head is a
  * signal. The engine stops feeding the queue until a `ci-failure` child issue
  * exists to say why, and the record's `linked-issue` is the proof it does.
+ *
+ * That proof buys exactly one more enqueue, and then the hold re-arms. Read as
+ * an open-ended licence it would be no hold at all: the record that released it
+ * never stops naming its issue, so a head whose sanctioned retry also ejects
+ * would be fed to the queue again on every cycle, forever. At
+ * `ENQUEUE_ATTEMPT_CEILING` attempts the refusal is therefore terminal *for
+ * this head* whatever the record says — and because the ledger is keyed by
+ * head, pushing a fix mints a new ref and resets the count to zero.
  *
  * `null` — no record at this head — is the ordinary first enqueue.
  */
 export function decideReEnqueue(record: EnqueueRecord | null): ReEnqueueDecision {
   if (record === null) return { allow: true };
   if (record.attempts <= 1) return { allow: true };
-  if (record.linkedIssue !== undefined) return { allow: true };
+  if (record.linkedIssue !== undefined && record.attempts < ENQUEUE_ATTEMPT_CEILING) {
+    return { allow: true };
+  }
   return { allow: false, reason: 'flake-hold' };
 }
 

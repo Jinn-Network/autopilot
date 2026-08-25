@@ -1545,5 +1545,41 @@ describe('enqueue mutation', () => {
       await expect(enqueue(harness)).resolves.toMatchObject({ status: 'enqueued' });
       expect(mutations).toBe(1);
     });
+
+    /**
+     * The hold re-arms. A linked issue sanctions exactly one more enqueue; when
+     * that sanctioned retry also ejects, the record reads three attempts and
+     * the hold is terminal for this head. Nothing is filed a second time —
+     * the issue that explains this head already exists.
+     */
+    it('re-arms the hold after the sanctioned retry and files nothing twice', async () => {
+      let mutations = 0;
+      const harness = enqueuePort({
+        refs: { [ref]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=3 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+          'linked-issue=4242',
+        ].join('\n'),
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({
+            data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+          });
+        },
+      });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({
+        status: 'flake-hold',
+        reason: expect.stringContaining('#4242'),
+      });
+      expect(mutations).toBe(0);
+      const created = harness.calls.filter((call) => (
+        call.command === 'gh' && call.args[0] === 'issue' && call.args[1] === 'create'
+      ));
+      expect(created).toEqual([]);
+    });
   });
 });

@@ -538,6 +538,19 @@ export function makeProductionEnqueueActionPort(
           : await readEnqueueRecord(transport, prNumber, head);
         const decision = decideReEnqueue(existing);
         if (!decision.allow && transport !== null && existing !== null) {
+          // A record that already names its issue is a hold that has *already*
+          // been explained: the sanctioned retry was spent and ejected too.
+          // Filing again would mint one child per cycle for a head nobody has
+          // touched, so the hold simply stands and points at the issue that
+          // already exists.
+          if (existing.linkedIssue !== undefined) {
+            return {
+              status: 'flake-hold',
+              head,
+              reason: `Enqueue held after ${existing.attempts} attempts at this head;`
+                + ` see #${existing.linkedIssue}`,
+            };
+          }
           // Two failed attempts at one head is a signal. Stop feeding the
           // queue, file the child that explains it, and write the child's
           // number into the record so a later cycle can tell "held and
