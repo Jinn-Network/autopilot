@@ -1392,6 +1392,8 @@ export async function initializeAutopilot(input: {
       diskFloorGb: 10,
       cleanup: true,
       children: true,
+      // Deprecated: unused since #85; kept because the config schema still
+      // requires the key (see src/config/config.ts).
       carryover: true,
     },
     mergePolicy: 'manual',

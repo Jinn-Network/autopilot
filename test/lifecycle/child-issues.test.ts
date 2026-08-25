@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  carryoverEnabled,
   childrenPathEnabled,
   closeChildrenFor,
   countChildrenOfKind,
@@ -371,18 +370,10 @@ describe('runaway helpers and knobs', () => {
     expect(shouldFileRunawayHold(3)).toBe(true);
   });
 
-  it('defaults children on and carryover on (Stage 4)', () => {
+  it('defaults children on (Stage 4)', () => {
     expect(childrenPathEnabled({})).toBe(true);
     expect(childrenPathEnabled({ JINN_AUTOPILOT_CHILDREN: '0' })).toBe(false);
     expect(childrenPathEnabled({ JINN_AUTOPILOT_CHILDREN: 'false' })).toBe(false);
-    expect(carryoverEnabled({})).toBe(true);
-    expect(carryoverEnabled({ JINN_AUTOPILOT_CARRYOVER: '' })).toBe(true);
-    expect(carryoverEnabled({ JINN_AUTOPILOT_CARRYOVER: '0' })).toBe(false);
-    expect(carryoverEnabled({ JINN_AUTOPILOT_CARRYOVER: 'false' })).toBe(false);
-    expect(carryoverEnabled({ JINN_AUTOPILOT_CARRYOVER: 'no' })).toBe(false);
-    expect(carryoverEnabled({ JINN_AUTOPILOT_CARRYOVER: 'off' })).toBe(false);
-    expect(carryoverEnabled({ JINN_AUTOPILOT_CARRYOVER: '1' })).toBe(true);
-    expect(carryoverEnabled({ JINN_AUTOPILOT_CARRYOVER: 'yes' })).toBe(true);
   });
 });
 

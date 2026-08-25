@@ -126,6 +126,11 @@ export const autopilotConfigSchema = z.object({
     diskFloorGb: nonNegativeInteger,
     cleanup: z.boolean(),
     children: z.boolean(),
+    // Deprecated: the approval carry-over knob lost its only caller when the
+    // merge stage was replaced by the enqueue stage (#85). Kept as a
+    // required, accept-and-ignore field -- `.strict()` above would otherwise
+    // reject every existing operator's `.autopilot/config.json`, which
+    // already has this key written by init's default template.
     carryover: z.boolean(),
   }).strict(),
   mergePolicy: z.enum(['manual', 'safe-auto']),
