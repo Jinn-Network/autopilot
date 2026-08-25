@@ -1,6 +1,6 @@
-import { REPO } from '../dispatcher/constants.js';
+import { ORG, REPO, REPO_REST_DATABASE_ID } from '../dispatcher/constants.js';
 import { parseHumanCommentEvidence } from './codecs.js';
-import { GitHubRestSchemaError } from './github-rest-discovery.js';
+import { ConfinedPaginator, GitHubRestSchemaError } from './github-rest-discovery.js';
 import type { ConditionalRestClient, ConditionalRestResponse } from './github-rest.js';
 import type { PullRequestEvidenceProbe } from './incremental-snapshot-source.js';
 import type {
@@ -15,6 +15,20 @@ import { gitOid, type GitOid } from './types.js';
 export interface BaseBranchTipReader {
   readBaseBranchTipOid(baseRefName: string): Promise<GitOid | 'unavailable'>;
 }
+
+const CHECK_EVIDENCE_PAGE_SIZE = 100;
+
+/**
+ * Check-evidence pages one head commit may span, first page included — 1000
+ * check runs or commit statuses. These are the only two evidence reads here
+ * that scale with the repository's workflow count rather than with human
+ * activity: a change that touches the workflows fans CI out well past the
+ * single page GitHub returns by default (mono PR #2918 carries 144 check runs
+ * on its head commit), and refusing that paged response failed every read of
+ * the repository outright. Past this cap the read still fails closed with the
+ * truncation error rather than paginating without bound.
+ */
+const MAX_CHECK_EVIDENCE_PAGES = 10;
 
 /**
  * Every merge state the queue can still take, BLOCKED included (issue #82).
@@ -404,6 +418,50 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
     private readonly baseBranchTipReader?: BaseBranchTipReader,
   ) {}
 
+  /**
+   * Reads one check-evidence endpoint whole, concatenating the `rowsKey` array
+   * across however many pages GitHub splits it into and handing back a single
+   * body in the shape the decoders already expect. The page-one envelope
+   * survives — its `total_count` is the count the decoder then asserts against
+   * the *merged* rows, so a page that goes missing mid-walk still fails closed.
+   *
+   * Every page goes through the same conditional client as the first, so each
+   * one carries its own ETag and a repeat cycle spends 304s rather than fresh
+   * quota. The next endpoint comes from the response's own Link header, run
+   * through the discovery paginator that already confines a next link to the
+   * same resource, the same immutable filters and a cursor that advances.
+   */
+  private async completeCheckEvidence(
+    startEndpoint: string,
+    subject: string,
+    rowsKey: 'check_runs' | 'statuses',
+  ): Promise<unknown> {
+    const paginator = new ConfinedPaginator(startEndpoint, 'page', {
+      repositorySlug: this.repositorySlug,
+      // The numeric `repositories/<id>/…` alias GitHub may use in a Link header
+      // is only this repository's alias when the configured slug is the one
+      // this process was configured for; otherwise no alias is accepted.
+      repositoryRestDatabaseId:
+        this.repositorySlug === REPO ? REPO_REST_DATABASE_ID : 0,
+      projectOwner: ORG,
+    });
+    let endpoint: string | null = startEndpoint;
+    let envelope: Record<string, unknown> | null = null;
+    const merged: unknown[] = [];
+    for (let page = 1; endpoint !== null; page += 1) {
+      if (page > MAX_CHECK_EVIDENCE_PAGES) {
+        throw new GitHubRestSchemaError(`${subject} pagination is truncated`);
+      }
+      const response: ConditionalRestResponse = await this.rest.getJson(endpoint);
+      const body = record(response.body, subject);
+      envelope ??= body;
+      merged.push(...rows(body[rowsKey], `${subject} page ${page}.${rowsKey}`));
+      endpoint = paginator.next(response.nextEndpoint);
+    }
+    if (envelope === null) throw new GitHubRestSchemaError(`${subject} returned no page`);
+    return { ...envelope, [rowsKey]: merged };
+  }
+
   async changed(pr: PullRequestSnapshot): Promise<boolean> {
     if (pr.state !== 'OPEN') return false;
     if (pr.evidenceIncompleteReason !== undefined) return true;
@@ -447,11 +505,17 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
     const eventResponse = await this.rest.getJson(
       `repos/${this.repositorySlug}/issues/${pr.number}/events?per_page=100&page=1`,
     );
-    const checkResponse = await this.rest.getJson(
-      `repos/${this.repositorySlug}/commits/${pr.headOid}/check-runs?per_page=100&page=1`,
+    const checkBody = await this.completeCheckEvidence(
+      `repos/${this.repositorySlug}/commits/${pr.headOid}`
+        + `/check-runs?per_page=${CHECK_EVIDENCE_PAGE_SIZE}&page=1`,
+      'check runs',
+      'check_runs',
     );
-    const statusResponse = await this.rest.getJson(
-      `repos/${this.repositorySlug}/commits/${pr.headOid}/status?per_page=100&page=1`,
+    const statusBody = await this.completeCheckEvidence(
+      `repos/${this.repositorySlug}/commits/${pr.headOid}`
+        + `/status?per_page=${CHECK_EVIDENCE_PAGE_SIZE}&page=1`,
+      'commit statuses',
+      'statuses',
     );
     const detail = exactPullRequestDetail(detailRaw, pr);
     const currentReviews = reviews(completeBody(reviewResponse, 'PR reviews'));
@@ -473,8 +537,8 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       detail.isDraft,
     );
     const currentChecks = [
-      ...checkRuns(completeBody(checkResponse, 'check runs')),
-      ...commitStatuses(completeBody(statusResponse, 'commit statuses')),
+      ...checkRuns(checkBody),
+      ...commitStatuses(statusBody),
     ];
     const cachedHuman = pr.humanReason === undefined
       ? null
