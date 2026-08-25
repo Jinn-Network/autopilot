@@ -577,7 +577,7 @@ function allowedPaginationPath(
     && linked.slice(numericRepositoryPrefix.length) === originalTail;
 }
 
-class ConfinedPaginator {
+export class ConfinedPaginator {
   private readonly original: ParsedEndpoint;
   private readonly immutable: readonly EndpointQueryPart[];
   private readonly immutableByKey: ReadonlyMap<string, string>;

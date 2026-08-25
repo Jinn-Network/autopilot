@@ -170,6 +170,109 @@ function probeWith(
   };
 }
 
+function checkRunRows(count: number, offset: number): unknown[] {
+  return Array.from({ length: count }, (_row, index) => ({
+    name: `check-${offset + index}`,
+    status: 'completed',
+    conclusion: 'success',
+  }));
+}
+
+function commitStatusRows(count: number, offset: number): unknown[] {
+  return Array.from({ length: count }, (_row, index) => ({
+    context: `status-${offset + index}`,
+    state: 'success',
+  }));
+}
+
+function cachedCheckSummaries(
+  prefix: string,
+  count: number,
+): PullRequestSnapshot['checks'] {
+  return Array.from({ length: count }, (_check, index) => ({
+    name: `${prefix}-${index}`,
+    status: 'COMPLETED',
+    conclusion: 'SUCCESS',
+  }));
+}
+
+function checkEndpoint(kind: 'check-runs' | 'status', page: number): string {
+  return `repos/Jinn-Network/mono/commits/${HEAD}/${kind}?per_page=100&page=${page}`;
+}
+
+/**
+ * mono PR #2918's shape: a head commit whose check evidence outruns GitHub's
+ * 100-row REST page. Serves `pages` pages of the named check endpoint, each
+ * linking to the next, and records every endpoint the probe reads so a test can
+ * prove the follow-up read followed the Link header rather than re-reading the
+ * first page. `endlessNext` never stops advertising a next page, which is what
+ * the pagination cap has to survive; `later304` replays every endpoint already
+ * read as a conditional hit, which is what a second cycle sees.
+ */
+function pagedCheckProbe(options: {
+  readonly kind: 'check-runs' | 'status';
+  readonly pages: readonly (readonly unknown[])[];
+  readonly totalCount: number;
+  readonly endlessNext?: boolean;
+  readonly later304?: boolean;
+}): {
+  readonly probe: ConditionalPullRequestEvidenceProbe;
+  readonly calls: string[];
+} {
+  const calls: string[] = [];
+  const bodies = equalBodies();
+  const etags = new Map<string, string>();
+  const run: CommandRunner = async (_command, args) => {
+    const endpoint = args[2]!;
+    calls.push(endpoint);
+    const served = etags.get(endpoint);
+    if (options.later304 === true && served !== undefined) {
+      return included({ status: 304, etag: served });
+    }
+    if (endpoint.includes(`/${options.kind}?`)) {
+      const page = Number(/[?&]page=(\d+)/.exec(endpoint)?.[1] ?? '0');
+      const rows = options.pages[page - 1] ?? [];
+      const hasNext = options.endlessNext === true || page < options.pages.length;
+      etags.set(endpoint, `"${options.kind}-${page}"`);
+      return included({
+        status: 200,
+        etag: `"${options.kind}-${page}"`,
+        body: options.kind === 'check-runs'
+          ? { total_count: options.totalCount, check_runs: rows }
+          : { state: 'success', total_count: options.totalCount, statuses: rows },
+        ...(hasNext
+          ? {
+              link: `<https://api.github.com/${
+                endpoint.replace(/([?&]page=)\d+/, `$1${page + 1}`)
+              }>; rel="next"`,
+            }
+          : {}),
+      });
+    }
+    const kind = endpoint === 'repos/Jinn-Network/mono/pulls/101'
+      ? 'detail'
+      : endpoint.includes('/reviews?')
+        ? 'reviews'
+        : endpoint.includes('/comments?')
+          ? 'comments'
+          : endpoint.includes('/events?')
+            ? 'events'
+            : endpoint.includes('/check-runs?')
+              ? 'checks'
+              : 'statuses';
+    etags.set(endpoint, '"same"');
+    return included({ status: 200, body: bodies[kind] });
+  };
+  return {
+    probe: new ConditionalPullRequestEvidenceProbe(
+      new ConditionalRestClient(run, { usageMeter: new GitHubUsageMeter() }),
+      'Jinn-Network/mono',
+      matchingBaseTipReader(),
+    ),
+    calls,
+  };
+}
+
 describe('ConditionalPullRequestEvidenceProbe', () => {
   it('parses workflow run ids rather than check-run ids', () => {
     const parser = (
@@ -431,6 +534,122 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
       await expect(probeWith(bodies).probe.changed(pr())).rejects.toThrow(/body|user/i);
     },
   );
+
+  /**
+   * mono PR #2918 carries 144 check runs on its head commit. A single
+   * `per_page=100` page cannot hold them, and refusing the paged response
+   * failed every `autopilot status` against the repository outright. The
+   * evidence has to be completed, not declined.
+   */
+  it('merges a check-runs response that spans two pages', async () => {
+    const context = pagedCheckProbe({
+      kind: 'check-runs',
+      pages: [checkRunRows(100, 0), checkRunRows(44, 100)],
+      totalCount: 144,
+    });
+
+    await expect(context.probe.changed(pr({
+      checks: cachedCheckSummaries('check', 144),
+    }))).resolves.toBe(false);
+
+    expect(context.calls.filter((call) => call.includes('/check-runs?')))
+      .toEqual([checkEndpoint('check-runs', 1), checkEndpoint('check-runs', 2)]);
+  });
+
+  it('issues no follow-up read when the check-runs response fits one page', async () => {
+    const context = pagedCheckProbe({
+      kind: 'check-runs',
+      pages: [checkRunRows(2, 0)],
+      totalCount: 2,
+    });
+
+    await expect(context.probe.changed(pr({
+      checks: cachedCheckSummaries('check', 2),
+    }))).resolves.toBe(false);
+
+    expect(context.calls.filter((call) => call.includes('/check-runs?')))
+      .toEqual([checkEndpoint('check-runs', 1)]);
+  });
+
+  /**
+   * The page a follow-up read goes to comes from the *cached* Link header on a
+   * 304, so every page after the first has to keep being reachable once the
+   * evidence stops changing. A cycle that lost the cached next endpoint would
+   * silently fall back to page one alone.
+   */
+  it('walks every check-runs page again from the conditional cache', async () => {
+    const context = pagedCheckProbe({
+      kind: 'check-runs',
+      pages: [checkRunRows(100, 0), checkRunRows(44, 100)],
+      totalCount: 144,
+      later304: true,
+    });
+    const cached = pr({ checks: cachedCheckSummaries('check', 144) });
+
+    await expect(context.probe.changed(cached)).resolves.toBe(false);
+    await expect(context.probe.changed(cached)).resolves.toBe(false);
+
+    expect(context.calls.filter((call) => call.includes('/check-runs?'))).toEqual([
+      checkEndpoint('check-runs', 1),
+      checkEndpoint('check-runs', 2),
+      checkEndpoint('check-runs', 1),
+      checkEndpoint('check-runs', 2),
+    ]);
+  });
+
+  it('fails closed when check-runs pagination outruns the page cap', async () => {
+    const context = pagedCheckProbe({
+      kind: 'check-runs',
+      pages: [checkRunRows(100, 0)],
+      totalCount: 100_000,
+      endlessNext: true,
+    });
+
+    await expect(context.probe.changed(pr()))
+      .rejects.toThrow(/check runs pagination is truncated/);
+    expect(context.calls.filter((call) => call.includes('/check-runs?')))
+      .toHaveLength(10);
+  });
+
+  it('asserts check-runs total_count against the merged pages, not the first', async () => {
+    const context = pagedCheckProbe({
+      kind: 'check-runs',
+      pages: [checkRunRows(100, 0), checkRunRows(43, 100)],
+      totalCount: 144,
+    });
+
+    await expect(context.probe.changed(pr()))
+      .rejects.toThrow(/check-runs response is incomplete/);
+  });
+
+  it('merges a commit-status response that spans two pages', async () => {
+    const context = pagedCheckProbe({
+      kind: 'status',
+      pages: [commitStatusRows(100, 0), commitStatusRows(44, 100)],
+      totalCount: 144,
+    });
+
+    await expect(context.probe.changed(pr({
+      checks: [
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        ...cachedCheckSummaries('status', 144),
+      ],
+    }))).resolves.toBe(false);
+
+    expect(context.calls.filter((call) => call.includes('/status?')))
+      .toEqual([checkEndpoint('status', 1), checkEndpoint('status', 2)]);
+  });
+
+  it('asserts commit-status total_count against the merged pages, not the first', async () => {
+    const context = pagedCheckProbe({
+      kind: 'status',
+      pages: [commitStatusRows(100, 0), commitStatusRows(43, 100)],
+      totalCount: 144,
+    });
+
+    await expect(context.probe.changed(pr()))
+      .rejects.toThrow(/commit-status response is incomplete/);
+  });
 
   it('detects a decisive review even when the PR index timestamp is unchanged', async () => {
     const bodies = equalBodies();
