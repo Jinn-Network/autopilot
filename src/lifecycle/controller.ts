@@ -161,6 +161,12 @@ export interface LifecycleStatusItem {
   readonly eligible?: boolean;
   readonly eligibilityReason?: IssueEligibilityReason;
   readonly eligibilityDetail?: string;
+  /**
+   * The pull request is proven to be sitting in GitHub's merge queue. Absent
+   * means *not proven queued*, never "proven not queued", so the operator-facing
+   * explanation says "ready to be enqueued" rather than asserting it is not.
+   */
+  readonly inMergeQueue?: boolean;
   readonly desiredActions: readonly ProjectionAction[];
 }
 
@@ -596,7 +602,11 @@ function statusItems(
         ...(entry.underlyingPhase === undefined ? {} : { underlyingPhase: entry.underlyingPhase }),
         issueNumber: item.issueNumber,
         ...(item.kind === 'pull-request'
-          ? { prNumber: item.prNumber, head: item.head }
+          ? {
+              prNumber: item.prNumber,
+              head: item.head,
+              ...(item.inMergeQueue === true ? { inMergeQueue: true } : {}),
+            }
           : {}),
         ...(claimGeneration === undefined ? {} : { claimGeneration }),
         ...(age === undefined ? {} : { progressAgeMs: age }),
@@ -920,9 +930,12 @@ function activeCandidates(
 }
 
 /**
- * Keep the scheduler fail-closed if a stale or custom snapshot projection
- * retained GraphQL's false-clean state after exact REST compare evidence was
- * already captured.
+ * Reconcile the lifecycle projection against the pull-request facts the
+ * scheduler and the operator-facing explanation both depend on, so a stale or
+ * custom projection cannot disagree with evidence the same snapshot carries.
+ *
+ * Keeps the scheduler fail-closed if such a projection retained GraphQL's
+ * false-clean state after exact REST compare evidence was already captured.
  *
  * Conflict outranks the compare status and is never overwritten. A diverged
  * compare and a CONFLICTING mergeability describe the same PR from two angles,
@@ -939,19 +952,27 @@ function lifecycleWithExactCompareEvidence(
     items: snapshot.lifecycle.items.map((item) => {
       if (item.kind !== 'pull-request') return item;
       const pr = byPr.get(item.prNumber);
+      // Membership is only ever added, never cleared: absence is "not proven
+      // queued", and overwriting a projected `true` with an unread `false`
+      // would license a second enqueue at a head already in line.
+      const queued = item.inMergeQueue === true || pr?.mergeQueue?.enqueued === true
+        ? { inMergeQueue: true as const }
+        : {};
       if (
         item.mergeState === 'conflict'
         || pr?.mergeability === 'CONFLICTING'
         || pr?.mergeStateStatus === 'DIRTY'
       ) {
-        return { ...item, mergeState: 'conflict' as const };
+        return { ...item, ...queued, mergeState: 'conflict' as const };
       }
       const compareStatus = pr?.compareStatus;
       if (compareStatus === 'behind' || compareStatus === 'diverged') {
-        return { ...item, mergeState: 'behind' as const };
+        return { ...item, ...queued, mergeState: 'behind' as const };
       }
-      if (compareStatus === 'unknown') return { ...item, mergeState: 'blocked' as const };
-      return item;
+      if (compareStatus === 'unknown') {
+        return { ...item, ...queued, mergeState: 'blocked' as const };
+      }
+      return { ...item, ...queued };
     }),
   };
 }
@@ -1622,9 +1643,14 @@ function explanation(item: LifecycleStatusItem): string {
     case 'blocked-by-child':
       return `${identity} is blocked by an open child issue before the lifecycle can continue.`;
     case 'ci-blocked':
-      return `${identity} is blocked by CI before it can enter the native merge gate.`;
+      return `${identity} is blocked by CI before it can be handed to the merge queue.`;
     case 'merge-ready':
-      return `${identity} is awaiting the native merge gate.`;
+      return item.inMergeQueue === true
+        ? `${identity} is in GitHub's merge queue; the queue builds and lands the merge, `
+          + 'and Done arrives from a later cycle reading the merged fact.'
+        : `${identity} is ready to be enqueued into GitHub's merge queue. Two gates `
+          + 'withhold the enqueue: JINN_AUTOPILOT_ENQUEUE disarms the path entirely, '
+          + 'and a manual repository merge policy leaves the enqueue to a maintainer.';
     case 'human':
       return `${identity} is blocked in Human: ${item.humanReason?.detail ?? 'explicit Human hold'}.`;
     case 'merged':

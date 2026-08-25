@@ -3155,6 +3155,29 @@ describe('enqueue stage scheduling', () => {
     }]);
   });
 
+  it('explains merge-ready as an enqueue and names both gates that withhold it', async () => {
+    const harness = cycle(approved());
+    const report = await harness.run();
+    const explanation = explainPullRequest(report, 101);
+
+    expect(explanation).toContain('merge queue');
+    expect(explanation).toContain('JINN_AUTOPILOT_ENQUEUE');
+    expect(explanation).toContain('manual');
+    expect(explanation).not.toContain('native merge gate');
+  });
+
+  it('explains a queued pull request as waiting on the queue, not on the engine', async () => {
+    const harness = cycle(approved(), {
+      mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
+    });
+    const report = await harness.run();
+    const explanation = explainPullRequest(report, 101);
+
+    expect(explanation).toContain("in GitHub's merge queue");
+    expect(explanation).toContain('Done');
+    expect(explanation).not.toContain('ready to be enqueued');
+  });
+
   it('schedules no enqueue at all when JINN_AUTOPILOT_ENQUEUE is off', async () => {
     const previous = process.env.JINN_AUTOPILOT_ENQUEUE;
     process.env.JINN_AUTOPILOT_ENQUEUE = '0';

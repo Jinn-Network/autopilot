@@ -6,13 +6,13 @@
 - **Work shape:** `design`
 - **Conversation status:** approved section by section
 - **Document status:** adopted
-- **Implementation status:** Stages 1–5 complete (Stage 5 deletion and closure landed); strangler-fig migration plan in §10
+- **Implementation status:** Stages 1–6 complete (Stage 6 replaced the merge stage with merge-queue enqueueing); strangler-fig migration plan in §10
 
 This document amends the active-active lifecycle design
 (`2026-07-19-active-active-autopilot-lifecycle-design.md`). Where the two
 conflict, this document wins. The 2026-07-19 document remains authoritative
 for everything it defines that this amendment does not touch: the branch-native
-claim protocol, review-claim ref mechanics, claimless head-pinned merge,
+claim protocol, review-claim ref mechanics, head-pinned queue admission,
 staleness/reaping, attempt isolation, credential handling, and the capability
 probe (as reduced by §8).
 
@@ -27,7 +27,7 @@ the API budget, and the review-fix and merge-prep sub-protocols each carried
 bespoke publication machinery (atomic two-ref pushes, expected-head leases,
 range-diff proofs) with bespoke recovery carve-outs.
 
-The claim CAS, the review ref, head-bound verdicts, and the claimless merge —
+The claim CAS, the review ref, head-bound verdicts, and the landing itself —
 the parts that never read or wrote the board — were the parts that never
 failed.
 
@@ -84,7 +84,8 @@ Each state is a predicate, never a stored value. HUMAN overrides everything.
 | IN REVIEW | review ref `active` for exact head, reviewer ≠ author |
 | BLOCKED-BY-CHILD | open child issue targeting the PR ∨ `REQUEST_CHANGES` on current head |
 | CI-BLOCKED | non-draft ∧ terminal approval for head ∧ CI not green ∧ no human hold ∧ no open child |
-| MERGE-READY | non-draft ∧ terminal approval for head ∧ CI green ∧ clean vs base ∧ no open children |
+| MERGE-READY | non-draft ∧ terminal approval for head ∧ CI green ∧ not conflicting with base ∧ no open children |
+| MERGE-READY, in the queue | the same state plus proven merge-queue membership; the engine withholds a second enqueue and waits (queue time is never staleness) |
 | DONE | PR merged (issue auto-closes via `Closes #N`; zero writes) |
 | HUMAN (overlay) | hold label + structured marker comment |
 
@@ -106,14 +107,16 @@ write to verify, race on, or reconcile.
 | IN REVIEW → gate | reviewer | native APPROVE + terminal ref |
 | IN REVIEW → BLOCKED-BY-CHILD | reviewer | native REQUEST_CHANGES + file finding child + release ref |
 | BLOCKED-BY-CHILD → DELIVERED | child session | fix commits land on parent branch (head moves → head-bound RC stales; child closes) |
-| gate: behind+clean → MERGE-READY | deterministic gate | update-branch API + approval carry-over (§6.1) |
+| gate: behind, not conflicting → MERGE-READY | derivation | no mutation; the queue rebases its own candidate |
 | gate: conflicting → BLOCKED-BY-CHILD | deterministic gate | file reconcile child (idempotent) |
 | gate: approved+CI not green → CI-BLOCKED | derivation | no mutation; visible stall state |
 | CI-BLOCKED → CI-BLOCKED | scheduler | wait while checks are pending/missing (no retry consumed) |
 | CI-BLOCKED → CI-BLOCKED | scheduler | one exact-head CAS-fenced `rerun-failed-jobs` per head |
 | CI-BLOCKED → MERGE-READY | gate | rerun passes ∧ integration ladder satisfied |
 | CI-BLOCKED → BLOCKED-BY-CHILD | scheduler | persistent failure after rerun, or external-only failure → file `ci-failure` child |
-| MERGE-READY → DONE | any process | claimless head-pinned squash merge |
+| MERGE-READY → in the queue | deterministic gate | `enqueuePullRequest(expectedHeadOid)`; one attempt per head recorded on a CAS ref |
+| in the queue → MERGE-READY | derivation | the queue ejected the entry; one re-enqueue per head, then a `ci-failure` child explains the hold |
+| in the queue → DONE | GitHub merge queue | the queue builds the merge commit and lands it; the engine reads the MERGED fact a cycle later |
 
 Session finalization is three PR-surface operations. The `pending: project`
 failure family of the previous design is unrepresentable.
@@ -203,10 +206,13 @@ reviewers read, verdict, file, and exit.
 Replaces merge-prep in full. For an approved, CI-green PR the deterministic
 merge gate applies the cheapest sufficient actor:
 
-- **Tier 0 — behind, no conflicts:** GitHub update-branch API (append-only
-  merge of base into head). No issue, no session. Approval carries over under
-  §6.1.
-- **Tier 1 — conflicting:** file a `reconcile` child. Its session merges the
+- **Behind, no conflicts:** nothing. A behind head is what the merge queue is
+  for — it builds its candidate on top of the current base and runs the
+  required checks against that candidate — so catching the head up is work
+  GitHub already does. The engine used to call the update-branch API here, and
+  paid a re-review every time, because that call mints a new head commit the
+  signed approval is no longer bound to.
+- **Conflicting:** file a `reconcile` child. Its session merges the
   base **into** the branch (never rebase), classifies every conflict before
   editing (§6.2), resolves inside the merge commit, regenerates lockfiles
   canonically, publishes with an ordinary fast-forward push, and closes the
@@ -218,6 +224,11 @@ merge gate applies the cheapest sufficient actor:
 No draft flip occurs during reconciliation: nothing mutates destructively,
 and the gate cannot merge mid-reconcile (conflicting until the push, then
 unapproved).
+
+A pull request whose base is another Autopilot work branch is never enqueued.
+A merge queue belongs to one protected branch, so a stacked pull request has
+no queue to be admitted to; its parent/child sequencing stays custom until the
+stack collapses onto a root pull request.
 
 The MERGE-PREP state, executor/session pair, dedicated cap and credential
 lane, expected-head lease publication, range-diff proof, and prep
@@ -235,13 +246,14 @@ is a fast-forward push. Rebase is not a method the autopilot uses (squash
 merge at landing makes branch-history purity moot).
 
 Head-bound verdicts remain the universal invalidator, with exactly one
-relaxation: after the gate's **own** tier-0 update-branch, it may carry the
-existing terminal approval to the new head **iff** it proves the PR's
-effective diff (content vs merge base) is byte-identical before and after.
-The proof is a local git computation, performed only by the deterministic
-gate, never by a session; CI still re-runs on the new head; native
-REQUEST_CHANGES and human/CODEOWNER gates are unaffected. A conservative
-deployment may disable carry-over and pay re-review instead (config knob).
+relaxation: when the PR head has moved but the head presents byte-identical
+effective diff (content vs merge base), the gate may carry the existing
+terminal approval to the new head. The engine no longer produces such a head
+itself — it does not call update-branch at all — but a human pressing
+GitHub's "Update branch" button does, and without the carry that click strands
+an approved pull request. The proof is computed from the compare response the
+gate already reads, never by a session; CI still re-runs on the new head;
+native REQUEST_CHANGES and human/CODEOWNER gates are unaffected.
 
 ### 6.2 Taxonomy as routing, not boundary
 
@@ -315,7 +327,7 @@ several thousand lines plus their tests.
 
 Retained proven core: branch claim CAS · review ref (simplified lifecycle:
 `active → terminal | released | stale`) · head-bound marker-bound verdicts ·
-claimless head-pinned merge · the staleness reaper · attempt isolation and
+head-pinned queue admission · the staleness reaper · attempt isolation and
 file-based credential handoff.
 
 ## 9. Governance deltas
@@ -345,9 +357,10 @@ Stage 5.
    deliver on a live contended board with zero project-pending failures.
 2. **Stage 2 — children.** Finding-children (review session files, fix
    sessions claim parent branch) and reconcile-children + tier-0
-   update-branch in the gate. The old fix-loop and merge-prep paths remain
-   armed but idle (children outrank). Canary: full loop including one forced
-   conflict and one behind-only PR; verify carry-over proof.
+   update-branch in the gate (removed again in Stage 6). The old fix-loop and
+   merge-prep paths remain armed but idle (children outrank). Canary: full loop
+   including one forced conflict and one behind-only PR; verify carry-over
+   proof.
 3. **Stage 3 — painter.** Scheduled GitHub Action paints Status + archives;
    autopilot Status writes removed. Canary: board converges within one
    painter period; **read-side budget** per §12 (incremental discovery +
@@ -357,6 +370,13 @@ Stage 5.
 5. **Stage 5 — deletion.** Remove §8's list; shrink the probe; re-mint
    attestations; spec cleanup. Full suite + one final canary ladder + the
    two-process same-host race re-run.
+6. **Stage 6 — merge queue.** MERGE-READY hands the exact head to GitHub's
+   merge queue instead of merging it, and the gate's own update-branch tier is
+   deleted with the re-review it kept causing. Armed by
+   `JINN_AUTOPILOT_ENQUEUE`; a `manual` repository merge policy withholds the
+   enqueue independently. Canary: one behind-only PR through the queue, one
+   observed ejection, and one head held after a second ejection with its
+   `ci-failure` child filed.
 
 Rollback at any stage: the previous machinery is still present until Stage 5;
 disarm the new path via its config knob.
