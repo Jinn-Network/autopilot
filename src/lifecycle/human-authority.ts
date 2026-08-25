@@ -1,7 +1,16 @@
 import type { BlockedOn } from '../dispatcher/types.js';
 
+/**
+ * The label a human applies — or the engine applies on their behalf — to take a
+ * pull request off the engine's hands. Exported from here rather than from the
+ * dispatcher's merge sweep because this module is the authority on what human
+ * authority *is*; the sweep was only the first file that happened to need the
+ * string.
+ */
+export const NEEDS_HUMAN_LABEL = 'review:needs-human';
+
 const HUMAN_LABELS = new Set([
-  'review:needs-human',
+  NEEDS_HUMAN_LABEL,
   'autopilot:human',
 ]);
 

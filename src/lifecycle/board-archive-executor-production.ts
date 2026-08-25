@@ -118,7 +118,7 @@ export interface BoardArchiveExecutionResult {
  * dropped for this call (the caller's next sweep picks up leftovers).
  * Uses the implementer credential, following the same
  * `withSelectedCredential` convention every other production executor in
- * this package uses (see `merge-executor-production.ts`,
+ * this package uses (see `enqueue-executor-production.ts`,
  * `reconciliation-writer-production.ts`).
  */
 export async function archiveBoardItems(

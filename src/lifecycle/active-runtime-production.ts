@@ -55,11 +55,10 @@ import {
 } from './review-executor.js';
 import { makeProductionReviewActionPort } from './review-executor-production.js';
 import {
-  executeMergeAction,
+  executeEnqueueAction,
   executeFileReconcileChildAction,
-  executeUpdateBranchAction,
-} from './merge-executor.js';
-import { makeProductionMergeActionPort } from './merge-executor-production.js';
+} from './enqueue-executor.js';
+import { makeProductionEnqueueActionPort } from './enqueue-executor-production.js';
 import {
   executeProductionFileCiFailureChild,
   executeProductionRerunFailedChecks,
@@ -92,8 +91,10 @@ import type {
 import { gitOid } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
-import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
-import { hasExternalHumanAuthority } from './human-authority.js';
+import {
+  hasExternalHumanAuthority,
+  NEEDS_HUMAN_LABEL,
+} from './human-authority.js';
 import {
   LocalSessionExecutionBackend,
   MARKETPLACE_EXECUTION_UNAVAILABLE_DETAIL,
@@ -228,6 +229,14 @@ export interface ProductionActiveRuntimeOptions {
   readonly repositoryUrl?: string;
   readonly defaultBranch?: string;
   readonly projectMapping?: ProjectMapping;
+  /**
+   * Logins the repository's CODEOWNERS policy names, used by the enqueue gate
+   * to decide whether a codeowner-sensitive change carries an owner's approval
+   * at the exact head. Absent or empty proves nobody is an owner, so every
+   * sensitive change refuses — the fail-safe default, and exactly what the
+   * unconditional `codeowner-sensitive` refusal used to do.
+   */
+  readonly codeOwnerLogins?: ReadonlySet<string>;
   /**
    * Injectable delay for the bounded post-win confirmation retries in
    * review-claim acquisition (replication-lag tolerance;
@@ -1041,12 +1050,12 @@ export function makeProductionActiveRuntime(
       },
 
 
-      merge: (action, credentials, cycleSnapshot) => executeMergeAction({
+      enqueue: (action, credentials, cycleSnapshot) => executeEnqueueAction({
         prNumber: action.prNumber,
         expectedHead: action.head,
         expectedBaseRefName: action.expectedBaseRefName,
       }, {
-        ...makeProductionMergeActionPort({
+        ...makeProductionEnqueueActionPort({
           readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
           authorAllowlist: options.authorAllowlist,
           expectedBaseRefName: action.expectedBaseRefName,
@@ -1054,42 +1063,24 @@ export function makeProductionActiveRuntime(
           projectOwner: options.projectMapping?.owner,
           projectNumber: options.projectMapping?.number,
           projectMapping: options.projectMapping,
+          // The attempt ledger lives on the canonical remote and is pushed from
+          // this clone. Without both of these the flake policy has no ledger to
+          // read, so it degrades to always-allow and a head that the queue keeps
+          // ejecting is fed back forever.
+          repositoryPath: options.repositoryPath,
+          repositoryUrl: options.repositoryUrl,
+          // The one branch the merge queue is configured on. Without it the
+          // gate cannot tell a root pull request from a stacked one.
+          defaultBranch: options.defaultBranch,
+          // Empty is the fail-safe: a codeowner-sensitive change refuses when
+          // nobody is proven to be an owner.
+          codeOwnerLogins: options.codeOwnerLogins ?? new Set<string>(),
+          fixIssueTypeId: options.projectMapping?.fields.type.options.fix,
           runner,
           environment: ambient,
         }),
         credentials,
       }),
-
-      updateBranch: async (action, credentials, cycleSnapshot) => {
-        const result = await executeUpdateBranchAction({
-          prNumber: action.prNumber,
-          expectedHead: action.head,
-        }, {
-          ...makeProductionMergeActionPort({
-            readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
-            authorAllowlist: options.authorAllowlist,
-            expectedBaseRefName: action.expectedBaseRefName,
-            repositorySlug: options.repositorySlug,
-            projectOwner: options.projectMapping?.owner,
-            projectNumber: options.projectMapping?.number,
-            projectMapping: options.projectMapping,
-            runner,
-            environment: ambient,
-          }),
-          credentials,
-        });
-        // Forward the reason whenever the result carries one, rather than
-        // enumerating the statuses that happen to have one today. The previous
-        // `status === 'ineligible' || status === 'rejected'` allowlist went
-        // stale the moment `pending` was added: the operator saw the status
-        // with none of `update-branch-queued` / `-rate-limited` / `-unavailable`
-        // / `-unclassified` telling them which it was. A presence test cannot
-        // go stale that way.
-        return {
-          status: result.status,
-          ...('reason' in result ? { reason: result.reason } : {}),
-        };
-      },
 
       fileReconcileChild: async (action, credentials, cycleSnapshot) => {
         const result = await executeFileReconcileChildAction({
@@ -1097,7 +1088,7 @@ export function makeProductionActiveRuntime(
           expectedHead: action.head,
           effort: action.effort,
         }, {
-          ...makeProductionMergeActionPort({
+          ...makeProductionEnqueueActionPort({
             readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
             expectedBaseRefName: action.expectedBaseRefName,

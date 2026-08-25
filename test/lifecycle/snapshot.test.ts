@@ -31,8 +31,8 @@ import {
 } from '../../src/lifecycle/codecs.js';
 import { makeProductionReconciliationWriter } from '../../src/lifecycle/reconciliation-writer-production.js';
 import { makeProductionReviewActionPort } from '../../src/lifecycle/review-executor-production.js';
-import { makeProductionMergeActionPort } from '../../src/lifecycle/merge-executor-production.js';
-import { evaluateMergeGate } from '../../src/lifecycle/merge-executor.js';
+import { makeProductionEnqueueActionPort } from '../../src/lifecycle/enqueue-executor-production.js';
+import { evaluateEnqueueGate } from '../../src/lifecycle/enqueue-executor.js';
 import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 import { makeReviewSessionProtocol } from '../../src/lifecycle/review-session.js';
@@ -255,7 +255,7 @@ describe('view and merge gate agree on a carried approval', () => {
   }
 
   function mergePort(snapshot, compareFiles) {
-    return makeProductionMergeActionPort({
+    return makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot,
       authorAllowlist: new Set(['trusted']),
       expectedBaseRefName: 'next',
@@ -291,7 +291,7 @@ describe('view and merge gate agree on a carried approval', () => {
     const candidate = await mergePort(snapshot, compareFiles).readCandidate(101);
     const gate = candidate === null
       ? { pass: false, reasons: ['pull-request-missing'] }
-      : evaluateMergeGate(candidate);
+      : evaluateEnqueueGate(candidate);
     return { view, gate, candidate };
   }
 
@@ -650,7 +650,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
       reviewSlots: 0,
       usableCredentialLanes: 1,
     }, 'active')).toEqual([{
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: 2084,
       prNumber: 84,
       head: HEAD,
@@ -717,6 +717,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
     const targetPr = () => ({
       ...page('page-2').nodes[0]!,
       number: 84,
+      graphqlId: 'PR_kwDOABCD84',
       body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
       baseRefName: 'autopilot/2083',
       headRefName: 'autopilot/2084',
@@ -1053,6 +1054,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
     duplicatePresent = true;
     let merged = false;
     let exactMergeCalls = 0;
+    let enqueueRecordPushes = 0;
     const mergeCommitOid = 'f'.repeat(40);
     let derivedMergeAction;
     let escalatedRecord;
@@ -1261,16 +1263,17 @@ describe('buildGitHubLifecycleSnapshot', () => {
         if (
           derivedMergeAction !== undefined
           && args[0] === 'api'
-          && args.includes('PUT')
-          && args.includes(
-            `repos/Jinn-Network/mono/pulls/${derivedMergeAction.prNumber}/merge`,
-          )
+          && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('enqueuePullRequest'))
         ) {
           exactMergeCalls += 1;
-          expect(args).toContain(`sha=${derivedMergeAction.head}`);
-          merged = true;
-          projectStatus = 'Done';
-          return JSON.stringify({ merged: true, sha: mergeCommitOid });
+          expect(args).toContain(`expectedHeadOid=${derivedMergeAction.head}`);
+          expect(args).toContain('pullRequestId=PR_kwDOABCD84');
+          return JSON.stringify({
+            data: {
+              enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } },
+            },
+          });
         }
         if (
           derivedMergeAction !== undefined
@@ -1288,7 +1291,19 @@ describe('buildGitHubLifecycleSnapshot', () => {
           return `${args.at(-1)} ${reviewOid}`;
         }
         if (args.includes('ls-remote')) {
+          // No enqueue-attempt ref exists for this head, so the flake ledger
+          // reads as "never attempted" and the first enqueue is permitted.
           return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (args.includes('push')) {
+          // The CAS write of the enqueue-attempt record. Without a transport
+          // that can publish it a successful enqueue reports `ambiguous`, not
+          // `enqueued`: this head's attempt count would be unassertable.
+          enqueueRecordPushes += 1;
+          expect(args.some((arg) => (
+            arg.endsWith(`refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`)
+          ))).toBe(true);
+          return '';
         }
         if (args.includes('read-tree') || args.includes('update-index')) return '';
         if (args[0] === 'api' && args.some((arg) => arg.includes('/comments'))) {
@@ -1943,18 +1958,22 @@ describe('buildGitHubLifecycleSnapshot', () => {
       usableCredentialLanes: 1,
     }, 'active');
     expect(mergeActions).toEqual([{
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: 2084,
       prNumber: 84,
       head: HEAD,
       expectedBaseRefName: 'autopilot/2083',
     }]);
     derivedMergeAction = mergeActions[0];
+    // The integration stage hands the PR to GitHub's merge queue and stops; the
+    // merge itself lands on GitHub's schedule and reaches the board through a
+    // later cycle's MERGED snapshot.
     await expect(escalationRuntime.executeAction(
       derivedMergeAction,
       terminal,
-    )).resolves.toEqual({ outcome: 'merged' });
+    )).resolves.toEqual({ outcome: 'enqueued' });
     expect(exactMergeCalls).toBe(1);
+    expect(enqueueRecordPushes).toBe(1);
   });
 
   it('turns missing #2084 dependency evidence into a structured diagnostic', async () => {
@@ -2063,6 +2082,69 @@ describe('buildGitHubLifecycleSnapshot', () => {
       mergeState: 'behind',
       approved: true,
     });
+  });
+
+  /**
+   * Issue #82. BLOCKED is what GitHub reports for a pull request waiting on a
+   * required context — including every context the merge queue itself runs
+   * against the merge group it builds — and for one already admitted to the
+   * queue. The engine no longer merges the head it pins, so BLOCKED is the
+   * queue's ordinary input rather than a refusal, exactly as BEHIND is. What
+   * still refuses is a head the queue cannot build a candidate from at all.
+   */
+  it('maps MERGEABLE/BLOCKED to lifecycle clean', async () => {
+    const raw = page('page-2').nodes[0]!;
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...raw,
+          mergeability: 'MERGEABLE',
+          mergeStateStatus: 'BLOCKED',
+          compareStatus: 'ahead',
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({
+      kind: 'pull-request',
+      mergeState: 'clean',
+      approved: true,
+    });
+  });
+
+  it('keeps a CONFLICTING BLOCKED head refusing as conflict', async () => {
+    const raw = page('page-2').nodes[0]!;
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...raw,
+          mergeability: 'CONFLICTING',
+          mergeStateStatus: 'BLOCKED',
+          compareStatus: 'diverged',
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({
+      kind: 'pull-request',
+      mergeState: 'conflict',
+    });
+    const [view] = deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60 * 1000,
+    ).items;
+    expect(view?.phase).not.toBe('merge-ready');
   });
 
   it('fails closed when MERGEABLE/CLEAN has exact unknown compare evidence', async () => {
@@ -3652,5 +3734,66 @@ describe('buildGitHubLifecycleSnapshot', () => {
       expect.objectContaining({ kind: 'pull-request', prNumber: 102, issueNumber: 43 }),
     ]));
     expect(snapshot.diagnostics).toEqual([]);
+  });
+});
+
+/**
+ * Merge-queue evidence reaches the lifecycle view (#82). The integration stage
+ * enqueues rather than merges, so the view must be able to say "this head is
+ * already in the queue" — otherwise the ladder re-dispatches an enqueue for a
+ * PR GitHub is already processing.
+ */
+describe('merge-queue evidence threading', () => {
+  function queuedPage(overrides = {}): PullRequestPage {
+    const base = page('page-2');
+    return {
+      ...base,
+      nodes: base.nodes.map((node) => ({ ...node, ...overrides })),
+    };
+  }
+
+  it('carries the PR node id and queue evidence onto the PR snapshot', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage({
+        graphqlId: 'PR_kwDOABCD123',
+        mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
+        enqueueRecorded: true,
+      }),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    expect(snapshot.pullRequests.find((pr) => pr.number === 101)).toMatchObject({
+      graphqlId: 'PR_kwDOABCD123',
+      mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
+      enqueueRecorded: true,
+    });
+  });
+
+  it('projects queue membership onto the lifecycle PR item', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage({
+        mergeQueue: { enqueued: true, position: 1, state: 'AWAITING_CHECKS' },
+      }),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    expect(snapshot.lifecycle.items.find((item) => item.prNumber === 101))
+      .toMatchObject({ inMergeQueue: true });
+  });
+
+  it('omits queue membership when nothing proves the PR is queued', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage(),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    const item = snapshot.lifecycle.items.find((entry) => entry.prNumber === 101);
+    expect(item?.inMergeQueue).toBeUndefined();
+  });
+
+  it('marks a recorded enqueue attempt on the lifecycle item', async () => {
+    const snapshot = await buildGitHubLifecycleSnapshot(reader({
+      readPullRequests: async () => queuedPage({ enqueueRecorded: true }),
+    }), { authorAllowlist: new Set(['trusted']) });
+
+    expect(snapshot.lifecycle.items.find((item) => item.prNumber === 101))
+      .toMatchObject({ enqueueRecorded: true });
   });
 });

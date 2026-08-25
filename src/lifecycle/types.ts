@@ -296,6 +296,14 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   readonly checks?: readonly CheckSummary[];
   /** True when a CAS-fenced CI rerun record exists for this PR head. */
   readonly ciRerunRecorded?: boolean;
+  /** True when a CAS-fenced enqueue-attempt record exists for this PR head. */
+  readonly enqueueRecorded?: boolean;
+  /**
+   * The PR is sitting in GitHub's merge queue. Absent means *not proven
+   * queued*, never "proven not queued": an unreadable membership must not
+   * license a second enqueue, and a proven one must not be enqueued again.
+   */
+  readonly inMergeQueue?: boolean;
   /** Open child issues targeting this PR (Stage 2 single-surface children). */
   readonly openChildKinds?: readonly ('review-finding' | 'reconcile' | 'ci-failure')[];
   readonly branchClaim?: BranchClaim;
@@ -400,13 +408,6 @@ export type NewWorkAction =
       readonly head: GitOid;
     }
   | {
-      readonly kind: 'update-branch';
-      readonly issueNumber: number;
-      readonly prNumber: number;
-      readonly head: GitOid;
-      readonly expectedBaseRefName: GitRefName;
-    }
-  | {
       readonly kind: 'file-reconcile-child';
       readonly issueNumber: number;
       readonly prNumber: number;
@@ -427,7 +428,12 @@ export type NewWorkAction =
       readonly head: GitOid;
     }
   | {
-      readonly kind: 'merge';
+      /**
+       * Hand the exact head to GitHub's merge queue. The queue, not this
+       * engine, constructs and lands the merge commit, so nothing downstream of
+       * a successful enqueue may claim the change is merged.
+       */
+      readonly kind: 'enqueue';
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;

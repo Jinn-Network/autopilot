@@ -15,8 +15,12 @@
   `BLOCKED-BY-CHILD` and the children ladder replace the fix loop and merge-prep.
 - **§8.3 (review fix loop)** — in-session fix publication is deleted; findings become
   child issues (`review-finding`).
-- **§8.4 (merge-prep protocol)** — deleted; reconcile children + tier-0
-  update-branch replace it.
+- **§8.4 (merge-prep protocol)** — deleted; the engine hands the exact head to
+  GitHub's merge queue (`enqueuePullRequest`) and reconcile children own the one
+  case the queue cannot take, a head that conflicts. Update-branch is gone with
+  it: the queue rebases its own candidate onto the base before it tests it, so
+  moving the PR head was work GitHub already does — and doing it here minted a
+  new head under the engine's signed approval and cost a re-review every time.
 - **§8.6 (projection)** — Project Status is paint-only; the scheduled board painter
   owns outbound Status writes.
 

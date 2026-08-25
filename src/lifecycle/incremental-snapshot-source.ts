@@ -888,7 +888,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       exactOpen.set(candidate.number, candidate);
     }
     const next: LifecycleDiscoveryState = {
-      version: 3,
+      version: 4,
       evidence: evidence(reconciled),
       terminalClaims: [...(reconciled.terminalClaims ?? [])],
       openPullRequestEvidence: [...exactOpen.values()]
@@ -1115,7 +1115,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       githubUsage: usage,
     });
     const next: LifecycleDiscoveryState = {
-      version: 3,
+      version: 4,
       evidence: evidence(snapshot),
       terminalClaims: [...(snapshot.terminalClaims ?? [])],
       openPullRequestEvidence: [...openEvidence.values()]

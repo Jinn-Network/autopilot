@@ -110,6 +110,17 @@ export interface RawBranchClaim {
   readonly implementationCompletionSummary?: string | null;
 }
 
+/**
+ * Merge-queue membership for a PR head, read from GitHub's `isInMergeQueue` and
+ * `mergeQueueEntry`. Absent means *unknown*, never "not queued": a read that
+ * could not prove membership must not license a second enqueue.
+ */
+export interface MergeQueueSnapshot {
+  readonly enqueued: boolean;
+  readonly position?: number;
+  readonly state?: string;
+}
+
 export interface PullRequestSnapshot {
   readonly number: number;
   readonly title: string;
@@ -120,6 +131,12 @@ export interface PullRequestSnapshot {
   readonly headOid: GitOid;
   readonly headCommittedAt: string;
   readonly updatedAt?: string;
+  /**
+   * The PR's GraphQL node id, the `pullRequestId` argument of
+   * `enqueuePullRequest`. Absent whenever the read could not prove it.
+   */
+  readonly graphqlId?: string;
+  readonly mergeQueue?: MergeQueueSnapshot;
   readonly isDraft: boolean;
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
@@ -147,6 +164,8 @@ export interface PullRequestSnapshot {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
+  /** True when a CAS-fenced enqueue-attempt record exists for this PR head. */
+  readonly enqueueRecorded?: boolean;
   readonly reviews: readonly NativeReviewSnapshot[];
   /**
    * Non-comment PR evidence could not be read completely. This is a machine
@@ -190,6 +209,8 @@ export interface RawPullRequest {
   readonly headOid: string;
   readonly headCommittedAt: string;
   readonly updatedAt?: string;
+  readonly graphqlId?: string;
+  readonly mergeQueue?: MergeQueueSnapshot;
   readonly isDraft: boolean;
   readonly state: 'OPEN' | 'MERGED';
   readonly labels: readonly string[];
@@ -202,6 +223,7 @@ export interface RawPullRequest {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
+  readonly enqueueRecorded?: boolean;
   readonly reviews: readonly RawNativeReview[];
   readonly evidenceIncompleteReason?: string;
   readonly branchClaimTrailers: string | null;
@@ -444,6 +466,8 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
       headOid,
       headCommittedAt: raw.headCommittedAt,
       ...(raw.updatedAt === undefined ? {} : { updatedAt: raw.updatedAt }),
+      ...(raw.graphqlId === undefined ? {} : { graphqlId: raw.graphqlId }),
+      ...(raw.mergeQueue === undefined ? {} : { mergeQueue: { ...raw.mergeQueue } }),
       isDraft: raw.isDraft,
       state: raw.state,
       labels: [...raw.labels],
@@ -464,6 +488,7 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
         : {}),
       checks: raw.checks.map((check) => ({ ...check })),
       ...(raw.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
+      ...(raw.enqueueRecorded === true ? { enqueueRecorded: true } : {}),
       reviews,
       ...(raw.evidenceIncompleteReason === undefined
         ? {}
@@ -545,7 +570,7 @@ function latestDecisiveReview(
  *
  * The gate requires the *claim reviewer's* effective (latest) native review at
  * the **current** head to be `APPROVED` and to carry the signed marker naming
- * the reviewed head (`merge-executor-production.ts`). Nothing else in the
+ * the reviewed head (`enqueue-executor-production.ts`). Nothing else in the
  * lifecycle item expresses that: `approved` is any reviewer's latest decisive
  * review at head, and `terminalVerdict` is selected by marker across every
  * commit. Without this projection the view can carry an approval the gate then
@@ -634,7 +659,39 @@ function terminalVerdict(pr: PullRequestSnapshot) {
   } as const;
 }
 
-function mergeState(pr: PullRequestSnapshot): Extract<
+/**
+ * Merge states the merge queue can build a candidate from.
+ *
+ * BLOCKED belongs here for the same reason BEHIND does (issue #82). This stage
+ * no longer merges the head it pins: it hands the pull request to GitHub's
+ * merge queue, which builds its own merge group on top of the current base and
+ * runs the required contexts against *that*. BLOCKED is precisely what GitHub
+ * reports while a required context has not reported on the pull request — which
+ * includes every merge-group-only context, by construction — and what a pull
+ * request already admitted to the queue reports. Refusing it stranded queued
+ * PRs outside the enqueue stage entirely, and left the merge-group-only
+ * contexts waiting for an enqueue that was waiting for them.
+ *
+ * What is *not* here is the refusal that still means something: a head the
+ * queue cannot build a candidate from at all. `CONFLICTING`/`DIRTY` is checked
+ * first and answers `conflict`, and the reconcile child still owns it.
+ *
+ * The remaining gates are untouched and do the work BLOCKED used to stand in
+ * for: `approved`/`needsReview` answer "a required review is missing" and the
+ * CI classifier answers "a required check failed".
+ */
+const QUEUE_ELIGIBLE_MERGE_STATE_STATUSES = [
+  'CLEAN',
+  'UNSTABLE',
+  'HAS_HOOKS',
+  'BLOCKED',
+] as const;
+
+export function queueEligibleMergeStateStatus(status: string): boolean {
+  return (QUEUE_ELIGIBLE_MERGE_STATE_STATUSES as readonly string[]).includes(status);
+}
+
+export function deriveMergeState(pr: PullRequestSnapshot): Extract<
 LifecycleItem,
 { kind: 'pull-request' }
 >['mergeState'] {
@@ -642,9 +699,10 @@ LifecycleItem,
   if (pr.mergeStateStatus === 'BEHIND') return 'behind';
   if (pr.compareStatus === 'behind' || pr.compareStatus === 'diverged') return 'behind';
   if (pr.compareStatus === 'unknown') return 'blocked';
-  if (pr.mergeability === 'MERGEABLE' && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(
-    pr.mergeStateStatus,
-  )) {
+  if (
+    pr.mergeability === 'MERGEABLE'
+    && queueEligibleMergeStateStatus(pr.mergeStateStatus)
+  ) {
     return 'clean';
   }
   return 'blocked';
@@ -766,9 +824,11 @@ function lifecyclePr(
     merged: pr.state === 'MERGED',
     needsReview: decisive?.state !== 'APPROVED',
     approved: decisive?.state === 'APPROVED',
-    mergeState: mergeState(pr),
+    mergeState: deriveMergeState(pr),
     checks: [...pr.checks],
     ...(pr.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
+    ...(pr.enqueueRecorded === true ? { enqueueRecorded: true } : {}),
+    ...(pr.mergeQueue?.enqueued === true ? { inMergeQueue: true } : {}),
     ...(openChildKinds.length === 0 ? {} : { openChildKinds: [...openChildKinds] }),
     ...(pr.branchClaim === undefined ? {} : { branchClaim: pr.branchClaim }),
     ...(pr.implementationCompletionSummary === undefined

@@ -36,6 +36,7 @@ import {
   resolveChildTriageExpectation,
 } from './child-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
+import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import type {
   AutopilotMode,
@@ -160,8 +161,24 @@ export interface LifecycleStatusItem {
   readonly eligible?: boolean;
   readonly eligibilityReason?: IssueEligibilityReason;
   readonly eligibilityDetail?: string;
+  /**
+   * The pull request is proven to be sitting in GitHub's merge queue. Absent
+   * means *not proven queued*, never "proven not queued", so the operator-facing
+   * explanation says "ready to be enqueued" rather than asserting it is not.
+   */
+  readonly inMergeQueue?: boolean;
+  /**
+   * Kill switches that are *engaged* this cycle and would withhold the enqueue
+   * of a merge-ready pull request. Empty is the ordinary case and says exactly
+   * that: nothing is holding it back. Naming a switch that is not engaged reads
+   * to an operator as the reason their PR has not moved, which is the one thing
+   * the explanation must never invent.
+   */
+  readonly enqueueHolds?: readonly EnqueueHold[];
   readonly desiredActions: readonly ProjectionAction[];
 }
+
+export type EnqueueHold = 'enqueue-path-disarmed' | 'manual-merge-policy';
 
 export interface LifecycleOrphanBranchClaimStatus {
   readonly kind: 'orphan-branch-claim';
@@ -575,11 +592,26 @@ function progressAge(view: LifecycleViewItem, now: Date): number | undefined {
   return Math.max(0, now.getTime() - progressAt);
 }
 
+/**
+ * The switches that withhold an enqueue, read as they actually stand right now.
+ * Both are read once per cycle, next to each other, so the operator-facing
+ * explanation and the scheduler cannot disagree about which is engaged.
+ */
+function engagedEnqueueHolds(
+  mergePolicy: MergePolicy | undefined,
+): readonly EnqueueHold[] {
+  return [
+    ...(enqueuePathEnabled() ? [] : ['enqueue-path-disarmed' as const]),
+    ...((mergePolicy ?? 'manual') === 'manual' ? ['manual-merge-policy' as const] : []),
+  ];
+}
+
 function statusItems(
   view: ReturnType<typeof deriveLifecycle>,
   actions: readonly ProjectionAction[],
   now: Date,
   orphanBranchClaims: readonly OrphanBranchClaim[],
+  enqueueHolds: readonly EnqueueHold[] = [],
 ): LifecycleStatusItem[] {
   const orphanIssues = new Set(orphanBranchClaims.map((claim) => claim.issueNumber));
   return view.items
@@ -595,7 +627,12 @@ function statusItems(
         ...(entry.underlyingPhase === undefined ? {} : { underlyingPhase: entry.underlyingPhase }),
         issueNumber: item.issueNumber,
         ...(item.kind === 'pull-request'
-          ? { prNumber: item.prNumber, head: item.head }
+          ? {
+              prNumber: item.prNumber,
+              head: item.head,
+              ...(item.inMergeQueue === true ? { inMergeQueue: true } : {}),
+              ...(enqueueHolds.length === 0 ? {} : { enqueueHolds }),
+            }
           : {}),
         ...(claimGeneration === undefined ? {} : { claimGeneration }),
         ...(age === undefined ? {} : { progressAgeMs: age }),
@@ -725,6 +762,10 @@ function activeCandidates(
   const childImplementation: ActiveCandidate[] = [];
   const freshImplementation: ActiveCandidate[] = [];
   const other: ActiveCandidate[] = [];
+  // Read once per cycle, next to the children knob it sits beside. Disarming
+  // it leaves derivation untouched — a merge-ready PR still reads as
+  // merge-ready — and only withholds the mutation.
+  const enqueueOn = enqueuePathEnabled();
   for (const entry of view.items) {
     const item = entry.item;
     if (
@@ -811,16 +852,17 @@ function activeCandidates(
         author: pr.author,
       });
     } else if (
+      // Conflict only. A behind or diverged head used to land here for an
+      // `update-branch`; the merge queue rebases its own candidate onto the
+      // base before it tests it, so moving the PR head is work GitHub already
+      // does — and doing it here cost a re-review every time, because
+      // update-branch mints a new head under the engine's signed approval.
+      // What the queue genuinely cannot do is merge a head that conflicts, and
+      // that is the one case the reconcile child still owns.
       (entry.phase === 'awaiting-review' || entry.phase === 'merge-ready')
       && item.approved
       && !item.needsReview
-      && (
-        item.mergeState === 'behind'
-        || item.mergeState === 'conflict'
-        || compareStatus === 'behind'
-        || compareStatus === 'diverged'
-        || compareStatus === 'unknown'
-      )
+      && item.mergeState === 'conflict'
       && !(item.openChildKinds ?? []).includes('reconcile')
     ) {
       const childrenOn = childrenPathEnabled();
@@ -837,16 +879,7 @@ function activeCandidates(
         openFindingChild: (item.openChildKinds ?? []).includes('review-finding'),
         childrenEnabled: childrenOn,
       });
-      if (ladder.kind === 'update-branch') {
-        if (item.expectedBaseRefName === undefined) continue;
-        other.push({
-          phase: 'update-branch',
-          issueNumber: item.issueNumber,
-          prNumber: item.prNumber,
-          head: item.head,
-          expectedBaseRefName: gitRefName(item.expectedBaseRefName),
-        });
-      } else if (ladder.kind === 'file-reconcile-child') {
+      if (ladder.kind === 'file-reconcile-child') {
         if (item.expectedBaseRefName === undefined) continue;
         other.push({
           phase: 'file-reconcile-child',
@@ -899,9 +932,15 @@ function activeCandidates(
         }
       }
     } else if (entry.phase === 'merge-ready') {
+      if (!enqueueOn) continue;
       if (item.expectedBaseRefName === undefined) continue;
+      // Proven queued — from either authority the snapshot carries. Absence is
+      // never proof of the opposite, so only a positive reading suppresses the
+      // action; an unreadable membership falls through to an enqueue the
+      // executor re-checks against GitHub before it mutates.
+      if (item.inMergeQueue === true || pr.mergeQueue?.enqueued === true) continue;
       other.push({
-        phase: 'merge',
+        phase: 'enqueue',
         issueNumber: item.issueNumber,
         prNumber: item.prNumber,
         head: item.head,
@@ -917,23 +956,49 @@ function activeCandidates(
 }
 
 /**
- * Keep the scheduler fail-closed if a stale or custom snapshot projection
- * retained GraphQL's false-clean state after exact REST compare evidence was
- * already captured.
+ * Reconcile the lifecycle projection against the pull-request facts the
+ * scheduler and the operator-facing explanation both depend on, so a stale or
+ * custom projection cannot disagree with evidence the same snapshot carries.
+ *
+ * Keeps the scheduler fail-closed if such a projection retained GraphQL's
+ * false-clean state after exact REST compare evidence was already captured.
+ *
+ * Conflict outranks the compare status and is never overwritten. A diverged
+ * compare and a CONFLICTING mergeability describe the same PR from two angles,
+ * and only one of them is disqualifying: the merge queue rebases a diverged
+ * head happily and cannot merge a conflicting one at all. Downgrading conflict
+ * to `behind` here would derive that PR as merge-ready and feed it to the
+ * queue, which is precisely the enqueue this stage must refuse.
  */
 function lifecycleWithExactCompareEvidence(
   snapshot: GitHubLifecycleSnapshot,
 ): LifecycleSnapshot {
-  const compareByPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr.compareStatus]));
+  const byPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr]));
   return {
     items: snapshot.lifecycle.items.map((item) => {
       if (item.kind !== 'pull-request') return item;
-      const compareStatus = compareByPr.get(item.prNumber);
-      if (compareStatus === 'behind' || compareStatus === 'diverged') {
-        return { ...item, mergeState: 'behind' as const };
+      const pr = byPr.get(item.prNumber);
+      // Membership is only ever added, never cleared: absence is "not proven
+      // queued", and overwriting a projected `true` with an unread `false`
+      // would license a second enqueue at a head already in line.
+      const queued = item.inMergeQueue === true || pr?.mergeQueue?.enqueued === true
+        ? { inMergeQueue: true as const }
+        : {};
+      if (
+        item.mergeState === 'conflict'
+        || pr?.mergeability === 'CONFLICTING'
+        || pr?.mergeStateStatus === 'DIRTY'
+      ) {
+        return { ...item, ...queued, mergeState: 'conflict' as const };
       }
-      if (compareStatus === 'unknown') return { ...item, mergeState: 'blocked' as const };
-      return item;
+      const compareStatus = pr?.compareStatus;
+      if (compareStatus === 'behind' || compareStatus === 'diverged') {
+        return { ...item, ...queued, mergeState: 'behind' as const };
+      }
+      if (compareStatus === 'unknown') {
+        return { ...item, ...queued, mergeState: 'blocked' as const };
+      }
+      return { ...item, ...queued };
     }),
   };
 }
@@ -944,9 +1009,7 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
     || action.kind === 'repair-machine-child'
   ) return 'eligible';
   if (action.kind === 'claim-review') return 'awaiting-review';
-  if (action.kind === 'update-branch' || action.kind === 'file-reconcile-child') {
-    return 'awaiting-review';
-  }
+  if (action.kind === 'file-reconcile-child') return 'awaiting-review';
   if (action.kind === 'rerun-failed-checks' || action.kind === 'file-ci-failure-child') {
     return 'ci-blocked';
   }
@@ -969,12 +1032,7 @@ function phaseForSchedulingSkip(
     || skip.phase === 'repair-machine-child'
   ) return 'eligible';
   if (skip.phase === 'review') return 'awaiting-review';
-  if (
-    skip.phase === 'update-branch'
-    || skip.phase === 'file-reconcile-child'
-  ) {
-    return 'awaiting-review';
-  }
+  if (skip.phase === 'file-reconcile-child') return 'awaiting-review';
   if (
     skip.phase === 'rerun-failed-checks'
     || skip.phase === 'file-ci-failure-child'
@@ -1076,7 +1134,13 @@ async function executeActivePass(
   );
   const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
   const plan = planProjection(context);
-  const items = statusItems(view, plan.actions, now, context.orphanBranchClaims);
+  const items = statusItems(
+    view,
+    plan.actions,
+    now,
+    context.orphanBranchClaims,
+    engagedEnqueueHolds(deps.mergePolicy),
+  );
   const orphanBranchClaims = orphanStatusItems(
     context.orphanBranchClaims,
     plan.actions,
@@ -1508,7 +1572,13 @@ export async function runLifecycleCycle(
   const view = deriveLifecycle(snapshot.lifecycle, now, deps.staleAfterMs);
   const context = projectionContext(snapshot, view, now, deps.staleAfterMs);
   const plan = planProjection(context);
-  const items = statusItems(view, plan.actions, now, context.orphanBranchClaims);
+  const items = statusItems(
+    view,
+    plan.actions,
+    now,
+    context.orphanBranchClaims,
+    engagedEnqueueHolds(deps.mergePolicy),
+  );
   const orphanBranchClaims = orphanStatusItems(
     context.orphanBranchClaims,
     plan.actions,
@@ -1611,9 +1681,19 @@ function explanation(item: LifecycleStatusItem): string {
     case 'blocked-by-child':
       return `${identity} is blocked by an open child issue before the lifecycle can continue.`;
     case 'ci-blocked':
-      return `${identity} is blocked by CI before it can enter the native merge gate.`;
-    case 'merge-ready':
-      return `${identity} is awaiting the native merge gate.`;
+      return `${identity} is blocked by CI before it can be handed to the merge queue.`;
+    case 'merge-ready': {
+      if (item.inMergeQueue === true) {
+        return `${identity} is in GitHub's merge queue; the queue builds and lands the merge, `
+          + 'and Done arrives from a later cycle reading the merged fact.';
+      }
+      const holds = item.enqueueHolds ?? [];
+      return holds.length === 0
+        ? `${identity} is ready to be enqueued into GitHub's merge queue, and nothing is `
+          + 'withholding the enqueue.'
+        : `${identity} is ready to be enqueued into GitHub's merge queue, but the enqueue is `
+          + `withheld: ${holds.map(enqueueHoldDetail).join('; ')}.`;
+    }
     case 'human':
       return `${identity} is blocked in Human: ${item.humanReason?.detail ?? 'explicit Human hold'}.`;
     case 'merged':
@@ -1621,6 +1701,12 @@ function explanation(item: LifecycleStatusItem): string {
     default:
       return assertNever(item.phase);
   }
+}
+
+function enqueueHoldDetail(hold: EnqueueHold): string {
+  return hold === 'enqueue-path-disarmed'
+    ? 'JINN_AUTOPILOT_ENQUEUE disarms the enqueue path entirely'
+    : 'the repository merge policy is manual, which leaves the enqueue to a maintainer';
 }
 
 function assertNever(phase: never): never {

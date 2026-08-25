@@ -48,7 +48,7 @@
  * (`scripts/run-autopilot-v2.ts:496`) threaded into the lifecycle reader
  * (`:510`), the conditional REST client (`:519`) and the active runtime
  * (`:740` → `src/lifecycle/active-runtime-production.ts:400`), which passes it
- * to the action ports (`:964` → `src/lifecycle/merge-executor-production.ts`,
+ * to the action ports (`:964` → `src/lifecycle/enqueue-executor-production.ts`,
  * whose `gh pr view` reads at `:242`, `:280`, `:309`, `:370` are therefore
  * covered).
  *

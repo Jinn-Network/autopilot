@@ -9,15 +9,21 @@ import type {
   NativeReviewState,
   PullRequestSnapshot,
 } from './snapshot.js';
+import { queueEligibleMergeStateStatus } from './snapshot.js';
 import { gitOid, type GitOid } from './types.js';
 
 export interface BaseBranchTipReader {
   readBaseBranchTipOid(baseRefName: string): Promise<GitOid | 'unavailable'>;
 }
 
+/**
+ * Every merge state the queue can still take, BLOCKED included (issue #82).
+ * These are the pull requests whose `compareStatus` decides behind-versus-
+ * conflicting, so these are the ones whose compare evidence has to stay fresh.
+ */
 function mergePathPullRequest(pr: PullRequestSnapshot): boolean {
   return pr.mergeability === 'MERGEABLE'
-    && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
+    && queueEligibleMergeStateStatus(pr.mergeStateStatus);
 }
 
 async function compareEvidenceNeedsRefresh(
@@ -500,6 +506,23 @@ export class ConditionalPullRequestEvidenceProbe implements PullRequestEvidenceP
       labels: pr.labels,
       mergeability: pr.mergeability,
       mergeStateStatus: pr.mergeStateStatus,
+      // Merge-queue membership is GraphQL-only evidence — `isInMergeQueue` and
+      // `mergeQueueEntry` have no counterpart on the REST pull detail read
+      // above — so the live side of this comparison is silence, and a cached
+      // membership never matches it. That is the intended reading, not a gap:
+      // membership is the one lifecycle fact that can lapse with every other
+      // term of this predicate reading identical, because an ejection changes
+      // no review, comment, event, check or label. A stale `true` would
+      // suppress the re-enqueue of an ejected head forever, so a PR proven to
+      // be sitting in the queue is always re-read canonically.
+      //
+      // Only a proven membership joins the key, and deliberately not the
+      // entry's position or state: those churn as the queue advances, and
+      // paying a canonical read for each move would spend the whole incremental
+      // budget on PRs the engine is already correctly leaving alone. A cached
+      // *absence* costs nothing either — a PR a human queued behind the
+      // engine's back is caught at the mutation, which answers already-enqueued.
+      ...(pr.mergeQueue?.enqueued === true ? { inMergeQueue: true } : {}),
     };
     return (await compareEvidenceNeedsRefresh(pr, this.baseBranchTipReader))
       || JSON.stringify({ ...detail, labels: [...detail.labels].sort() })

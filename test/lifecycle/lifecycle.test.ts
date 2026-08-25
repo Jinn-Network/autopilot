@@ -1043,14 +1043,26 @@ describe('engine approval must be head-bound to reach merge-ready', () => {
       .toBe('ci-blocked');
   });
 
-  it('never lets a matching digest substitute for a head that is behind its base', () => {
+  // #82 flipped this one. While the engine merged the head it pinned, a behind
+  // head was a real hazard and the carried digest was not allowed to excuse it.
+  // The merge queue rebases the candidate onto the base before it tests it, so
+  // behind is now ordinary queue input — and the carry still has to prove
+  // itself on its own terms, which is what the assertions below check.
+  it('lets a carried approval on a behind head reach the queue', () => {
     const item = provenCarry({ mergeState: 'behind' });
+    expect(engineApprovedAtHead(item)).toBe(true);
+    expect(deriveLifecycle(snapshot(item), NOW, STALE_AFTER).items[0].phase)
+      .toBe('merge-ready');
+  });
+
+  it('never lets a matching digest substitute for a head that does not merge', () => {
+    const item = provenCarry({ mergeState: 'conflict' });
     expect(engineApprovedAtHead(item)).toBe(true);
     expect(deriveLifecycle(snapshot(item), NOW, STALE_AFTER).items[0].phase)
       .toBe('awaiting-review');
   });
 
-  it('plans claim-review, not merge, for carried approvals', () => {
+  it('plans claim-review, not enqueue, for carried approvals', () => {
     const capacity = {
       implementationSlots: 1,
       reviewSlots: 1,
@@ -1080,7 +1092,7 @@ describe('engine approval must be head-bound to reach merge-ready', () => {
         prNumber: item.prNumber,
         head: HEAD_B,
       }]);
-      expect(planned.some((action) => action.kind === 'merge')).toBe(false);
+      expect(planned.some((action) => action.kind === 'enqueue')).toBe(false);
     }
   });
 
@@ -1161,11 +1173,153 @@ describe('engine approval must be head-bound to reach merge-ready', () => {
       mergePrepSlots: 0,
       usableCredentialLanes: 1,
     }, 'active')).toEqual([{
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: 42,
       prNumber: 101,
       head: HEAD_B,
       expectedBaseRefName: 'next',
     }]);
+  });
+});
+
+// #82: the integration stage stops merging and starts enqueueing. GitHub's
+// merge queue rebases the candidate onto the base it merges into, so a head
+// that is merely BEHIND is queue-normal input rather than a hazard the engine
+// must fix first. A conflicting head is still the engine's problem and still
+// falls through to the reconcile-child path.
+describe('enqueue stage derivation', () => {
+  const GREEN = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] as const;
+  const MARKER = '44444444-4444-4444-8444-444444444444';
+
+  function approvedAtHead(overrides = {}) {
+    return implementation({
+      branchClaim: undefined,
+      isDraft: false,
+      labels: ['engine:review'],
+      expectedBaseRefName: 'next',
+      head: HEAD_A,
+      needsReview: false,
+      approved: true,
+      mergeState: 'clean',
+      checks: [...GREEN],
+      reviewClaim: {
+        kind: 'review-claim' as const,
+        protocolVersion: 2 as const,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'reviewer',
+        head: HEAD_A,
+        state: 'terminal-approved' as const,
+        recordedAt: '2026-07-20T11:00:00.000Z',
+        verdict: { marker: MARKER, state: 'APPROVE' as const },
+      },
+      terminalVerdict: {
+        head: HEAD_A,
+        state: 'APPROVE',
+        marker: MARKER,
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
+      ...overrides,
+    });
+  }
+
+  const capacity = {
+    implementationSlots: 0,
+    reviewSlots: 0,
+    mergePrepSlots: 0,
+    usableCredentialLanes: 0,
+  };
+
+  it('derives merge-ready for a behind head carrying a fresh engine approval', () => {
+    const [view] = deriveLifecycle(
+      snapshot(approvedAtHead({ mergeState: 'behind' })),
+      NOW,
+      STALE_AFTER,
+    ).items;
+
+    expect(view.phase).toBe('merge-ready');
+  });
+
+  it('keeps a conflicting head in awaiting-review so the reconcile child owns it', () => {
+    const [view] = deriveLifecycle(
+      snapshot(approvedAtHead({ mergeState: 'conflict' })),
+      NOW,
+      STALE_AFTER,
+    ).items;
+
+    expect(view.phase).toBe('awaiting-review');
+  });
+
+  it('still refuses merge-ready for a behind head whose engine approval lapsed', () => {
+    const [view] = deriveLifecycle(
+      snapshot(approvedAtHead({ mergeState: 'behind', head: HEAD_B })),
+      NOW,
+      STALE_AFTER,
+    ).items;
+
+    expect(view.phase).toBe('awaiting-review');
+  });
+
+  it('plans an enqueue rather than a merge for a merge-ready pull request', () => {
+    const view = deriveLifecycle(snapshot(approvedAtHead()), NOW, STALE_AFTER);
+
+    expect(planCycle(view, capacity, 'active')).toEqual([{
+      kind: 'enqueue',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD_A,
+      expectedBaseRefName: 'next',
+    }]);
+  });
+
+  it('plans an enqueue for a behind head too', () => {
+    const view = deriveLifecycle(
+      snapshot(approvedAtHead({ mergeState: 'behind' })),
+      NOW,
+      STALE_AFTER,
+    );
+
+    expect(planCycle(view, capacity, 'active')).toEqual([{
+      kind: 'enqueue',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD_A,
+      expectedBaseRefName: 'next',
+    }]);
+  });
+
+  it('plans nothing for a pull request already sitting in the merge queue', () => {
+    const view = deriveLifecycle(
+      snapshot(approvedAtHead({ inMergeQueue: true })),
+      NOW,
+      STALE_AFTER,
+    );
+
+    expect(view.items[0].phase).toBe('merge-ready');
+    expect(planCycle(view, capacity, 'active')).toEqual([]);
+  });
+
+  // A merge queue holds a PR for as long as the queue takes: minutes on a quiet
+  // repository, many hours behind a long batch. None of that is engine
+  // progress, so none of it may accumulate toward a staleness escalation.
+  // Staleness covers implementing and reviewing — the two phases the engine
+  // actually drives — and nothing else.
+  it('never marks a queued pull request stale however long the queue holds it', () => {
+    const longAgo = '2026-07-19T00:00:00.000Z';
+    for (const inMergeQueue of [true, false]) {
+      for (const mergeState of ['clean', 'behind'] as const) {
+        const [view] = deriveLifecycle(
+          snapshot(approvedAtHead({ mergeState, inMergeQueue, headChangedAt: longAgo })),
+          NOW,
+          STALE_AFTER,
+        ).items;
+
+        expect(view.phase).toBe('merge-ready');
+        expect(view.stale).toBe(false);
+        expect(view.staleReason).toBeUndefined();
+        expect(view.item.labels).not.toContain('review:needs-human');
+      }
+    }
   });
 });

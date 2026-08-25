@@ -15,7 +15,7 @@ function input(overrides: Partial<ActiveSchedulingInput> = {}): ActiveScheduling
       { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
       { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
       {
-        phase: 'merge',
+        phase: 'enqueue',
         issueNumber: 5,
         prNumber: 50,
         head: HEAD,
@@ -36,26 +36,16 @@ function input(overrides: Partial<ActiveSchedulingInput> = {}): ActiveScheduling
 }
 
 describe('active local scheduler', () => {
-  it('enforces independent per-phase local caps and keeps merge claimless', () => {
+  it('enforces independent per-phase local caps and keeps the enqueue claimless', () => {
     const plan = scheduleActiveActions(input());
     expect(plan.actions.map((action) => action.kind)).toEqual([
       'claim-implementation',
       'claim-review',
-      'merge',
+      'enqueue',
     ]);
   });
 
   it.each([
-    {
-      phase: 'update-branch' as const,
-      expected: {
-        kind: 'update-branch',
-        issueNumber: 42,
-        prNumber: 84,
-        head: HEAD,
-        expectedBaseRefName: gitRefName('stack/custom-parent'),
-      },
-    },
     {
       phase: 'file-reconcile-child' as const,
       expected: {
@@ -124,7 +114,7 @@ describe('active local scheduler', () => {
     const plan = scheduleActiveActions(input({ openPipelineBacklog: 10 }));
     expect(plan.actions.map((action) => action.kind)).toEqual([
       'claim-review',
-      'merge',
+      'enqueue',
     ]);
     expect(plan.skips).toContainEqual({
       phase: 'implementation',
@@ -140,7 +130,7 @@ describe('active local scheduler', () => {
         { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
         { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
         {
-          phase: 'merge',
+          phase: 'enqueue',
           issueNumber: 5,
           prNumber: 50,
           head: HEAD,
@@ -159,7 +149,7 @@ describe('active local scheduler', () => {
         head: HEAD,
       },
       {
-        kind: 'merge',
+        kind: 'enqueue',
         issueNumber: 5,
         prNumber: 50,
         head: HEAD,
@@ -288,7 +278,7 @@ describe('active local scheduler', () => {
       remaining: { implementation: 0, review: 0 },
       newWorkPaused: true,
     }));
-    expect(plan.actions.map((action) => action.kind)).toEqual(['merge']);
+    expect(plan.actions.map((action) => action.kind)).toEqual(['enqueue']);
     expect(plan.skips).toContainEqual({
       phase: 'implementation',
       subject: 'issue:1',

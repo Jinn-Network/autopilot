@@ -8,8 +8,10 @@ import { join } from 'node:path';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
-import { NEEDS_HUMAN_LABEL } from '../dispatcher/merge-sweep.js';
-import { hasExternalHumanAuthority } from './human-authority.js';
+import {
+  hasExternalHumanAuthority,
+  NEEDS_HUMAN_LABEL,
+} from './human-authority.js';
 import type { BlockedOn, ProjectStatus } from '../dispatcher/types.js';
 import {
   IMPLEMENTATION_SUMMARY_END,

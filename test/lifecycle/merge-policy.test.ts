@@ -8,7 +8,7 @@ describe('repository merge policy', () => {
   const candidates = [
     { phase: 'implementation' as const, intent: 'fresh' as const, issueNumber: 1 },
     {
-      phase: 'merge' as const,
+      phase: 'enqueue' as const,
       issueNumber: 2,
       prNumber: 20,
       head: HEAD,
@@ -16,13 +16,13 @@ describe('repository merge policy', () => {
     },
   ];
 
-  it('removes merge candidates in the default manual policy', () => {
+  it('removes enqueue candidates in the default manual policy', () => {
     expect(applyMergePolicy(candidates, 'manual')).toEqual([
       { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
     ]);
   });
 
-  it('preserves the existing exact-head merge lane only for safe-auto', () => {
+  it('preserves the exact-head enqueue lane only for safe-auto', () => {
     expect(applyMergePolicy(candidates, 'safe-auto')).toEqual(candidates);
   });
 });

@@ -95,9 +95,14 @@ function equalBodies(): Record<string, unknown> {
  * Merge-path PRs key `compareStatus` freshness on the recorded base branch tip.
  * Tests whose subject is the conditional-equality path itself must therefore use
  * a PR that is *not* on the merge path, in both the live body and the cached
- * snapshot.
+ * snapshot. Every merge state the queue can take is on that path — BLOCKED
+ * included, since issue #82 — so the state that keeps a fixture off it is one
+ * GitHub has not finished computing.
  */
-const OFF_MERGE_PATH = { mergeStateStatus: 'BLOCKED' } as const;
+const OFF_MERGE_PATH = {
+  mergeability: 'UNKNOWN',
+  mergeStateStatus: 'UNKNOWN',
+} as const;
 
 function matchingBaseTipReader(tip: string = BASE_TIP) {
   return {
@@ -106,6 +111,16 @@ function matchingBaseTipReader(tip: string = BASE_TIP) {
 }
 
 function offMergePathBodies(): Record<string, unknown> {
+  const bodies = equalBodies();
+  bodies.detail = {
+    ...(bodies.detail as Record<string, unknown>),
+    mergeable: null,
+    mergeable_state: 'unknown',
+  };
+  return bodies;
+}
+
+function blockedBodies(): Record<string, unknown> {
   const bodies = equalBodies();
   bodies.detail = {
     ...(bodies.detail as Record<string, unknown>),
@@ -221,6 +236,26 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     expect(context.meter.read()).toMatchObject({ restNotModified: 6 });
   });
 
+  /**
+   * Issue #82. A BLOCKED head is queue-eligible, so its `compareStatus` is what
+   * separates "behind the base" from "conflicts with it" — and stale compare
+   * evidence is what would let a conflicting head derive as merge-ready.
+   */
+  it('refreshes a BLOCKED head when the base branch tip moves', async () => {
+    const movedTip = 'dddddddddddddddddddddddddddddddddddddddd';
+    const context = probeWith(blockedBodies(), true, movedTip);
+
+    await expect(context.probe.changed(pr({ mergeStateStatus: 'BLOCKED' })))
+      .resolves.toBe(true);
+  });
+
+  it('reuses a BLOCKED head cached compare evidence when the tip is unchanged', async () => {
+    const context = probeWith(blockedBodies(), true);
+
+    await expect(context.probe.changed(pr({ mergeStateStatus: 'BLOCKED' })))
+      .resolves.toBe(false);
+  });
+
   it('refreshes merge-path compare evidence when the live base tip is unavailable', async () => {
     const meter = new GitHubUsageMeter();
     const unavailableProbe = new ConditionalPullRequestEvidenceProbe(
@@ -244,6 +279,30 @@ describe('ConditionalPullRequestEvidenceProbe', () => {
     );
 
     await expect(unavailableProbe.changed(pr())).resolves.toBe(true);
+  });
+
+  /**
+   * Queue membership is the one fact the enqueue stage acts on that can lapse
+   * with nothing else moving: an ejection changes no review, comment, check or
+   * label, so every other term of this predicate reads identical. Left out, a
+   * stale `enqueued: true` suppresses the re-enqueue forever.
+   */
+  it('refreshes a PR whose only change could be leaving the merge queue', async () => {
+    const context = probeWith(offMergePathBodies(), true);
+
+    await expect(context.probe.changed(pr({
+      ...OFF_MERGE_PATH,
+      mergeQueue: { enqueued: true, position: 1, state: 'QUEUED' },
+    }))).resolves.toBe(true);
+  });
+
+  it('does not refresh a PR that is merely not proven queued', async () => {
+    const context = probeWith(offMergePathBodies(), true);
+
+    await expect(context.probe.changed(pr({
+      ...OFF_MERGE_PATH,
+      mergeQueue: { enqueued: false },
+    }))).resolves.toBe(false);
   });
 
   it('still fails closed on malformed evidence for a merge-path PR', async () => {

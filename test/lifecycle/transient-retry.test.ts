@@ -288,7 +288,7 @@ describe('isRetryableReadCommand', () => {
  *
  * They cover the two argv-constructing shapes the metered boundary actually
  * carries — the REST `gh api` reads in `src/lifecycle/github-changed-files.ts`,
- * called from `merge-executor-production.ts:117` and
+ * called from `enqueue-executor-production.ts:117` and
  * `review-executor-production.ts:252` (`readExactChangedFiles`) and from
  * `github-reader.ts:1395` (`readExactCompareStatus`) — and the reader's
  * `git -C <path> ls-remote` reads

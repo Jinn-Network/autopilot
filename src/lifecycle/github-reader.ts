@@ -24,6 +24,7 @@ import type {
   RawNativeReview,
   RawPullRequest,
 } from './snapshot.js';
+import { queueEligibleMergeStateStatus } from './snapshot.js';
 import {
   decodeBranchClaimTrailers,
   decodeReviewClaimPayload,
@@ -50,7 +51,9 @@ const COMMIT_HISTORY_PAGE_SIZE = 100;
 const MAX_COMMIT_HISTORY_PAGES = 100;
 
 const PR_FIELDS = `
-        number title body updatedAt baseRefName headRefName headRefOid isDraft state
+        id number title body updatedAt baseRefName headRefName headRefOid isDraft state
+        isInMergeQueue
+        mergeQueueEntry { position state enqueuedAt }
         author { login }
         labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
         closingIssuesReferences(first: 20) { pageInfo { hasNextPage } nodes { number } }
@@ -176,6 +179,8 @@ export const REVIEW_CLAIM_REF_PREFIX = 'refs/jinn-autopilot/review-claims/v1/';
 export const REVIEW_CLAIM_REF_GLOB = `${REVIEW_CLAIM_REF_PREFIX}*`;
 export const CI_RERUN_REF_PREFIX = 'refs/jinn-autopilot/ci-reruns/v1/pr-';
 export const CI_RERUN_REF_GLOB = `${CI_RERUN_REF_PREFIX}*`;
+export const ENQUEUE_REF_PREFIX = 'refs/jinn-autopilot/enqueues/v1/pr-';
+export const ENQUEUE_REF_GLOB = `${ENQUEUE_REF_PREFIX}*`;
 const AUTOPILOT_BRANCH_REF_PREFIX = 'refs/heads/autopilot/';
 export const AUTOPILOT_BRANCH_REF_GLOB = `${AUTOPILOT_BRANCH_REF_PREFIX}*`;
 
@@ -420,6 +425,18 @@ interface GraphQlPrResponse {
 }
 
 interface GraphQlPr {
+  /**
+   * The PR's GraphQL node id — the `pullRequestId` the `enqueuePullRequest`
+   * mutation takes. Optional so a fixture or a cached page written before #82
+   * still decodes; absence means "cannot enqueue", never "enqueue anyway".
+   */
+  id?: string;
+  isInMergeQueue?: boolean;
+  mergeQueueEntry?: {
+    position?: number | null;
+    state?: string | null;
+    enqueuedAt?: string | null;
+  } | null;
   number: number;
   title: string;
   body: string;
@@ -669,6 +686,31 @@ function rawMergedPullRequest(pr: GraphQlMergedPr): RawPullRequest {
   };
 }
 
+/**
+ * Merge-queue membership, read from the two fields that answer it: the boolean
+ * GitHub sets on the PR and the entry it exposes while the PR sits in a queue.
+ * `enqueued` is true when either says so, because an entry with a state but no
+ * flag (or the reverse) still means the PR is in the queue — and a candidate
+ * already in the queue must short-circuit rather than be enqueued twice.
+ */
+function mergeQueueEvidence(pr: GraphQlPr): {
+  readonly enqueued: boolean;
+  readonly position?: number;
+  readonly state?: string;
+} {
+  const entry = pr.mergeQueueEntry ?? null;
+  const enqueued = pr.isInMergeQueue === true || entry !== null;
+  return {
+    enqueued,
+    ...(typeof entry?.position === 'number' && Number.isSafeInteger(entry.position)
+      ? { position: entry.position }
+      : {}),
+    ...(typeof entry?.state === 'string' && entry.state.length > 0
+      ? { state: entry.state }
+      : {}),
+  };
+}
+
 function inconsistentPullRequest(
   pr: GraphQlPr,
   error: PrEvidenceInconsistentError,
@@ -732,12 +774,24 @@ function reviewedDiffCarryInQuestion(
   }
 }
 
-function looksFalseCleanMergeState(
+/**
+ * Does this pull request need the exact REST compare read?
+ *
+ * GraphQL's `mergeStateStatus` cannot separate "behind the base" from "conflicts
+ * with the base" on its own, and the enqueue stage needs that distinction:
+ * behind is the queue's ordinary input, conflicting is the one shape it cannot
+ * build a candidate from. So every state the queue can still take gets the
+ * compare read — BLOCKED included (issue #82), because a queued pull request
+ * and one waiting on a merge-group-only context both report BLOCKED, and
+ * skipping the read would leave them with `unknown` compare evidence, which
+ * derives as `blocked` and strands them outside the stage.
+ */
+function queueEligibleMergeState(
   mergeability: RawPullRequest['mergeability'],
   mergeStateStatus: string,
 ): boolean {
   return mergeability === 'MERGEABLE'
-    && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(mergeStateStatus);
+    && queueEligibleMergeStateStatus(mergeStateStatus);
 }
 
 function checks(pr: GraphQlPr): RawPullRequest['checks'] {
@@ -912,6 +966,25 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       const [, ref] = line.split('\t');
       if (ref === undefined || !ref.startsWith(CI_RERUN_REF_PREFIX)) continue;
       recorded.add(ref.slice(CI_RERUN_REF_PREFIX.length));
+    }
+    return recorded;
+  }
+
+  /**
+   * One `git ls-remote` listing of the enqueue-attempt CAS namespace per
+   * snapshot, keyed exactly like the CI-rerun listing above (`<pr>/<headOid>`).
+   * The refs are per-head, so a new commit resets the attempt count by
+   * construction — a missing entry is "no attempt recorded for *this* head".
+   */
+  private async listEnqueueRecordedHeads(): Promise<Set<string>> {
+    const raw = await this.gitRun(['ls-remote', this.remoteName, ENQUEUE_REF_GLOB]);
+    const trimmed = raw.trimEnd();
+    const recorded = new Set<string>();
+    if (trimmed.length === 0) return recorded;
+    for (const line of trimmed.split('\n')) {
+      const [, ref] = line.split('\t');
+      if (ref === undefined || !ref.startsWith(ENQUEUE_REF_PREFIX)) continue;
+      recorded.add(ref.slice(ENQUEUE_REF_PREFIX.length));
     }
     return recorded;
   }
@@ -1394,6 +1467,10 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       headOid: pr.headRefOid,
       headCommittedAt: latest.committedDate,
       updatedAt: pr.updatedAt,
+      ...(typeof pr.id === 'string' && pr.id.length > 0 ? { graphqlId: pr.id } : {}),
+      ...(pr.isInMergeQueue === undefined && pr.mergeQueueEntry === undefined
+        ? {}
+        : { mergeQueue: mergeQueueEvidence(pr) }),
       isDraft: pr.isDraft,
       state: pr.state,
       labels: pr.labels.nodes.map((label) => label.name),
@@ -1424,7 +1501,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       // reading is identical to the merge gate's — see `proveReviewedDiff` — and
       // that proof is only paid for when a carry is actually in question, i.e.
       // for a PR that was just update-branched under a recorded approval.
-      ...(pr.state === 'OPEN' && looksFalseCleanMergeState(pr.mergeable, pr.mergeStateStatus)
+      ...(pr.state === 'OPEN' && queueEligibleMergeState(pr.mergeable, pr.mergeStateStatus)
         ? await readExactCompareEvidence({
             run: this.run,
             prNumber: pr.number,
@@ -1645,16 +1722,20 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     // GraphQL ref read per PR.
     const reviewClaimListing = await this.listReviewClaimRefs();
     const ciRerunRecorded = await this.listCiRerunRecordedHeads();
+    const enqueueRecorded = await this.listEnqueueRecordedHeads();
     const openNodes = await Promise.all(connection.nodes.map((pr) => (
       this.rawPullRequest(pr, true, reviewClaimListing).catch((error: unknown) => {
         if (!(error instanceof PrEvidenceInconsistentError)) throw error;
         return inconsistentPullRequest(pr, error);
       })
-    ))).then((nodes) => nodes.map((pr) => (
-      ciRerunRecorded.has(`${pr.number}/${pr.headOid}`)
-        ? { ...pr, ciRerunRecorded: true as const }
-        : pr
-    )));
+    ))).then((nodes) => nodes.map((pr) => {
+      const key = `${pr.number}/${pr.headOid}`;
+      return {
+        ...pr,
+        ...(ciRerunRecorded.has(key) ? { ciRerunRecorded: true as const } : {}),
+        ...(enqueueRecorded.has(key) ? { enqueueRecorded: true as const } : {}),
+      };
+    }));
     const mergedOutcomes = cursor === null
       ? await this.readMergedOutcomes(nonDoneIssueNumbers, reviewClaimListing)
       : { nodes: [], closingIssueEvidenceIncomplete: false };

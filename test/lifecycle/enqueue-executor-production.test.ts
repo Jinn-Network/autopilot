@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
-  classifyUpdateBranchFailure,
-  makeProductionMergeActionPort,
-} from '../../src/lifecycle/merge-executor-production.js';
+  classifyEnqueueFailure,
+  makeProductionEnqueueActionPort,
+} from '../../src/lifecycle/enqueue-executor-production.js';
 import {
-  executeMergeAction,
-  executeUpdateBranchAction,
-} from '../../src/lifecycle/merge-executor.js';
+  executeEnqueueAction,
+} from '../../src/lifecycle/enqueue-executor.js';
 import { CredentialPool, selectCredential } from '../../src/lifecycle/credentials.js';
 import type {
   GitHubLifecycleSnapshot,
@@ -14,8 +13,11 @@ import type {
 } from '../../src/lifecycle/snapshot.js';
 import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
 import { resolveStructuredPullRequestMappings } from '../../src/lifecycle/pr-mapping.js';
-import { evaluateMergeGate } from '../../src/lifecycle/merge-executor.js';
+import { evaluateEnqueueGate } from '../../src/lifecycle/enqueue-executor.js';
 import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
+import {
+  CANONICAL_GITHUB_HTTPS_REMOTE,
+} from '../../src/lifecycle/implementation-executor.js';
 
 const HEAD = gitOid('1'.repeat(40));
 const OTHER_HEAD = gitOid('2'.repeat(40));
@@ -59,6 +61,7 @@ function snapshot(
       headRefName: 'autopilot/84',
       headOid: HEAD,
       headCommittedAt: isoTimestamp('2026-07-20T00:00:00.000Z'),
+      graphqlId: 'PR_kwDOABCD84',
       isDraft: false,
       state: 'OPEN',
       labels: ['engine:review'],
@@ -182,7 +185,7 @@ function candidateRunner(changedFiles: number, filenames: readonly string[]) {
   };
 }
 
-describe('production head-pinned merge port', () => {
+describe('production head-pinned enqueue port', () => {
   it('does not treat stale painter-owned Project Status Human as authority', async () => {
     const current = snapshot();
     const staleStatus: GitHubLifecycleSnapshot = {
@@ -196,7 +199,7 @@ describe('production head-pinned merge port', () => {
         )),
       },
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => staleStatus,
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -240,17 +243,17 @@ describe('production head-pinned merge port', () => {
         }),
       ],
     },
-  ])('does not merge when $name before the final reread', async ({ finalReviews }) => {
+  ])('does not enqueue when $name before the final reread', async ({ finalReviews }) => {
     let candidateReads = 0;
     let mergeCalls = 0;
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(candidateReads++ === 0 ? undefined : finalReviews),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
       runner: candidateRunner(1, ['GREETING.md']),
     });
 
-    const result = await executeMergeAction({
+    const result = await executeEnqueueAction({
       prNumber: 84,
       expectedHead: HEAD,
       expectedBaseRefName: gitRefName('stack/base'),
@@ -261,11 +264,10 @@ describe('production head-pinned merge port', () => {
         normalizedLogin: 'implementation-bot',
         implementationToken: 'selected-secret',
       }]),
-      mergeExactHead: async ({ head }) => {
+      enqueueAtHead: async ({ head }) => {
         mergeCalls += 1;
-        return { status: 'merged', head, mergeCommitOid: OTHER_HEAD };
+        return { status: 'enqueued', head };
       },
-      reconcileDone: async () => {},
     });
 
     expect(result).toMatchObject({
@@ -278,7 +280,7 @@ describe('production head-pinned merge port', () => {
 
   it('uses each reviewer latest exact-head state when checking native blockers', async () => {
     let mergeCalls = 0;
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot([
         approvedReview(),
         approvedReview({
@@ -298,7 +300,7 @@ describe('production head-pinned merge port', () => {
       runner: candidateRunner(1, ['GREETING.md']),
     });
 
-    const result = await executeMergeAction({
+    const result = await executeEnqueueAction({
       prNumber: 84,
       expectedHead: HEAD,
       expectedBaseRefName: gitRefName('stack/base'),
@@ -309,14 +311,13 @@ describe('production head-pinned merge port', () => {
         normalizedLogin: 'implementation-bot',
         implementationToken: 'selected-secret',
       }]),
-      mergeExactHead: async ({ head }) => {
+      enqueueAtHead: async ({ head }) => {
         mergeCalls += 1;
-        return { status: 'merged', head, mergeCommitOid: OTHER_HEAD };
+        return { status: 'enqueued', head };
       },
-      reconcileDone: async () => {},
     });
 
-    expect(result).toMatchObject({ status: 'merged', head: HEAD });
+    expect(result).toMatchObject({ status: 'enqueued', head: HEAD });
     expect(mergeCalls).toBe(1);
   });
 
@@ -335,12 +336,16 @@ describe('production head-pinned merge port', () => {
           baseRefName: 'next',
         });
       }
-      if (command === 'gh' && args.includes('-X') && args.includes('PUT')) {
-        return JSON.stringify({ merged: true, sha: '2'.repeat(40), message: 'merged' });
+      if (command === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+        return JSON.stringify({
+          data: {
+            enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } },
+          },
+        });
       }
       throw new Error(`unexpected ${command} ${args.join(' ')}`);
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshotWithBase('next'),
       authorAllowlist: new Set(['implementation-bot']),
       runner,
@@ -353,23 +358,25 @@ describe('production head-pinned merge port', () => {
     }]), { phase: 'merge' });
     if (selection.status !== 'selected') throw new Error('selection failed');
 
-    await expect(port.mergeExactHead({
+    await expect(port.enqueueAtHead({
       prNumber: 84,
+      issueNumber: 84,
       head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
       expectedBaseRefName: gitRefName('next'),
       credential: selection.credential,
-    })).resolves.toMatchObject({ status: 'merged', head: HEAD });
+    })).resolves.toMatchObject({ status: 'enqueued', head: HEAD });
 
-    const merge = calls.find((call) =>
-      call.args.some((arg) => arg.endsWith('pulls/84/merge')));
-    expect(merge?.args).toContain(`sha=${HEAD}`);
-    expect(merge?.args).toContain('merge_method=squash');
-    expect(merge?.args.join(' ')).not.toMatch(/admin|bypass/i);
-    expect(merge?.env?.GH_TOKEN).toBe('selected-secret');
-    expect(merge?.env?.GITHUB_TOKEN).toBe('');
+    const mutation = calls.find((call) =>
+      call.args[0] === 'api' && call.args[1] === 'graphql');
+    expect(mutation?.args).toContain(`expectedHeadOid=${HEAD}`);
+    expect(mutation?.args).toContain('pullRequestId=PR_kwDOABCD84');
+    expect(mutation?.args.join(' ')).not.toMatch(/admin|bypass|--auto/i);
+    expect(mutation?.env?.GH_TOKEN).toBe('selected-secret');
+    expect(mutation?.env?.GITHUB_TOKEN).toBe('');
   });
 
-  it('rereads and rejects a retargeted base immediately before the merge PUT', async () => {
+  it('rereads and rejects a retargeted base immediately before the enqueue', async () => {
     let mergeCalls = 0;
     const runner = async (
       command: string,
@@ -389,7 +396,7 @@ describe('production head-pinned merge port', () => {
       }
       throw new Error(`unexpected ${args.join(' ')}`);
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -402,9 +409,11 @@ describe('production head-pinned merge port', () => {
     }]), { phase: 'merge' });
     if (selection.status !== 'selected') throw new Error('selection failed');
 
-    await expect(port.mergeExactHead({
+    await expect(port.enqueueAtHead({
       prNumber: 84,
+      issueNumber: 84,
       head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
       expectedBaseRefName: gitRefName('stack/base'),
       credential: selection.credential,
     })).resolves.toMatchObject({
@@ -460,7 +469,7 @@ describe('production head-pinned merge port', () => {
       }],
     },
   ])(
-    'rejects $name from a distinctly recomputed final canonical snapshot before merge',
+    'rejects $name from a distinctly recomputed final canonical snapshot before enqueue',
     async ({ livePullRequests }) => {
     let mergeCalls = 0;
     const current = snapshot();
@@ -493,7 +502,7 @@ describe('production head-pinned merge port', () => {
       ],
       pullRequestMappings: mappings,
     } as unknown as GitHubLifecycleSnapshot;
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => ambiguous,
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -509,9 +518,11 @@ describe('production head-pinned merge port', () => {
     }]), { phase: 'merge' });
     if (selection.status !== 'selected') throw new Error('selection failed');
 
-    await expect(port.mergeExactHead({
+    await expect(port.enqueueAtHead({
       prNumber: 84,
+      issueNumber: 84,
       head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
       expectedBaseRefName: gitRefName('stack/base'),
       credential: selection.credential,
     })).resolves.toMatchObject({
@@ -523,7 +534,7 @@ describe('production head-pinned merge port', () => {
 
   it('fails closed when the candidate snapshot omits canonical mapping authority', async () => {
     const current = snapshot();
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => ({ ...current, pullRequestMappings: undefined }),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -538,7 +549,7 @@ describe('production head-pinned merge port', () => {
     { name: 'GitHub file endpoint ceiling is exceeded', total: 3_001, files: ['src/a.ts'] },
     { name: 'returned filenames are duplicated', total: 2, files: ['src/a.ts', 'src/a.ts'] },
   ])('fails changed-file completeness when $name', async ({ total, files }) => {
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -552,7 +563,7 @@ describe('production head-pinned merge port', () => {
   });
 
   it('binds complete files and CODEOWNERS to the exact candidate base OID', async () => {
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -579,7 +590,7 @@ describe('production head-pinned merge port', () => {
       }
       return candidateRunner(1, ['GREETING.md'])(command, args);
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -625,7 +636,7 @@ describe('merge candidate CODEOWNERS authority', () => {
 
   it('reads CODEOWNERS at the base branch tip, not at the pinned fork point', async () => {
     const seen: string[] = [];
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -660,7 +671,7 @@ describe('merge candidate CODEOWNERS authority', () => {
    */
   it('drops sensitivity for a rule deleted from the base after the PR forked', async () => {
     const seen: string[] = [];
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -679,9 +690,39 @@ describe('merge candidate CODEOWNERS authority', () => {
     });
   });
 
+  // The gate compares an owner-approval at the exact head against this set, and
+  // an empty set is the fail-safe: nobody is proven to be an owner, so every
+  // sensitive change refuses. The option only earns its keep if the port
+  // actually carries it onto the candidate.
+  it('carries the configured code-owner logins onto the candidate', async () => {
+    const port = makeProductionEnqueueActionPort({
+      readSnapshot: async () => snapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      codeOwnerLogins: new Set(['Owner-One', 'owner-two']),
+      runner: codeownersRunner({ atForkPoint: '', atTip: '', seen: [] }),
+    });
+
+    const candidate = await port.readCandidate(84);
+    expect([...candidate!.codeOwnerLogins].sort())
+      .toEqual(['Owner-One', 'owner-two']);
+  });
+
+  it('defaults the code-owner logins to the empty fail-safe set', async () => {
+    const port = makeProductionEnqueueActionPort({
+      readSnapshot: async () => snapshot(),
+      authorAllowlist: new Set(['implementation-bot']),
+      expectedBaseRefName: 'stack/base',
+      runner: codeownersRunner({ atForkPoint: '', atTip: '', seen: [] }),
+    });
+
+    const candidate = await port.readCandidate(84);
+    expect([...candidate!.codeOwnerLogins]).toEqual([]);
+  });
+
   it('pins CODEOWNERS through heads/ so a same-named tag cannot hijack it', async () => {
     const seen: string[] = [];
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -698,289 +739,11 @@ describe('merge candidate CODEOWNERS authority', () => {
 });
 
 /**
- * `update-branch` diagnosis. `PUT /pulls/{n}/update-branch` answers **202
- * Accepted**: GitHub queues the update and the head has not moved when the call
- * returns. The old port read the head back exactly once and called any
- * unchanged head `rejected`, which reported a merge conflict for an update
- * merely in flight — and identically for a 403 refusal, a secondary rate limit,
- * and a dropped socket. Live evidence: PR #2130 was reported `rejected`, then
- * the identical operation later succeeded unchanged.
- */
-describe('update-branch failure classification', () => {
-  const ACCOUNT = {
-    login: 'implementation-bot',
-    normalizedLogin: 'implementation-bot',
-    implementationToken: 'selected-secret',
-  } as const;
-
-  function credential() {
-    const selection = selectCredential(new CredentialPool([ACCOUNT]), { phase: 'merge' });
-    if (selection.status !== 'selected') throw new Error('selection failed');
-    return selection.credential;
-  }
-
-  function updateBranchPort(input: {
-    readonly updateBranch: () => Promise<string>;
-    readonly heads: readonly string[];
-    readonly sleeps: number[];
-  }) {
-    let readbacks = 0;
-    const runner = async (command: string, args: readonly string[]): Promise<string> => {
-      if (args[0] === 'pr' && args[1] === 'update-branch') {
-        return input.updateBranch();
-      }
-      if (args[0] === 'pr' && args[1] === 'view') {
-        const head = input.heads[Math.min(readbacks, input.heads.length - 1)];
-        readbacks += 1;
-        if (head === undefined) throw new Error('gh: connection reset by peer');
-        return JSON.stringify({ headRefOid: head });
-      }
-      // These cases are about a head that genuinely needs updating, so the
-      // executor's up-to-date staleness guard must not short-circuit them.
-      if (args.some((arg) => arg.includes('/compare/'))) {
-        return JSON.stringify({ status: 'behind' });
-      }
-      return candidateRunner(1, ['GREETING.md'])(command, args);
-    };
-    return {
-      readbacks: () => readbacks,
-      port: makeProductionMergeActionPort({
-        readSnapshot: async () => snapshot(),
-        authorAllowlist: new Set(['implementation-bot']),
-        expectedBaseRefName: 'stack/base',
-        runner,
-        sleep: async (milliseconds: number) => { input.sleeps.push(milliseconds); },
-      }),
-    };
-  }
-
-  it.each([
-    ['422 unprocessable', 'gh: HTTP 422: Unprocessable Entity', 'conflict'],
-    ['merge conflict prose', 'merge conflict between base and head', 'conflict'],
-    ['403 refusal', 'gh: HTTP 403: Resource not accessible by integration', 'forbidden'],
-    ['401 credentials', 'gh: HTTP 401: Bad credentials', 'forbidden'],
-    ['secondary rate limit', 'HTTP 403: You have exceeded a secondary rate limit', 'rate-limited'],
-    ['primary rate limit', 'gh: HTTP 429: API rate limit exceeded', 'rate-limited'],
-    ['server error', 'gh: HTTP 502: Bad Gateway', 'unavailable'],
-    ['socket failure', 'dial tcp: ECONNRESET', 'unavailable'],
-    ['nothing recognisable', 'gh: something nobody has seen before', 'unclassified'],
-  ] as const)('classifies %s as %s', (_name, text, expected) => {
-    expect(classifyUpdateBranchFailure(text)).toBe(expected);
-  });
-
-  it('never guesses conflict for an unrecognised failure', () => {
-    expect(classifyUpdateBranchFailure('totally novel gh failure')).not.toBe('conflict');
-  });
-
-  it('tolerates the documented 202 async queue and reports the later head move', async () => {
-    const sleeps: number[] = [];
-    const { port } = updateBranchPort({
-      updateBranch: async () => '\u2713 PR branch updated\n',
-      // 202 Accepted: the head has not moved yet on the first readback.
-      heads: [HEAD, HEAD, OTHER_HEAD],
-      sleeps,
-    });
-
-    await expect(port.updateBranch!({
-      prNumber: 84,
-      expectedHead: HEAD,
-      credential: credential(),
-    })).resolves.toEqual({ status: 'updated', head: OTHER_HEAD });
-    expect(sleeps.length).toBeGreaterThan(0);
-  });
-
-  it('reports a still-queued update as pending, never rejected', async () => {
-    const sleeps: number[] = [];
-    const { port } = updateBranchPort({
-      updateBranch: async () => '\u2713 PR branch updated\n',
-      heads: [HEAD],
-      sleeps,
-    });
-
-    await expect(port.updateBranch!({
-      prNumber: 84,
-      expectedHead: HEAD,
-      credential: credential(),
-    })).resolves.toEqual({ status: 'pending', head: HEAD, failure: 'queued' });
-  });
-
-  it.each([
-    ['gh: HTTP 422: Unprocessable Entity', 'rejected', 'conflict'],
-    ['gh: HTTP 403: Resource not accessible by integration', 'rejected', 'forbidden'],
-    ['HTTP 403: You have exceeded a secondary rate limit', 'pending', 'rate-limited'],
-    ['gh: HTTP 503: Service Unavailable', 'pending', 'unavailable'],
-    ['gh: unexplained failure', 'pending', 'unclassified'],
-  ] as const)('maps %s to %s/%s', async (message, status, failure) => {
-    const sleeps: number[] = [];
-    const { port } = updateBranchPort({
-      updateBranch: async () => { throw new Error(message); },
-      heads: [HEAD],
-      sleeps,
-    });
-
-    await expect(port.updateBranch!({
-      prNumber: 84,
-      expectedHead: HEAD,
-      credential: credential(),
-    })).resolves.toEqual({ status, head: HEAD, failure });
-  });
-
-  it('does not burn the readback budget on a durable conflict', async () => {
-    const sleeps: number[] = [];
-    const harness = updateBranchPort({
-      updateBranch: async () => { throw new Error('gh: HTTP 422: Unprocessable Entity'); },
-      heads: [HEAD],
-      sleeps,
-    });
-
-    await harness.port.updateBranch!({
-      prNumber: 84,
-      expectedHead: HEAD,
-      credential: credential(),
-    });
-    expect(harness.readbacks()).toBe(1);
-    expect(sleeps).toEqual([]);
-  });
-
-  it('accepts a head move even when the update-branch call reported an error', async () => {
-    const sleeps: number[] = [];
-    const { port } = updateBranchPort({
-      updateBranch: async () => { throw new Error('gh: HTTP 422: Unprocessable Entity'); },
-      heads: [OTHER_HEAD],
-      sleeps,
-    });
-
-    await expect(port.updateBranch!({
-      prNumber: 84,
-      expectedHead: HEAD,
-      credential: credential(),
-    })).resolves.toEqual({ status: 'updated', head: OTHER_HEAD });
-  });
-
-  it('treats an unreadable head as undetermined rather than a refusal', async () => {
-    const sleeps: number[] = [];
-    const { port } = updateBranchPort({
-      updateBranch: async () => '\u2713 PR branch updated\n',
-      heads: [undefined as unknown as string],
-      sleeps,
-    });
-
-    await expect(port.updateBranch!({
-      prNumber: 84,
-      expectedHead: HEAD,
-      credential: credential(),
-    })).resolves.toEqual({ status: 'pending', head: HEAD, failure: 'unavailable' });
-  });
-
-  it('surfaces a throttled update to the executor as pending, not rejected', async () => {
-    const sleeps: number[] = [];
-    const { port } = updateBranchPort({
-      updateBranch: async () => {
-        throw new Error('HTTP 403: You have exceeded a secondary rate limit');
-      },
-      heads: [HEAD],
-      sleeps,
-    });
-
-    await expect(executeUpdateBranchAction({ prNumber: 84, expectedHead: HEAD }, {
-      ...port,
-      credentials: new CredentialPool([ACCOUNT]),
-    })).resolves.toEqual({
-      status: 'pending',
-      prNumber: 84,
-      reason: 'update-branch-rate-limited',
-    });
-  });
-});
-
-/**
- * The `already-up-to-date` outcome, straight from `gh`'s own behaviour.
- *
- * `gh pr update-branch` (cli/cli v2.78, `pkg/cmd/pr/update-branch/update_branch.go`)
- * runs its own compare first. When `behind_by == 0` it prints
- * `PR branch already up-to-date` to **stdout** and returns nil — exit 0, no API
- * mutation at all. `defaultRunner` returns stdout, so this is observable;
- * gh's failure messages go to stderr and are not.
- *
- * That is the exact shape of PR #2229: `ahead_by=4, behind_by=0`, reported by
- * the old code as `rejected (update-branch-rejected)` — the same string it
- * emitted for PR #2130, whose true cause was the opposite.
- */
-describe('update-branch reports nothing-to-do as success', () => {
-  const ACCOUNT_2229 = {
-    login: 'implementation-bot',
-    normalizedLogin: 'implementation-bot',
-    implementationToken: 'selected-secret',
-  } as const;
-
-  function pick() {
-    const selection = selectCredential(new CredentialPool([ACCOUNT_2229]), { phase: 'merge' });
-    if (selection.status !== 'selected') throw new Error('selection failed');
-    return selection.credential;
-  }
-
-  function port(update: () => Promise<string>, sleeps: number[]) {
-    let readbacks = 0;
-    return {
-      readbacks: () => readbacks,
-      value: makeProductionMergeActionPort({
-        readSnapshot: async () => snapshot(),
-        authorAllowlist: new Set(['implementation-bot']),
-        expectedBaseRefName: 'stack/base',
-        runner: async (command, args) => {
-          if (args[0] === 'pr' && args[1] === 'update-branch') return update();
-          if (args[0] === 'pr' && args[1] === 'view') {
-            readbacks += 1;
-            return JSON.stringify({ headRefOid: HEAD });
-          }
-          return candidateRunner(1, ['GREETING.md'])(command, args);
-        },
-        sleep: async (milliseconds: number) => { sleeps.push(milliseconds); },
-      }),
-    };
-  }
-
-  it.each([
-    ['gh success line', '✓ PR branch already up-to-date\n'],
-    ['unstyled variant', 'PR branch already up to date\n'],
-  ])('reports %s as already-up-to-date, not rejected', async (_name, output) => {
-    const sleeps: number[] = [];
-    const harness = port(async () => output, sleeps);
-
-    await expect(harness.value.updateBranch!({
-      prNumber: 2229,
-      expectedHead: HEAD,
-      credential: pick(),
-    })).resolves.toEqual({ status: 'already-up-to-date', head: HEAD });
-    // Nothing is queued, so nothing is worth waiting for.
-    expect(harness.readbacks()).toBe(1);
-    expect(sleeps).toEqual([]);
-  });
-
-  it('does not mistake a real update for an up-to-date no-op', async () => {
-    const sleeps: number[] = [];
-    const harness = port(async () => '✓ PR branch updated\n', sleeps);
-
-    await expect(harness.value.updateBranch!({
-      prNumber: 2130,
-      expectedHead: HEAD,
-      credential: pick(),
-    })).resolves.toMatchObject({ status: 'pending', failure: 'queued' });
-  });
-
-  it.each([
-    ['gh pre-flight refusal', 'Cannot update PR branch due to conflicts'],
-    [
-      'GraphQL mutation refusal',
-      'GraphQL: merge conflict between base and head (updatePullRequestBranch)',
-    ],
-  ])('classifies the real gh conflict wording (%s) as conflict', (_name, text) => {
-    expect(classifyUpdateBranchFailure(text)).toBe('conflict');
-  });
-});
-
-/**
  * Carrying an approval across an `update-branch` head.
+ *
+ * The engine no longer performs `update-branch` — the merge queue rebases its
+ * own candidate — but a human can still press GitHub's "Update branch" button,
+ * and this is what stops that click from stranding an approved PR.
  *
  * `update-branch` merges the base into the PR branch. That mints a new head
  * commit but changes nothing the reviewer read, and GitHub re-points the
@@ -1094,7 +857,7 @@ function carriedPort(
   compareFiles: unknown,
   filenames: readonly string[] = ['GREETING.md'],
 ) {
-  return makeProductionMergeActionPort({
+  return makeProductionEnqueueActionPort({
     readSnapshot: async () => snapshotValue,
     authorAllowlist: new Set(['implementation-bot']),
     expectedBaseRefName: 'stack/base',
@@ -1109,11 +872,11 @@ describe('approval carry across an update-branch head', () => {
     expect(candidate).not.toBeNull();
     expect(candidate!.head).toBe(CARRIED_HEAD);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateMergeGate(candidate!)).toEqual({ pass: true, reasons: [] });
+    expect(evaluateEnqueueGate(candidate!)).toEqual({ pass: true, reasons: [] });
   });
 
-  it('merges at the new head under the carried approval', async () => {
-    const merged = await executeMergeAction(
+  it('enqueues at the new head under the carried approval', async () => {
+    const enqueued = await executeEnqueueAction(
       {
         prNumber: 84,
         expectedHead: CARRIED_HEAD,
@@ -1126,15 +889,10 @@ describe('approval carry across an update-branch head', () => {
           normalizedLogin: 'implementation-bot',
           implementationToken: 'selected-secret',
         }]),
-        mergeExactHead: async () => ({
-          status: 'merged',
-          head: CARRIED_HEAD,
-          mergeCommitOid: gitOid('9'.repeat(40)),
-        }),
-        reconcileDone: async () => undefined,
+        enqueueAtHead: async () => ({ status: 'enqueued', head: CARRIED_HEAD }),
       },
     );
-    expect(merged).toMatchObject({ status: 'merged', head: CARRIED_HEAD });
+    expect(enqueued).toMatchObject({ status: 'enqueued', head: CARRIED_HEAD });
   });
 
   it('does not carry when a base change altered a file the PR also changed', async () => {
@@ -1146,7 +904,7 @@ describe('approval carry across an update-branch head', () => {
     }];
     const candidate = await carriedPort(carriedSnapshot(), rebased).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it('does not carry when a worker pushed a real code change', async () => {
@@ -1167,7 +925,7 @@ describe('approval carry across an update-branch head', () => {
       ['GREETING.md', 'src/backdoor.ts'],
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it('does not carry a claim written before digests existed', async () => {
@@ -1176,7 +934,7 @@ describe('approval carry across an update-branch head', () => {
       REVIEWED_FILES,
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it.each([
@@ -1202,7 +960,7 @@ describe('approval carry across an update-branch head', () => {
       filenames,
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it('does not carry a digest that matches some other PR head state', async () => {
@@ -1272,9 +1030,9 @@ describe('approval carry across an update-branch head', () => {
       'checks-not-green',
     ],
     [
-      'mergeability',
+      'a conflicting head',
       { prOverrides: { mergeability: 'CONFLICTING', mergeStateStatus: 'DIRTY' } },
-      'mergeability',
+      'conflicting',
     ],
     [
       'review-label',
@@ -1304,14 +1062,14 @@ describe('approval carry across an update-branch head', () => {
     ).readCandidate(84);
     // The approval itself still carries — only the independent reason blocks.
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    const gate = evaluateMergeGate(candidate!);
+    const gate = evaluateEnqueueGate(candidate!);
     expect(gate.pass).toBe(false);
     expect(gate.reasons).toContain(reason);
     expect(gate.reasons).not.toContain('terminal-approval');
   });
 
   it('a matching digest does not unblock a disallowed author', async () => {
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => carriedSnapshot(),
       authorAllowlist: new Set(['someone-else']),
       expectedBaseRefName: 'stack/base',
@@ -1319,11 +1077,16 @@ describe('approval carry across an update-branch head', () => {
     });
     const candidate = await port.readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('author');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('author');
   });
 
-  it('a matching digest does not unblock a behind head', async () => {
-    const port = makeProductionMergeActionPort({
+  /**
+   * A behind head is the merge queue's ordinary input, not a refusal — the
+   * queue rebases onto the base it merges into. What the carry must still not
+   * do is *manufacture* an approval, which the surrounding cases pin.
+   */
+  it('does not refuse a behind head once the digest carries', async () => {
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => carriedSnapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -1337,6 +1100,577 @@ describe('approval carry across an update-branch head', () => {
     });
     const candidate = await port.readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('behind');
+    expect(evaluateEnqueueGate(candidate!)).toEqual({ pass: true, reasons: [] });
+  });
+});
+
+/**
+ * The enqueue mutation itself (#82). The engine no longer merges: it hands the
+ * PR to GitHub's merge queue with `enqueuePullRequest`, pinned to the exact head
+ * it gated. `gh pr merge` — with or without `--auto` — must never run, because
+ * it would either merge outside the queue or hand GitHub a standing instruction
+ * the engine cannot retract.
+ */
+describe('enqueue mutation', () => {
+  const ACCOUNT = {
+    login: 'implementation-bot',
+    normalizedLogin: 'implementation-bot',
+    implementationToken: 'selected-secret',
+  } as const;
+
+  function credential() {
+    const selection = selectCredential(new CredentialPool([ACCOUNT]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    return selection.credential;
+  }
+
+  interface EnqueueHarness {
+    readonly calls: Array<{ command: string; args: readonly string[]; env?: NodeJS.ProcessEnv }>;
+    readonly port: ReturnType<typeof makeProductionEnqueueActionPort>;
+  }
+
+  function enqueuePort(input: {
+    readonly mutation?: () => Promise<string>;
+    readonly view?: (call: number) => Promise<string>;
+    readonly refs?: Record<string, string>;
+    readonly catFile?: (oid: string) => string;
+    readonly lsRemoteFails?: boolean;
+    readonly fetchFails?: boolean;
+    readonly pushFails?: boolean;
+    readonly onPush?: (args: readonly string[]) => void;
+    readonly childNumber?: number;
+  } = {}): EnqueueHarness {
+    let views = 0;
+    const calls: Array<{
+      command: string;
+      args: readonly string[];
+      env?: NodeJS.ProcessEnv;
+    }> = [];
+    const refs = { ...(input.refs ?? {}) };
+    const runner = async (
+      command: string,
+      args: readonly string[],
+      options?: { readonly env?: NodeJS.ProcessEnv },
+    ): Promise<string> => {
+      calls.push({ command, args, env: options?.env });
+      if (command === 'git') {
+        const rest = args.slice(args.indexOf('-C') + 2);
+        if (rest[0] === 'ls-remote') {
+          if (input.lsRemoteFails === true) throw new Error('could not read Username');
+          const ref = rest[2] ?? '';
+          return refs[ref] === undefined ? '' : `${refs[ref]}\t${ref}\n`;
+        }
+        if (rest[0] === 'fetch') {
+          if (input.fetchFails === true) throw new Error('couldn\'t find remote ref');
+          return '';
+        }
+        if (rest[0] === 'commit-tree') return `${'e'.repeat(40)}\n`;
+        if (rest[0] === 'cat-file') return input.catFile?.(rest[2] ?? '') ?? '';
+        if (rest[0] === 'push') {
+          input.onPush?.(rest);
+          if (input.pushFails === true) throw new Error('stale info');
+          return '';
+        }
+        return '';
+      }
+      if (
+        args[0] === 'api'
+        && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('enqueuePullRequest'))
+      ) {
+        return (input.mutation ?? (async () => JSON.stringify({
+          data: {
+            enqueuePullRequest: { mergeQueueEntry: { position: 4, state: 'QUEUED' } },
+          },
+        })))();
+      }
+      if (args[0] === 'pr' && args[1] === 'view') {
+        const call = views;
+        views += 1;
+        return (input.view ?? ((): Promise<string> => Promise.resolve(JSON.stringify({
+          state: 'OPEN',
+          headRefOid: HEAD,
+          baseRefName: 'stack/base',
+          isInMergeQueue: false,
+        }))))(call);
+      }
+      // The `ci-failure` child the flake hold files, and everything the child
+      // port does around it.
+      if (args[0] === 'project' && args[1] === 'field-list') {
+        return JSON.stringify({
+          fields: [
+            {
+              id: 'F_blocked',
+              name: 'Blocked on',
+              options: [
+                { id: 'O_nothing', name: 'Nothing' },
+                { id: 'O_human', name: 'Human' },
+              ],
+            },
+            {
+              id: 'F_effort',
+              name: 'Effort',
+              options: ['Low', 'Medium', 'High', 'XHigh', 'Max']
+                .map((name) => ({ id: `O_effort_${name}`, name })),
+            },
+            {
+              id: 'F_priority',
+              name: 'Priority',
+              options: ['P0', 'P1', 'P2', 'P3', 'P4']
+                .map((name) => ({ id: `O_priority_${name}`, name })),
+            },
+          ],
+        });
+      }
+      if (args[0] === 'project' && args[1] === 'item-add') {
+        return JSON.stringify({ id: 'PVTI_child' });
+      }
+      if (args[0] === 'project') return JSON.stringify({});
+      if (args[0] === 'issue' && args[1] === 'create') {
+        return `https://github.com/${'Jinn-Network/mono'}/issues/${input.childNumber ?? 4242}\n`;
+      }
+      if (args[0] === 'issue' && args[1] === 'view') return 'I_kwDOissue\n';
+      if (args[0] === 'issue' && args[1] === 'list') return '[]';
+      if (args[0] === 'issue' || args[0] === 'label' || args[0] === 'search'
+        || args[0] === 'project' || args[0] === 'api') {
+        return JSON.stringify([]);
+      }
+      return candidateRunner(1, ['GREETING.md'])(command, args);
+    };
+    return {
+      calls,
+      port: makeProductionEnqueueActionPort({
+        readSnapshot: async () => snapshot(),
+        authorAllowlist: new Set(['implementation-bot']),
+        expectedBaseRefName: 'stack/base',
+        repositoryPath: '/tmp/repo',
+        fixIssueTypeId: 'IT_kwDOfix',
+        runner,
+        environment: { GH_TOKEN: 'ambient-secret' },
+      }),
+    };
+  }
+
+  function enqueue(harness: EnqueueHarness) {
+    return harness.port.enqueueAtHead({
+      prNumber: 84,
+      issueNumber: 84,
+      head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
+      expectedBaseRefName: gitRefName('stack/base'),
+      credential: credential(),
+    });
+  }
+
+  it('sends enqueuePullRequest pinned to the exact head under the selected identity', async () => {
+    const harness = enqueuePort();
+
+    await expect(enqueue(harness)).resolves.toMatchObject({
+      status: 'enqueued',
+      head: HEAD,
+      position: 4,
+      queueState: 'QUEUED',
+    });
+
+    const mutation = harness.calls.find((call) =>
+      call.command === 'gh' && call.args[0] === 'api' && call.args[1] === 'graphql');
+    expect(mutation).toBeDefined();
+    expect(mutation!.args).toContain('-f');
+    expect(mutation!.args).toContain('pullRequestId=PR_kwDOABCD84');
+    expect(mutation!.args).toContain(`expectedHeadOid=${HEAD}`);
+    expect(mutation!.args.join(' ')).toMatch(/enqueuePullRequest\(input:/);
+    expect(mutation!.env?.GH_TOKEN).toBe('selected-secret');
+    expect(mutation!.env?.GITHUB_TOKEN).toBe('');
+  });
+
+  it('never runs gh pr merge and never arms auto-merge', async () => {
+    const harness = enqueuePort();
+
+    await enqueue(harness);
+
+    for (const call of harness.calls) {
+      expect(`${call.command} ${call.args.join(' ')}`).not.toMatch(/\bpr merge\b/);
+      expect(call.args).not.toContain('--auto');
+      expect(call.args.join(' ')).not.toMatch(/pulls\/\d+\/merge/);
+    }
+  });
+
+  it.each([
+    ['already queued prose', 'Pull request is already queued', 'already-enqueued'],
+    ['not mergeable', 'GraphQL: Pull request is not mergeable', 'rejected'],
+    ['queue not enabled', 'GraphQL: Merge queue is not enabled for this branch', 'rejected'],
+    ['a 403 refusal', 'gh: HTTP 403: Resource not accessible by integration', 'rejected'],
+    ['a stale expected head', 'GraphQL: Head sha did not match the expected head oid', 'changed-head'],
+    ['a 502', 'gh: HTTP 502: Bad Gateway', 'undetermined'],
+    ['a socket failure', 'dial tcp: ECONNRESET', 'undetermined'],
+    ['a secondary rate limit', 'HTTP 403: You have exceeded a secondary rate limit', 'undetermined'],
+    [
+      'an unresolvable node id',
+      "GraphQL: Could not resolve to a node with the global id of 'PR_kwDOABCD84'",
+      'rejected',
+    ],
+    ['nothing recognisable', 'gh: something nobody has seen before', 'undetermined'],
+  ] as const)('classifies %s as %s', (_name, text, expected) => {
+    expect(classifyEnqueueFailure(text)).toBe(expected);
+  });
+
+  it('reports an already-queued refusal as success, not as a rejection', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('GraphQL: Pull request is already queued'); },
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'already-enqueued' });
+  });
+
+  it('rereads the head when GitHub refuses the expected head oid', async () => {
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error('GraphQL: Head sha did not match the expected head oid');
+      },
+      view: async (): Promise<string> => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: OTHER_HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: false,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({
+      status: 'changed-head',
+      head: OTHER_HEAD,
+    });
+  });
+
+  it('reports a durable refusal as rejected and names it', async () => {
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error('GraphQL: Merge queue is not enabled for this branch');
+      },
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({
+      status: 'rejected',
+      reason: expect.stringMatching(/merge queue is not enabled/i),
+    });
+  });
+
+  /**
+   * A dropped connection is not proof the mutation did not land. The readback
+   * is the only thing that can tell "never reached GitHub" from "landed and the
+   * response was lost", and only an observed queue entry at the expected head
+   * resolves it as success.
+   */
+  it('resolves an undetermined failure by reading the queue back', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
+      // Not queued when the pre-flight authority read runs; queued afterwards,
+      // which is the only evidence that the lost mutation actually landed.
+      view: async (call) => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: call > 0,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'enqueued' });
+  });
+
+  it('stays ambiguous when the readback does not show the PR queued', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
+      view: async (): Promise<string> => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: false,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'ambiguous' });
+  });
+
+  it('does not accept a readback queued at some other head', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
+      view: async (): Promise<string> => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: OTHER_HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: true,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'changed-head' });
+  });
+
+  /**
+   * Mutate first, record second. A record written before the mutation would
+   * burn an attempt for a call that never reached GitHub, and two of those
+   * would put a perfectly healthy head on a flake hold.
+   */
+  it('publishes the attempt record only after the mutation succeeded', async () => {
+    const order: string[] = [];
+    const harness = enqueuePort({
+      mutation: async () => {
+        order.push('mutation');
+        return JSON.stringify({
+          data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+        });
+      },
+      onPush: () => order.push('push'),
+    });
+
+    await enqueue(harness);
+
+    expect(order).toEqual(['mutation', 'push']);
+  });
+
+  it('does not burn an attempt when the mutation durably failed', async () => {
+    const pushes: string[][] = [];
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error('GraphQL: Merge queue is not enabled for this branch');
+      },
+      onPush: (args) => pushes.push([...args]),
+    });
+
+    await enqueue(harness);
+
+    expect(pushes).toEqual([]);
+  });
+
+  it('CAS-publishes the first attempt against an absent ref', async () => {
+    const leases: string[] = [];
+    const harness = enqueuePort({
+      onPush: (args) => {
+        leases.push(args.find((arg) => arg.startsWith('--force-with-lease=')) ?? '');
+      },
+    });
+
+    await enqueue(harness);
+
+    expect(leases).toEqual([
+      `--force-with-lease=refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}:`,
+    ]);
+  });
+
+  it('increments the attempt count against the recorded one', async () => {
+    const messages: string[] = [];
+    const ref = `refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`;
+    const harness = enqueuePort({
+      refs: { [ref]: 'd'.repeat(40) },
+      catFile: () => [
+        'Autopilot enqueue record',
+        '',
+        `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=1 -->`,
+        'enqueued-at=2026-07-20T12:00:00.000Z',
+      ].join('\n'),
+    });
+    const runner = harness.calls;
+    await enqueue(harness);
+    for (const call of runner) {
+      if (call.command === 'git' && call.args.includes('commit-tree')) {
+        messages.push(call.args[call.args.indexOf('-m') + 1] ?? '');
+      }
+    }
+
+    expect(messages[0]).toContain('attempts=2');
+  });
+
+  /**
+   * A lost CAS publish means another writer moved the ref underneath us and we
+   * cannot say how many attempts this head has now had. The enqueue itself may
+   * well have landed, so the honest answer is `ambiguous`.
+   */
+  it('reports a lost record publication as ambiguous', async () => {
+    const harness = enqueuePort({ pushFails: true });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'ambiguous' });
+  });
+
+  /**
+   * The attempt ledger is a remote ref. The record commit only exists in the
+   * clone that pushed it, so a read that goes straight to `cat-file` finds
+   * nothing on any other clone, after a gc, or on any transient failure — and
+   * "nothing" is precisely the answer that licenses another enqueue. An
+   * unreadable ledger is not an empty ledger, and must never be read as one.
+   */
+  describe('attempt ledger reads', () => {
+    const ledgerRef = `refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`;
+
+    function withRecord(
+      overrides: Partial<Parameters<typeof enqueuePort>[0]> = {},
+    ) {
+      return enqueuePort({
+        refs: { [ledgerRef]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=1 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+        ].join('\n'),
+        ...overrides,
+      });
+    }
+
+    it('fetches the record commit before reading it', async () => {
+      const harness = withRecord();
+
+      await enqueue(harness);
+
+      const git = harness.calls.filter((call) => call.command === 'git');
+      const fetched = git.findIndex((call) => call.args.includes('fetch'));
+      const read = git.findIndex((call) => call.args.includes('cat-file'));
+      expect(fetched).toBeGreaterThanOrEqual(0);
+      expect(read).toBeGreaterThan(fetched);
+      expect(git[fetched]!.args).toContain(ledgerRef);
+      expect(git[fetched]!.args).toContain(CANONICAL_GITHUB_HTTPS_REMOTE);
+    });
+
+    it('resolves the ledger ref once rather than twice', async () => {
+      const harness = withRecord();
+
+      await enqueue(harness);
+
+      const reads = harness.calls.filter((call) => (
+        call.command === 'git'
+        && call.args.includes('ls-remote')
+        && call.args.includes(ledgerRef)
+      ));
+      expect(reads).toHaveLength(1);
+    });
+
+    it.each([
+      ['the ref listing fails', { lsRemoteFails: true }],
+      ['the record commit cannot be fetched', { fetchFails: true }],
+      [
+        'the record commit cannot be read',
+        { catFile: (): string => { throw new Error('bad object'); } },
+      ],
+    ] as const)('refuses to read an absent ledger when %s', async (_name, overrides) => {
+      let mutations = 0;
+      const harness = withRecord({
+        ...overrides,
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({
+            data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+          });
+        },
+      });
+
+      await expect(enqueue(harness)).rejects.toThrow();
+      expect(mutations).toBe(0);
+    });
+  });
+
+  /**
+   * The flake hold. Two failed attempts at the same head is a signal, not
+   * noise: the engine stops feeding the queue, files a `ci-failure` child so a
+   * human can see why, and writes the child's number into the record so a
+   * later cycle can tell "held and explained" from "held and silent".
+   */
+  describe('flake hold', () => {
+    const ref = `refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`;
+
+    function twoAttempts(overrides: Partial<Parameters<typeof enqueuePort>[0]> = {}) {
+      return enqueuePort({
+        refs: { [ref]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=2 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+        ].join('\n'),
+        ...overrides,
+      });
+    }
+
+    it('refuses a third attempt and never reaches the mutation', async () => {
+      let mutations = 0;
+      const harness = twoAttempts({
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: null } } });
+        },
+      });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({ status: 'flake-hold' });
+      expect(mutations).toBe(0);
+    });
+
+    it('files a ci-failure child and links it into the record', async () => {
+      const messages: string[] = [];
+      const harness = twoAttempts();
+
+      await enqueue(harness);
+
+      for (const call of harness.calls) {
+        if (call.command === 'git' && call.args.includes('commit-tree')) {
+          messages.push(call.args[call.args.indexOf('-m') + 1] ?? '');
+        }
+      }
+      expect(messages.some((message) => /^linked-issue=\d+$/m.test(message))).toBe(true);
+    });
+
+    it('lets a record that already names its issue through', async () => {
+      let mutations = 0;
+      const harness = enqueuePort({
+        refs: { [ref]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=2 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+          'linked-issue=4242',
+        ].join('\n'),
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({
+            data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+          });
+        },
+      });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({ status: 'enqueued' });
+      expect(mutations).toBe(1);
+    });
+
+    /**
+     * The hold re-arms. A linked issue sanctions exactly one more enqueue; when
+     * that sanctioned retry also ejects, the record reads three attempts and
+     * the hold is terminal for this head. Nothing is filed a second time —
+     * the issue that explains this head already exists.
+     */
+    it('re-arms the hold after the sanctioned retry and files nothing twice', async () => {
+      let mutations = 0;
+      const harness = enqueuePort({
+        refs: { [ref]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=3 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+          'linked-issue=4242',
+        ].join('\n'),
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({
+            data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+          });
+        },
+      });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({
+        status: 'flake-hold',
+        reason: expect.stringContaining('#4242'),
+      });
+      expect(mutations).toBe(0);
+      const created = harness.calls.filter((call) => (
+        call.command === 'gh' && call.args[0] === 'issue' && call.args[1] === 'create'
+      ));
+      expect(created).toEqual([]);
+    });
   });
 });

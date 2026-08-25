@@ -33,7 +33,7 @@ function state(): LifecycleDiscoveryState {
     reviews: [],
   };
   return {
-    version: 3,
+    version: 4,
     evidence: {
       project: {
         items: [{
@@ -275,6 +275,51 @@ describe('LifecycleDiscoveryCacheStore', () => {
     const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
 
     await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
+  });
+
+  /**
+   * A version-3 cache predates the merge-queue read (#82): its PR entries carry
+   * no `graphqlId` and no `mergeQueue`, so absence there is indistinguishable
+   * from "read and proven not queued". Reading a stale cache as proof of queue
+   * membership either skips an enqueue that never happened or repeats one that
+   * did, so the envelope is discarded and reseeded from a full read.
+   */
+  it('rejects a version 3 envelope so pre-merge-queue PR evidence cannot survive', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    await chmod(directory, 0o700);
+    await writeFile(
+      join(directory, 'lifecycle-cache.json'),
+      JSON.stringify({ ...state(), version: 3 }),
+      { mode: 0o600 },
+    );
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+
+    await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
+  });
+
+  it('round-trips merge-queue and enqueue-record evidence', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const base = state();
+    const queueEvidence = {
+      graphqlId: 'PR_kwDOABCD123',
+      mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
+      enqueueRecorded: true,
+    } as const;
+    const withQueue: LifecycleDiscoveryState = {
+      ...base,
+      evidence: {
+        ...base.evidence,
+        pullRequests: [{ ...base.evidence.pullRequests[0]!, ...queueEvidence }],
+      },
+      openPullRequestEvidence: [{
+        ...base.openPullRequestEvidence[0]!,
+        ...queueEvidence,
+      }],
+    };
+
+    await expect(store.save(withQueue)).resolves.toBeUndefined();
+    await expect(store.load()).resolves.toEqual(withQueue);
   });
 
   it('loads a legacy cache without terminal claim evidence as an empty fail-closed ledger', async () => {

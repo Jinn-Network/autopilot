@@ -6,7 +6,7 @@ import {
 } from '../../src/lifecycle/github-changed-files.js';
 import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 import { chooseIntegrationLadderAction } from '../../src/lifecycle/integration-ladder.js';
-import { evaluateMergeGate, type MergeCandidate } from '../../src/lifecycle/merge-executor.js';
+import { evaluateEnqueueGate, type EnqueueCandidate } from '../../src/lifecycle/enqueue-executor.js';
 import { gitOid, gitRefName, type CompareStatus } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
@@ -320,7 +320,7 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
     };
   }
 
-  function gateCandidate(compareStatus: CompareStatus): MergeCandidate {
+  function gateCandidate(compareStatus: CompareStatus): EnqueueCandidate {
     return {
       issueNumber: 2080,
       prNumber: 2081,
@@ -349,6 +349,9 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       changedFilesComplete: true,
       codeownersComplete: true,
       codeownerSensitive: false,
+      codeOwnerLogins: new Set<string>(),
+      graphqlId: 'PR_kwDOABCD2081',
+      inMergeQueue: false,
     };
   }
 
@@ -368,7 +371,7 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
     );
   });
 
-  it('reaches the ladder and arms update-branch on that status', async () => {
+  it('reaches the ladder and reads that status as enqueue-ready', async () => {
     const status = await readExactCompareStatus({
       run: monoRun([]),
       prNumber: 2081,
@@ -391,10 +394,16 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       openReconcileChild: false,
       openFindingChild: false,
       childrenEnabled: true,
-    })).toEqual({ kind: 'update-branch' });
+    })).toEqual({ kind: 'enqueue-ready' });
   });
 
-  it('blocks the merge gate with reason "behind" on that status', async () => {
+  /**
+   * The compare status still has to be read correctly — the ladder routes on
+   * it. What changed with #82 is who acts on it: the merge queue rebases onto
+   * the base it merges into, so a diverged head is the queue's ordinary input
+   * and the enqueue gate no longer refuses it.
+   */
+  it('does not block the enqueue gate on that status', async () => {
     const status = await readExactCompareStatus({
       run: monoRun([]),
       prNumber: 2081,
@@ -402,10 +411,10 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       expectedBaseRefName: 'next',
       repositorySlug: 'Jinn-Network/mono',
     });
-    const gate = evaluateMergeGate(gateCandidate(status));
+    const gate = evaluateEnqueueGate(gateCandidate(status));
 
-    expect(gate.pass).toBe(false);
-    expect(gate.reasons).toContain('behind');
+    expect(gate.reasons).not.toContain('behind');
+    expect(gate).toEqual({ pass: true, reasons: [] });
   });
 
   it('keeps baseOid pinned to the fork point for CODEOWNERS while exposing the ref separately', async () => {

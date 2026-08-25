@@ -956,7 +956,7 @@ describe('IncrementalLifecycleSnapshotSource', () => {
       lastFullReconciliationAt: FULL_AT,
     });
     expect(store.state).toMatchObject({
-      version: 3,
+      version: 4,
       recentlyClosedCutoff: '2026-07-22T09:55:00.000Z',
       evidence: { snapshotMode: 'incremental', lastFullReconciliationAt: FULL_AT },
     });
