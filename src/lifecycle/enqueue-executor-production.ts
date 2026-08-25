@@ -2,20 +2,28 @@ import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { parseOwnedPrefixes, touchesCodeOwnedPath } from '../dispatcher/code-owned.js';
 import { REPO } from '../dispatcher/constants.js';
-import { ensureFieldIds } from '../dispatcher/field-cache.js';
-import { fetchProjectSnapshot } from '../dispatcher/project-snapshot.js';
 import { formatAutomatedReviewMarker } from './codecs.js';
 import type { SelectedCredential } from './credentials.js';
 import { fileChildIssue } from './child-issues.js';
 import { makeProductionChildIssuePort } from './child-issues-production.js';
 import type {
-  MergeCandidate,
-  MergeExecutorDeps,
-  ExactMergeOutcome,
+  EnqueueCandidate,
+  EnqueueExecutorDeps,
+  ExactEnqueueOutcome,
   UpdateBranchFailureClass,
   UpdateBranchOutcome,
-} from './merge-executor.js';
-import { DURABLE_UPDATE_BRANCH_FAILURES } from './merge-executor.js';
+} from './enqueue-executor.js';
+import { DURABLE_UPDATE_BRANCH_FAILURES } from './enqueue-executor.js';
+import { emptyTreeOid } from './ci-rerun.js';
+import {
+  decideReEnqueue,
+  decodeEnqueueRecord,
+  encodeEnqueueRecord,
+  enqueueRef,
+  type EnqueueRecord,
+} from './enqueue-record.js';
+import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
+import { gitPublicationArgs } from './credentials.js';
 import { readExactChangedFiles } from './github-changed-files.js';
 import { reviewedDiffDigestFromCompare } from './reviewed-diff-digest.js';
 import { withSelectedCredential } from './production-auth.js';
@@ -24,11 +32,11 @@ import type {
   NativeReviewSnapshot,
   PullRequestSnapshot,
 } from './snapshot.js';
-import { decodeCompareStatus, gitOid, gitRefName } from './types.js';
+import { decodeCompareStatus, gitOid, gitRefName, type GitOid } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import { hasExternalHumanAuthority } from './human-authority.js';
 
-export interface ProductionMergeActionPortOptions {
+export interface ProductionEnqueueActionPortOptions {
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
   readonly authorAllowlist: ReadonlySet<string>;
   readonly expectedBaseRefName?: string;
@@ -36,6 +44,22 @@ export interface ProductionMergeActionPortOptions {
   readonly projectOwner?: string;
   readonly projectNumber?: number;
   readonly projectMapping?: ProjectMapping;
+  /** Issue-type node id for `fix`, used when the flake hold files its child. */
+  readonly fixIssueTypeId?: string;
+  /**
+   * Logins the repository's CODEOWNERS policy names. Empty (the default) proves
+   * nobody is an owner, so every codeowner-sensitive change refuses — exactly
+   * what the unconditional `codeowner-sensitive` refusal did before, kept as
+   * the fail-safe default rather than an accident of configuration.
+   */
+  readonly codeOwnerLogins?: ReadonlySet<string>;
+  /**
+   * Local clone the enqueue-attempt CAS records are pushed from. Absent means
+   * no record can be read or written, so the flake policy cannot hold a head
+   * back — it degrades to "always allow", never to "always refuse".
+   */
+  readonly repositoryPath?: string;
+  readonly repositoryUrl?: string;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
   /**
@@ -121,13 +145,141 @@ export function classifyUpdateBranchFailure(text: string): UpdateBranchFailureCl
   return 'unclassified';
 }
 
-export type ProductionMergeActionPort = Pick<
-MergeExecutorDeps,
-'readCandidate' | 'mergeExactHead' | 'reconcileDone' | 'updateBranch' | 'fileReconcileChild'
+export const ENQUEUE_MUTATION = `mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
+  enqueuePullRequest(input: { pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid }) {
+    mergeQueueEntry { position state }
+  }
+}`;
+
+/**
+ * How an `enqueuePullRequest` failure should be read. Classified once, here, at
+ * the only place that can still see the raw error text.
+ *
+ * `already-enqueued` and `changed-head` are *answers*, not failures: GitHub is
+ * saying the queue already holds this PR, or that the head we pinned is no
+ * longer the head. `rejected` is durable — the queue keeps refusing until a
+ * human changes something. `undetermined` covers everything a retry could still
+ * resolve, and is the only class that earns a queue readback.
+ *
+ * Ordering is load-bearing for the same reason it is in
+ * `classifyUpdateBranchFailure`: GitHub serves *secondary* rate limits as HTTP
+ * 403, so the throttle probe must run before the permission probe, or every
+ * throttle would be reported as a durable branch-protection refusal.
+ *
+ * Anything unrecognised is `undetermined`, never `rejected`: asserting a durable
+ * refusal we cannot see would strand a PR that only needed a retry.
+ */
+export type EnqueueFailureClass =
+  | 'already-enqueued'
+  | 'changed-head'
+  | 'rejected'
+  | 'undetermined';
+
+export function classifyEnqueueFailure(text: string): EnqueueFailureClass {
+  if (/already\s+(?:queued|in\s+(?:the\s+)?merge\s+queue|enqueued)/i.test(text)
+    || /\bis\s+in\s+the\s+merge\s+queue\b/i.test(text)) {
+    return 'already-enqueued';
+  }
+  if (/expected\s*head\s*oid/i.test(text)
+    || /head\s+sha\s+did\s+not\s+match/i.test(text)
+    || /head\s+(?:oid|sha)[^.]*(?:mismatch|did not match|changed)/i.test(text)) {
+    return 'changed-head';
+  }
+  if (/\b(429|rate limit|secondary rate|abuse detection|retry-after)\b/i.test(text)
+    || /HTTP 429/i.test(text)) {
+    return 'undetermined';
+  }
+  if (/not\s+mergeable|cannot\s+be\s+merged|merge\s+conflict/i.test(text)
+    || /merge\s+queue\s+is\s+not\s+enabled|queue\s+is\s+not\s+enabled|no\s+merge\s+queue/i
+      .test(text)
+    || /HTTP 40[134]/i.test(text)
+    || /bad credentials|requires authentication|not authorized|unauthorized/i.test(text)
+    || /resource not accessible|must have|permission|protected branch|forbidden/i.test(text)) {
+    return 'rejected';
+  }
+  return 'undetermined';
+}
+
+export type ProductionEnqueueActionPort = Pick<
+EnqueueExecutorDeps,
+'readCandidate' | 'enqueueAtHead' | 'updateBranch' | 'fileReconcileChild'
 >;
 
 function decodeBase64(value: string): string {
   return Buffer.from(value.replace(/\n/g, ''), 'base64').toString('utf8');
+}
+
+interface RecordTransport {
+  readonly run: CommandRunner;
+  readonly repositoryPath: string;
+  readonly askpass: string;
+  readonly environment: Record<string, string>;
+  readonly repositoryUrl: string;
+}
+
+async function remoteRefOid(
+  transport: RecordTransport,
+  ref: string,
+): Promise<GitOid | null> {
+  const raw = await transport.run('git', [
+    ...gitPublicationArgs(transport.askpass, []),
+    '-C', transport.repositoryPath,
+    'ls-remote', transport.repositoryUrl, ref,
+  ], { env: transport.environment }).catch(() => '');
+  const line = raw.trimEnd().split('\n').find((entry) => entry.endsWith(`\t${ref}`));
+  if (line === undefined) return null;
+  const oid = line.split('\t')[0];
+  return oid === undefined || oid.length === 0 ? null : gitOid(oid);
+}
+
+async function readEnqueueRecord(
+  transport: RecordTransport,
+  prNumber: number,
+  head: GitOid,
+): Promise<EnqueueRecord | null> {
+  const ref = enqueueRef(prNumber, head);
+  const oid = await remoteRefOid(transport, ref);
+  if (oid === null) return null;
+  const raw = await transport.run('git', [
+    ...gitPublicationArgs(transport.askpass, []),
+    '-C', transport.repositoryPath,
+    'cat-file', '-p', oid,
+  ], { env: transport.environment }).catch(() => '');
+  const message = raw.split('\n\n').slice(1).join('\n\n').trim();
+  return message.length === 0 ? null : decodeEnqueueRecord(message);
+}
+
+/**
+ * CAS-publish an enqueue-attempt record, leased against the ref value we read.
+ * `won` and `already-applied` both mean the record now says what we intended;
+ * anything else means another writer moved the ref underneath us and this
+ * head's attempt count is no longer something we can assert.
+ */
+async function publishEnqueueRecord(
+  transport: RecordTransport,
+  record: EnqueueRecord,
+  expected: GitOid | null,
+): Promise<'won' | 'already-applied' | 'lost'> {
+  const ref = enqueueRef(record.prNumber, record.head);
+  const published = gitOid((await transport.run('git', [
+    ...gitPublicationArgs(transport.askpass, []),
+    '-C', transport.repositoryPath,
+    'commit-tree', emptyTreeOid(),
+    '-m', encodeEnqueueRecord(record),
+  ], { env: transport.environment })).trim());
+  if (expected === published) return 'already-applied';
+  try {
+    await transport.run('git', [
+      ...gitPublicationArgs(transport.askpass, []),
+      '-C', transport.repositoryPath,
+      'push', `--force-with-lease=${ref}:${expected ?? ''}`,
+      transport.repositoryUrl, `${published}:${ref}`,
+    ], { env: transport.environment });
+    return 'won';
+  } catch {
+    const observed = await remoteRefOid(transport, ref);
+    return observed === published ? 'already-applied' : 'lost';
+  }
 }
 
 function effectiveCurrentHeadReviews(
@@ -167,9 +319,9 @@ function hasExactCanonicalMergeAuthority(
     && mapping.expectedBaseRefName === expectedBaseRefName;
 }
 
-export function makeProductionMergeActionPort(
-  options: ProductionMergeActionPortOptions,
-): ProductionMergeActionPort {
+export function makeProductionEnqueueActionPort(
+  options: ProductionEnqueueActionPortOptions,
+): ProductionEnqueueActionPort {
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
   const pause = options.sleep
@@ -182,7 +334,7 @@ export function makeProductionMergeActionPort(
     credential: SelectedCredential,
     operation: Parameters<typeof withSelectedCredential<Value>>[2],
   ) => withSelectedCredential(credential, ambient, operation, runner);
-  const readCandidate = async (prNumber: number): Promise<MergeCandidate | null> => {
+  const readCandidate = async (prNumber: number): Promise<EnqueueCandidate | null> => {
     const snapshot = await options.readSnapshot();
     const pr = snapshot.pullRequests.find((entry) => entry.number === prNumber);
     if (pr === undefined) return null;
@@ -375,18 +527,23 @@ export function makeProductionMergeActionPort(
         [...files],
         parseOwnedPrefixes(decodeBase64(codeownersRaw.content)),
       ),
+      codeOwnerLogins: options.codeOwnerLogins ?? new Set<string>(),
+      ...(pr.graphqlId === undefined ? {} : { graphqlId: pr.graphqlId }),
+      inMergeQueue: pr.mergeQueue?.enqueued === true,
     };
   };
 
   return {
     readCandidate,
-    mergeExactHead: ({
+    enqueueAtHead: ({
       prNumber,
+      issueNumber,
       head,
+      graphqlId,
       expectedBaseRefName,
       credential,
-    }): Promise<ExactMergeOutcome> =>
-      withCredential(credential, async ({ run }) => {
+    }): Promise<ExactEnqueueOutcome> =>
+      withCredential(credential, async ({ run, askpass, environment }) => {
         const canonical = await options.readSnapshot();
         const canonicalPr = canonical.pullRequests.find(
           (entry) => entry.number === prNumber,
@@ -403,17 +560,20 @@ export function makeProductionMergeActionPort(
           return {
             status: 'rejected',
             head,
-            reason: 'Canonical mapping authority changed before the exact-head merge',
+            reason: 'Canonical mapping authority changed before the exact-head enqueue',
           };
         }
-        const authority = JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', repositorySlug,
-          '--json', 'state,headRefOid,baseRefName',
-        ])) as {
+        type PrAuthority = {
           state?: unknown;
           headRefOid?: unknown;
           baseRefName?: unknown;
+          isInMergeQueue?: unknown;
         };
+        const readAuthority = async (): Promise<PrAuthority> => JSON.parse(await run('gh', [
+          'pr', 'view', String(prNumber), '--repo', repositorySlug,
+          '--json', 'state,headRefOid,baseRefName,isInMergeQueue',
+        ])) as Record<string, unknown>;
+        const authority = await readAuthority();
         if (typeof authority.headRefOid === 'string' && authority.headRefOid !== head) {
           return { status: 'changed-head', head: gitOid(authority.headRefOid) };
         }
@@ -425,103 +585,160 @@ export function makeProductionMergeActionPort(
           return {
             status: 'rejected',
             head,
-            reason: 'Merge base authority changed before the exact-head merge',
+            reason: 'Enqueue base authority changed before the exact-head enqueue',
           };
         }
-        try {
-          const response = JSON.parse(await run('gh', [
-            'api', '-X', 'PUT', `repos/${repositorySlug}/pulls/${prNumber}/merge`,
-            '-f', `sha=${head}`,
-            '-f', 'merge_method=squash',
-          ])) as { merged?: unknown; sha?: unknown; message?: unknown };
-          if (response.merged === true && typeof response.sha === 'string') {
-            return {
-              status: 'merged',
-              head,
-              mergeCommitOid: gitOid(response.sha),
-            };
-          }
-        } catch {
-          // Exact PR readback below classifies accepted ambiguity versus rejection.
+        if (authority.isInMergeQueue === true) {
+          return { status: 'already-enqueued', head };
         }
-        const readback = JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', repositorySlug,
-          '--json', 'state,headRefOid,baseRefName,mergeCommit',
-        ])) as {
-          state?: unknown;
-          headRefOid?: unknown;
-          baseRefName?: unknown;
-          mergeCommit?: { oid?: unknown } | null;
-        };
-        if (
-          readback.state === 'MERGED'
-          && readback.headRefOid === head
-          && readback.baseRefName === expectedBaseRefName
-          && typeof readback.mergeCommit?.oid === 'string'
-        ) {
-          return {
-            status: 'already-merged',
-            head,
-            mergeCommitOid: gitOid(readback.mergeCommit.oid),
-          };
-        }
-        if (typeof readback.headRefOid === 'string' && readback.headRefOid !== head) {
-          return { status: 'changed-head', head: gitOid(readback.headRefOid) };
-        }
-        return { status: 'rejected', head, reason: 'GitHub rejected the exact-head merge gate' };
-      }),
-
-    reconcileDone: ({ issueNumber, prNumber, expectedHead, credential }) =>
-      withCredential(credential, async ({ run }) => {
-        const pr = JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', repositorySlug,
-          '--json', 'state,headRefOid,mergeCommit',
-        ])) as { state?: unknown; headRefOid?: unknown; mergeCommit?: unknown };
-        if (pr.state !== 'MERGED' || pr.headRefOid !== expectedHead || pr.mergeCommit === null) {
-          throw new Error('Merged readback is not exact');
-        }
-        const snapshot = await fetchProjectSnapshot(run, {
-          projectOwner: options.projectOwner,
-          projectNumber: options.projectNumber,
-        });
-        const item = snapshot.items.find((entry) =>
-          entry.contentType === 'Issue' && entry.number === issueNumber);
-        if (item === undefined) throw new Error('Merged issue is missing from Project');
-        if (item.status !== 'Done') {
-          const fields = options.projectMapping === undefined
-            ? await ensureFieldIds(run)
-            : {
-                projectId: options.projectMapping.id,
-                status: {
-                  fieldId: options.projectMapping.fields.status.id,
-                  options: {
-                    Done: options.projectMapping.fields.status.options.done,
-                  },
-                },
-              };
-          let mutationError: unknown;
-          try {
-            await run('gh', [
-              'project', 'item-edit',
-              '--id', item.id,
-              '--project-id', fields.projectId,
-              '--field-id', fields.status.fieldId,
-              '--single-select-option-id', fields.status.options.Done,
-            ]);
-          } catch (error) {
-            mutationError = error;
-          }
-          const after = await fetchProjectSnapshot(run, {
+        const transport = options.repositoryPath === undefined
+          ? null
+          : {
+              run,
+              repositoryPath: options.repositoryPath,
+              askpass,
+              environment,
+              repositoryUrl: options.repositoryUrl ?? CANONICAL_GITHUB_HTTPS_REMOTE,
+            } satisfies RecordTransport;
+        // The attempt ledger for *this head*. No transport means no ledger, and
+        // an absent ledger reads as "no attempt recorded" — the flake policy
+        // degrades to always-allow, never to always-refuse.
+        const existingRef = transport === null
+          ? null
+          : await remoteRefOid(transport, enqueueRef(prNumber, head));
+        const existing = transport === null
+          ? null
+          : await readEnqueueRecord(transport, prNumber, head);
+        const decision = decideReEnqueue(existing);
+        if (!decision.allow && transport !== null && existing !== null) {
+          // Two failed attempts at one head is a signal. Stop feeding the
+          // queue, file the child that explains it, and write the child's
+          // number into the record so a later cycle can tell "held and
+          // explained" from "held and silent".
+          const child = await fileChildIssue(makeProductionChildIssuePort({
+            runner: run,
+            repo: repositorySlug,
+            fixIssueTypeId: options.fixIssueTypeId
+              ?? options.projectMapping?.fields.type.options.fix,
             projectOwner: options.projectOwner,
             projectNumber: options.projectNumber,
-          });
-          const current = after.items.find((entry) =>
-            entry.contentType === 'Issue' && entry.number === issueNumber);
-          if (current?.status !== 'Done') {
-            if (mutationError !== undefined) throw mutationError;
-            throw new Error('Merged Done projection was ambiguous');
+            projectMapping: options.projectMapping,
+          }), {
+            parentPr: prNumber,
+            kind: 'ci-failure',
+            title: `Merge queue rejected PR #${prNumber} twice`,
+            body: [
+              `Parent pull request: #${prNumber}`,
+              `Parent issue: #${issueNumber}`,
+              `Head: ${head}`,
+              `Enqueue attempts at this head: ${existing.attempts}`,
+              `First enqueued at: ${existing.enqueuedAt}`,
+              '',
+              'The merge queue has rejected or ejected this head more than once.',
+              'Diagnose the failure before the engine enqueues it again; pushing a',
+              'new commit resets the attempt count.',
+            ].join('\n'),
+            effort: 'medium',
+            priority: 'p1',
+          }).catch(() => null);
+          if (child !== null && !('runawayHold' in child && child.runawayHold)) {
+            await publishEnqueueRecord(
+              transport,
+              { ...existing, linkedIssue: child.number },
+              existingRef,
+            ).catch(() => 'lost' as const);
+          }
+          return {
+            status: 'flake-hold',
+            head,
+            reason: `Enqueue held after ${existing.attempts} attempts at this head`,
+          };
+        }
+        // Mutate first, record second. A record written before the mutation
+        // would burn an attempt for a call that never reached GitHub, and two
+        // of those would put a perfectly healthy head on a flake hold.
+        let entry: { position?: unknown; state?: unknown } | null = null;
+        let failure: EnqueueFailureClass | undefined;
+        let failureText = '';
+        try {
+          const response = JSON.parse(await run('gh', [
+            'api', 'graphql',
+            '-f', `query=${ENQUEUE_MUTATION}`,
+            '-f', `pullRequestId=${graphqlId}`,
+            '-f', `expectedHeadOid=${head}`,
+          ])) as {
+            data?: { enqueuePullRequest?: { mergeQueueEntry?: unknown } | null };
+            errors?: readonly { message?: unknown }[];
+          };
+          if (Array.isArray(response.errors) && response.errors.length > 0) {
+            throw new Error(response.errors
+              .map((error) => String(error.message ?? ''))
+              .join('; '));
+          }
+          const raw = response.data?.enqueuePullRequest?.mergeQueueEntry;
+          entry = raw === null || raw === undefined
+            ? null
+            : raw as { position?: unknown; state?: unknown };
+        } catch (error) {
+          failureText = errorText(error);
+          failure = classifyEnqueueFailure(failureText);
+        }
+        if (failure === 'changed-head') {
+          const after = await readAuthority().catch((): PrAuthority => ({}));
+          return typeof after.headRefOid === 'string' && after.headRefOid !== head
+            ? { status: 'changed-head', head: gitOid(after.headRefOid) }
+            : { status: 'ambiguous', head, reason: failureText };
+        }
+        if (failure === 'rejected') {
+          return { status: 'rejected', head, reason: failureText };
+        }
+        if (failure === 'undetermined') {
+          // A dropped connection is not proof the mutation did not land. Only
+          // an observed queue entry at the expected head resolves it.
+          const after = await readAuthority().catch((): PrAuthority => ({}));
+          if (typeof after.headRefOid === 'string' && after.headRefOid !== head) {
+            return { status: 'changed-head', head: gitOid(after.headRefOid) };
+          }
+          if (after.isInMergeQueue !== true) {
+            return { status: 'ambiguous', head, reason: failureText };
           }
         }
+        const succeeded = failure === undefined || failure === 'undetermined';
+        const status = failure === 'already-enqueued'
+          ? 'already-enqueued' as const
+          : 'enqueued' as const;
+        if (transport === null || !succeeded) {
+          return {
+            status,
+            head,
+            ...(typeof entry?.position === 'number' ? { position: entry.position } : {}),
+            ...(typeof entry?.state === 'string' ? { queueState: entry.state } : {}),
+          };
+        }
+        const published = await publishEnqueueRecord(transport, {
+          prNumber,
+          head,
+          attempts: (existing?.attempts ?? 0) + 1,
+          enqueuedAt: new Date().toISOString(),
+          ...(existing?.linkedIssue === undefined
+            ? {}
+            : { linkedIssue: existing.linkedIssue }),
+        }, existingRef).catch(() => 'lost' as const);
+        if (published === 'lost') {
+          // Another writer moved the ref. The enqueue may well have landed, but
+          // this head's attempt count is no longer something we can assert.
+          return {
+            status: 'ambiguous',
+            head,
+            reason: 'Enqueue attempt record publication was lost',
+          };
+        }
+        return {
+          status,
+          head,
+          ...(typeof entry?.position === 'number' ? { position: entry.position } : {}),
+          ...(typeof entry?.state === 'string' ? { queueState: entry.state } : {}),
+        };
       }),
 
     /**

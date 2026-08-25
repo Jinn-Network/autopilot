@@ -58,8 +58,8 @@ import {
   executeMergeAction,
   executeFileReconcileChildAction,
   executeUpdateBranchAction,
-} from './merge-executor.js';
-import { makeProductionMergeActionPort } from './merge-executor-production.js';
+} from './enqueue-executor.js';
+import { makeProductionEnqueueActionPort } from './enqueue-executor-production.js';
 import {
   executeProductionFileCiFailureChild,
   executeProductionRerunFailedChecks,
@@ -1046,7 +1046,7 @@ export function makeProductionActiveRuntime(
         expectedHead: action.head,
         expectedBaseRefName: action.expectedBaseRefName,
       }, {
-        ...makeProductionMergeActionPort({
+        ...makeProductionEnqueueActionPort({
           readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
           authorAllowlist: options.authorAllowlist,
           expectedBaseRefName: action.expectedBaseRefName,
@@ -1065,7 +1065,7 @@ export function makeProductionActiveRuntime(
           prNumber: action.prNumber,
           expectedHead: action.head,
         }, {
-          ...makeProductionMergeActionPort({
+          ...makeProductionEnqueueActionPort({
             readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
             expectedBaseRefName: action.expectedBaseRefName,
@@ -1097,7 +1097,7 @@ export function makeProductionActiveRuntime(
           expectedHead: action.head,
           effort: action.effort,
         }, {
-          ...makeProductionMergeActionPort({
+          ...makeProductionEnqueueActionPort({
             readSnapshot: targetedPullRequestSnapshot(cycleSnapshot, action.prNumber),
             authorAllowlist: options.authorAllowlist,
             expectedBaseRefName: action.expectedBaseRefName,

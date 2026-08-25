@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  classifyEnqueueFailure,
   classifyUpdateBranchFailure,
-  makeProductionMergeActionPort,
-} from '../../src/lifecycle/merge-executor-production.js';
+  makeProductionEnqueueActionPort,
+} from '../../src/lifecycle/enqueue-executor-production.js';
 import {
-  executeMergeAction,
+  executeEnqueueAction,
   executeUpdateBranchAction,
-} from '../../src/lifecycle/merge-executor.js';
+} from '../../src/lifecycle/enqueue-executor.js';
 import { CredentialPool, selectCredential } from '../../src/lifecycle/credentials.js';
 import type {
   GitHubLifecycleSnapshot,
@@ -14,7 +15,7 @@ import type {
 } from '../../src/lifecycle/snapshot.js';
 import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
 import { resolveStructuredPullRequestMappings } from '../../src/lifecycle/pr-mapping.js';
-import { evaluateMergeGate } from '../../src/lifecycle/merge-executor.js';
+import { evaluateEnqueueGate } from '../../src/lifecycle/enqueue-executor.js';
 import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 
 const HEAD = gitOid('1'.repeat(40));
@@ -59,6 +60,7 @@ function snapshot(
       headRefName: 'autopilot/84',
       headOid: HEAD,
       headCommittedAt: isoTimestamp('2026-07-20T00:00:00.000Z'),
+      graphqlId: 'PR_kwDOABCD84',
       isDraft: false,
       state: 'OPEN',
       labels: ['engine:review'],
@@ -182,7 +184,7 @@ function candidateRunner(changedFiles: number, filenames: readonly string[]) {
   };
 }
 
-describe('production head-pinned merge port', () => {
+describe('production head-pinned enqueue port', () => {
   it('does not treat stale painter-owned Project Status Human as authority', async () => {
     const current = snapshot();
     const staleStatus: GitHubLifecycleSnapshot = {
@@ -196,7 +198,7 @@ describe('production head-pinned merge port', () => {
         )),
       },
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => staleStatus,
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -240,17 +242,17 @@ describe('production head-pinned merge port', () => {
         }),
       ],
     },
-  ])('does not merge when $name before the final reread', async ({ finalReviews }) => {
+  ])('does not enqueue when $name before the final reread', async ({ finalReviews }) => {
     let candidateReads = 0;
     let mergeCalls = 0;
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(candidateReads++ === 0 ? undefined : finalReviews),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
       runner: candidateRunner(1, ['GREETING.md']),
     });
 
-    const result = await executeMergeAction({
+    const result = await executeEnqueueAction({
       prNumber: 84,
       expectedHead: HEAD,
       expectedBaseRefName: gitRefName('stack/base'),
@@ -261,11 +263,10 @@ describe('production head-pinned merge port', () => {
         normalizedLogin: 'implementation-bot',
         implementationToken: 'selected-secret',
       }]),
-      mergeExactHead: async ({ head }) => {
+      enqueueAtHead: async ({ head }) => {
         mergeCalls += 1;
-        return { status: 'merged', head, mergeCommitOid: OTHER_HEAD };
+        return { status: 'enqueued', head };
       },
-      reconcileDone: async () => {},
     });
 
     expect(result).toMatchObject({
@@ -278,7 +279,7 @@ describe('production head-pinned merge port', () => {
 
   it('uses each reviewer latest exact-head state when checking native blockers', async () => {
     let mergeCalls = 0;
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot([
         approvedReview(),
         approvedReview({
@@ -298,7 +299,7 @@ describe('production head-pinned merge port', () => {
       runner: candidateRunner(1, ['GREETING.md']),
     });
 
-    const result = await executeMergeAction({
+    const result = await executeEnqueueAction({
       prNumber: 84,
       expectedHead: HEAD,
       expectedBaseRefName: gitRefName('stack/base'),
@@ -309,14 +310,13 @@ describe('production head-pinned merge port', () => {
         normalizedLogin: 'implementation-bot',
         implementationToken: 'selected-secret',
       }]),
-      mergeExactHead: async ({ head }) => {
+      enqueueAtHead: async ({ head }) => {
         mergeCalls += 1;
-        return { status: 'merged', head, mergeCommitOid: OTHER_HEAD };
+        return { status: 'enqueued', head };
       },
-      reconcileDone: async () => {},
     });
 
-    expect(result).toMatchObject({ status: 'merged', head: HEAD });
+    expect(result).toMatchObject({ status: 'enqueued', head: HEAD });
     expect(mergeCalls).toBe(1);
   });
 
@@ -335,12 +335,16 @@ describe('production head-pinned merge port', () => {
           baseRefName: 'next',
         });
       }
-      if (command === 'gh' && args.includes('-X') && args.includes('PUT')) {
-        return JSON.stringify({ merged: true, sha: '2'.repeat(40), message: 'merged' });
+      if (command === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+        return JSON.stringify({
+          data: {
+            enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } },
+          },
+        });
       }
       throw new Error(`unexpected ${command} ${args.join(' ')}`);
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshotWithBase('next'),
       authorAllowlist: new Set(['implementation-bot']),
       runner,
@@ -353,20 +357,22 @@ describe('production head-pinned merge port', () => {
     }]), { phase: 'merge' });
     if (selection.status !== 'selected') throw new Error('selection failed');
 
-    await expect(port.mergeExactHead({
+    await expect(port.enqueueAtHead({
       prNumber: 84,
+      issueNumber: 84,
       head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
       expectedBaseRefName: gitRefName('next'),
       credential: selection.credential,
-    })).resolves.toMatchObject({ status: 'merged', head: HEAD });
+    })).resolves.toMatchObject({ status: 'enqueued', head: HEAD });
 
-    const merge = calls.find((call) =>
-      call.args.some((arg) => arg.endsWith('pulls/84/merge')));
-    expect(merge?.args).toContain(`sha=${HEAD}`);
-    expect(merge?.args).toContain('merge_method=squash');
-    expect(merge?.args.join(' ')).not.toMatch(/admin|bypass/i);
-    expect(merge?.env?.GH_TOKEN).toBe('selected-secret');
-    expect(merge?.env?.GITHUB_TOKEN).toBe('');
+    const mutation = calls.find((call) =>
+      call.args[0] === 'api' && call.args[1] === 'graphql');
+    expect(mutation?.args).toContain(`expectedHeadOid=${HEAD}`);
+    expect(mutation?.args).toContain('pullRequestId=PR_kwDOABCD84');
+    expect(mutation?.args.join(' ')).not.toMatch(/admin|bypass|--auto/i);
+    expect(mutation?.env?.GH_TOKEN).toBe('selected-secret');
+    expect(mutation?.env?.GITHUB_TOKEN).toBe('');
   });
 
   it('rereads and rejects a retargeted base immediately before the merge PUT', async () => {
@@ -389,7 +395,7 @@ describe('production head-pinned merge port', () => {
       }
       throw new Error(`unexpected ${args.join(' ')}`);
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -402,9 +408,11 @@ describe('production head-pinned merge port', () => {
     }]), { phase: 'merge' });
     if (selection.status !== 'selected') throw new Error('selection failed');
 
-    await expect(port.mergeExactHead({
+    await expect(port.enqueueAtHead({
       prNumber: 84,
+      issueNumber: 84,
       head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
       expectedBaseRefName: gitRefName('stack/base'),
       credential: selection.credential,
     })).resolves.toMatchObject({
@@ -460,7 +468,7 @@ describe('production head-pinned merge port', () => {
       }],
     },
   ])(
-    'rejects $name from a distinctly recomputed final canonical snapshot before merge',
+    'rejects $name from a distinctly recomputed final canonical snapshot before enqueue',
     async ({ livePullRequests }) => {
     let mergeCalls = 0;
     const current = snapshot();
@@ -493,7 +501,7 @@ describe('production head-pinned merge port', () => {
       ],
       pullRequestMappings: mappings,
     } as unknown as GitHubLifecycleSnapshot;
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => ambiguous,
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -509,9 +517,11 @@ describe('production head-pinned merge port', () => {
     }]), { phase: 'merge' });
     if (selection.status !== 'selected') throw new Error('selection failed');
 
-    await expect(port.mergeExactHead({
+    await expect(port.enqueueAtHead({
       prNumber: 84,
+      issueNumber: 84,
       head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
       expectedBaseRefName: gitRefName('stack/base'),
       credential: selection.credential,
     })).resolves.toMatchObject({
@@ -523,7 +533,7 @@ describe('production head-pinned merge port', () => {
 
   it('fails closed when the candidate snapshot omits canonical mapping authority', async () => {
     const current = snapshot();
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => ({ ...current, pullRequestMappings: undefined }),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -538,7 +548,7 @@ describe('production head-pinned merge port', () => {
     { name: 'GitHub file endpoint ceiling is exceeded', total: 3_001, files: ['src/a.ts'] },
     { name: 'returned filenames are duplicated', total: 2, files: ['src/a.ts', 'src/a.ts'] },
   ])('fails changed-file completeness when $name', async ({ total, files }) => {
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -552,7 +562,7 @@ describe('production head-pinned merge port', () => {
   });
 
   it('binds complete files and CODEOWNERS to the exact candidate base OID', async () => {
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -579,7 +589,7 @@ describe('production head-pinned merge port', () => {
       }
       return candidateRunner(1, ['GREETING.md'])(command, args);
     };
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -625,7 +635,7 @@ describe('merge candidate CODEOWNERS authority', () => {
 
   it('reads CODEOWNERS at the base branch tip, not at the pinned fork point', async () => {
     const seen: string[] = [];
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -660,7 +670,7 @@ describe('merge candidate CODEOWNERS authority', () => {
    */
   it('drops sensitivity for a rule deleted from the base after the PR forked', async () => {
     const seen: string[] = [];
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -681,7 +691,7 @@ describe('merge candidate CODEOWNERS authority', () => {
 
   it('pins CODEOWNERS through heads/ so a same-named tag cannot hijack it', async () => {
     const seen: string[] = [];
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -744,7 +754,7 @@ describe('update-branch failure classification', () => {
     };
     return {
       readbacks: () => readbacks,
-      port: makeProductionMergeActionPort({
+      port: makeProductionEnqueueActionPort({
         readSnapshot: async () => snapshot(),
         authorAllowlist: new Set(['implementation-bot']),
         expectedBaseRefName: 'stack/base',
@@ -923,7 +933,7 @@ describe('update-branch reports nothing-to-do as success', () => {
     let readbacks = 0;
     return {
       readbacks: () => readbacks,
-      value: makeProductionMergeActionPort({
+      value: makeProductionEnqueueActionPort({
         readSnapshot: async () => snapshot(),
         authorAllowlist: new Set(['implementation-bot']),
         expectedBaseRefName: 'stack/base',
@@ -1094,7 +1104,7 @@ function carriedPort(
   compareFiles: unknown,
   filenames: readonly string[] = ['GREETING.md'],
 ) {
-  return makeProductionMergeActionPort({
+  return makeProductionEnqueueActionPort({
     readSnapshot: async () => snapshotValue,
     authorAllowlist: new Set(['implementation-bot']),
     expectedBaseRefName: 'stack/base',
@@ -1109,11 +1119,11 @@ describe('approval carry across an update-branch head', () => {
     expect(candidate).not.toBeNull();
     expect(candidate!.head).toBe(CARRIED_HEAD);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateMergeGate(candidate!)).toEqual({ pass: true, reasons: [] });
+    expect(evaluateEnqueueGate(candidate!)).toEqual({ pass: true, reasons: [] });
   });
 
-  it('merges at the new head under the carried approval', async () => {
-    const merged = await executeMergeAction(
+  it('enqueues at the new head under the carried approval', async () => {
+    const enqueued = await executeEnqueueAction(
       {
         prNumber: 84,
         expectedHead: CARRIED_HEAD,
@@ -1126,15 +1136,10 @@ describe('approval carry across an update-branch head', () => {
           normalizedLogin: 'implementation-bot',
           implementationToken: 'selected-secret',
         }]),
-        mergeExactHead: async () => ({
-          status: 'merged',
-          head: CARRIED_HEAD,
-          mergeCommitOid: gitOid('9'.repeat(40)),
-        }),
-        reconcileDone: async () => undefined,
+        enqueueAtHead: async () => ({ status: 'enqueued', head: CARRIED_HEAD }),
       },
     );
-    expect(merged).toMatchObject({ status: 'merged', head: CARRIED_HEAD });
+    expect(enqueued).toMatchObject({ status: 'enqueued', head: CARRIED_HEAD });
   });
 
   it('does not carry when a base change altered a file the PR also changed', async () => {
@@ -1146,7 +1151,7 @@ describe('approval carry across an update-branch head', () => {
     }];
     const candidate = await carriedPort(carriedSnapshot(), rebased).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it('does not carry when a worker pushed a real code change', async () => {
@@ -1167,7 +1172,7 @@ describe('approval carry across an update-branch head', () => {
       ['GREETING.md', 'src/backdoor.ts'],
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it('does not carry a claim written before digests existed', async () => {
@@ -1176,7 +1181,7 @@ describe('approval carry across an update-branch head', () => {
       REVIEWED_FILES,
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it.each([
@@ -1202,7 +1207,7 @@ describe('approval carry across an update-branch head', () => {
       filenames,
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
   });
 
   it('does not carry a digest that matches some other PR head state', async () => {
@@ -1272,9 +1277,9 @@ describe('approval carry across an update-branch head', () => {
       'checks-not-green',
     ],
     [
-      'mergeability',
+      'a conflicting head',
       { prOverrides: { mergeability: 'CONFLICTING', mergeStateStatus: 'DIRTY' } },
-      'mergeability',
+      'conflicting',
     ],
     [
       'review-label',
@@ -1304,14 +1309,14 @@ describe('approval carry across an update-branch head', () => {
     ).readCandidate(84);
     // The approval itself still carries — only the independent reason blocks.
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    const gate = evaluateMergeGate(candidate!);
+    const gate = evaluateEnqueueGate(candidate!);
     expect(gate.pass).toBe(false);
     expect(gate.reasons).toContain(reason);
     expect(gate.reasons).not.toContain('terminal-approval');
   });
 
   it('a matching digest does not unblock a disallowed author', async () => {
-    const port = makeProductionMergeActionPort({
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => carriedSnapshot(),
       authorAllowlist: new Set(['someone-else']),
       expectedBaseRefName: 'stack/base',
@@ -1319,11 +1324,16 @@ describe('approval carry across an update-branch head', () => {
     });
     const candidate = await port.readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('author');
+    expect(evaluateEnqueueGate(candidate!).reasons).toContain('author');
   });
 
-  it('a matching digest does not unblock a behind head', async () => {
-    const port = makeProductionMergeActionPort({
+  /**
+   * A behind head is the merge queue's ordinary input, not a refusal — the
+   * queue rebases onto the base it merges into. What the carry must still not
+   * do is *manufacture* an approval, which the surrounding cases pin.
+   */
+  it('does not refuse a behind head once the digest carries', async () => {
+    const port = makeProductionEnqueueActionPort({
       readSnapshot: async () => carriedSnapshot(),
       authorAllowlist: new Set(['implementation-bot']),
       expectedBaseRefName: 'stack/base',
@@ -1337,6 +1347,453 @@ describe('approval carry across an update-branch head', () => {
     });
     const candidate = await port.readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateMergeGate(candidate!).reasons).toContain('behind');
+    expect(evaluateEnqueueGate(candidate!)).toEqual({ pass: true, reasons: [] });
+  });
+});
+
+/**
+ * The enqueue mutation itself (#82). The engine no longer merges: it hands the
+ * PR to GitHub's merge queue with `enqueuePullRequest`, pinned to the exact head
+ * it gated. `gh pr merge` — with or without `--auto` — must never run, because
+ * it would either merge outside the queue or hand GitHub a standing instruction
+ * the engine cannot retract.
+ */
+describe('enqueue mutation', () => {
+  const ACCOUNT = {
+    login: 'implementation-bot',
+    normalizedLogin: 'implementation-bot',
+    implementationToken: 'selected-secret',
+  } as const;
+
+  function credential() {
+    const selection = selectCredential(new CredentialPool([ACCOUNT]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('selection failed');
+    return selection.credential;
+  }
+
+  interface EnqueueHarness {
+    readonly calls: Array<{ command: string; args: readonly string[]; env?: NodeJS.ProcessEnv }>;
+    readonly port: ReturnType<typeof makeProductionEnqueueActionPort>;
+  }
+
+  function enqueuePort(input: {
+    readonly mutation?: () => Promise<string>;
+    readonly view?: (call: number) => Promise<string>;
+    readonly refs?: Record<string, string>;
+    readonly catFile?: (oid: string) => string;
+    readonly pushFails?: boolean;
+    readonly onPush?: (args: readonly string[]) => void;
+    readonly childNumber?: number;
+  } = {}): EnqueueHarness {
+    let views = 0;
+    const calls: Array<{
+      command: string;
+      args: readonly string[];
+      env?: NodeJS.ProcessEnv;
+    }> = [];
+    const refs = { ...(input.refs ?? {}) };
+    const runner = async (
+      command: string,
+      args: readonly string[],
+      options?: { readonly env?: NodeJS.ProcessEnv },
+    ): Promise<string> => {
+      calls.push({ command, args, env: options?.env });
+      if (command === 'git') {
+        const rest = args.slice(args.indexOf('-C') + 2);
+        if (rest[0] === 'ls-remote') {
+          const ref = rest[2] ?? '';
+          return refs[ref] === undefined ? '' : `${refs[ref]}\t${ref}\n`;
+        }
+        if (rest[0] === 'commit-tree') return `${'e'.repeat(40)}\n`;
+        if (rest[0] === 'cat-file') return input.catFile?.(rest[2] ?? '') ?? '';
+        if (rest[0] === 'push') {
+          input.onPush?.(rest);
+          if (input.pushFails === true) throw new Error('stale info');
+          return '';
+        }
+        return '';
+      }
+      if (
+        args[0] === 'api'
+        && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('enqueuePullRequest'))
+      ) {
+        return (input.mutation ?? (async () => JSON.stringify({
+          data: {
+            enqueuePullRequest: { mergeQueueEntry: { position: 4, state: 'QUEUED' } },
+          },
+        })))();
+      }
+      if (args[0] === 'pr' && args[1] === 'view') {
+        const call = views;
+        views += 1;
+        return (input.view ?? ((): Promise<string> => Promise.resolve(JSON.stringify({
+          state: 'OPEN',
+          headRefOid: HEAD,
+          baseRefName: 'stack/base',
+          isInMergeQueue: false,
+        }))))(call);
+      }
+      // The `ci-failure` child the flake hold files, and everything the child
+      // port does around it.
+      if (args[0] === 'project' && args[1] === 'field-list') {
+        return JSON.stringify({
+          fields: [
+            {
+              id: 'F_blocked',
+              name: 'Blocked on',
+              options: [
+                { id: 'O_nothing', name: 'Nothing' },
+                { id: 'O_human', name: 'Human' },
+              ],
+            },
+            {
+              id: 'F_effort',
+              name: 'Effort',
+              options: ['Low', 'Medium', 'High', 'XHigh', 'Max']
+                .map((name) => ({ id: `O_effort_${name}`, name })),
+            },
+            {
+              id: 'F_priority',
+              name: 'Priority',
+              options: ['P0', 'P1', 'P2', 'P3', 'P4']
+                .map((name) => ({ id: `O_priority_${name}`, name })),
+            },
+          ],
+        });
+      }
+      if (args[0] === 'project' && args[1] === 'item-add') {
+        return JSON.stringify({ id: 'PVTI_child' });
+      }
+      if (args[0] === 'project') return JSON.stringify({});
+      if (args[0] === 'issue' && args[1] === 'create') {
+        return `https://github.com/${'Jinn-Network/mono'}/issues/${input.childNumber ?? 4242}\n`;
+      }
+      if (args[0] === 'issue' && args[1] === 'view') return 'I_kwDOissue\n';
+      if (args[0] === 'issue' && args[1] === 'list') return '[]';
+      if (args[0] === 'issue' || args[0] === 'label' || args[0] === 'search'
+        || args[0] === 'project' || args[0] === 'api') {
+        return JSON.stringify([]);
+      }
+      return candidateRunner(1, ['GREETING.md'])(command, args);
+    };
+    return {
+      calls,
+      port: makeProductionEnqueueActionPort({
+        readSnapshot: async () => snapshot(),
+        authorAllowlist: new Set(['implementation-bot']),
+        expectedBaseRefName: 'stack/base',
+        repositoryPath: '/tmp/repo',
+        fixIssueTypeId: 'IT_kwDOfix',
+        runner,
+        environment: { GH_TOKEN: 'ambient-secret' },
+      }),
+    };
+  }
+
+  function enqueue(harness: EnqueueHarness) {
+    return harness.port.enqueueAtHead({
+      prNumber: 84,
+      issueNumber: 84,
+      head: HEAD,
+      graphqlId: 'PR_kwDOABCD84',
+      expectedBaseRefName: gitRefName('stack/base'),
+      credential: credential(),
+    });
+  }
+
+  it('sends enqueuePullRequest pinned to the exact head under the selected identity', async () => {
+    const harness = enqueuePort();
+
+    await expect(enqueue(harness)).resolves.toMatchObject({
+      status: 'enqueued',
+      head: HEAD,
+      position: 4,
+      queueState: 'QUEUED',
+    });
+
+    const mutation = harness.calls.find((call) =>
+      call.command === 'gh' && call.args[0] === 'api' && call.args[1] === 'graphql');
+    expect(mutation).toBeDefined();
+    expect(mutation!.args).toContain('-f');
+    expect(mutation!.args).toContain('pullRequestId=PR_kwDOABCD84');
+    expect(mutation!.args).toContain(`expectedHeadOid=${HEAD}`);
+    expect(mutation!.args.join(' ')).toMatch(/enqueuePullRequest\(input:/);
+    expect(mutation!.env?.GH_TOKEN).toBe('selected-secret');
+    expect(mutation!.env?.GITHUB_TOKEN).toBe('');
+  });
+
+  it('never runs gh pr merge and never arms auto-merge', async () => {
+    const harness = enqueuePort();
+
+    await enqueue(harness);
+
+    for (const call of harness.calls) {
+      expect(`${call.command} ${call.args.join(' ')}`).not.toMatch(/\bpr merge\b/);
+      expect(call.args).not.toContain('--auto');
+      expect(call.args.join(' ')).not.toMatch(/pulls\/\d+\/merge/);
+    }
+  });
+
+  it.each([
+    ['already queued prose', 'Pull request is already queued', 'already-enqueued'],
+    ['not mergeable', 'GraphQL: Pull request is not mergeable', 'rejected'],
+    ['queue not enabled', 'GraphQL: Merge queue is not enabled for this branch', 'rejected'],
+    ['a 403 refusal', 'gh: HTTP 403: Resource not accessible by integration', 'rejected'],
+    ['a stale expected head', 'GraphQL: Head sha did not match the expected head oid', 'changed-head'],
+    ['a 502', 'gh: HTTP 502: Bad Gateway', 'undetermined'],
+    ['a socket failure', 'dial tcp: ECONNRESET', 'undetermined'],
+    ['a secondary rate limit', 'HTTP 403: You have exceeded a secondary rate limit', 'undetermined'],
+    ['nothing recognisable', 'gh: something nobody has seen before', 'undetermined'],
+  ] as const)('classifies %s as %s', (_name, text, expected) => {
+    expect(classifyEnqueueFailure(text)).toBe(expected);
+  });
+
+  it('reports an already-queued refusal as success, not as a rejection', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('GraphQL: Pull request is already queued'); },
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'already-enqueued' });
+  });
+
+  it('rereads the head when GitHub refuses the expected head oid', async () => {
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error('GraphQL: Head sha did not match the expected head oid');
+      },
+      view: async (): Promise<string> => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: OTHER_HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: false,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({
+      status: 'changed-head',
+      head: OTHER_HEAD,
+    });
+  });
+
+  it('reports a durable refusal as rejected and names it', async () => {
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error('GraphQL: Merge queue is not enabled for this branch');
+      },
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({
+      status: 'rejected',
+      reason: expect.stringMatching(/merge queue is not enabled/i),
+    });
+  });
+
+  /**
+   * A dropped connection is not proof the mutation did not land. The readback
+   * is the only thing that can tell "never reached GitHub" from "landed and the
+   * response was lost", and only an observed queue entry at the expected head
+   * resolves it as success.
+   */
+  it('resolves an undetermined failure by reading the queue back', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
+      // Not queued when the pre-flight authority read runs; queued afterwards,
+      // which is the only evidence that the lost mutation actually landed.
+      view: async (call) => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: call > 0,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'enqueued' });
+  });
+
+  it('stays ambiguous when the readback does not show the PR queued', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
+      view: async (): Promise<string> => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: false,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'ambiguous' });
+  });
+
+  it('does not accept a readback queued at some other head', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
+      view: async (): Promise<string> => JSON.stringify({
+        state: 'OPEN',
+        headRefOid: OTHER_HEAD,
+        baseRefName: 'stack/base',
+        isInMergeQueue: true,
+      }),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'changed-head' });
+  });
+
+  /**
+   * Mutate first, record second. A record written before the mutation would
+   * burn an attempt for a call that never reached GitHub, and two of those
+   * would put a perfectly healthy head on a flake hold.
+   */
+  it('publishes the attempt record only after the mutation succeeded', async () => {
+    const order: string[] = [];
+    const harness = enqueuePort({
+      mutation: async () => {
+        order.push('mutation');
+        return JSON.stringify({
+          data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+        });
+      },
+      onPush: () => order.push('push'),
+    });
+
+    await enqueue(harness);
+
+    expect(order).toEqual(['mutation', 'push']);
+  });
+
+  it('does not burn an attempt when the mutation durably failed', async () => {
+    const pushes: string[][] = [];
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error('GraphQL: Merge queue is not enabled for this branch');
+      },
+      onPush: (args) => pushes.push([...args]),
+    });
+
+    await enqueue(harness);
+
+    expect(pushes).toEqual([]);
+  });
+
+  it('CAS-publishes the first attempt against an absent ref', async () => {
+    const leases: string[] = [];
+    const harness = enqueuePort({
+      onPush: (args) => {
+        leases.push(args.find((arg) => arg.startsWith('--force-with-lease=')) ?? '');
+      },
+    });
+
+    await enqueue(harness);
+
+    expect(leases).toEqual([
+      `--force-with-lease=refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}:`,
+    ]);
+  });
+
+  it('increments the attempt count against the recorded one', async () => {
+    const messages: string[] = [];
+    const ref = `refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`;
+    const harness = enqueuePort({
+      refs: { [ref]: 'd'.repeat(40) },
+      catFile: () => [
+        'Autopilot enqueue record',
+        '',
+        `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=1 -->`,
+        'enqueued-at=2026-07-20T12:00:00.000Z',
+      ].join('\n'),
+    });
+    const runner = harness.calls;
+    await enqueue(harness);
+    for (const call of runner) {
+      if (call.command === 'git' && call.args.includes('commit-tree')) {
+        messages.push(call.args[call.args.indexOf('-m') + 1] ?? '');
+      }
+    }
+
+    expect(messages[0]).toContain('attempts=2');
+  });
+
+  /**
+   * A lost CAS publish means another writer moved the ref underneath us and we
+   * cannot say how many attempts this head has now had. The enqueue itself may
+   * well have landed, so the honest answer is `ambiguous`.
+   */
+  it('reports a lost record publication as ambiguous', async () => {
+    const harness = enqueuePort({ pushFails: true });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'ambiguous' });
+  });
+
+  /**
+   * The flake hold. Two failed attempts at the same head is a signal, not
+   * noise: the engine stops feeding the queue, files a `ci-failure` child so a
+   * human can see why, and writes the child's number into the record so a
+   * later cycle can tell "held and explained" from "held and silent".
+   */
+  describe('flake hold', () => {
+    const ref = `refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`;
+
+    function twoAttempts(overrides: Partial<Parameters<typeof enqueuePort>[0]> = {}) {
+      return enqueuePort({
+        refs: { [ref]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=2 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+        ].join('\n'),
+        ...overrides,
+      });
+    }
+
+    it('refuses a third attempt and never reaches the mutation', async () => {
+      let mutations = 0;
+      const harness = twoAttempts({
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: null } } });
+        },
+      });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({ status: 'flake-hold' });
+      expect(mutations).toBe(0);
+    });
+
+    it('files a ci-failure child and links it into the record', async () => {
+      const messages: string[] = [];
+      const harness = twoAttempts();
+
+      await enqueue(harness);
+
+      for (const call of harness.calls) {
+        if (call.command === 'git' && call.args.includes('commit-tree')) {
+          messages.push(call.args[call.args.indexOf('-m') + 1] ?? '');
+        }
+      }
+      expect(messages.some((message) => /^linked-issue=\d+$/m.test(message))).toBe(true);
+    });
+
+    it('lets a record that already names its issue through', async () => {
+      let mutations = 0;
+      const harness = enqueuePort({
+        refs: { [ref]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=2 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+          'linked-issue=4242',
+        ].join('\n'),
+        mutation: async () => {
+          mutations += 1;
+          return JSON.stringify({
+            data: { enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } } },
+          });
+        },
+      });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({ status: 'enqueued' });
+      expect(mutations).toBe(1);
+    });
   });
 });

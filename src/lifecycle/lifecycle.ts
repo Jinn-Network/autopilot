@@ -163,7 +163,7 @@ function approvalCarriesToCurrentHead(
  * The engine's own signed approval, valid for the current head.
  *
  * Mirrors the engine-side half of `terminalApprovalMatches` in
- * merge-executor-production (the merge gate additionally re-derives the signed
+ * enqueue-executor-production (the enqueue gate additionally re-derives the signed
  * marker, requires a native APPROVED review carrying it, and recomputes the
  * digest from a *fresh* compare rather than the snapshot's). Deliberately a
  * strict subset: the view may never call an item merge-ready that the gate

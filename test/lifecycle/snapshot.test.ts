@@ -31,8 +31,8 @@ import {
 } from '../../src/lifecycle/codecs.js';
 import { makeProductionReconciliationWriter } from '../../src/lifecycle/reconciliation-writer-production.js';
 import { makeProductionReviewActionPort } from '../../src/lifecycle/review-executor-production.js';
-import { makeProductionMergeActionPort } from '../../src/lifecycle/merge-executor-production.js';
-import { evaluateMergeGate } from '../../src/lifecycle/merge-executor.js';
+import { makeProductionEnqueueActionPort } from '../../src/lifecycle/enqueue-executor-production.js';
+import { evaluateEnqueueGate } from '../../src/lifecycle/enqueue-executor.js';
 import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 import { makeReviewSessionProtocol } from '../../src/lifecycle/review-session.js';
@@ -255,7 +255,7 @@ describe('view and merge gate agree on a carried approval', () => {
   }
 
   function mergePort(snapshot, compareFiles) {
-    return makeProductionMergeActionPort({
+    return makeProductionEnqueueActionPort({
       readSnapshot: async () => snapshot,
       authorAllowlist: new Set(['trusted']),
       expectedBaseRefName: 'next',
@@ -291,7 +291,7 @@ describe('view and merge gate agree on a carried approval', () => {
     const candidate = await mergePort(snapshot, compareFiles).readCandidate(101);
     const gate = candidate === null
       ? { pass: false, reasons: ['pull-request-missing'] }
-      : evaluateMergeGate(candidate);
+      : evaluateEnqueueGate(candidate);
     return { view, gate, candidate };
   }
 
@@ -717,6 +717,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
     const targetPr = () => ({
       ...page('page-2').nodes[0]!,
       number: 84,
+      graphqlId: 'PR_kwDOABCD84',
       body: '<!-- jinn-autopilot:v2 issue=2084 branch=autopilot/2084 -->',
       baseRefName: 'autopilot/2083',
       headRefName: 'autopilot/2084',
@@ -1261,16 +1262,17 @@ describe('buildGitHubLifecycleSnapshot', () => {
         if (
           derivedMergeAction !== undefined
           && args[0] === 'api'
-          && args.includes('PUT')
-          && args.includes(
-            `repos/Jinn-Network/mono/pulls/${derivedMergeAction.prNumber}/merge`,
-          )
+          && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('enqueuePullRequest'))
         ) {
           exactMergeCalls += 1;
-          expect(args).toContain(`sha=${derivedMergeAction.head}`);
-          merged = true;
-          projectStatus = 'Done';
-          return JSON.stringify({ merged: true, sha: mergeCommitOid });
+          expect(args).toContain(`expectedHeadOid=${derivedMergeAction.head}`);
+          expect(args).toContain('pullRequestId=PR_kwDOABCD84');
+          return JSON.stringify({
+            data: {
+              enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } },
+            },
+          });
         }
         if (
           derivedMergeAction !== undefined
@@ -1950,10 +1952,13 @@ describe('buildGitHubLifecycleSnapshot', () => {
       expectedBaseRefName: 'autopilot/2083',
     }]);
     derivedMergeAction = mergeActions[0];
+    // The integration stage hands the PR to GitHub's merge queue and stops; the
+    // merge itself lands on GitHub's schedule and reaches the board through a
+    // later cycle's MERGED snapshot.
     await expect(escalationRuntime.executeAction(
       derivedMergeAction,
       terminal,
-    )).resolves.toEqual({ outcome: 'merged' });
+    )).resolves.toEqual({ outcome: 'enqueued' });
     expect(exactMergeCalls).toBe(1);
   });
 

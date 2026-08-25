@@ -13,13 +13,13 @@ import {
   isCiGreen,
 } from './ci-classifier.js';
 
-export interface MergeEffectiveReview {
+export interface EnqueueEffectiveReview {
   readonly reviewer: string;
   readonly state: 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED' | 'PENDING';
   readonly commitId: GitOid;
 }
 
-export interface MergeCandidate {
+export interface EnqueueCandidate {
   readonly issueNumber: number;
   readonly prNumber: number;
   readonly open: boolean;
@@ -35,7 +35,7 @@ export interface MergeCandidate {
   readonly uniqueIssueMapping: boolean;
   readonly terminalApprovalMatches: boolean;
   readonly terminalApprovalReviewer?: string;
-  readonly effectiveReviews: readonly MergeEffectiveReview[];
+  readonly effectiveReviews: readonly EnqueueEffectiveReview[];
   readonly checks: readonly {
     readonly name: string;
     readonly status: string;
@@ -47,14 +47,69 @@ export interface MergeCandidate {
   readonly changedFilesComplete: boolean;
   readonly codeownersComplete: boolean;
   readonly codeownerSensitive: boolean;
+  /**
+   * Logins the repository's CODEOWNERS policy names; compared case-insensitively.
+   * An empty set proves nobody is an owner, so a sensitive change refuses —
+   * the same answer the unconditional `codeowner-sensitive` refusal gave, kept
+   * as the fail-safe default rather than an accident of configuration.
+   */
+  readonly codeOwnerLogins: ReadonlySet<string>;
+  /**
+   * The PR's GraphQL node id, the `pullRequestId` argument of
+   * `enqueuePullRequest`. Absent means the mutation cannot be addressed at all.
+   */
+  readonly graphqlId?: string;
+  /** The PR already sits in the merge queue; a second enqueue is a no-op. */
+  readonly inMergeQueue: boolean;
 }
 
-export interface MergeGateResult {
+export interface EnqueueGateResult {
   readonly pass: boolean;
   readonly reasons: readonly string[];
 }
 
-export function evaluateMergeGate(candidate: MergeCandidate): MergeGateResult {
+/**
+ * An effective APPROVED review at the candidate's head from a login the
+ * repository's CODEOWNERS policy names. Head-bound on purpose: an approval
+ * recorded against an older commit says nothing about the diff being enqueued.
+ */
+function codeOwnerApprovedAtHead(candidate: EnqueueCandidate): boolean {
+  // GitHub logins are case-insensitive, so both sides are folded here rather
+  // than trusting the casing a CODEOWNERS file or a config file happened to
+  // use. A casing mismatch would refuse a change an owner really did approve.
+  const owners = new Set(
+    [...candidate.codeOwnerLogins].map((login) => login.toLowerCase()),
+  );
+  return candidate.effectiveReviews.some((review) => (
+    review.commitId === candidate.head
+    && review.state === 'APPROVED'
+    && owners.has(review.reviewer.toLowerCase())
+  ));
+}
+
+/**
+ * What the engine still owns once merging belongs to GitHub's merge queue.
+ *
+ * The queue builds its own merge candidate on top of the current base and runs
+ * the required checks against it, so three of the old merge gate's refusals
+ * became refusals of the queue's ordinary input and are gone:
+ *
+ *   - `behind` / `compare-unknown`. The old gate merged *this exact commit*, so
+ *     an out-of-date head was a real hazard. The queue rebases onto the base it
+ *     merges into, which is precisely what BEHIND means, so a behind or
+ *     diverged head is queue-normal.
+ *   - the `mergeStateStatus ∈ {CLEAN, UNSTABLE, HAS_HOOKS}` requirement. BEHIND
+ *     and BLOCKED are the states a queue-managed PR sits in by construction.
+ *     Only `DIRTY` (and a `CONFLICTING` mergeable) is a real refusal, and it
+ *     now says so by name.
+ *   - `self-review`. The account that authors a change and the account that
+ *     enqueues it are the same in the engine's ordinary flow, and
+ *     `terminalApprovalMatches` above already proves an engine reviewer signed
+ *     this exact head.
+ *
+ * Everything that is *not* the queue's job stays exactly as strict as it was.
+ */
+export function evaluateEnqueueGate(candidate: EnqueueCandidate): EnqueueGateResult {
   const reasons: string[] = [];
   if (!candidate.open || candidate.merged) reasons.push('pull-request-not-open');
   if (candidate.draft) reasons.push('draft');
@@ -64,12 +119,6 @@ export function evaluateMergeGate(candidate: MergeCandidate): MergeGateResult {
   if (!candidate.uniqueIssueMapping) reasons.push('mapping');
   if (candidate.baseRefName !== candidate.expectedBaseRefName) reasons.push('base');
   if (!candidate.terminalApprovalMatches) reasons.push('terminal-approval');
-  if (
-    candidate.terminalApprovalReviewer !== undefined
-    && candidate.terminalApprovalReviewer.toLowerCase() === candidate.author.toLowerCase()
-  ) {
-    reasons.push('self-review');
-  }
   if (candidate.effectiveReviews.some((review) => (
     review.commitId === candidate.head && review.state === 'CHANGES_REQUESTED'
   ))) {
@@ -80,31 +129,50 @@ export function evaluateMergeGate(candidate: MergeCandidate): MergeGateResult {
     if (classification.state === 'missing') reasons.push('checks-missing');
     else reasons.push('checks-not-green');
   }
-  if (
-    candidate.mergeable !== 'MERGEABLE'
-    || !['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(candidate.mergeStateStatus)
-  ) {
-    reasons.push('mergeability');
+  if (candidate.mergeable === 'CONFLICTING' || candidate.mergeStateStatus === 'DIRTY') {
+    reasons.push('conflicting');
+  } else if (candidate.mergeable === 'UNKNOWN') {
+    // GitHub has not finished computing mergeability. Undetermined, not a
+    // refusal — the next cycle reads it again.
+    reasons.push('mergeability-unknown');
   }
-  if (candidate.compareStatus === 'behind' || candidate.compareStatus === 'diverged') {
-    reasons.push('behind');
-  } else if (candidate.compareStatus === 'unknown') {
-    reasons.push('compare-unknown');
+  if (candidate.graphqlId === undefined || candidate.graphqlId.length === 0) {
+    reasons.push('pull-request-node-id-missing');
   }
   if (!candidate.changedFilesComplete) reasons.push('changed-files-incomplete');
   if (!candidate.codeownersComplete) reasons.push('codeowners-incomplete');
-  if (candidate.codeownerSensitive) reasons.push('codeowner-sensitive');
+  if (candidate.codeownerSensitive && !codeOwnerApprovedAtHead(candidate)) {
+    reasons.push('codeowner-approval-missing');
+  }
   return { pass: reasons.length === 0, reasons };
 }
 
-export type ExactMergeOutcome =
+/**
+ * What one `enqueuePullRequest` attempt at an exact head resolved to.
+ *
+ * `enqueued` and `already-enqueued` are both success — the PR is in the queue
+ * at the expected head, and which call put it there does not matter.
+ * `already-merged` means GitHub merged it out from under us, also success.
+ * `rejected` is a durable refusal (not mergeable, queue not enabled, forbidden);
+ * `ambiguous` is undetermined and a later identical attempt can still succeed;
+ * `flake-hold` is the engine's own refusal to keep feeding a head that has
+ * already failed the queue twice.
+ */
+export type ExactEnqueueOutcome =
   | {
-      readonly status: 'merged' | 'already-merged';
+      readonly status: 'enqueued' | 'already-enqueued';
       readonly head: GitOid;
-      readonly mergeCommitOid: GitOid;
+      readonly position?: number;
+      readonly queueState?: string;
+      readonly reason?: string;
     }
   | {
-      readonly status: 'rejected' | 'changed-head' | 'ambiguous';
+      readonly status:
+      | 'already-merged'
+      | 'rejected'
+      | 'changed-head'
+      | 'ambiguous'
+      | 'flake-hold';
       readonly head: GitOid;
       readonly reason?: string;
     };
@@ -153,21 +221,17 @@ export type UpdateBranchOutcome =
       readonly failure: UpdateBranchFailureClass;
     };
 
-export interface MergeExecutorDeps {
-  readCandidate(prNumber: number): Promise<MergeCandidate | null>;
+export interface EnqueueExecutorDeps {
+  readCandidate(prNumber: number): Promise<EnqueueCandidate | null>;
   readonly credentials: CredentialPool;
-  mergeExactHead(input: {
+  enqueueAtHead(input: {
     readonly prNumber: number;
+    readonly issueNumber: number;
     readonly head: GitOid;
+    readonly graphqlId: string;
     readonly expectedBaseRefName: GitRefName;
     readonly credential: SelectedCredential;
-  }): Promise<ExactMergeOutcome>;
-  reconcileDone(input: {
-    readonly issueNumber: number;
-    readonly prNumber: number;
-    readonly expectedHead: GitOid;
-    readonly credential: SelectedCredential;
-  }): Promise<void>;
+  }): Promise<ExactEnqueueOutcome>;
   updateBranch?(input: {
     readonly prNumber: number;
     readonly expectedHead: GitOid;
@@ -183,18 +247,21 @@ export interface MergeExecutorDeps {
   >;
 }
 
-export type MergeExecutionResult =
+/**
+ * `merged` and `merged-projection-pending` are deliberately absent. This stage
+ * hands the PR to GitHub's merge queue and stops; the merge itself happens on
+ * GitHub's schedule, and Done arrives from a later cycle reading a MERGED
+ * snapshot through the existing merged-phase machinery. A status claiming a
+ * merge here would be asserting an outcome this code never observed.
+ */
+export type EnqueueExecutionResult =
   | {
-      readonly status: 'merged';
+      readonly status: 'enqueued' | 'already-enqueued';
       readonly prNumber: number;
       readonly head: GitOid;
-      readonly mergeCommitOid: GitOid;
-    }
-  | {
-      readonly status: 'merged-projection-pending';
-      readonly prNumber: number;
-      readonly head: GitOid;
-      readonly mergeCommitOid: GitOid;
+      readonly position?: number;
+      readonly queueState?: string;
+      readonly reason?: string;
     }
   | {
       readonly status: 'ineligible';
@@ -208,22 +275,22 @@ export type MergeExecutionResult =
       readonly head: GitOid;
     }
   | {
-      readonly status: 'rejected' | 'ambiguous';
+      readonly status: 'already-merged' | 'rejected' | 'ambiguous' | 'flake-hold';
       readonly prNumber: number;
       readonly head: GitOid;
       readonly reason?: string;
     };
 
-export async function executeMergeAction(
+export async function executeEnqueueAction(
   action: {
     readonly prNumber: number;
     readonly expectedHead: GitOid;
     readonly expectedBaseRefName: GitRefName;
   },
-  deps: MergeExecutorDeps,
-): Promise<MergeExecutionResult> {
+  deps: EnqueueExecutorDeps,
+): Promise<EnqueueExecutionResult> {
   if (!Number.isSafeInteger(action.prNumber) || action.prNumber <= 0) {
-    throw new Error('Merge action requires a positive PR number');
+    throw new Error('Enqueue action requires a positive PR number');
   }
   const initial = await deps.readCandidate(action.prNumber);
   if (initial === null) {
@@ -244,7 +311,10 @@ export async function executeMergeAction(
       reasons: ['base'],
     };
   }
-  const initialGate = evaluateMergeGate(initial);
+  if (initial.inMergeQueue) {
+    return { status: 'already-enqueued', prNumber: action.prNumber, head: initial.head };
+  }
+  const initialGate = evaluateEnqueueGate(initial);
   if (!initialGate.pass) {
     return {
       status: 'ineligible',
@@ -281,7 +351,10 @@ export async function executeMergeAction(
       reasons: ['base'],
     };
   }
-  const gate = evaluateMergeGate(current);
+  if (current.inMergeQueue) {
+    return { status: 'already-enqueued', prNumber: action.prNumber, head: current.head };
+  }
+  const gate = evaluateEnqueueGate(current);
   if (!gate.pass) {
     return {
       status: 'ineligible',
@@ -290,49 +363,31 @@ export async function executeMergeAction(
       reasons: gate.reasons,
     };
   }
-  const outcome = await deps.mergeExactHead({
+  // Proven by the gate immediately above: `pull-request-node-id-missing` is a
+  // refusal, so a passing gate means the id is present.
+  const graphqlId = current.graphqlId!;
+  const outcome = await deps.enqueueAtHead({
     prNumber: action.prNumber,
+    issueNumber: current.issueNumber,
     head: action.expectedHead,
+    graphqlId,
     expectedBaseRefName: action.expectedBaseRefName,
     credential: selection.credential,
   });
-  if (outcome.status !== 'merged' && outcome.status !== 'already-merged') {
-    if (outcome.status === 'changed-head') {
-      return {
-        status: 'changed-head',
-        prNumber: action.prNumber,
-        head: outcome.head,
-      };
-    }
-    return {
-      status: outcome.status,
-      prNumber: action.prNumber,
-      head: outcome.head,
-      ...(!('reason' in outcome) || outcome.reason === undefined
-        ? {}
-        : { reason: outcome.reason }),
-    };
-  }
-  try {
-    await deps.reconcileDone({
-      issueNumber: current.issueNumber,
-      prNumber: current.prNumber,
-      expectedHead: action.expectedHead,
-      credential: selection.credential,
-    });
-  } catch {
-    return {
-      status: 'merged-projection-pending',
-      prNumber: action.prNumber,
-      head: action.expectedHead,
-      mergeCommitOid: outcome.mergeCommitOid,
-    };
+  if (outcome.status === 'changed-head') {
+    return { status: 'changed-head', prNumber: action.prNumber, head: outcome.head };
   }
   return {
-    status: 'merged',
+    status: outcome.status,
     prNumber: action.prNumber,
-    head: action.expectedHead,
-    mergeCommitOid: outcome.mergeCommitOid,
+    head: outcome.head,
+    ...('position' in outcome && outcome.position !== undefined
+      ? { position: outcome.position }
+      : {}),
+    ...('queueState' in outcome && outcome.queueState !== undefined
+      ? { queueState: outcome.queueState }
+      : {}),
+    ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
   };
 }
 
@@ -376,7 +431,7 @@ export type UpdateBranchResult =
 
 export async function executeUpdateBranchAction(
   action: { readonly prNumber: number; readonly expectedHead: GitOid },
-  deps: MergeExecutorDeps,
+  deps: EnqueueExecutorDeps,
 ): Promise<UpdateBranchResult> {
   if (deps.updateBranch === undefined) {
     return { status: 'ineligible', prNumber: action.prNumber, reason: 'update-branch-unavailable' };
@@ -474,7 +529,7 @@ export async function executeFileReconcileChildAction(
     readonly expectedHead: GitOid;
     readonly effort: 'low' | 'medium' | 'high';
   },
-  deps: MergeExecutorDeps,
+  deps: EnqueueExecutorDeps,
 ): Promise<FileReconcileChildResult> {
   if (deps.fileReconcileChild === undefined) {
     return {
@@ -512,3 +567,25 @@ export async function executeFileReconcileChildAction(
     childNumber: filed.number,
   };
 }
+
+// TODO(T6): remove compatibility aliases.
+//
+// The integration stage becomes an enqueue stage across #82's T1-T9. T3/T4
+// rename this module and its production port; T5-T9 rewire the controller,
+// the ladder, the scheduler and the runtime onto the new names. These aliases
+// exist only so the tree typechecks at the half-done boundary between those
+// two halves, and every one of them must be deleted with the rewiring.
+//
+// Exactly one live consumer remains: `active-runtime-production.ts` imports
+// `executeMergeAction` for its `merge` handler. Point that handler at
+// `executeEnqueueAction` and this whole block goes.
+//
+// Note that the aliases are name-only. `executeMergeAction` does not merge any
+// more — it enqueues, and its result statuses are the enqueue ones. Nothing
+// here preserves the old behaviour, only the old spelling.
+export type MergeCandidate = EnqueueCandidate;
+export type MergeGateResult = EnqueueGateResult;
+export type MergeExecutorDeps = EnqueueExecutorDeps;
+export type MergeExecutionResult = EnqueueExecutionResult;
+export { evaluateEnqueueGate as evaluateMergeGate };
+export { executeEnqueueAction as executeMergeAction };

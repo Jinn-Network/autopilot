@@ -570,7 +570,7 @@ function latestDecisiveReview(
  *
  * The gate requires the *claim reviewer's* effective (latest) native review at
  * the **current** head to be `APPROVED` and to carry the signed marker naming
- * the reviewed head (`merge-executor-production.ts`). Nothing else in the
+ * the reviewed head (`enqueue-executor-production.ts`). Nothing else in the
  * lifecycle item expresses that: `approved` is any reviewer's latest decisive
  * review at head, and `terminalVerdict` is selected by marker across every
  * commit. Without this projection the view can carry an approval the gate then
