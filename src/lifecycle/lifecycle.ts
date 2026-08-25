@@ -275,6 +275,12 @@ function underlyingPhase(item: LifecycleItem): Exclude<LifecyclePhase, 'human'> 
     // base and runs the required checks against *that*, which is precisely what
     // BEHIND describes — so an out-of-date head is the queue's ordinary input,
     // not a hazard the engine has to fix first.
+    //
+    // A MERGEABLE head reporting BLOCKED reaches `clean` for the same reason
+    // (issue #82): see `deriveMergeState`. It is not admitted here by a third
+    // arm of this condition — the derivation already answered it, so the gates
+    // that genuinely stand between a BLOCKED head and the queue are the ones
+    // above: `approved`, `needsReview`, and `isCiGreen`.
     if (
       (item.mergeState === 'clean' || item.mergeState === 'behind')
       && !engineApprovalLapsed(item)

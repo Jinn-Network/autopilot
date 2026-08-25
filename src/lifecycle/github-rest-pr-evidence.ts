@@ -9,15 +9,21 @@ import type {
   NativeReviewState,
   PullRequestSnapshot,
 } from './snapshot.js';
+import { queueEligibleMergeStateStatus } from './snapshot.js';
 import { gitOid, type GitOid } from './types.js';
 
 export interface BaseBranchTipReader {
   readBaseBranchTipOid(baseRefName: string): Promise<GitOid | 'unavailable'>;
 }
 
+/**
+ * Every merge state the queue can still take, BLOCKED included (issue #82).
+ * These are the pull requests whose `compareStatus` decides behind-versus-
+ * conflicting, so these are the ones whose compare evidence has to stay fresh.
+ */
 function mergePathPullRequest(pr: PullRequestSnapshot): boolean {
   return pr.mergeability === 'MERGEABLE'
-    && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
+    && queueEligibleMergeStateStatus(pr.mergeStateStatus);
 }
 
 async function compareEvidenceNeedsRefresh(

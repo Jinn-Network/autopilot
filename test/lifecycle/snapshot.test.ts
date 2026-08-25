@@ -2084,6 +2084,69 @@ describe('buildGitHubLifecycleSnapshot', () => {
     });
   });
 
+  /**
+   * Issue #82. BLOCKED is what GitHub reports for a pull request waiting on a
+   * required context — including every context the merge queue itself runs
+   * against the merge group it builds — and for one already admitted to the
+   * queue. The engine no longer merges the head it pins, so BLOCKED is the
+   * queue's ordinary input rather than a refusal, exactly as BEHIND is. What
+   * still refuses is a head the queue cannot build a candidate from at all.
+   */
+  it('maps MERGEABLE/BLOCKED to lifecycle clean', async () => {
+    const raw = page('page-2').nodes[0]!;
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...raw,
+          mergeability: 'MERGEABLE',
+          mergeStateStatus: 'BLOCKED',
+          compareStatus: 'ahead',
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({
+      kind: 'pull-request',
+      mergeState: 'clean',
+      approved: true,
+    });
+  });
+
+  it('keeps a CONFLICTING BLOCKED head refusing as conflict', async () => {
+    const raw = page('page-2').nodes[0]!;
+    const source = reader({
+      readPullRequests: async () => ({
+        nodes: [{
+          ...raw,
+          mergeability: 'CONFLICTING',
+          mergeStateStatus: 'BLOCKED',
+          compareStatus: 'diverged',
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items[0]).toMatchObject({
+      kind: 'pull-request',
+      mergeState: 'conflict',
+    });
+    const [view] = deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60 * 1000,
+    ).items;
+    expect(view?.phase).not.toBe('merge-ready');
+  });
+
   it('fails closed when MERGEABLE/CLEAN has exact unknown compare evidence', async () => {
     const raw = page('page-2').nodes[0]!;
     const source = reader({

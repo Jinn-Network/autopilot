@@ -107,7 +107,12 @@ function graphQlPr(input: {
       nodes: [{ number: input.closingIssueNumber ?? (input.number === 101 ? 42 : 41) }],
     },
     mergeable: 'MERGEABLE',
-    mergeStateStatus: 'BLOCKED',
+    // Deliberately off the compare-evidence path. These tests are about claim
+    // parsing, paging, transport and usage accounting, and none of them stubs
+    // the exact REST compare read that every queue-eligible merge state now
+    // pays for — BLOCKED included, since issue #82. UNKNOWN keeps the fixture
+    // out of that read without asserting anything about mergeability.
+    mergeStateStatus: 'UNKNOWN',
     mergedAt: input.state === 'MERGED' ? '2026-07-20T10:00:00.000Z' : null,
     mergeCommit: input.state === 'MERGED' ? { oid: input.head } : null,
     commits: {
@@ -2099,5 +2104,38 @@ describe('merge-queue snapshot evidence', () => {
     const page = await new GhLifecycleReader(run).readPullRequests(null);
 
     expect(page.nodes[0]?.enqueueRecorded).toBeUndefined();
+  });
+
+  /**
+   * BLOCKED is what a queued pull request reports, and what one waiting on a
+   * merge-group-only context reports. GraphQL cannot tell "behind the base"
+   * from "conflicts with it" for either, so the exact REST compare read has to
+   * cover BLOCKED just as it covers CLEAN — otherwise the head derives with no
+   * compare evidence at all.
+   */
+  it('reads exact compare evidence for a BLOCKED head', async () => {
+    const endpoints: string[] = [];
+    const base = 'b'.repeat(40);
+    const { run: graphQl } = queueRun(queueAwarePr({ mergeStateStatus: 'BLOCKED' }));
+    const run: CommandRunner = async (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && args[1] !== 'graphql') {
+        const endpoint = args[1]!;
+        endpoints.push(endpoint);
+        if (endpoint.includes('/compare/')) {
+          return JSON.stringify({ status: 'behind', base_commit: { sha: base } });
+        }
+        return JSON.stringify({
+          head: { sha: OPEN_HEAD },
+          base: { ref: 'next', sha: base },
+        });
+      }
+      return graphQl(command, args);
+    };
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(endpoints.some((endpoint) => endpoint.includes('/compare/'))).toBe(true);
+    expect(page.nodes[0]?.compareStatus).toBe('behind');
+    expect(page.nodes[0]?.compareBaseTipOid).toBe(base);
   });
 });

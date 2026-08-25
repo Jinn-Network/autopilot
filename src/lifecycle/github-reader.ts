@@ -24,6 +24,7 @@ import type {
   RawNativeReview,
   RawPullRequest,
 } from './snapshot.js';
+import { queueEligibleMergeStateStatus } from './snapshot.js';
 import {
   decodeBranchClaimTrailers,
   decodeReviewClaimPayload,
@@ -773,12 +774,24 @@ function reviewedDiffCarryInQuestion(
   }
 }
 
-function looksFalseCleanMergeState(
+/**
+ * Does this pull request need the exact REST compare read?
+ *
+ * GraphQL's `mergeStateStatus` cannot separate "behind the base" from "conflicts
+ * with the base" on its own, and the enqueue stage needs that distinction:
+ * behind is the queue's ordinary input, conflicting is the one shape it cannot
+ * build a candidate from. So every state the queue can still take gets the
+ * compare read — BLOCKED included (issue #82), because a queued pull request
+ * and one waiting on a merge-group-only context both report BLOCKED, and
+ * skipping the read would leave them with `unknown` compare evidence, which
+ * derives as `blocked` and strands them outside the stage.
+ */
+function queueEligibleMergeState(
   mergeability: RawPullRequest['mergeability'],
   mergeStateStatus: string,
 ): boolean {
   return mergeability === 'MERGEABLE'
-    && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(mergeStateStatus);
+    && queueEligibleMergeStateStatus(mergeStateStatus);
 }
 
 function checks(pr: GraphQlPr): RawPullRequest['checks'] {
@@ -1488,7 +1501,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       // reading is identical to the merge gate's — see `proveReviewedDiff` — and
       // that proof is only paid for when a carry is actually in question, i.e.
       // for a PR that was just update-branched under a recorded approval.
-      ...(pr.state === 'OPEN' && looksFalseCleanMergeState(pr.mergeable, pr.mergeStateStatus)
+      ...(pr.state === 'OPEN' && queueEligibleMergeState(pr.mergeable, pr.mergeStateStatus)
         ? await readExactCompareEvidence({
             run: this.run,
             prNumber: pr.number,

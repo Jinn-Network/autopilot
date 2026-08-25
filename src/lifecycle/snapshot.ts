@@ -659,7 +659,39 @@ function terminalVerdict(pr: PullRequestSnapshot) {
   } as const;
 }
 
-function mergeState(pr: PullRequestSnapshot): Extract<
+/**
+ * Merge states the merge queue can build a candidate from.
+ *
+ * BLOCKED belongs here for the same reason BEHIND does (issue #82). This stage
+ * no longer merges the head it pins: it hands the pull request to GitHub's
+ * merge queue, which builds its own merge group on top of the current base and
+ * runs the required contexts against *that*. BLOCKED is precisely what GitHub
+ * reports while a required context has not reported on the pull request — which
+ * includes every merge-group-only context, by construction — and what a pull
+ * request already admitted to the queue reports. Refusing it stranded queued
+ * PRs outside the enqueue stage entirely, and left the merge-group-only
+ * contexts waiting for an enqueue that was waiting for them.
+ *
+ * What is *not* here is the refusal that still means something: a head the
+ * queue cannot build a candidate from at all. `CONFLICTING`/`DIRTY` is checked
+ * first and answers `conflict`, and the reconcile child still owns it.
+ *
+ * The remaining gates are untouched and do the work BLOCKED used to stand in
+ * for: `approved`/`needsReview` answer "a required review is missing" and the
+ * CI classifier answers "a required check failed".
+ */
+const QUEUE_ELIGIBLE_MERGE_STATE_STATUSES = [
+  'CLEAN',
+  'UNSTABLE',
+  'HAS_HOOKS',
+  'BLOCKED',
+] as const;
+
+export function queueEligibleMergeStateStatus(status: string): boolean {
+  return (QUEUE_ELIGIBLE_MERGE_STATE_STATUSES as readonly string[]).includes(status);
+}
+
+export function deriveMergeState(pr: PullRequestSnapshot): Extract<
 LifecycleItem,
 { kind: 'pull-request' }
 >['mergeState'] {
@@ -667,9 +699,10 @@ LifecycleItem,
   if (pr.mergeStateStatus === 'BEHIND') return 'behind';
   if (pr.compareStatus === 'behind' || pr.compareStatus === 'diverged') return 'behind';
   if (pr.compareStatus === 'unknown') return 'blocked';
-  if (pr.mergeability === 'MERGEABLE' && ['CLEAN', 'UNSTABLE', 'HAS_HOOKS'].includes(
-    pr.mergeStateStatus,
-  )) {
+  if (
+    pr.mergeability === 'MERGEABLE'
+    && queueEligibleMergeStateStatus(pr.mergeStateStatus)
+  ) {
     return 'clean';
   }
   return 'blocked';
@@ -791,7 +824,7 @@ function lifecyclePr(
     merged: pr.state === 'MERGED',
     needsReview: decisive?.state !== 'APPROVED',
     approved: decisive?.state === 'APPROVED',
-    mergeState: mergeState(pr),
+    mergeState: deriveMergeState(pr),
     checks: [...pr.checks],
     ...(pr.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
     ...(pr.enqueueRecorded === true ? { enqueueRecorded: true } : {}),
