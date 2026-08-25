@@ -37,6 +37,13 @@ export interface ProductionEnqueueActionPortOptions {
   readonly readSnapshot: () => Promise<GitHubLifecycleSnapshot>;
   readonly authorAllowlist: ReadonlySet<string>;
   readonly expectedBaseRefName?: string;
+  /**
+   * The repository's protected integration branch, the only branch a merge
+   * queue is configured on. Supplied, it refuses a stacked pull request before
+   * any mutation; absent, the gate simply does not assert anything about the
+   * base beyond the canonical mapping match.
+   */
+  readonly defaultBranch?: string;
   readonly repositorySlug?: string;
   readonly projectOwner?: string;
   readonly projectNumber?: number;
@@ -415,6 +422,9 @@ export function makeProductionEnqueueActionPort(
       head: pr.headOid,
       baseRefName: gitRefName(pr.baseRefName),
       expectedBaseRefName: expectedBase,
+      ...(options.defaultBranch === undefined
+        ? {}
+        : { defaultBaseRefName: gitRefName(options.defaultBranch) }),
       draft: pr.isDraft,
       labels: [...pr.labels],
       humanHold: hasExternalHumanAuthority({

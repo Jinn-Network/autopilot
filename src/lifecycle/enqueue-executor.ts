@@ -27,6 +27,12 @@ export interface EnqueueCandidate {
   readonly head: GitOid;
   readonly baseRefName: GitRefName;
   readonly expectedBaseRefName: GitRefName;
+  /**
+   * The repository's protected integration branch — the one branch a merge
+   * queue is configured on. Absent means the caller could not say, which
+   * asserts nothing either way; every production path supplies it.
+   */
+  readonly defaultBaseRefName?: GitRefName;
   readonly draft: boolean;
   readonly labels: readonly string[];
   readonly humanHold: boolean;
@@ -118,6 +124,20 @@ export function evaluateEnqueueGate(candidate: EnqueueCandidate): EnqueueGateRes
   if (!candidate.authorAllowed) reasons.push('author');
   if (!candidate.uniqueIssueMapping) reasons.push('mapping');
   if (candidate.baseRefName !== candidate.expectedBaseRefName) reasons.push('base');
+  // A merge queue belongs to one protected branch. A stacked pull request whose
+  // base is another Autopilot work branch has no queue to be admitted to, so
+  // this is not a risk being weighed — it is a call that cannot succeed, and
+  // one that would burn an attempt-ledger entry against a head that did nothing
+  // wrong. Distinct from `base` on purpose: `base` catches a PR retargeted away
+  // from the base its canonical mapping names, while this catches a mapping
+  // that legitimately names a parent work branch, which is the ordinary and
+  // entirely correct shape of a stack until it collapses onto the root.
+  if (
+    candidate.defaultBaseRefName !== undefined
+    && candidate.baseRefName !== candidate.defaultBaseRefName
+  ) {
+    reasons.push('stacked-base');
+  }
   if (!candidate.terminalApprovalMatches) reasons.push('terminal-approval');
   if (candidate.effectiveReviews.some((review) => (
     review.commitId === candidate.head && review.state === 'CHANGES_REQUESTED'

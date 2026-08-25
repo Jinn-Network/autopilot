@@ -1069,6 +1069,9 @@ export function makeProductionActiveRuntime(
           // ejecting is fed back forever.
           repositoryPath: options.repositoryPath,
           repositoryUrl: options.repositoryUrl,
+          // The one branch the merge queue is configured on. Without it the
+          // gate cannot tell a root pull request from a stacked one.
+          defaultBranch: options.defaultBranch,
           // Empty is the fail-safe: a codeowner-sensitive change refuses when
           // nobody is proven to be an owner.
           codeOwnerLogins: options.codeOwnerLogins ?? new Set<string>(),

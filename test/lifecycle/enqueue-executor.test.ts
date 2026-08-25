@@ -213,6 +213,51 @@ describe('head-pinned enqueue executor', () => {
     });
   });
 
+  /**
+   * A merge queue is a property of one protected branch. A stacked pull request
+   * whose base is another Autopilot work branch has no queue to be admitted to,
+   * so enqueueing it is not a risk to be weighed — it is a call that cannot
+   * succeed, and one that would burn an attempt-ledger entry against a head
+   * that never did anything wrong.
+   *
+   * This is not the `base` reason. `base` catches a PR retargeted away from the
+   * base its canonical mapping names; this catches a PR whose canonical mapping
+   * legitimately names a parent work branch, which is the ordinary shape of a
+   * stack and stays entirely correct until the stack collapses onto the root.
+   */
+  describe('stacked pull requests', () => {
+    it('refuses a base that is not the repository default branch', () => {
+      expect(evaluateEnqueueGate(candidate({
+        baseRefName: gitRefName('autopilot/2083'),
+        expectedBaseRefName: gitRefName('autopilot/2083'),
+        defaultBaseRefName: gitRefName('next'),
+      })).reasons).toEqual(['stacked-base']);
+    });
+
+    it('passes a root pull request targeting the default branch', () => {
+      expect(evaluateEnqueueGate(candidate({
+        defaultBaseRefName: gitRefName('next'),
+      }))).toEqual({ pass: true, reasons: [] });
+    });
+
+    // Not a licence, an absence of evidence. Every production path configures
+    // the default branch; a fixture that does not is simply not asserting this.
+    it('says nothing about the base when the default branch is unknown', () => {
+      expect(evaluateEnqueueGate(candidate({
+        baseRefName: gitRefName('autopilot/2083'),
+        expectedBaseRefName: gitRefName('autopilot/2083'),
+      }))).toEqual({ pass: true, reasons: [] });
+    });
+
+    it('still names a retargeted base separately from a stacked one', () => {
+      expect(evaluateEnqueueGate(candidate({
+        baseRefName: gitRefName('autopilot/2083'),
+        expectedBaseRefName: gitRefName('next'),
+        defaultBaseRefName: gitRefName('next'),
+      })).reasons).toEqual(['base', 'stacked-base']);
+    });
+  });
+
   it('rereads every gate and enqueues the exact head under the selected credential', async () => {
     const h = harness();
     await expect(
