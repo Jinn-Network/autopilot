@@ -28,11 +28,6 @@ export interface ActiveRuntimeHandlers {
     snapshot: GitHubLifecycleSnapshot,
     context?: { readonly cohortQuotaReserved: boolean },
   ): Promise<ActiveRuntimeResult>;
-  updateBranch?(
-    action: Extract<NewWorkAction, { kind: 'update-branch' }>,
-    credentials: CredentialPool,
-    snapshot: GitHubLifecycleSnapshot,
-  ): Promise<ActiveRuntimeResult>;
   fileReconcileChild?(
     action: Extract<NewWorkAction, { kind: 'file-reconcile-child' }>,
     credentials: CredentialPool,
@@ -48,9 +43,13 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
-  // TODO(T6): rename to `enqueue` and narrow back to a single kind.
-  merge(
-    action: Extract<NewWorkAction, { kind: 'merge' | 'enqueue' }>,
+  /**
+   * Hand the exact head to GitHub's merge queue. Nothing this handler returns
+   * may claim the change landed: the queue merges on its own schedule, and Done
+   * arrives from a later cycle reading a MERGED snapshot.
+   */
+  enqueue(
+    action: Extract<NewWorkAction, { kind: 'enqueue' }>,
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
@@ -182,12 +181,8 @@ export function makeActiveRuntime(
           ? options.handlers.repairMachineChild === undefined
             ? { status: 'skipped', detail: 'repair-machine-child handler unavailable' }
             : await options.handlers.repairMachineChild(action, credentials, snapshot)
-        : action.kind === 'claim-review'
-          ? await options.handlers.review(action, credentials, snapshot)
-          : action.kind === 'update-branch'
-            ? options.handlers.updateBranch === undefined
-              ? { status: 'skipped', detail: 'update-branch handler unavailable' }
-              : await options.handlers.updateBranch(action, credentials, snapshot)
+          : action.kind === 'claim-review'
+            ? await options.handlers.review(action, credentials, snapshot)
             : action.kind === 'file-reconcile-child'
               ? options.handlers.fileReconcileChild === undefined
                 ? { status: 'skipped', detail: 'file-reconcile-child handler unavailable' }
@@ -200,16 +195,12 @@ export function makeActiveRuntime(
                   ? options.handlers.fileCiFailureChild === undefined
                     ? { status: 'skipped', detail: 'file-ci-failure-child handler unavailable' }
                     : await options.handlers.fileCiFailureChild(action, credentials, snapshot)
-              // TODO(T6): drop the `'merge'` spelling. `planCycle` already emits
-              // `'enqueue'`; the handler, the scheduler and the controller are
-              // renamed together in the next commit, and this arm collapses to
-              // the single `'enqueue'` test then.
-              : action.kind === 'merge' || action.kind === 'enqueue'
-                ? await options.handlers.merge(action, credentials, snapshot)
-                : {
-                    status: 'skipped',
-                    detail: `action ${(action as { kind: string }).kind} is not wired`,
-                  };
+                  : action.kind === 'enqueue'
+                    ? await options.handlers.enqueue(action, credentials, snapshot)
+                    : {
+                        status: 'skipped',
+                        detail: `action ${(action as { kind: string }).kind} is not wired`,
+                      };
       const detail = reason(result);
       return {
         outcome: result.status,

@@ -40,13 +40,6 @@ export type ActiveCandidate =
       readonly author: string;
     }
   | {
-      readonly phase: 'update-branch';
-      readonly issueNumber: number;
-      readonly prNumber: number;
-      readonly head: GitOid;
-      readonly expectedBaseRefName: GitRefName;
-    }
-  | {
       readonly phase: 'file-reconcile-child';
       readonly issueNumber: number;
       readonly prNumber: number;
@@ -67,7 +60,11 @@ export type ActiveCandidate =
       readonly head: GitOid;
     }
   | {
-      readonly phase: 'merge';
+      /**
+       * Hand the exact head to GitHub's merge queue. The queue builds and lands
+       * the merge commit; this engine only puts the PR in line.
+       */
+      readonly phase: 'enqueue';
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
@@ -103,7 +100,7 @@ export function applyMergePolicy(
   policy: MergePolicy,
 ): readonly ActiveCandidate[] {
   return policy === 'manual'
-    ? candidates.filter((candidate) => candidate.phase !== 'merge')
+    ? candidates.filter((candidate) => candidate.phase !== 'enqueue')
     : candidates;
 }
 
@@ -212,16 +209,6 @@ export function scheduleActiveActions(
   }
 
   for (const candidate of input.candidates) {
-    if (candidate.phase === 'update-branch') {
-      actions.push({
-        kind: 'update-branch',
-        issueNumber: candidate.issueNumber,
-        prNumber: candidate.prNumber,
-        head: candidate.head,
-        expectedBaseRefName: candidate.expectedBaseRefName,
-      });
-      continue;
-    }
     if (candidate.phase === 'file-reconcile-child') {
       actions.push({
         kind: 'file-reconcile-child',
@@ -253,13 +240,13 @@ export function scheduleActiveActions(
   }
 
   for (const candidate of input.candidates) {
-    if (candidate.phase !== 'merge') continue;
+    if (candidate.phase !== 'enqueue') continue;
     if (configuredLogins.size === 0) {
       skips.push({ phase: candidate.phase, subject: subject(candidate), reason: 'credential-lane' });
       continue;
     }
     actions.push({
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: candidate.issueNumber,
       prNumber: candidate.prNumber,
       head: candidate.head,

@@ -1320,7 +1320,7 @@ describe('lifecycle controller', () => {
     ]);
   });
 
-  it('keeps merge-ready visible but never constructs a merge action under manual policy', async () => {
+  it('keeps merge-ready visible but never constructs an enqueue under manual policy', async () => {
     const mergeReady = implementation({
       projectStatus: 'In Review',
       approved: true,
@@ -1404,7 +1404,7 @@ describe('lifecycle controller', () => {
       active,
     });
     expect(actions).toEqual([{
-      kind: 'merge',
+      kind: 'enqueue',
       issueNumber: 42,
       prNumber: 101,
       head: HEAD,
@@ -1484,12 +1484,15 @@ describe('lifecycle controller', () => {
       prNumber: 101,
       head: NEW_HEAD,
     }]);
-    expect(actions.some((action) => (action as { kind: string }).kind === 'merge')).toBe(false);
+    expect(actions.some((action) => (action as { kind: string }).kind === 'enqueue')).toBe(false);
   });
 
-  it('lets the integration ladder outrank re-review while a lapsed PR is still behind', async () => {
-    // Ordering guard: re-reviewing a behind PR would only be invalidated again
-    // by the update-branch that has to follow it, so the ladder goes first.
+  it('re-reviews a lapsed approval immediately even while the PR is behind', async () => {
+    // #82 inverted this. The ladder used to go first, because re-reviewing a
+    // behind PR would only be invalidated again by the `update-branch` that had
+    // to follow it. Nothing moves the head under the approval any more — the
+    // merge queue rebases its own candidate — so the re-review is simply the
+    // next thing that has to happen, and it happens now.
     const NEW_HEAD = gitOid('cccccccccccccccccccccccccccccccccccccccc');
     const behind = implementation({
       projectStatus: 'In Review',
@@ -1556,15 +1559,14 @@ describe('lifecycle controller', () => {
     });
 
     expect(actions).toEqual([{
-      kind: 'update-branch',
+      kind: 'claim-review',
       issueNumber: 42,
       prNumber: 101,
       head: NEW_HEAD,
-      expectedBaseRefName: 'next',
     }]);
   });
 
-  it('retains the canonical parent base when a stacked PR is behind', async () => {
+  it('never moves a stacked PR head, however far behind its parent base it is', async () => {
     const clean = implementation({
       projectStatus: 'In Review',
       expectedBaseRefName: 'stack/custom-parent',
@@ -1628,16 +1630,20 @@ describe('lifecycle controller', () => {
       active,
     });
 
+    // The engine no longer owns catching a head up to its base; the queue does.
+    // The lapsed approval is what still needs an action, and it gets one.
     expect(actions).toEqual([{
-      kind: 'update-branch',
+      kind: 'claim-review',
       issueNumber: 42,
       prNumber: 101,
       head: HEAD,
-      expectedBaseRefName: 'stack/custom-parent',
     }]);
+    expect(actions.every(
+      (action) => (action as { kind: string }).kind !== 'update-branch',
+    )).toBe(true);
   });
 
-  it('does not schedule a merge or update when CLEAN has exact unknown evidence', async () => {
+  it('never enqueues when a CLEAN mergeability has exact unknown compare evidence', async () => {
     const clean = implementation({
       projectStatus: 'In Review',
       approved: true,
@@ -1698,7 +1704,17 @@ describe('lifecycle controller', () => {
       active,
     });
 
-    expect(actions).toEqual([]);
+    // An unreadable compare cannot prove the head is enqueueable, so no enqueue
+    // is constructed. The lapsed approval still earns its re-review.
+    expect(actions).toEqual([{
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+    }]);
+    expect(actions.every(
+      (action) => (action as { kind: string }).kind !== 'enqueue',
+    )).toBe(true);
     expect(writerCalls).toEqual([]);
   });
 
@@ -2976,5 +2992,180 @@ describe('operator usage summary', () => {
       .toContain('Retried reads: 2 transport faults.');
     expect(renderLifecycleHuman({ ...base, githubUsage: new GitHubUsageMeter().read() }))
       .not.toContain('Retried reads:');
+  });
+});
+
+// #82: the integration stage hands the exact head to GitHub's merge queue.
+// `update-branch` is gone with it — the queue rebases its own candidate, so the
+// engine has no reason to move a PR head under an approval it already signed.
+describe('enqueue stage scheduling', () => {
+  const MARKER = '44444444-4444-4444-8444-444444444444';
+
+  function approved(overrides = {}) {
+    return implementation({
+      projectStatus: 'In Review',
+      approved: true,
+      needsReview: false,
+      mergeState: 'clean',
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'review-bot',
+        head: HEAD,
+        state: 'terminal-approved',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+        verdict: { marker: MARKER, state: 'APPROVE' },
+      },
+      terminalVerdict: {
+        head: HEAD,
+        state: 'APPROVE',
+        marker: MARKER,
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{
+        source: 'check-run',
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+      }],
+      ...overrides,
+    });
+  }
+
+  function cycle(item, prOverrides = {}) {
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+    const built = snapshot(item);
+    built.pullRequests[0] = {
+      ...built.pullRequests[0]!,
+      mergeability: 'MERGEABLE',
+      mergeStateStatus: 'CLEAN',
+      compareStatus: 'ahead',
+      checks: item.checks!,
+      ...prOverrides,
+    };
+    return {
+      actions,
+      run: () => runLifecycleCycle('active', {
+        ...deps(item, [], noOpWriter),
+        readSnapshot: async () => built,
+        mergePolicy: 'safe-auto',
+        active: {
+          preflight: async () => ({ ok: true }),
+          readLocalState: () => ({
+            remaining: { implementation: 1, review: 1 },
+            availableLogins: ['implementation-bot'],
+            implementationPreferredLogin: 'implementation-bot',
+          }),
+          implementationBackpressureThreshold: 10,
+          executeAction: async (action: unknown) => {
+            actions.push(action);
+            return { outcome: 'enqueued' };
+          },
+        },
+      }),
+    };
+  }
+
+  it('schedules an enqueue for a behind pull request instead of an update-branch', async () => {
+    const harness = cycle(approved({ mergeState: 'behind' }), { compareStatus: 'behind' });
+    await harness.run();
+
+    expect(harness.actions).toEqual([{
+      kind: 'enqueue',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+    }]);
+  });
+
+  it('schedules an enqueue for a clean pull request', async () => {
+    const harness = cycle(approved());
+    await harness.run();
+
+    expect(harness.actions).toEqual([{
+      kind: 'enqueue',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+    }]);
+  });
+
+  it('schedules nothing for a pull request already in the merge queue', async () => {
+    const harness = cycle(approved(), {
+      mergeQueue: { enqueued: true, position: 2, state: 'QUEUED' },
+    });
+    const report = await harness.run();
+
+    expect(report.items[0]).toMatchObject({ phase: 'merge-ready' });
+    expect(harness.actions).toEqual([]);
+  });
+
+  it('never schedules an update-branch, however far behind the head is', async () => {
+    for (const compareStatus of ['behind', 'diverged'] as const) {
+      const harness = cycle(
+        approved({ mergeState: 'behind' }),
+        { compareStatus },
+      );
+      await harness.run();
+      expect(harness.actions.every(
+        (action) => (action as { kind: string }).kind !== 'update-branch',
+      )).toBe(true);
+    }
+  });
+
+  it('files a reconcile child, not an enqueue, for a conflicting head', async () => {
+    const harness = cycle(approved({ mergeState: 'conflict' }), {
+      mergeability: 'CONFLICTING',
+      mergeStateStatus: 'DIRTY',
+      compareStatus: 'diverged',
+    });
+    await harness.run();
+
+    expect(harness.actions).toEqual([{
+      kind: 'file-reconcile-child',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+      effort: 'medium',
+    }]);
+  });
+
+  it('schedules no enqueue at all when JINN_AUTOPILOT_ENQUEUE is off', async () => {
+    const previous = process.env.JINN_AUTOPILOT_ENQUEUE;
+    process.env.JINN_AUTOPILOT_ENQUEUE = '0';
+    try {
+      const harness = cycle(approved());
+      const report = await harness.run();
+      expect(report.items[0]).toMatchObject({ phase: 'merge-ready' });
+      expect(harness.actions).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.JINN_AUTOPILOT_ENQUEUE;
+      else process.env.JINN_AUTOPILOT_ENQUEUE = previous;
+    }
   });
 });

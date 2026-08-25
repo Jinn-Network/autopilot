@@ -58,7 +58,7 @@ describe('active runtime boundary', () => {
             releases.set(action.prNumber, { resolve, reject });
           });
         },
-        merge: async () => ({ status: 'merged' }),
+        enqueue: async () => ({ status: 'enqueued' }),
       },
     });
     const actions = [84, 85].map((prNumber, index) => ({
@@ -97,7 +97,7 @@ describe('active runtime boundary', () => {
           calls.push('review');
           return { status: 'spawned' };
         },
-        merge: async () => ({ status: 'merged' }),
+        enqueue: async () => ({ status: 'enqueued' }),
       },
     });
     const actions = [84, 85].map((prNumber, index) => ({
@@ -123,7 +123,7 @@ describe('active runtime boundary', () => {
       handlers: {
         implementation: async () => ({ status: 'spawned' }),
         review: async () => ({ status: 'spawned' }),
-        merge: async () => ({ status: 'merged' }),
+        enqueue: async () => ({ status: 'enqueued' }),
       },
     });
 
@@ -147,7 +147,7 @@ describe('active runtime boundary', () => {
       handlers: {
         implementation: async () => ({ status: 'spawned' }),
         review: async () => ({ status: 'spawned' }),
-        merge: async () => ({ status: 'merged' }),
+        enqueue: async () => ({ status: 'enqueued' }),
       },
     });
 
@@ -175,7 +175,7 @@ describe('active runtime boundary', () => {
           expect(action).toMatchObject({ prNumber: 84, head: HEAD });
           return { status: 'spawned' };
         },
-        merge: async () => ({ status: 'merged' }),
+        enqueue: async () => ({ status: 'enqueued' }),
       },
     });
 
@@ -204,7 +204,7 @@ describe('active runtime boundary', () => {
           received.push(action);
           return { status: 'repaired' };
         },
-        merge: async () => ({ status: 'merged' }),
+        enqueue: async () => ({ status: 'enqueued' }),
       },
     });
     const action = {
@@ -221,5 +221,68 @@ describe('active runtime boundary', () => {
       outcome: 'repaired',
     });
     expect(received).toEqual([action]);
+  });
+
+  it('dispatches an enqueue action to the enqueue handler and nowhere else', async () => {
+    const received: unknown[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async (action) => {
+          received.push(action);
+          return { status: 'enqueued', detail: 'position:1' };
+        },
+      },
+    });
+    const action = {
+      kind: 'enqueue' as const,
+      issueNumber: 42,
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+    };
+
+    await expect(runtime.executeAction(action, {} as never)).resolves.toEqual({
+      outcome: 'enqueued',
+      reason: 'position:1',
+    });
+    expect(received).toEqual([action]);
+  });
+
+  // The handler is gone, and so is the action kind. An `update-branch` that
+  // somehow reaches the runtime must fall through to the unwired arm rather
+  // than quietly finding a handler that still knows how to move a PR head.
+  it('has no update-branch handler left to reach', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    await expect(runtime.executeAction({
+      kind: 'update-branch',
+      issueNumber: 42,
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+    } as never, {} as never)).resolves.toEqual({
+      outcome: 'skipped',
+      reason: 'action update-branch is not wired',
+    });
   });
 });

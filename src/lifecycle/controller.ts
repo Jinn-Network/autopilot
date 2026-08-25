@@ -36,6 +36,7 @@ import {
   resolveChildTriageExpectation,
 } from './child-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
+import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import type {
   AutopilotMode,
@@ -725,6 +726,10 @@ function activeCandidates(
   const childImplementation: ActiveCandidate[] = [];
   const freshImplementation: ActiveCandidate[] = [];
   const other: ActiveCandidate[] = [];
+  // Read once per cycle, next to the children knob it sits beside. Disarming
+  // it leaves derivation untouched — a merge-ready PR still reads as
+  // merge-ready — and only withholds the mutation.
+  const enqueueOn = enqueuePathEnabled();
   for (const entry of view.items) {
     const item = entry.item;
     if (
@@ -811,16 +816,17 @@ function activeCandidates(
         author: pr.author,
       });
     } else if (
+      // Conflict only. A behind or diverged head used to land here for an
+      // `update-branch`; the merge queue rebases its own candidate onto the
+      // base before it tests it, so moving the PR head is work GitHub already
+      // does — and doing it here cost a re-review every time, because
+      // update-branch mints a new head under the engine's signed approval.
+      // What the queue genuinely cannot do is merge a head that conflicts, and
+      // that is the one case the reconcile child still owns.
       (entry.phase === 'awaiting-review' || entry.phase === 'merge-ready')
       && item.approved
       && !item.needsReview
-      && (
-        item.mergeState === 'behind'
-        || item.mergeState === 'conflict'
-        || compareStatus === 'behind'
-        || compareStatus === 'diverged'
-        || compareStatus === 'unknown'
-      )
+      && item.mergeState === 'conflict'
       && !(item.openChildKinds ?? []).includes('reconcile')
     ) {
       const childrenOn = childrenPathEnabled();
@@ -837,16 +843,7 @@ function activeCandidates(
         openFindingChild: (item.openChildKinds ?? []).includes('review-finding'),
         childrenEnabled: childrenOn,
       });
-      if (ladder.kind === 'update-branch') {
-        if (item.expectedBaseRefName === undefined) continue;
-        other.push({
-          phase: 'update-branch',
-          issueNumber: item.issueNumber,
-          prNumber: item.prNumber,
-          head: item.head,
-          expectedBaseRefName: gitRefName(item.expectedBaseRefName),
-        });
-      } else if (ladder.kind === 'file-reconcile-child') {
+      if (ladder.kind === 'file-reconcile-child') {
         if (item.expectedBaseRefName === undefined) continue;
         other.push({
           phase: 'file-reconcile-child',
@@ -899,9 +896,15 @@ function activeCandidates(
         }
       }
     } else if (entry.phase === 'merge-ready') {
+      if (!enqueueOn) continue;
       if (item.expectedBaseRefName === undefined) continue;
+      // Proven queued — from either authority the snapshot carries. Absence is
+      // never proof of the opposite, so only a positive reading suppresses the
+      // action; an unreadable membership falls through to an enqueue the
+      // executor re-checks against GitHub before it mutates.
+      if (item.inMergeQueue === true || pr.mergeQueue?.enqueued === true) continue;
       other.push({
-        phase: 'merge',
+        phase: 'enqueue',
         issueNumber: item.issueNumber,
         prNumber: item.prNumber,
         head: item.head,
@@ -920,15 +923,30 @@ function activeCandidates(
  * Keep the scheduler fail-closed if a stale or custom snapshot projection
  * retained GraphQL's false-clean state after exact REST compare evidence was
  * already captured.
+ *
+ * Conflict outranks the compare status and is never overwritten. A diverged
+ * compare and a CONFLICTING mergeability describe the same PR from two angles,
+ * and only one of them is disqualifying: the merge queue rebases a diverged
+ * head happily and cannot merge a conflicting one at all. Downgrading conflict
+ * to `behind` here would derive that PR as merge-ready and feed it to the
+ * queue, which is precisely the enqueue this stage must refuse.
  */
 function lifecycleWithExactCompareEvidence(
   snapshot: GitHubLifecycleSnapshot,
 ): LifecycleSnapshot {
-  const compareByPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr.compareStatus]));
+  const byPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr]));
   return {
     items: snapshot.lifecycle.items.map((item) => {
       if (item.kind !== 'pull-request') return item;
-      const compareStatus = compareByPr.get(item.prNumber);
+      const pr = byPr.get(item.prNumber);
+      if (
+        item.mergeState === 'conflict'
+        || pr?.mergeability === 'CONFLICTING'
+        || pr?.mergeStateStatus === 'DIRTY'
+      ) {
+        return { ...item, mergeState: 'conflict' as const };
+      }
+      const compareStatus = pr?.compareStatus;
       if (compareStatus === 'behind' || compareStatus === 'diverged') {
         return { ...item, mergeState: 'behind' as const };
       }
@@ -944,9 +962,7 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
     || action.kind === 'repair-machine-child'
   ) return 'eligible';
   if (action.kind === 'claim-review') return 'awaiting-review';
-  if (action.kind === 'update-branch' || action.kind === 'file-reconcile-child') {
-    return 'awaiting-review';
-  }
+  if (action.kind === 'file-reconcile-child') return 'awaiting-review';
   if (action.kind === 'rerun-failed-checks' || action.kind === 'file-ci-failure-child') {
     return 'ci-blocked';
   }
@@ -969,12 +985,7 @@ function phaseForSchedulingSkip(
     || skip.phase === 'repair-machine-child'
   ) return 'eligible';
   if (skip.phase === 'review') return 'awaiting-review';
-  if (
-    skip.phase === 'update-branch'
-    || skip.phase === 'file-reconcile-child'
-  ) {
-    return 'awaiting-review';
-  }
+  if (skip.phase === 'file-reconcile-child') return 'awaiting-review';
   if (
     skip.phase === 'rerun-failed-checks'
     || skip.phase === 'file-ci-failure-child'

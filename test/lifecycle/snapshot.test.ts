@@ -1054,6 +1054,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
     duplicatePresent = true;
     let merged = false;
     let exactMergeCalls = 0;
+    let enqueueRecordPushes = 0;
     const mergeCommitOid = 'f'.repeat(40);
     let derivedMergeAction;
     let escalatedRecord;
@@ -1290,7 +1291,19 @@ describe('buildGitHubLifecycleSnapshot', () => {
           return `${args.at(-1)} ${reviewOid}`;
         }
         if (args.includes('ls-remote')) {
+          // No enqueue-attempt ref exists for this head, so the flake ledger
+          // reads as "never attempted" and the first enqueue is permitted.
           return `${reviewOid}\trefs/jinn-autopilot/review-claims/v1/84\n`;
+        }
+        if (args.includes('push')) {
+          // The CAS write of the enqueue-attempt record. Without a transport
+          // that can publish it a successful enqueue reports `ambiguous`, not
+          // `enqueued`: this head's attempt count would be unassertable.
+          enqueueRecordPushes += 1;
+          expect(args.some((arg) => (
+            arg.endsWith(`refs/jinn-autopilot/enqueues/v1/pr-84/${HEAD}`)
+          ))).toBe(true);
+          return '';
         }
         if (args.includes('read-tree') || args.includes('update-index')) return '';
         if (args[0] === 'api' && args.some((arg) => arg.includes('/comments'))) {
@@ -1960,6 +1973,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
       terminal,
     )).resolves.toEqual({ outcome: 'enqueued' });
     expect(exactMergeCalls).toBe(1);
+    expect(enqueueRecordPushes).toBe(1);
   });
 
   it('turns missing #2084 dependency evidence into a structured diagnostic', async () => {

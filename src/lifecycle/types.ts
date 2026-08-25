@@ -408,13 +408,6 @@ export type NewWorkAction =
       readonly head: GitOid;
     }
   | {
-      readonly kind: 'update-branch';
-      readonly issueNumber: number;
-      readonly prNumber: number;
-      readonly head: GitOid;
-      readonly expectedBaseRefName: GitRefName;
-    }
-  | {
       readonly kind: 'file-reconcile-child';
       readonly issueNumber: number;
       readonly prNumber: number;
@@ -433,13 +426,6 @@ export type NewWorkAction =
       readonly issueNumber: number;
       readonly prNumber: number;
       readonly head: GitOid;
-    }
-  | {
-      readonly kind: 'merge';
-      readonly issueNumber: number;
-      readonly prNumber: number;
-      readonly head: GitOid;
-      readonly expectedBaseRefName: GitRefName;
     }
   | {
       /**

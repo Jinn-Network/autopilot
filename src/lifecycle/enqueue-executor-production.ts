@@ -10,10 +10,7 @@ import type {
   EnqueueCandidate,
   EnqueueExecutorDeps,
   ExactEnqueueOutcome,
-  UpdateBranchFailureClass,
-  UpdateBranchOutcome,
 } from './enqueue-executor.js';
-import { DURABLE_UPDATE_BRANCH_FAILURES } from './enqueue-executor.js';
 import { emptyTreeOid } from './ci-rerun.js';
 import {
   decideReEnqueue,
@@ -62,87 +59,12 @@ export interface ProductionEnqueueActionPortOptions {
   readonly repositoryUrl?: string;
   readonly runner?: CommandRunner;
   readonly environment?: NodeJS.ProcessEnv;
-  /**
-   * Injection seam for the bounded `update-branch` readback poll. Tests supply
-   * a no-op so the 202-async path costs no wall clock.
-   */
-  readonly sleep?: (milliseconds: number) => Promise<void>;
-  readonly updateBranchReadback?: {
-    readonly attempts?: number;
-    readonly delayMs?: number;
-  };
 }
-
-/**
- * Bounded poll for the documented 202 Accepted behaviour of
- * `PUT /repos/{owner}/{repo}/pulls/{n}/update-branch`. Four reads spanning
- * ~4.5s is enough for GitHub's queue in the overwhelming majority of cases and
- * short enough that a genuinely stuck update still surfaces inside one cycle.
- * Exceeding the budget is not an error — it yields `pending`, never `updated`.
- */
-const UPDATE_BRANCH_READBACK_ATTEMPTS = 4;
-const UPDATE_BRANCH_READBACK_DELAY_MS = 1_500;
-
-/**
- * `gh pr update-branch` compares before it mutates. When `behind_by == 0` it
- * prints this to **stdout** and exits 0 without calling the API at all
- * (`cli/cli` v2.78, `pkg/cmd/pr/update-branch/update_branch.go`). `defaultRunner`
- * returns stdout, so this is directly observable — unlike gh's failure messages,
- * which go to stderr.
- */
-const ALREADY_UP_TO_DATE_PATTERN = /already\s+up[-\s]?to[-\s]?date/i;
 
 function errorText(error: unknown): string {
   return error instanceof Error
     ? `${error.message}\n${String((error as { stderr?: unknown }).stderr ?? '')}`
     : String(error);
-}
-
-/**
- * Map an `update-branch` failure onto the smallest set of classes that lead to
- * different operator actions.
- *
- * Ordering is load-bearing. GitHub serves *secondary* rate limits as HTTP 403,
- * so the rate-limit probe must run before the permission probe or every
- * throttle would be misreported as a branch-protection refusal — which is
- * exactly the class of false diagnosis this function exists to stop.
- *
- * Both transports are covered. `gh pr update-branch` drives the GraphQL
- * `updatePullRequestBranch` mutation, whose conflict answer is the literal
- * `GraphQL: merge conflict between base and head (updatePullRequestBranch)`,
- * and gh's own pre-flight refusal is `Cannot update PR branch due to conflicts`
- * — neither carries an HTTP status. The REST endpoint answers HTTP 422 for the
- * same condition. Conflict prose and 422 are both matched so the classification
- * does not depend on which transport produced the failure.
- *
- * Anything unrecognised is `unclassified`, never `conflict`: asserting a
- * conflict we cannot see is the failure mode that misled the operator on
- * PR #2130.
- */
-export function classifyUpdateBranchFailure(text: string): UpdateBranchFailureClass {
-  if (/\b(429|rate limit|secondary rate|abuse detection|retry-after)\b/i.test(text)
-    || /HTTP 429/i.test(text)) {
-    return 'rate-limited';
-  }
-  if (/HTTP 422/i.test(text)
-    || /\bunprocessable\b/i.test(text)
-    || /merge conflict/i.test(text)
-    || /\bconflict/i.test(text)
-    || /not mergeable|cannot be merged/i.test(text)) {
-    return 'conflict';
-  }
-  if (/HTTP 40[134]/i.test(text)
-    || /bad credentials|requires authentication|not authorized|unauthorized/i.test(text)
-    || /resource not accessible|must have|permission|protected branch|forbidden/i.test(text)) {
-    return 'forbidden';
-  }
-  if (/HTTP 5\d\d/i.test(text)
-    || /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE/i.test(text)
-    || /timed out|timeout|connection reset|socket hang up|network is unreachable|TLS handshake|EOF/i
-      .test(text)) {
-    return 'unavailable';
-  }
-  return 'unclassified';
 }
 
 export const ENQUEUE_MUTATION = `mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
@@ -161,10 +83,9 @@ export const ENQUEUE_MUTATION = `mutation($pullRequestId: ID!, $expectedHeadOid:
  * human changes something. `undetermined` covers everything a retry could still
  * resolve, and is the only class that earns a queue readback.
  *
- * Ordering is load-bearing for the same reason it is in
- * `classifyUpdateBranchFailure`: GitHub serves *secondary* rate limits as HTTP
- * 403, so the throttle probe must run before the permission probe, or every
- * throttle would be reported as a durable branch-protection refusal.
+ * Ordering is load-bearing: GitHub serves *secondary* rate limits as HTTP 403,
+ * so the throttle probe must run before the permission probe, or every throttle
+ * would be reported as a durable branch-protection refusal.
  *
  * Anything unrecognised is `undetermined`, never `rejected`: asserting a durable
  * refusal we cannot see would strand a PR that only needed a retry.
@@ -202,7 +123,7 @@ export function classifyEnqueueFailure(text: string): EnqueueFailureClass {
 
 export type ProductionEnqueueActionPort = Pick<
 EnqueueExecutorDeps,
-'readCandidate' | 'enqueueAtHead' | 'updateBranch' | 'fileReconcileChild'
+'readCandidate' | 'enqueueAtHead' | 'fileReconcileChild'
 >;
 
 function decodeBase64(value: string): string {
@@ -324,10 +245,6 @@ export function makeProductionEnqueueActionPort(
 ): ProductionEnqueueActionPort {
   const runner = options.runner ?? defaultRunner;
   const ambient = options.environment ?? process.env;
-  const pause = options.sleep
-    ?? ((milliseconds: number) => new Promise<void>((resolve) => {
-      setTimeout(resolve, milliseconds);
-    }));
   const expectedBase = gitRefName(options.expectedBaseRefName ?? 'next');
   const repositorySlug = options.repositorySlug ?? REPO;
   const withCredential = <Value>(
@@ -741,97 +658,13 @@ export function makeProductionEnqueueActionPort(
         };
       }),
 
-    /**
-     * The old shape was `try { update } catch {} ; read head once ; unchanged
-     * => rejected`. That single readback conflated five distinguishable
-     * outcomes — 422 conflict, 401/403 refusal, 429/secondary throttle, network
-     * failure, and the endpoint's documented 202 Accepted queueing — into one
-     * verdict that reads as "merge conflict" to an operator. Observed live on
-     * PR #2130: reported `rejected`, then succeeded unchanged.
-     *
-     * Now: capture and classify the error text, and give an accepted-but-queued
-     * update a bounded readback window before deciding anything. A durable
-     * refusal (conflict/forbidden) skips the poll entirely, so the common
-     * conflict case costs no extra wall clock.
-     */
-    updateBranch: ({ prNumber, expectedHead, credential }): Promise<UpdateBranchOutcome> =>
-      withCredential(credential, async ({ run }) => {
-        let failure: UpdateBranchFailureClass | undefined;
-        let alreadyUpToDate = false;
-        try {
-          const output = await run('gh', [
-            'pr', 'update-branch', String(prNumber),
-            '--repo', repositorySlug,
-          ]);
-          alreadyUpToDate = ALREADY_UP_TO_DATE_PATTERN.test(output);
-        } catch (error) {
-          failure = classifyUpdateBranchFailure(errorText(error));
-        }
-        // A non-zero exit is not proof the request failed to land, so even a
-        // durable-looking refusal gets one readback — it just gets no poll.
-        // Nothing is in flight when gh never called the API, so an
-        // already-up-to-date answer skips the poll for the same reason.
-        const durable = failure !== undefined
-          && DURABLE_UPDATE_BRANCH_FAILURES.has(failure);
-        const attempts = durable || alreadyUpToDate
-          ? 1
-          : Math.max(1, options.updateBranchReadback?.attempts
-            ?? UPDATE_BRANCH_READBACK_ATTEMPTS);
-        const delayMs = options.updateBranchReadback?.delayMs
-          ?? UPDATE_BRANCH_READBACK_DELAY_MS;
-        let readbackFailed = false;
-        for (let attempt = 0; attempt < attempts; attempt += 1) {
-          if (attempt > 0) await pause(delayMs);
-          let head: string | undefined;
-          try {
-            const readback = JSON.parse(await run('gh', [
-              'pr', 'view', String(prNumber), '--repo', repositorySlug,
-              '--json', 'headRefOid',
-            ])) as { headRefOid?: unknown };
-            if (typeof readback.headRefOid === 'string') head = readback.headRefOid;
-          } catch {
-            // Fall through: an unreadable head is undetermined, not a refusal.
-          }
-          if (head === undefined) {
-            readbackFailed = true;
-            continue;
-          }
-          readbackFailed = false;
-          const observed = gitOid(head);
-          if (observed !== expectedHead) {
-            return { status: 'updated' as const, head: observed };
-          }
-        }
-        if (failure !== undefined) {
-          return {
-            status: durable ? ('rejected' as const) : ('pending' as const),
-            head: expectedHead,
-            failure,
-          };
-        }
-        if (alreadyUpToDate) {
-          // gh compared and found `behind_by == 0`. The head correctly did not
-          // move; that is success with nothing to do, not a refusal.
-          return { status: 'already-up-to-date' as const, head: expectedHead };
-        }
-        // The queue call itself succeeded. An unchanged head after the whole
-        // readback budget is the 202-async case (or a readback we could not
-        // complete) — undetermined, and explicitly not `updated`.
-        return {
-          status: 'pending' as const,
-          head: expectedHead,
-          failure: readbackFailed
-            ? ('unavailable' as const)
-            : ('queued' as const),
-        };
-      }),
-
     fileReconcileChild: ({ prNumber, effort, credential }) =>
       withCredential(credential, async ({ run }) => {
         const port = makeProductionChildIssuePort({
           runner: run,
           repo: repositorySlug,
-          fixIssueTypeId: options.projectMapping?.fields.type.options.fix,
+          fixIssueTypeId: options.fixIssueTypeId
+            ?? options.projectMapping?.fields.type.options.fix,
           projectOwner: options.projectOwner,
           projectNumber: options.projectNumber,
           projectMapping: options.projectMapping,
