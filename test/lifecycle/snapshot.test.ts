@@ -1242,23 +1242,32 @@ describe('buildGitHubLifecycleSnapshot', () => {
           );
           return JSON.stringify({ status: 'ahead' });
         }
+        // The enqueue's queue-authority read: GraphQL, because
+        // `isInMergeQueue` has no `gh pr view --json` equivalent.
         if (
           derivedMergeAction !== undefined
-          && args[0] === 'pr'
-          && args[1] === 'view'
+          && args[0] === 'api'
+          && args[1] === 'graphql'
+          && args.some((arg) => arg.includes('isInMergeQueue'))
         ) {
-          return JSON.stringify(merged
-            ? {
-                state: 'MERGED',
-                headRefOid: derivedMergeAction.head,
-                baseRefName: derivedMergeAction.expectedBaseRefName,
-                mergeCommit: { oid: mergeCommitOid },
-              }
-            : {
-                state: 'OPEN',
-                headRefOid: derivedMergeAction.head,
-                baseRefName: derivedMergeAction.expectedBaseRefName,
-              });
+          return JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: merged
+                  ? {
+                      state: 'MERGED',
+                      headRefOid: derivedMergeAction.head,
+                      baseRefName: derivedMergeAction.expectedBaseRefName,
+                      mergeCommit: { oid: mergeCommitOid },
+                    }
+                  : {
+                      state: 'OPEN',
+                      headRefOid: derivedMergeAction.head,
+                      baseRefName: derivedMergeAction.expectedBaseRefName,
+                    },
+              },
+            },
+          });
         }
         if (
           derivedMergeAction !== undefined

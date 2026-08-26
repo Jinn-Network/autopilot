@@ -15,6 +15,7 @@ import {
   readExactCompareStatus,
 } from '../../src/lifecycle/github-changed-files.js';
 import { GhLifecycleReader } from '../../src/lifecycle/github-reader.js';
+import { ENQUEUE_AUTHORITY_QUERY } from '../../src/lifecycle/enqueue-executor-production.js';
 import { gitOid } from '../../src/lifecycle/types.js';
 import type { CommandRunner } from '../../src/dispatcher/issue-source.js';
 
@@ -363,6 +364,24 @@ describe('argv derived from production call sites', () => {
     const observed = recording.admitted();
     expect(observed).toHaveLength(2);
     expect(observed.filter(([, verdict]) => verdict !== 'retryable')).toEqual([]);
+  });
+
+  /**
+   * The enqueue's queue-authority read moved off `gh pr view`, which the
+   * porcelain allowlist admitted by name, onto `gh api graphql`, where
+   * admission depends on the document proving itself a query. Retry coverage
+   * has to survive the move.
+   */
+  it('admits the enqueue queue-authority GraphQL read', () => {
+    const args = [
+      'api', 'graphql',
+      '-f', `query=${ENQUEUE_AUTHORITY_QUERY}`,
+      '-f', 'owner=o',
+      '-f', 'name=r',
+      '-F', 'number=84',
+    ];
+
+    expect(isRetryableReadCommand('gh', args)).toBe(true);
   });
 
   it("admits the reader's own git ls-remote reads", async () => {

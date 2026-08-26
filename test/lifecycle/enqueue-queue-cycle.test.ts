@@ -265,7 +265,7 @@ function oidFor(value: string): string {
 interface HarnessOptions {
   /** Seeds the remote enqueue-attempt ledger for this head. */
   readonly seedRecord?: { readonly attempts: number; readonly linkedIssue?: number };
-  /** Answer of the pre-mutation `gh pr view` authority read. */
+  /** Answer of the pre-mutation GraphQL authority read. */
   readonly authorityInMergeQueue?: boolean;
 }
 
@@ -313,18 +313,31 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
     if (endpoint?.startsWith(`repos/${SLUG}/compare/`)) {
       return JSON.stringify({ status: current.compareStatus ?? 'ahead' });
     }
+    // `isInMergeQueue` is GraphQL-only; gh 2.78.0 refuses the whole
+    // `gh pr view --json` invocation when it is named.
     if (args[0] === 'pr' && args[1] === 'view') {
-      return JSON.stringify({
-        state: current.state ?? 'OPEN',
-        headRefOid: head,
-        baseRefName,
-        isInMergeQueue: options.authorityInMergeQueue
-          ?? current.mergeQueue?.enqueued
-          ?? false,
-      });
+      throw new Error(
+        `Command failed: gh ${args.join(' ')}\nUnknown JSON field: "isInMergeQueue"`,
+      );
     }
     if (args[0] === 'api' && args[1] === 'graphql') {
       const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('isInMergeQueue')) {
+        return JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                state: current.state ?? 'OPEN',
+                headRefOid: head,
+                baseRefName,
+                isInMergeQueue: options.authorityInMergeQueue
+                  ?? current.mergeQueue?.enqueued
+                  ?? false,
+              },
+            },
+          },
+        });
+      }
       if (query.includes('enqueuePullRequest')) {
         enqueueMutations.push(
           args.find((arg) => arg.startsWith('expectedHeadOid=')) ?? '',
