@@ -154,6 +154,21 @@ function apiError(
   );
 }
 
+/**
+ * Whether a next link addresses the resource the walk is already reading.
+ * GitHub answers a `/repos/<owner>/<repo>/…` read with a Link header that names
+ * the repository by its numeric database id instead; the alias is accepted only
+ * when the rest of the path matches exactly. Nothing but the page cursor is
+ * ever taken from the header — every follow-up read is rebuilt from the walk's
+ * own path — so the alias cannot steer a read off the configured repository.
+ */
+function samePaginationResource(linked: string, expectedPath: string): boolean {
+  if (linked === expectedPath) return true;
+  const alias = /^\/repositories\/[1-9][0-9]*\/(.+)$/.exec(linked)?.[1];
+  const named = /^\/repos\/[^/]+\/[^/]+\/(.+)$/.exec(expectedPath)?.[1];
+  return alias !== undefined && named !== undefined && alias === named;
+}
+
 function nextPage(
   response: RelayGitHubApiResponse,
   current: number,
@@ -173,7 +188,7 @@ function nextPage(
   if (
     url.protocol !== 'https:'
     || url.hostname !== 'api.github.com'
-    || url.pathname !== expectedPath
+    || !samePaginationResource(url.pathname, expectedPath)
     || !Number.isSafeInteger(page)
     || page <= current
     || page > MAX_PAGES
@@ -940,72 +955,118 @@ export function createRelayGitHubProductionPorts(options: {
         draft: pr.draft,
       };
     },
+    /**
+     * Both check reads are walked to their end rather than refused past one
+     * page. These are the only Relay evidence reads that scale with the
+     * repository's workflow count rather than with human activity: a pull
+     * request that touches the workflows fans CI out well beyond GitHub's
+     * 100-row page (mono PR #2918 carries 144 check contexts on its head), and
+     * the exact-head ready invariant reads exactly this evidence. The walk uses
+     * the same `MAX_PAGES` bound as every other read here, so a connection that
+     * never ends still fails closed.
+     */
     async readChecks(input) {
       if (!OID.test(input.head) || input.base !== options.config.targetBase) {
         throw new Error('Relay check read requires exact configured head/base');
       }
-      const runsResponse = await request({
-        method: 'GET',
-        path:
-          `/repos/${options.config.repository}/commits/${input.head}/check-runs`,
-        query: { per_page: '100' },
-      });
-      const runsBody = object(runsResponse.body, 'GitHub check runs');
-      if (!Array.isArray(runsBody.check_runs) || runsBody.check_runs.length > 100) {
-        throw new Error('GitHub check runs are malformed or oversized');
-      }
-      const checks: RelayGitHubCheckFact[] = runsBody.check_runs.map((value) => {
-        const run = object(value, 'GitHub check run');
-        const app = object(run.app, 'GitHub check run App');
-        return {
-          kind: 'check-run',
-          name: string(run.name, 'GitHub check run name'),
-          appId: positiveInteger(app.id, 'GitHub check run App ID'),
-          head: string(run.head_sha, 'GitHub check run head'),
-          status: string(run.status, 'GitHub check run status') as
-            Extract<RelayGitHubCheckFact, { kind: 'check-run' }>['status'],
-          conclusion: (run.conclusion === null ? null : string(
-            run.conclusion,
-            'GitHub check run conclusion',
-          )) as Extract<
-          RelayGitHubCheckFact,
-          { kind: 'check-run' }
-          >['conclusion'],
-          ...(typeof run.html_url === 'string' ? { url: run.html_url } : {}),
-        };
-      });
-      const statusesResponse = await request({
-        method: 'GET',
-        path:
-          `/repos/${options.config.repository}/commits/${input.head}/status`,
-      });
-      const combinedStatus = object(
-        statusesResponse.body,
-        'GitHub combined status',
-      );
-      const combinedHead = string(
-        combinedStatus.sha,
-        'GitHub combined status head',
-      );
-      if (combinedHead !== input.head) {
-        throw new Error('GitHub combined status is tied to a stale head');
-      }
-      const statuses = combinedStatus.statuses;
-      if (!Array.isArray(statuses) || statuses.length > 100) {
-        throw new Error('GitHub status contexts are malformed or oversized');
-      }
-      for (const value of statuses) {
-        const status = object(value, 'GitHub status context');
-        checks.push({
-          kind: 'status-context',
-          name: string(status.context, 'GitHub status context name'),
-          head: typeof status.sha === 'string' ? status.sha : combinedHead,
-          state: string(status.state, 'GitHub status state') as
-            Extract<RelayGitHubCheckFact, { kind: 'status-context' }>['state'],
-          ...(typeof status.target_url === 'string'
-            ? { url: status.target_url }
-            : {}),
+      const checks: RelayGitHubCheckFact[] = [];
+      const runsPath =
+        `/repos/${options.config.repository}/commits/${input.head}/check-runs`;
+      let runsTotal: number | undefined;
+      let runsPage = 1;
+      for (;;) {
+        const runsResponse = await request({
+          method: 'GET',
+          path: runsPath,
+          query: { per_page: '100', page: String(runsPage) },
         });
+        const runsBody = object(runsResponse.body, 'GitHub check runs');
+        runsTotal ??= nonNegativeInteger(
+          runsBody.total_count,
+          'GitHub check runs total',
+        );
+        if (!Array.isArray(runsBody.check_runs) || runsBody.check_runs.length > 100) {
+          throw new Error('GitHub check runs are malformed or oversized');
+        }
+        for (const value of runsBody.check_runs) {
+          const run = object(value, 'GitHub check run');
+          const app = object(run.app, 'GitHub check run App');
+          checks.push({
+            kind: 'check-run',
+            name: string(run.name, 'GitHub check run name'),
+            appId: positiveInteger(app.id, 'GitHub check run App ID'),
+            head: string(run.head_sha, 'GitHub check run head'),
+            status: string(run.status, 'GitHub check run status') as
+              Extract<RelayGitHubCheckFact, { kind: 'check-run' }>['status'],
+            conclusion: (run.conclusion === null ? null : string(
+              run.conclusion,
+              'GitHub check run conclusion',
+            )) as Extract<
+            RelayGitHubCheckFact,
+            { kind: 'check-run' }
+            >['conclusion'],
+            ...(typeof run.html_url === 'string' ? { url: run.html_url } : {}),
+          });
+        }
+        const following = nextPage(runsResponse, runsPage, runsPath);
+        if (following === undefined) break;
+        runsPage = following;
+      }
+      // The count the first page reported is asserted against the *merged*
+      // rows, so a page lost mid-walk still fails closed.
+      if (checks.length !== runsTotal) {
+        throw new Error('GitHub check runs are incomplete');
+      }
+      const statusPath =
+        `/repos/${options.config.repository}/commits/${input.head}/status`;
+      let statusTotal: number | undefined;
+      let statusRows = 0;
+      let statusPage = 1;
+      for (;;) {
+        const statusesResponse = await request({
+          method: 'GET',
+          path: statusPath,
+          query: { per_page: '100', page: String(statusPage) },
+        });
+        const combinedStatus = object(
+          statusesResponse.body,
+          'GitHub combined status',
+        );
+        const combinedHead = string(
+          combinedStatus.sha,
+          'GitHub combined status head',
+        );
+        if (combinedHead !== input.head) {
+          throw new Error('GitHub combined status is tied to a stale head');
+        }
+        statusTotal ??= nonNegativeInteger(
+          combinedStatus.total_count,
+          'GitHub status contexts total',
+        );
+        const statuses = combinedStatus.statuses;
+        if (!Array.isArray(statuses) || statuses.length > 100) {
+          throw new Error('GitHub status contexts are malformed or oversized');
+        }
+        statusRows += statuses.length;
+        for (const value of statuses) {
+          const status = object(value, 'GitHub status context');
+          checks.push({
+            kind: 'status-context',
+            name: string(status.context, 'GitHub status context name'),
+            head: typeof status.sha === 'string' ? status.sha : combinedHead,
+            state: string(status.state, 'GitHub status state') as
+              Extract<RelayGitHubCheckFact, { kind: 'status-context' }>['state'],
+            ...(typeof status.target_url === 'string'
+              ? { url: status.target_url }
+              : {}),
+          });
+        }
+        const following = nextPage(statusesResponse, statusPage, statusPath);
+        if (following === undefined) break;
+        statusPage = following;
+      }
+      if (statusRows !== statusTotal) {
+        throw new Error('GitHub status contexts are incomplete');
       }
       const requiredResponse = await request({
         method: 'GET',

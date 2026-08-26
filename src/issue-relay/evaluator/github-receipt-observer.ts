@@ -18,6 +18,19 @@ import { parseIssueRelayAssuranceComment } from './issue-relay-comment.js';
 
 const DEFAULT_MAX_PAGES = 20;
 const MAX_MAX_PAGES = 100;
+const CHECK_EVIDENCE_PAGE_SIZE = 100;
+
+/**
+ * Check-evidence pages one head commit may span, first page included — 1000
+ * check runs or commit statuses. These two reads are the only Relay evidence
+ * that scales with the repository's workflow count rather than with human
+ * activity: a pull request that touches the workflows fans CI out well past the
+ * single page GitHub returns (mono PR #2918 carries 144 check contexts on its
+ * head commit), and the Relay's exact-head ready invariant reads exactly this
+ * evidence. Past this cap the read still fails closed rather than paginating
+ * without bound.
+ */
+const MAX_CHECK_EVIDENCE_PAGES = 10;
 const GENERATION_V2_MARKER = '<!-- jinn-issue-relay:generation:v2 -->';
 const ASSURANCE_MARKER = '<!-- jinn-issue-relay:assurance:v1 -->';
 const ASSURANCE_V2_MARKER = '<!-- jinn-issue-relay:assurance:v2 -->';
@@ -325,6 +338,48 @@ export function createIssueRelayGitHubRestReadPort(
     };
   };
 
+  /**
+   * Reads one check-evidence endpoint whole, concatenating its `rowsKey` array
+   * across however many pages GitHub splits it into and handing back a single
+   * body in the shape the caller already decodes. The page-one envelope
+   * survives the merge, so the caller's `total_count` assertion compares
+   * against the *merged* rows: a page lost mid-walk still fails closed.
+   *
+   * Only the page cursor is taken from a response's Link header — the path is
+   * rebuilt here from the caller's own, exactly as the comment walk does — so a
+   * rewritten next link cannot steer the read off this commit.
+   */
+  const completeCheckEvidence = async (input: {
+    readonly path: string;
+    readonly rowsKey: 'check_runs' | 'statuses';
+    readonly bodyLabel: string;
+    readonly rowsLabel: string;
+    readonly subject: string;
+  }): Promise<Record<string, unknown>> => {
+    let envelope: Record<string, unknown> | undefined;
+    const merged: unknown[] = [];
+    let page = 1;
+    for (let read = 1; ; read += 1) {
+      const response = await getJson(
+        `${input.path}?per_page=${CHECK_EVIDENCE_PAGE_SIZE}&page=${page}`,
+      );
+      const body = githubRecord(response.value, input.bodyLabel);
+      envelope ??= body;
+      merged.push(...githubArray(body[input.rowsKey], input.rowsLabel));
+      const following = nextPage(response.headers.get('link'));
+      if (following === undefined) break;
+      if (read >= MAX_CHECK_EVIDENCE_PAGES) {
+        throw new Error(`GitHub ${input.subject} pagination is truncated`);
+      }
+      const followingPage = Number(following);
+      if (followingPage <= page) {
+        throw new Error(`GitHub ${input.subject} pagination is cyclic`);
+      }
+      page = followingPage;
+    }
+    return { ...envelope, [input.rowsKey]: merged };
+  };
+
   return {
     listIssueComments: ({ repository, issueNumber, cursor }) =>
       commentsPage(repository, issueNumber, cursor),
@@ -348,12 +403,13 @@ export function createIssueRelayGitHubRestReadPort(
         'pull request head repository name',
       ));
       const headSha = exactOid(head['sha'], 'pull request head SHA');
-      const checkRuns = githubRecord(
-        (await getJson(
-          `repos/${checkedRepository}/commits/${headSha}/check-runs?per_page=100&page=1`,
-        )).value,
-        'check-runs response',
-      );
+      const checkRuns = await completeCheckEvidence({
+        path: `repos/${checkedRepository}/commits/${headSha}/check-runs`,
+        rowsKey: 'check_runs',
+        bodyLabel: 'check-runs response',
+        rowsLabel: 'check runs',
+        subject: 'check-runs',
+      });
       const checkRunRows = githubArray(checkRuns['check_runs'], 'check runs');
       if (
         githubNonNegativeInteger(
@@ -363,12 +419,13 @@ export function createIssueRelayGitHubRestReadPort(
       ) {
         throw new Error('GitHub check-runs response is incomplete');
       }
-      const combinedStatus = githubRecord(
-        (await getJson(
-          `repos/${checkedRepository}/commits/${headSha}/status?per_page=100&page=1`,
-        )).value,
-        'combined status response',
-      );
+      const combinedStatus = await completeCheckEvidence({
+        path: `repos/${checkedRepository}/commits/${headSha}/status`,
+        rowsKey: 'statuses',
+        bodyLabel: 'combined status response',
+        rowsLabel: 'commit statuses',
+        subject: 'commit-status',
+      });
       const statusRows = githubArray(
         combinedStatus['statuses'],
         'commit statuses',

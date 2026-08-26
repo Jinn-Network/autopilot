@@ -11,7 +11,16 @@ const GitHubRepositorySlugSchema = z.string().regex(
 
 export const ISSUE_RELAY_MAX_FINDINGS = 50;
 export const ISSUE_RELAY_MAX_ACCEPTANCE_ITEMS = 50;
-export const ISSUE_RELAY_MAX_CHECKS = 100;
+
+/**
+ * Check contexts one evaluated head may carry. This is the ceiling of the
+ * bounded page walk the Relay's check reads perform (10 pages of 100), not a
+ * page boundary: a head whose CI fans out past GitHub's 100-row page is
+ * ordinary on a repository with many workflows — mono PR #2918 carries 144 —
+ * and the evidence is now read whole rather than truncated, so the context that
+ * carries it has to admit every context that walk can return.
+ */
+export const ISSUE_RELAY_MAX_CHECKS = 1000;
 export const ISSUE_RELAY_MAX_FINDING_TITLE_BYTES = 240;
 export const ISSUE_RELAY_MAX_FINDING_DETAIL_BYTES = 8 * 1024;
 export const ISSUE_RELAY_MAX_REPOSITORY_BYTES = 200;

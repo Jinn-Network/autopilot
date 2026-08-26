@@ -1,6 +1,7 @@
 export const ISSUE_RELAY_MAX_FINDINGS = 50;
 export const ISSUE_RELAY_MAX_ACCEPTANCE_ITEMS = 50;
-export const ISSUE_RELAY_MAX_CHECKS = 100;
+/** Kept in step with the contract bound of the same name. */
+export const ISSUE_RELAY_MAX_CHECKS = 1000;
 export const ISSUE_RELAY_MAX_FINDING_LABEL_BYTES = 240;
 export const ISSUE_RELAY_MAX_FINDING_BODY_BYTES = 8 * 1024;
 export const ISSUE_RELAY_MAX_GENERATION_BYTES = 8 * 1024;
