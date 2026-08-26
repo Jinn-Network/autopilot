@@ -49,8 +49,9 @@
  * (`:510`), the conditional REST client (`:519`) and the active runtime
  * (`:740` → `src/lifecycle/active-runtime-production.ts:400`), which passes it
  * to the action ports (`:964` → `src/lifecycle/enqueue-executor-production.ts`,
- * whose `gh pr view` reads at `:242`, `:280`, `:309`, `:370` are therefore
- * covered).
+ * whose queue-authority read is therefore covered — as a `gh api graphql`
+ * query admitted by the GraphQL document check below, not by the `pr view`
+ * porcelain shape it used before `isInMergeQueue` forced it onto GraphQL).
  *
  * NOT covered, and deliberately left so:
  *   - Any port constructed without an explicit runner, which falls back to

@@ -81,6 +81,49 @@ export const ENQUEUE_MUTATION = `mutation($pullRequestId: ID!, $expectedHeadOid:
 }`;
 
 /**
+ * The exact-head authority read the enqueue takes before mutating, and again
+ * after a failure it cannot classify from the error text alone.
+ *
+ * It is a GraphQL query rather than `gh pr view --json` because
+ * `isInMergeQueue` exists only on the GraphQL `PullRequest` type. The CLI does
+ * not silently omit an unsupported `--json` field — it refuses the whole
+ * invocation (`Unknown JSON field: "isInMergeQueue"`, gh 2.78.0), which took
+ * every enqueue on jinn-mono down at the pre-mutation read. A mocked
+ * `CommandRunner` asserting argv cannot see that, so the shape is pinned here
+ * and guarded by a source scan in the tests.
+ *
+ * Held to exactly the four fields the enqueue decision consumes: the head and
+ * base the mutation is pinned to, the state that proves the PR is still open,
+ * and the queue membership that turns a lost mutation into a proven landing.
+ */
+export const ENQUEUE_AUTHORITY_QUERY =
+  `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) { state headRefOid baseRefName isInMergeQueue }
+  }
+}`;
+
+/**
+ * `owner`/`name` variables for {@link ENQUEUE_AUTHORITY_QUERY}, split from the
+ * configured slug. Refuses anything that is not exactly `owner/name` rather
+ * than sending a half-empty variable GitHub would answer with a null
+ * repository, which the caller would then have to tell apart from a deleted PR.
+ */
+function repositoryVariables(slug: string): readonly string[] {
+  const [owner, name, ...unexpected] = slug.split('/');
+  if (
+    owner === undefined
+    || owner.length === 0
+    || name === undefined
+    || name.length === 0
+    || unexpected.length > 0
+  ) {
+    throw new Error(`Enqueue repository must be owner/name, got: ${slug}`);
+  }
+  return ['-f', `owner=${owner}`, '-f', `name=${name}`];
+}
+
+/**
  * How an `enqueuePullRequest` failure should be read. Classified once, here, at
  * the only place that can still see the raw error text.
  *
@@ -531,10 +574,31 @@ export function makeProductionEnqueueActionPort(
           baseRefName?: unknown;
           isInMergeQueue?: unknown;
         };
-        const readAuthority = async (): Promise<PrAuthority> => JSON.parse(await run('gh', [
-          'pr', 'view', String(prNumber), '--repo', repositorySlug,
-          '--json', 'state,headRefOid,baseRefName,isInMergeQueue',
-        ])) as Record<string, unknown>;
+        const readAuthority = async (): Promise<PrAuthority> => {
+          const response = JSON.parse(await run('gh', [
+            'api', 'graphql',
+            '-f', `query=${ENQUEUE_AUTHORITY_QUERY}`,
+            ...repositoryVariables(repositorySlug),
+            // `-F` so gh types the variable as the Int the query declares; `-f`
+            // would send the string "84" and GraphQL would refuse it.
+            '-F', `number=${prNumber}`,
+          ])) as {
+            data?: { repository?: { pullRequest?: PrAuthority | null } | null };
+            errors?: readonly { message?: unknown }[];
+          };
+          if (Array.isArray(response.errors) && response.errors.length > 0) {
+            throw new Error(response.errors
+              .map((error) => String(error.message ?? ''))
+              .join('; '));
+          }
+          const pullRequest = response.data?.repository?.pullRequest;
+          if (pullRequest === null || pullRequest === undefined) {
+            throw new Error(
+              `Enqueue authority read returned no pull request for #${prNumber}`,
+            );
+          }
+          return pullRequest;
+        };
         const authority = await readAuthority();
         if (typeof authority.headRefOid === 'string' && authority.headRefOid !== head) {
           return { status: 'changed-head', head: gitOid(authority.headRefOid) };

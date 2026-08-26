@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   classifyEnqueueFailure,
@@ -18,6 +21,13 @@ import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff
 import {
   CANONICAL_GITHUB_HTTPS_REMOTE,
 } from '../../src/lifecycle/implementation-executor.js';
+
+/**
+ * `PullRequest` fields GitHub serves only over GraphQL. `gh pr view --json`
+ * does not merely omit them — it refuses the whole invocation, so naming one
+ * in a `--json` field list is a runtime failure, not a missing key.
+ */
+const GRAPHQL_ONLY_PR_FIELDS = new Set(['isInMergeQueue', 'mergeQueueEntry']);
 
 const HEAD = gitOid('1'.repeat(40));
 const OTHER_HEAD = gitOid('2'.repeat(40));
@@ -329,14 +339,16 @@ describe('production head-pinned enqueue port', () => {
       options?: { readonly env?: NodeJS.ProcessEnv },
     ): Promise<string> => {
       calls.push({ command, args, env: options?.env });
-      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
-        return JSON.stringify({
-          state: 'OPEN',
-          headRefOid: HEAD,
-          baseRefName: 'next',
-        });
-      }
       if (command === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+        if (args.some((arg) => arg.includes('isInMergeQueue'))) {
+          return JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: { state: 'OPEN', headRefOid: HEAD, baseRefName: 'next' },
+              },
+            },
+          });
+        }
         return JSON.stringify({
           data: {
             enqueuePullRequest: { mergeQueueEntry: { position: 1, state: 'QUEUED' } },
@@ -368,7 +380,9 @@ describe('production head-pinned enqueue port', () => {
     })).resolves.toMatchObject({ status: 'enqueued', head: HEAD });
 
     const mutation = calls.find((call) =>
-      call.args[0] === 'api' && call.args[1] === 'graphql');
+      call.args[0] === 'api'
+      && call.args[1] === 'graphql'
+      && call.args.some((arg) => arg.includes('enqueuePullRequest')));
     expect(mutation?.args).toContain(`expectedHeadOid=${HEAD}`);
     expect(mutation?.args).toContain('pullRequestId=PR_kwDOABCD84');
     expect(mutation?.args.join(' ')).not.toMatch(/admin|bypass|--auto/i);
@@ -383,11 +397,21 @@ describe('production head-pinned enqueue port', () => {
       args: readonly string[],
     ): Promise<string> => {
       expect(command).toBe('gh');
-      if (args[0] === 'pr' && args[1] === 'view') {
+      if (
+        args[0] === 'api'
+        && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('isInMergeQueue'))
+      ) {
         return JSON.stringify({
-          state: 'OPEN',
-          headRefOid: HEAD,
-          baseRefName: 'attacker/base',
+          data: {
+            repository: {
+              pullRequest: {
+                state: 'OPEN',
+                headRefOid: HEAD,
+                baseRefName: 'attacker/base',
+              },
+            },
+          },
         });
       }
       if (args.includes('-X') && args.includes('PUT')) {
@@ -1131,7 +1155,12 @@ describe('enqueue mutation', () => {
 
   function enqueuePort(input: {
     readonly mutation?: () => Promise<string>;
-    readonly view?: (call: number) => Promise<string>;
+    /**
+     * The PullRequest node the authority read resolves to, per call. Returned
+     * as the node itself; the runner wraps it in the GraphQL envelope the
+     * executor decodes.
+     */
+    readonly authority?: (call: number) => Promise<Record<string, unknown>>;
     readonly refs?: Record<string, string>;
     readonly catFile?: (oid: string) => string;
     readonly lsRemoteFails?: boolean;
@@ -1184,15 +1213,38 @@ describe('enqueue mutation', () => {
           },
         })))();
       }
+      // gh 2.78.0 has no `isInMergeQueue` on `gh pr view --json` — the field is
+      // GraphQL-only, and the real CLI refuses the whole invocation rather than
+      // omitting the field. Reproduced verbatim so no readback can regress back
+      // onto the porcelain.
       if (args[0] === 'pr' && args[1] === 'view') {
+        throw new Error(
+          `Command failed: gh ${args.join(' ')}\n`
+          + 'Unknown JSON field: "isInMergeQueue"\n'
+          + 'Available fields: additions assignees author autoMergeRequest baseRefName body'
+          + ' changedFiles closed closedAt comments commits createdAt deletions files'
+          + ' fullDatabaseId headRefName headRefOid headRepository headRepositoryOwner id'
+          + ' isCrossRepository isDraft labels latestReviews maintainerCanModify'
+          + ' mergeCommit mergeStateStatus mergeable mergedAt mergedBy milestone number'
+          + ' potentialMergeCommit projectCards projectItems reactionGroups reviewDecision'
+          + ' reviewRequests reviews state statusCheckRollup title updatedAt url',
+        );
+      }
+      if (
+        args[0] === 'api'
+        && args[1] === 'graphql'
+        && args.some((arg) => arg.includes('isInMergeQueue'))
+      ) {
         const call = views;
         views += 1;
-        return (input.view ?? ((): Promise<string> => Promise.resolve(JSON.stringify({
-          state: 'OPEN',
-          headRefOid: HEAD,
-          baseRefName: 'stack/base',
-          isInMergeQueue: false,
-        }))))(call);
+        const node = await (input.authority ?? ((): Promise<Record<string, unknown>> =>
+          Promise.resolve({
+            state: 'OPEN',
+            headRefOid: HEAD,
+            baseRefName: 'stack/base',
+            isInMergeQueue: false,
+          })))(call);
+        return JSON.stringify({ data: { repository: { pullRequest: node } } });
       }
       // The `ci-failure` child the flake hold files, and everything the child
       // port does around it.
@@ -1273,7 +1325,10 @@ describe('enqueue mutation', () => {
     });
 
     const mutation = harness.calls.find((call) =>
-      call.command === 'gh' && call.args[0] === 'api' && call.args[1] === 'graphql');
+      call.command === 'gh'
+      && call.args[0] === 'api'
+      && call.args[1] === 'graphql'
+      && call.args.some((arg) => arg.includes('enqueuePullRequest')));
     expect(mutation).toBeDefined();
     expect(mutation!.args).toContain('-f');
     expect(mutation!.args).toContain('pullRequestId=PR_kwDOABCD84');
@@ -1281,6 +1336,44 @@ describe('enqueue mutation', () => {
     expect(mutation!.args.join(' ')).toMatch(/enqueuePullRequest\(input:/);
     expect(mutation!.env?.GH_TOKEN).toBe('selected-secret');
     expect(mutation!.env?.GITHUB_TOKEN).toBe('');
+  });
+
+  /**
+   * `isInMergeQueue` is a GraphQL-only PullRequest field: `gh pr view --json`
+   * refuses the whole invocation with `Unknown JSON field`, so the authority
+   * read has to be a GraphQL query. It runs through the same credentialled,
+   * metered runner as the mutation it guards.
+   */
+  it('reads the queue authority over GraphQL, never over gh pr view', async () => {
+    const harness = enqueuePort();
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'enqueued' });
+
+    for (const call of harness.calls) {
+      expect(`${call.command} ${call.args.join(' ')}`).not.toMatch(/\bpr view\b/);
+    }
+    const authority = harness.calls.find((call) =>
+      call.command === 'gh'
+      && call.args[0] === 'api'
+      && call.args[1] === 'graphql'
+      && call.args.some((arg) => arg.includes('isInMergeQueue')));
+    expect(authority).toBeDefined();
+    expect(authority!.args).toContain('owner=Jinn-Network');
+    expect(authority!.args).toContain('name=mono');
+    expect(authority!.args).toContain('number=84');
+    // `number` must go over `-F` so gh types it as an Int; `-f` would send the
+    // string "84" and GraphQL would refuse the variable.
+    expect(authority!.args[authority!.args.indexOf('number=84') - 1]).toBe('-F');
+    const field = authority!.args.find((arg) => arg.startsWith('query=')) ?? '';
+    const document = field.slice('query='.length);
+    expect(document).toMatch(/^query\(/);
+    expect(document).toMatch(/pullRequest\(number:\s*\$number\)/);
+    expect(document).toMatch(/\bstate\b/);
+    expect(document).toMatch(/\bheadRefOid\b/);
+    expect(document).toMatch(/\bbaseRefName\b/);
+    expect(document).not.toMatch(/\bmutation\b/);
+    expect(authority!.env?.GH_TOKEN).toBe('selected-secret');
+    expect(authority!.env?.GITHUB_TOKEN).toBe('');
   });
 
   it('never runs gh pr merge and never arms auto-merge', async () => {
@@ -1327,7 +1420,7 @@ describe('enqueue mutation', () => {
       mutation: async () => {
         throw new Error('GraphQL: Head sha did not match the expected head oid');
       },
-      view: async (): Promise<string> => JSON.stringify({
+      authority: async () => ({
         state: 'OPEN',
         headRefOid: OTHER_HEAD,
         baseRefName: 'stack/base',
@@ -1365,7 +1458,7 @@ describe('enqueue mutation', () => {
       mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
       // Not queued when the pre-flight authority read runs; queued afterwards,
       // which is the only evidence that the lost mutation actually landed.
-      view: async (call) => JSON.stringify({
+      authority: async (call) => ({
         state: 'OPEN',
         headRefOid: HEAD,
         baseRefName: 'stack/base',
@@ -1379,7 +1472,7 @@ describe('enqueue mutation', () => {
   it('stays ambiguous when the readback does not show the PR queued', async () => {
     const harness = enqueuePort({
       mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
-      view: async (): Promise<string> => JSON.stringify({
+      authority: async () => ({
         state: 'OPEN',
         headRefOid: HEAD,
         baseRefName: 'stack/base',
@@ -1393,7 +1486,7 @@ describe('enqueue mutation', () => {
   it('does not accept a readback queued at some other head', async () => {
     const harness = enqueuePort({
       mutation: async () => { throw new Error('gh: HTTP 502: Bad Gateway'); },
-      view: async (): Promise<string> => JSON.stringify({
+      authority: async () => ({
         state: 'OPEN',
         headRefOid: OTHER_HEAD,
         baseRefName: 'stack/base',
@@ -1672,5 +1765,39 @@ describe('enqueue mutation', () => {
       ));
       expect(created).toEqual([]);
     });
+  });
+});
+
+/**
+ * Cheap insurance against reintroduction. `isInMergeQueue` exists only on the
+ * GraphQL `PullRequest` type; `gh pr view --json` rejects the entire
+ * invocation with `Unknown JSON field: "isInMergeQueue"` (observed on gh
+ * 2.78.0 against Jinn-Network/mono PR #2993), so a mocked `CommandRunner` that
+ * only inspects argv cannot catch the reintroduction on its own. This scans
+ * every `--json` field list the engine emits.
+ */
+describe('gh pr view --json field lists', () => {
+  function sourceFiles(directory: string): string[] {
+    return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+      const full = join(directory, entry.name);
+      if (entry.isDirectory()) return sourceFiles(full);
+      return entry.isFile() && full.endsWith('.ts') ? [full] : [];
+    });
+  }
+
+  it('never request a GraphQL-only field', () => {
+    const root = fileURLToPath(new URL('../../src', import.meta.url));
+    const offenders: string[] = [];
+    for (const file of sourceFiles(root)) {
+      const source = readFileSync(file, 'utf8');
+      for (const match of source.matchAll(/(['"])--json\1\s*,\s*(['"])([^'"]*)\2/g)) {
+        for (const field of (match[3] ?? '').split(',')) {
+          if (GRAPHQL_ONLY_PR_FIELDS.has(field.trim())) {
+            offenders.push(`${relative(root, file)}: ${field.trim()}`);
+          }
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });
