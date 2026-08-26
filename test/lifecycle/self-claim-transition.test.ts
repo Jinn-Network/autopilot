@@ -64,4 +64,58 @@ describe('selfClaimHeadTransition', () => {
       transition,
     )).toBe(true);
   });
+
+  it('authorizes the live re-read that still trails its own claim push', () => {
+    const transition = selfClaimHeadTransition({
+      prNumber: 2085,
+      previousHead: PREVIOUS,
+      candidateParent: PREVIOUS,
+      claimedHead: CLAIMED,
+    });
+
+    // The two GitHub surfaces replicate a push independently, so the skew runs
+    // in both directions. Here the REST open-PR index already carries the
+    // engine's own claim commit while the GraphQL PR node still answers with
+    // the head the claim was CAS-pushed from.
+    expect(allowsSelfClaimHeadMismatch(
+      { ...ENTRY, headOid: CLAIMED },
+      { ...LIVE, headOid: PREVIOUS },
+      transition,
+    )).toBe(true);
+  });
+
+  it('refuses every head that is not an end of the proven claim transition', () => {
+    const foreign = gitOid('9'.repeat(40));
+    const transition = selfClaimHeadTransition({
+      prNumber: 2085,
+      previousHead: PREVIOUS,
+      candidateParent: PREVIOUS,
+      claimedHead: CLAIMED,
+    });
+
+    // A foreign index row against a trailing live read.
+    expect(allowsSelfClaimHeadMismatch(
+      { ...ENTRY, headOid: foreign },
+      { ...LIVE, headOid: PREVIOUS },
+      transition,
+    )).toBe(false);
+    // A foreign live head against a caught-up index row.
+    expect(allowsSelfClaimHeadMismatch(
+      { ...ENTRY, headOid: CLAIMED },
+      { ...LIVE, headOid: foreign },
+      transition,
+    )).toBe(false);
+    // A foreign live head against a trailing index row.
+    expect(allowsSelfClaimHeadMismatch(
+      ENTRY,
+      { ...LIVE, headOid: foreign },
+      transition,
+    )).toBe(false);
+    // The right pair, the wrong PR.
+    expect(allowsSelfClaimHeadMismatch(
+      { ...ENTRY, number: 2086, headOid: CLAIMED },
+      { ...LIVE, number: 2086, headOid: PREVIOUS },
+      transition,
+    )).toBe(false);
+  });
 });
