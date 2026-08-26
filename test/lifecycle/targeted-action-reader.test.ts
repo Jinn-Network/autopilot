@@ -15,7 +15,10 @@ import {
 import { encodeBranchClaimTrailers } from '../../src/lifecycle/codecs.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
-import { selfClaimHeadTransition } from '../../src/lifecycle/self-claim-transition.js';
+import {
+  selfClaimHeadTransition,
+  type SelfClaimHeadTransition,
+} from '../../src/lifecycle/self-claim-transition.js';
 import type {
   GitHubLifecycleSnapshot,
   RawPullRequest,
@@ -225,6 +228,16 @@ function executeTargetedRecovery(
   snapshot: GitHubLifecycleSnapshot,
   events: string[],
 ) {
+  return executeRecoveryAgainst(async () => snapshot, events);
+}
+
+function executeRecoveryAgainst(
+  readSnapshot: (
+    selfClaim?: SelfClaimHeadTransition,
+  ) => Promise<GitHubLifecycleSnapshot>,
+  events: string[],
+  overrides: Partial<ImplementationExecutorDeps> = {},
+) {
   return executeImplementationAction({
     kind: 'claim-implementation',
     intent: 'stale-recovery',
@@ -241,7 +254,7 @@ function executeTargetedRecovery(
       credentials: new CredentialPool([]),
       authorAllowlist: new Set(['oaksprout']),
       defaultBranch: 'next',
-      readSnapshot: async () => snapshot,
+      readSnapshot,
     }),
     runRealityCheck: async () => {
       events.push('reality');
@@ -312,7 +325,76 @@ function executeTargetedRecovery(
     nextAttemptId: () => '22222222-2222-4222-8222-222222222222',
     runnerId: 'runner-a',
     now: () => new Date('2026-07-22T10:00:00.000Z'),
+    ...overrides,
   } satisfies ImplementationExecutorDeps);
+}
+
+/**
+ * The live shape of jinn-mono#2822: a stale implementing draft whose recovery
+ * pushes its claim commit, after which the two GitHub surfaces disagree about
+ * the head for a moment. `indexHead` is what `GET /pulls?state=open` reports,
+ * `liveHead` what the GraphQL PR node reports; the claim push moves them
+ * independently, and the engine holds a git-protocol `ls-remote` readback
+ * proving the branch is at `claimOid` regardless of either.
+ */
+function selfClaimSkew() {
+  const fixture = staleRecoveryCycle();
+  const claimOid = gitOid('c'.repeat(40));
+  const surfaces = { indexHead: HEAD as string, liveHead: HEAD as string };
+  const reader = makeTargetedActionReader({
+    authorAllowlist: new Set(['oaksprout']),
+    rateLimitFloor: 500,
+    readGraphQlRemaining: async () => 510,
+    readOpenPullRequestIndex: async () => [
+      indexEntry(fixture.implementation, { headOid: surfaces.indexHead }),
+      indexEntry(fixture.blocker),
+    ],
+    readPullRequest: async (number) => {
+      if (number === fixture.implementation.number) {
+        return { ...fixture.implementation, headOid: surfaces.liveHead };
+      }
+      if (number === fixture.blocker.number) return fixture.blocker;
+      return null;
+    },
+    readProjectItem: async () => ({
+      id: 'item-42',
+      status: 'In Progress',
+      priority: 'P1',
+      effort: 'Medium',
+      blockedOn: 'Another issue',
+      issueType: 'fix',
+    }),
+    readIssue: async (number) => ({
+      number,
+      title: 'Target issue',
+      open: true,
+      author: 'oaksprout',
+      labels: [],
+    }),
+    readBlockedByIssueNumbers: async () => [7],
+    readPullRequestOutcomeNumbersClosingIssues: async () =>
+      new Set([fixture.blocker.number]),
+  });
+  // The same composition run-autopilot-v2.ts wires for a stale-recovery
+  // action, including the rejection message the engine log carries.
+  const readSnapshot = async (
+    selfClaim?: SelfClaimHeadTransition,
+  ): Promise<GitHubLifecycleSnapshot> => {
+    const read = await reader.readStaleRecoveryPullRequest(
+      fixture.cycle,
+      101,
+      selfClaim,
+    );
+    const snapshot = snapshotOf(read);
+    if (snapshot === null) {
+      throw new Error(
+        'Targeted implementation authority for issue #42 is unavailable'
+        + ` (${targetedAuthorityRefusalDetail(read) ?? 'no authority'})`,
+      );
+    }
+    return snapshot;
+  };
+  return { claimOid, surfaces, readSnapshot };
 }
 
 function indexEntry(pr: RawPullRequest, overrides: {
@@ -608,6 +690,107 @@ describe('targeted action reader', () => {
       }),
     );
     expect(snapshotOf(allowed)).not.toBeNull();
+  });
+
+  it('dispatches the recovery worker when the live PR read still trails its own claim push', async () => {
+    const { claimOid, surfaces, readSnapshot } = selfClaimSkew();
+    const events: string[] = [];
+
+    const result = await executeRecoveryAgainst(readSnapshot, events, {
+      createClaimCommit: async () => {
+        events.push('claim-commit');
+        return claimOid;
+      },
+      claimBranch: async (input) => {
+        events.push('claim');
+        // The CAS push wins and `ls-remote` proves the branch head. The REST
+        // open-PR index shows it at once; the GraphQL PR node does not.
+        surfaces.indexHead = claimOid;
+        return {
+          status: 'won',
+          expected: input.expectedRemoteHead,
+          published: input.claimOid,
+          observed: input.claimOid,
+        };
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: 'spawned',
+      issueNumber: 42,
+      prNumber: 101,
+      claimOid,
+    });
+    expect(events).toContain('worker');
+    expect(events.filter((event) => event === 'claim-commit')).toHaveLength(1);
+  });
+
+  it('still aborts the recovery when a foreign head lands on the claim branch', async () => {
+    const foreign = gitOid('9'.repeat(40));
+    for (const surface of ['index', 'live'] as const) {
+      const { claimOid, surfaces, readSnapshot } = selfClaimSkew();
+      const events: string[] = [];
+
+      await expect(executeRecoveryAgainst(readSnapshot, events, {
+        createClaimCommit: async () => {
+          events.push('claim-commit');
+          return claimOid;
+        },
+        claimBranch: async (input) => {
+          events.push('claim');
+          if (surface === 'index') {
+            surfaces.indexHead = foreign;
+          } else {
+            surfaces.indexHead = claimOid;
+            surfaces.liveHead = foreign;
+          }
+          return {
+            status: 'won',
+            expected: input.expectedRemoteHead,
+            published: input.claimOid,
+            observed: input.claimOid,
+          };
+        },
+      })).rejects.toThrow('live read disagrees with its open PR index row');
+      expect(events).not.toContain('worker');
+    }
+  });
+
+  it('refuses a second claim commit once the branch already carries this claim', async () => {
+    const { claimOid, surfaces, readSnapshot } = selfClaimSkew();
+    const events: string[] = [];
+    const deps = {
+      createClaimCommit: async () => {
+        events.push('claim-commit');
+        return claimOid;
+      },
+      claimBranch: async (input: { readonly expectedRemoteHead: unknown; readonly claimOid: unknown }) => {
+        events.push('claim');
+        surfaces.indexHead = claimOid;
+        surfaces.liveHead = claimOid;
+        return {
+          status: 'won' as const,
+          expected: input.expectedRemoteHead,
+          published: input.claimOid,
+          observed: input.claimOid,
+        };
+      },
+    } as Partial<ImplementationExecutorDeps>;
+
+    await expect(executeRecoveryAgainst(readSnapshot, events, deps))
+      .resolves.toMatchObject({ status: 'spawned' });
+
+    // The next cycle replays the same frozen candidate. The claim protocol
+    // pins the action to the head it was derived from, so the recovery refuses
+    // before it mutates anything rather than stacking a second claim commit.
+    const replay = await executeRecoveryAgainst(readSnapshot, events, deps);
+
+    expect(replay).toMatchObject({
+      status: 'ineligible',
+      issueNumber: 42,
+      detail: expect.stringContaining('head changed'),
+    });
+    expect(events.filter((event) => event === 'claim-commit')).toHaveLength(1);
   });
 
   it('withholds stale-recovery authority when a blocker closes unmerged after the cycle', async () => {
