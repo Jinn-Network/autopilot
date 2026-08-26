@@ -47,6 +47,7 @@ import type { ReviewSessionPort } from './review-session.js';
 import type { ReviewNativeReview } from './review-executor.js';
 import {
   resolveStructuredPullRequestMappings,
+  stableBranchMapping,
   type StructuredMappingInput,
   type StructuredMappingPullRequest,
 } from './pr-mapping.js';
@@ -285,19 +286,13 @@ export function makeProductionReviewSessionPort(
         );
         if (raw === null) continue;
         const claim = decodeBranchClaimTrailers(raw.claimTrailers);
-        if (
-          claim.issueNumber !== issue.number
-          || claim.expectedHead !== gitOid(raw.headOid)
-        ) {
-          return null;
-        }
-        stableBranches.push({
+        if (claim.issueNumber !== issue.number) return null;
+        stableBranches.push(stableBranchMapping({
           issueNumber: issue.number,
-          phase: claim.phase,
-          head: claim.expectedHead,
           headRefName: raw.headRefName,
-          targetBase: claim.targetBase,
-        });
+          headOid: gitOid(raw.headOid),
+          claim,
+        }));
       }
       return {
         defaultBranch: loaded.config.repository.defaultBranch,

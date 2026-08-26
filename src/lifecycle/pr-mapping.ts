@@ -95,6 +95,47 @@ export function evidencedIssueNumbers(
   return numbers;
 }
 
+/**
+ * The stable-branch row for one `autopilot/<issue>` ref and its decoded claim.
+ * Every caller that feeds {@link resolveStructuredPullRequestMappings} must
+ * build its rows here, for the same reason {@link evidencedIssueNumbers} exists:
+ * a private copy of this projection is how the derivations silently disagree.
+ *
+ * `head` is the ref's observed head OID and never the claim's
+ * `Jinn-Autopilot-Expected-Head` trailer. The two are different things and are
+ * *expected* to differ on exactly the branches a review reads: the implement
+ * session builds its phase-complete claim from the head it holds and only then
+ * commits the marker carrying that claim on top (`completionClaim` in
+ * `implementation-session.ts`), so on a finished branch the trailer names the
+ * marker's parent. Reading `expectedHead` as if it were the head therefore
+ * fails on a branch that is perfectly well-formed — mono#2993, where two
+ * consecutive reviews derived `mapping-pending` against a clean 1:1 mapping and
+ * could publish no verdict.
+ *
+ * The head identity that actually guards against publishing onto the wrong
+ * issue is enforced downstream, where the resolver requires the stable claim's
+ * head to equal the pull request's head.
+ */
+export function stableBranchMapping(
+  branch: {
+    readonly issueNumber: number;
+    readonly headRefName: string;
+    readonly headOid: GitOid;
+    readonly claim: {
+      readonly phase: StructuredMappingStableBranch['phase'];
+      readonly targetBase: string;
+    };
+  },
+): StructuredMappingStableBranch {
+  return {
+    issueNumber: branch.issueNumber,
+    phase: branch.claim.phase,
+    head: branch.headOid,
+    headRefName: branch.headRefName,
+    targetBase: branch.claim.targetBase,
+  };
+}
+
 function inferredIssueNumbers(
   pr: StructuredMappingPullRequest,
   knownIssues: ReadonlySet<number>,

@@ -1,5 +1,5 @@
 // @ts-nocheck — Stage 5 leftover fixtures for deleted merge-prep/review-fix/project APIs.
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -104,6 +104,266 @@ function manifest(): AttemptManifest {
       updatedAt: '2026-07-20T12:00:00.000Z',
       childStartedAt: '2026-07-20T12:00:00.000Z',
     },
+  };
+}
+
+/**
+ * The head the implementation attempt held *before* it appended its
+ * phase-complete marker commit. `Jinn-Autopilot-Expected-Head` names this OID,
+ * never the marker commit that carries the trailer — see `completionClaim` in
+ * `implementation-session.ts`, which builds the claim from `authority.remoteHead`
+ * and only then commits it on top.
+ */
+const MARKER_PARENT = gitOid('7'.repeat(40));
+
+/**
+ * A repository root carrying the product configuration the session's own
+ * mapping derivation loads. Tests that exercise the default
+ * `readMappingAuthority` need it; tests that inject one do not.
+ */
+function autopilotRepositoryRoot(roots: string[]): string {
+  const dir = mkdtempSync(join(tmpdir(), 'jinn-review-session-config-'));
+  roots.push(dir);
+  mkdirSync(join(dir, '.autopilot'));
+  writeFileSync(join(dir, '.autopilot', 'config.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    repository: {
+      slug: 'Jinn-Network/mono',
+      defaultBranch: 'next',
+      restDatabaseId: 123456,
+      remote: {
+        name: 'jinn-autopilot-v2',
+        url: 'https://github.com/Jinn-Network/mono.git',
+      },
+      instructionFiles: [],
+    },
+    project: {
+      owner: 'Jinn-Network',
+      number: 1,
+      id: 'PVT_external',
+      fields: {
+        status: {
+          id: 'PVTF_status',
+          options: {
+            todo: 'status_todo',
+            inProgress: 'status_progress',
+            human: 'status_human',
+            inReview: 'status_review',
+            done: 'status_done',
+          },
+        },
+        priority: {
+          id: 'PVTF_priority',
+          options: {
+            p0: 'priority_0',
+            p1: 'priority_1',
+            p2: 'priority_2',
+            p3: 'priority_3',
+            p4: 'priority_4',
+          },
+        },
+        effort: {
+          id: 'PVTF_effort',
+          options: {
+            low: 'effort_low',
+            medium: 'effort_medium',
+            high: 'effort_high',
+            xhigh: 'effort_xhigh',
+            max: 'effort_max',
+          },
+        },
+        blockedOn: {
+          id: 'PVTF_blocked',
+          options: {
+            nothing: 'blocked_nothing',
+            human: 'blocked_human',
+            anotherIssue: 'blocked_issue',
+          },
+        },
+        sprint: { id: 'PVTF_sprint' },
+        type: {
+          options: {
+            feat: 'type_feat',
+            fix: 'type_fix',
+            refactor: 'type_refactor',
+            spike: 'type_spike',
+            chore: 'type_chore',
+            docs: 'type_docs',
+            test: 'type_test',
+            incident: 'type_incident',
+            design: 'type_design',
+          },
+        },
+      },
+    },
+    worker: {
+      runtime: 'hermes',
+      model: 'gpt-5.6-sol',
+      provider: 'openai-codex',
+      repositorySkillDirectories: [],
+    },
+    scheduler: {
+      pollSeconds: 600,
+      fullReconcileSeconds: 3600,
+      implementationConcurrency: 1,
+      reviewConcurrency: 1,
+      openPrBackpressure: 30,
+    },
+    triage: { allowedAuthors: ['ritsukai'] },
+    safety: {
+      staleAfterSeconds: 7200,
+      diskFloorGb: 10,
+      cleanup: true,
+      children: true,
+      carryover: true,
+    },
+    mergePolicy: 'manual',
+    maintainerSkills: { host: 'claude', version: '0.1.0' },
+  })}\n`);
+  return dir;
+}
+
+/** The exact phase-complete marker commit message the implement session writes. */
+function markerCommitMessage(options: {
+  readonly issueNumber: number;
+  readonly prNumber: number;
+  readonly expectedHead: string;
+  readonly targetBase: string;
+}): string {
+  return [
+    'Autopilot implementation phase complete',
+    '',
+    `Closes #${options.issueNumber}`,
+    '',
+    'Jinn-Autopilot-Protocol: 2',
+    'Jinn-Autopilot-Phase: implement',
+    `Jinn-Autopilot-Issue: ${options.issueNumber}`,
+    `Jinn-Autopilot-PR: ${options.prNumber}`,
+    'Jinn-Autopilot-Attempt: 1a83de42-0135-4f4c-831d-504c759ce2e5',
+    'Jinn-Autopilot-Runner: runner-a',
+    'Jinn-Autopilot-Login: implementation-bot',
+    `Jinn-Autopilot-Expected-Head: ${options.expectedHead}`,
+    `Jinn-Autopilot-Target-Base: ${options.targetBase}`,
+    'Jinn-Autopilot-Claimed-At: 2026-07-20T11:40:42.223Z',
+    'Jinn-Autopilot-Phase-Complete: true',
+  ].join('\n');
+}
+
+/**
+ * Serves every read the session's own `defaultMappingAuthority` makes, so the
+ * derivation under test runs for real instead of through an injected authority.
+ */
+function sessionDerivedMappingRunner(overrides: {
+  readonly closingIssueNumbers?: readonly number[];
+  readonly baseRefName?: string;
+  readonly blockedBy?: readonly number[];
+  readonly branchHead?: string;
+} = {}) {
+  const closingIssueNumbers = overrides.closingIssueNumbers ?? [42];
+  const baseRefName = overrides.baseRefName ?? 'next';
+  const branchHead = overrides.branchHead ?? HEAD;
+  const closingIssuesReferences = closingIssueNumbers.map((number) => ({ number }));
+  const body = 'Closes #42';
+  const restResponse = (payload: string): string => [
+    'HTTP/2.0 200 OK',
+    'etag: "etag-v1"',
+    'x-ratelimit-remaining: 4998',
+    'x-ratelimit-used: 2',
+    'x-ratelimit-reset: 1784725200',
+    'x-ratelimit-resource: core',
+    'content-type: application/json; charset=utf-8',
+    '',
+    payload,
+  ].join('\r\n');
+  return async (cmd: string, args: readonly string[]): Promise<string> => {
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return JSON.stringify({
+        number: 84,
+        state: 'OPEN',
+        headRefOid: HEAD,
+        headRefName: 'autopilot/42',
+        baseRefName,
+        baseRefOid: BASE,
+        isDraft: false,
+        body,
+        author: { login: 'implementation-bot' },
+        labels: [{ name: 'engine:review' }],
+        closingIssuesReferences,
+        files: [],
+      });
+    }
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list') {
+      return JSON.stringify([{
+        number: 84,
+        headRefOid: HEAD,
+        headRefName: 'autopilot/42',
+        baseRefName,
+        body,
+        closingIssuesReferences,
+      }]);
+    }
+    if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+      return JSON.stringify({
+        data: {
+          rateLimit: { cost: 1, remaining: 4999, resetAt: '2026-07-20T13:00:00.000Z' },
+          repository: {
+            issue: {
+              issueType: { name: 'fix' },
+              projectItems: {
+                pageInfo: { hasNextPage: false },
+                nodes: [{
+                  id: 'PVTI_issue',
+                  project: { number: 1 },
+                  status: { name: 'In Review' },
+                  priority: { name: 'P1' },
+                  effort: { name: 'High' },
+                  blockedOn: { name: 'Nothing' },
+                }],
+              },
+            },
+          },
+        },
+      });
+    }
+    if (
+      cmd === 'gh'
+      && args[0] === 'api'
+      && args[1] === '--include'
+      && String(args[2]).includes('/dependencies/blocked_by')
+    ) {
+      return restResponse(JSON.stringify(
+        (overrides.blockedBy ?? []).map((number) => ({ number })),
+      ));
+    }
+    if (cmd === 'git' && args.includes('ls-remote')) {
+      // Only issue #42 has a stable branch; every other lifecycle issue the
+      // mapping graph reaches simply has none.
+      return args.at(-1) === 'refs/heads/autopilot/42'
+        ? `${branchHead}\trefs/heads/autopilot/42\n`
+        : '';
+    }
+    if (
+      cmd === 'gh'
+      && args[0] === 'api'
+      && String(args[1]).startsWith('repos/Jinn-Network/mono/commits')
+    ) {
+      // The branch head *is* the phase-complete marker, so its
+      // `Expected-Head` trailer names the marker's parent.
+      return JSON.stringify([{
+        sha: branchHead,
+        commit: {
+          committer: { date: '2026-07-20T11:41:00Z' },
+          message: markerCommitMessage({
+            issueNumber: 42,
+            prNumber: 84,
+            expectedHead: MARKER_PARENT,
+            targetBase: 'next',
+          }),
+        },
+      }]);
+    }
+    if (cmd === 'git' && args.includes('ls-tree')) return '';
+    throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
   };
 }
 
@@ -427,6 +687,88 @@ describe('production review session port', () => {
     });
     expect(pullRequest).not.toHaveProperty('mappingProblem');
   });
+
+  it(
+    'regression (mono#2993): derives a clean 1:1 mapping through the session'
+    + " path when the branch head is the claim's own phase-complete marker",
+    async () => {
+      const bound: AttemptManifest = {
+        ...manifest(),
+        repository: {
+          ...manifest().repository,
+          root: autopilotRepositoryRoot(roots),
+        },
+      };
+      const port = makeRawProductionReviewSessionPort({
+        environment: {
+          GH_TOKEN: 'selected-secret',
+          JINN_AUTOPILOT_SESSION_MANIFEST: bound.paths.manifest,
+        },
+        readManifest: () => bound,
+        readProjectHumanAuthority: async () => false,
+        readNativeIssueHumanAuthority: async () => false,
+        runner: sessionDerivedMappingRunner(),
+      });
+
+      const pullRequest = await port.readPullRequest(84, HEAD);
+      expect(pullRequest).toMatchObject({
+        number: 84,
+        issueNumber: 42,
+        headRefName: 'autopilot/42',
+        baseRefName: 'next',
+      });
+      expect(pullRequest).not.toHaveProperty('mappingProblem');
+    },
+  );
+
+  it.each([
+    {
+      name: 'the closing references name two lifecycle issues',
+      overrides: { closingIssueNumbers: [42, 43] },
+      expected: /Closing-reference mapping is duplicated or names multiple issues/,
+    },
+    {
+      name: 'the PR targets a base that is neither default nor a dependency',
+      overrides: { baseRefName: 'release/1.0' },
+      expected: /PR base release\/1\.0 is not an authorized base/,
+    },
+    {
+      // The head identity the removed `expectedHead` comparison was reaching
+      // for. It lives in the resolver, where it compares the branch's real head
+      // to the PR's, and it still bites.
+      name: 'the stable branch has advanced past the reviewed PR head',
+      overrides: { branchHead: gitOid('8'.repeat(40)) },
+      expected: /stable branch claim does not match the exact PR branch, head, and base/,
+    },
+  ])(
+    'still refuses a session-derived mapping when $name',
+    async ({ overrides, expected }) => {
+      const bound: AttemptManifest = {
+        ...manifest(),
+        ...(overrides.baseRefName === undefined
+          ? {}
+          : { targetBase: overrides.baseRefName }),
+        repository: {
+          ...manifest().repository,
+          root: autopilotRepositoryRoot(roots),
+        },
+      };
+      const port = makeRawProductionReviewSessionPort({
+        environment: {
+          GH_TOKEN: 'selected-secret',
+          JINN_AUTOPILOT_SESSION_MANIFEST: bound.paths.manifest,
+        },
+        readManifest: () => bound,
+        readProjectHumanAuthority: async () => false,
+        readNativeIssueHumanAuthority: async () => false,
+        runner: sessionDerivedMappingRunner(overrides),
+      });
+
+      await expect(port.readPullRequest(84, HEAD)).resolves.toMatchObject({
+        mappingProblem: expect.stringMatching(expected),
+      });
+    },
+  );
 
   it.each([
     {

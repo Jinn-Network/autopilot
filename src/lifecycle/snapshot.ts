@@ -39,6 +39,7 @@ import {
 } from './github-usage.js';
 import {
   resolveStructuredPullRequestMappings,
+  stableBranchMapping,
   type StructuredPullRequestMapping,
 } from './pr-mapping.js';
 import {
@@ -875,13 +876,7 @@ function resolveMappings(
         closingIssueNumbers: [...pr.closingIssueNumbers],
         body: pr.body,
       })),
-    stableBranches: branches.map((branch) => ({
-      issueNumber: branch.issueNumber,
-      phase: branch.claim.phase,
-      head: branch.headOid,
-      headRefName: branch.headRefName,
-      targetBase: branch.claim.targetBase,
-    })),
+    stableBranches: branches.map(stableBranchMapping),
   });
   const candidatesByPr = new Map(resolutions.map((resolution) => [
     resolution.prNumber,
