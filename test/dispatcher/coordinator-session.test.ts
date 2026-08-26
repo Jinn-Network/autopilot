@@ -1,4 +1,6 @@
 // @ts-nocheck — Stage 5 leftover fixtures for deleted merge-prep/review-fix/project APIs.
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   spawnCoordinatorSession,
@@ -8,8 +10,17 @@ import {
 } from '../../src/dispatcher/coordinator-session.js';
 import { HERMES_STATELESS_LAUNCHER } from '../../src/dispatcher/hermes-runtime.js';
 import { DEFAULT_CONFIG } from '../../src/dispatcher/types.js';
-import { AUTOPILOT_PACKAGE_DIR } from '../../src/dispatcher/runtime-path.js';
 import type { AutopilotRuntime } from '../../src/autopilot-runtime.js';
+
+/**
+ * Reads the `name` field from the package.json inside `dir`, proving `dir` is
+ * actually this package's root rather than merely equal to some other
+ * (possibly also wrong) computed constant.
+ */
+function packageNameAt(dir: string): string {
+  const manifest = readFileSync(join(dir, 'package.json'), 'utf8');
+  return (JSON.parse(manifest) as { name: string }).name;
+}
 
 type SpawnCall = {
   cmd: string;
@@ -85,10 +96,9 @@ describe.each(['claude', 'hermes', 'cursor'] as const)(
         expect(call.opts.env).toMatchObject({
           GH_TOKEN: `${session.kind}-token`,
           JINN_AUTOPILOT_RUNTIME: runtime,
-          JINN_AUTOPILOT_PACKAGE_DIR: AUTOPILOT_PACKAGE_DIR,
         });
-        expect((call.opts.env as Record<string, string>)
-          .JINN_AUTOPILOT_PACKAGE_DIR).toBe(AUTOPILOT_PACKAGE_DIR);
+        expect(packageNameAt((call.opts.env as Record<string, string>)
+          .JINN_AUTOPILOT_PACKAGE_DIR)).toBe('@jinn-network/autopilot');
 
         if (runtime === 'claude') {
           expect(call.cmd).toBe('claude');
@@ -152,8 +162,8 @@ describe.each(['claude', 'hermes', 'cursor'] as const)(
 
     it('overrides ambient JINN_AUTOPILOT_PACKAGE_DIR for $kind', (session) => {
       const { call } = exercise(runtime, session);
-      expect((call.opts.env as Record<string, string>).JINN_AUTOPILOT_PACKAGE_DIR)
-        .toBe(AUTOPILOT_PACKAGE_DIR);
+      expect(packageNameAt((call.opts.env as Record<string, string>)
+        .JINN_AUTOPILOT_PACKAGE_DIR)).toBe('@jinn-network/autopilot');
     });
 
     it('composes exit diagnostics with caller onExit for $kind', (session) => {

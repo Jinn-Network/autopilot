@@ -19,7 +19,7 @@ import {
   loadRuntimeCanon,
   repositorySkillDirectories,
 } from '../config/runtime-assets.js';
-import { pinnedAutopilotPackageDir } from './runtime-path.js';
+import { packageRoot } from '../package-paths.js';
 
 export interface SpawnResult {
   pid: number | undefined;
@@ -159,7 +159,10 @@ export function spawnCoordinatorSession(
   const env: NodeJS.ProcessEnv = {
     ...spec.env,
     JINN_AUTOPILOT_RUNTIME: cfg.runtime,
-    JINN_AUTOPILOT_PACKAGE_DIR: pinnedAutopilotPackageDir(spec.env),
+    // Overrides any ambient JINN_AUTOPILOT_PACKAGE_DIR the operator may have
+    // exported: pinned to this package's real root (works from `src/` and
+    // from the bundled `dist/autopilot.js` alike), not derived from it.
+    JINN_AUTOPILOT_PACKAGE_DIR: packageRoot(),
   };
   let result: SpawnResult;
 
