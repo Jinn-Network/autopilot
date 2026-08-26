@@ -2685,4 +2685,248 @@ describe('bounded production GitHub ports', () => {
       },
     });
   });
+
+  describe('exact-head check evidence', () => {
+    const head = 'a'.repeat(40);
+    const checkRunsPath = `/repos/Jinn-Network/mono/commits/${head}/check-runs`;
+    const statusPath = `/repos/Jinn-Network/mono/commits/${head}/status`;
+
+    function checkRunRows(count: number, offset: number): unknown[] {
+      return Array.from({ length: count }, (_row, index) => ({
+        name: `check-${offset + index}`,
+        app: { id: 1 },
+        head_sha: head,
+        status: 'completed',
+        conclusion: 'success',
+      }));
+    }
+
+    function commitStatusRows(count: number, offset: number): unknown[] {
+      return Array.from({ length: count }, (_row, index) => ({
+        context: `status-${offset + index}`,
+        state: 'success',
+      }));
+    }
+
+    /**
+     * mono PR #2918's shape: a head commit whose check evidence outruns the
+     * 100-row page GitHub serves. Serves `pages` pages of the named check
+     * endpoint, each advertising the next through its own Link header, and
+     * records every request so a test can prove the follow-up read followed
+     * that header. `endlessNext` never stops advertising a next page, which is
+     * what the page cap has to survive.
+     */
+    function pagedChecks(options: {
+      readonly kind: 'check-runs' | 'status';
+      readonly pages: readonly (readonly unknown[])[];
+      readonly totalCount: number;
+      readonly endlessNext?: boolean;
+      readonly numericAlias?: boolean;
+    }): {
+      readonly readChecks: () => Promise<{
+        readonly checks: readonly { readonly name: string }[];
+      }>;
+      readonly calls: RelayGitHubApiRequest[];
+    } {
+      const calls: RelayGitHubApiRequest[] = [];
+      const pagedPath = options.kind === 'check-runs' ? checkRunsPath : statusPath;
+      const request = vi.fn(async (
+        input: RelayGitHubApiRequest,
+      ): Promise<{
+        status: number;
+        headers: Readonly<Record<string, string>>;
+        body: unknown;
+      }> => {
+        calls.push(input);
+        if (input.path === pagedPath) {
+          // A request that names no page is GitHub's page one, which is exactly
+          // what the unpaginated read sent.
+          const page = Number(input.query?.page ?? '1');
+          const rows = options.pages[page - 1] ?? [];
+          const hasNext = options.endlessNext === true
+            || page < options.pages.length;
+          const nextPath = options.numericAlias === true
+            ? pagedPath.replace('/repos/Jinn-Network/mono/', '/repositories/1296269/')
+            : pagedPath;
+          const next = `https://api.github.com${nextPath}`
+            + `?per_page=100&page=${page + 1}`;
+          return {
+            status: 200,
+            headers: hasNext ? { link: `<${next}>; rel="next"` } : {},
+            body: options.kind === 'check-runs'
+              ? { total_count: options.totalCount, check_runs: rows }
+              : {
+                  sha: head,
+                  state: 'success',
+                  total_count: options.totalCount,
+                  statuses: rows,
+                },
+          };
+        }
+        if (input.path === checkRunsPath) {
+          return {
+            status: 200,
+            headers: {},
+            body: { total_count: 0, check_runs: [] },
+          };
+        }
+        if (input.path === statusPath) {
+          return {
+            status: 200,
+            headers: {},
+            body: { sha: head, state: 'success', total_count: 0, statuses: [] },
+          };
+        }
+        if (input.path.endsWith('/protection/required_status_checks')) {
+          return { status: 404, headers: {}, body: null };
+        }
+        throw new Error(`Unexpected request ${input.method} ${input.path}`);
+      });
+      const ports = createRelayGitHubProductionPorts({
+        config: config(),
+        token: 'test-token',
+        request,
+      });
+      return {
+        readChecks: () => ports.authority.readChecks({ head, base: 'main' }),
+        calls,
+      };
+    }
+
+    function pagesRead(
+      calls: readonly RelayGitHubApiRequest[],
+      path: string,
+    ): (string | undefined)[] {
+      return calls
+        .filter((call) => call.path === path)
+        .map((call) => call.query?.page);
+    }
+
+    /**
+     * mono PR #2918 carries 144 check contexts on its head commit. One
+     * `per_page=100` page cannot hold them, and the Relay's exact-head ready
+     * invariant reads exactly this evidence — refusing the paged response
+     * failed the pull request outright rather than reading it whole.
+     */
+    it('merges a check-runs response that spans two pages', async () => {
+      const context = pagedChecks({
+        kind: 'check-runs',
+        pages: [checkRunRows(100, 0), checkRunRows(44, 100)],
+        totalCount: 144,
+      });
+
+      const observed = await context.readChecks();
+
+      expect(observed.checks).toHaveLength(144);
+      expect(observed.checks.at(-1)?.name).toBe('check-143');
+      expect(pagesRead(context.calls, checkRunsPath)).toEqual(['1', '2']);
+    });
+
+    /**
+     * GitHub answers a `/repos/<owner>/<repo>/…` read with a Link header that
+     * names the repository by its numeric database id. Only the page cursor is
+     * taken from that header — the follow-up read is rebuilt from the named
+     * path — but refusing the alias outright would strand the walk on page one
+     * exactly where it matters.
+     */
+    it('follows a next link that names the repository numerically', async () => {
+      const context = pagedChecks({
+        kind: 'check-runs',
+        pages: [checkRunRows(100, 0), checkRunRows(44, 100)],
+        totalCount: 144,
+        numericAlias: true,
+      });
+
+      const observed = await context.readChecks();
+
+      expect(observed.checks).toHaveLength(144);
+      expect(pagesRead(context.calls, checkRunsPath)).toEqual(['1', '2']);
+    });
+
+    it('refuses a next link that names a different resource', async () => {
+      const request = vi.fn(async (input: RelayGitHubApiRequest) => {
+        if (input.path === checkRunsPath) {
+          return {
+            status: 200,
+            headers: {
+              link: '<https://api.github.com/repos/Jinn-Network/mono/commits/'
+                + `${'b'.repeat(40)}/check-runs?per_page=100&page=2>; rel="next"`,
+            },
+            body: { total_count: 144, check_runs: checkRunRows(100, 0) },
+          };
+        }
+        throw new Error(`Unexpected request ${input.method} ${input.path}`);
+      });
+      const ports = createRelayGitHubProductionPorts({
+        config: config(),
+        token: 'test-token',
+        request,
+      });
+
+      await expect(ports.authority.readChecks({ head, base: 'main' }))
+        .rejects.toThrow(/pagination is cyclic or exceeds its bound/);
+    });
+
+    it('issues no follow-up read when the check-runs response fits one page', async () => {
+      const context = pagedChecks({
+        kind: 'check-runs',
+        pages: [checkRunRows(2, 0)],
+        totalCount: 2,
+      });
+
+      await expect(context.readChecks()).resolves.toMatchObject({
+        branchRequiredChecks: [],
+      });
+
+      expect(pagesRead(context.calls, checkRunsPath)).toEqual(['1']);
+    });
+
+    it('fails closed when check-runs pagination outruns the page cap', async () => {
+      const context = pagedChecks({
+        kind: 'check-runs',
+        pages: [checkRunRows(100, 0)],
+        totalCount: 100_000,
+        endlessNext: true,
+      });
+
+      await expect(context.readChecks())
+        .rejects.toThrow(/pagination is cyclic or exceeds its bound/);
+      expect(pagesRead(context.calls, checkRunsPath)).toHaveLength(10);
+    });
+
+    it('asserts check-runs total_count against the merged pages, not the first', async () => {
+      const context = pagedChecks({
+        kind: 'check-runs',
+        pages: [checkRunRows(100, 0), checkRunRows(43, 100)],
+        totalCount: 144,
+      });
+
+      await expect(context.readChecks())
+        .rejects.toThrow(/check runs are incomplete/);
+    });
+
+    it('merges a commit-status response that spans two pages', async () => {
+      const context = pagedChecks({
+        kind: 'status',
+        pages: [commitStatusRows(100, 0), commitStatusRows(44, 100)],
+        totalCount: 144,
+      });
+
+      const observed = await context.readChecks();
+
+      expect(observed.checks).toHaveLength(144);
+      expect(pagesRead(context.calls, statusPath)).toEqual(['1', '2']);
+    });
+
+    it('asserts commit-status total_count against the merged pages, not the first', async () => {
+      const context = pagedChecks({
+        kind: 'status',
+        pages: [commitStatusRows(100, 0), commitStatusRows(43, 100)],
+        totalCount: 144,
+      });
+
+      await expect(context.readChecks())
+        .rejects.toThrow(/status contexts are incomplete/);
+    });
+  });
 });

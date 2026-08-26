@@ -210,11 +210,29 @@ describe('local Issue Relay wire mirrors', () => {
       checks: {
         ...context.checks,
         required: Array.from(
-          { length: 101 },
+          { length: 1001 },
           (_, index) => ({ name: `required-${index}`, status: 'passed' as const }),
         ),
       },
     }).success).toBe(false);
+  });
+
+  /**
+   * mono PR #2918 — a dependabot bump that touches the workflows — carries 144
+   * check contexts on its head commit. The Relay now reads that head whole
+   * rather than at GitHub's 100-row page boundary, so the context that carries
+   * the evidence has to admit every context the bounded walk can return.
+   */
+  it('admits a head whose check evidence outruns a single GitHub page', () => {
+    const optional = Array.from(
+      { length: 144 },
+      (_, index) => ({ name: `check-${index}`, status: 'passed' as const }),
+    );
+
+    expect(IssueRelayEvaluationContextV1Schema.safeParse({
+      ...context,
+      checks: { ...context.checks, optional },
+    }).success).toBe(true);
   });
 
   it('requires outcome-specific verdict findings', () => {
