@@ -33,7 +33,10 @@ import { makeGitProtocolPort } from './git-protocol.js';
 import { readIssueCommentBodies } from './github-comments.js';
 import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import { withSelectedCredential } from './production-auth.js';
-import { resolveStructuredPullRequestMappings } from './pr-mapping.js';
+import {
+  resolveStructuredPullRequestMappings,
+  stableBranchMapping,
+} from './pr-mapping.js';
 import type {
   ReconciliationHumanCommentAuthority,
   ReconciliationPullRequestState,
@@ -519,13 +522,7 @@ function makeProductionReconciliationWriterWithScope(
               body: pr.body,
             }
       )),
-      stableBranches: options.cycleSnapshot.branches.map((branch) => ({
-        issueNumber: branch.issueNumber,
-        phase: branch.claim.phase,
-        head: branch.headOid,
-        headRefName: branch.headRefName,
-        targetBase: branch.claim.targetBase,
-      })),
+      stableBranches: options.cycleSnapshot.branches.map(stableBranchMapping),
     });
     const live = liveMappings.find((mapping) => mapping.prNumber === prNumber);
     const recordedCycle = options.cycleSnapshot.pullRequestMappings?.find(

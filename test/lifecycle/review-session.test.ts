@@ -331,6 +331,53 @@ describe('review session protocol', () => {
     expect(h.events).not.toContain('draft:true');
   });
 
+  it(
+    'files findings from a fresh claim minted after a mapping-reread record'
+    + ' spent an earlier attempt',
+    async () => {
+      const h = harness();
+      const read = h.port.readPullRequest;
+      let mappingProblem: string | undefined =
+        'Complete dependency and stable-branch mapping authority is unavailable.';
+      h.port.readPullRequest = async (...args) => ({
+        ...await read(...args),
+        ...(mappingProblem === undefined ? {} : { mappingProblem }),
+      });
+      const findings = '## Findings\n\n- Fix the race.';
+
+      // The attempt that could not publish. Nothing is filed and the ref moves
+      // to `mapping-reread`, which spends this attempt's authority: the retry
+      // publishes no second record and still cannot file.
+      await expect(h.protocol.reviewFindings!(h.manifest, findings))
+        .resolves.toMatchObject({ status: 'mapping-pending', head: HEAD });
+      expect(h.authority.record.state).toBe('mapping-reread');
+      expect(h.events).toEqual(['record:mapping-reread', 'claim:mapping-reread']);
+      await expect(h.protocol.reviewFindings!(h.manifest, findings))
+        .resolves.toMatchObject({ status: 'mapping-pending', head: HEAD });
+      expect(h.events).toEqual(['record:mapping-reread', 'claim:mapping-reread']);
+      expect(h.events.some((event) => event.startsWith('child:'))).toBe(false);
+
+      // What the coordinator does next: it marks the review claim stale and
+      // mints a fresh `active` claim parented on the `mapping-reread` record.
+      // A spent attempt must not be a spent pull request.
+      mappingProblem = undefined;
+      h.authority = {
+        reviewRefOid: h.manifest.reviewRefOid,
+        record: record('active'),
+      };
+
+      await expect(h.protocol.reviewFindings!(h.manifest, findings)).resolves.toEqual({
+        status: 'filed',
+        head: HEAD,
+        childNumber: 9001,
+        created: true,
+      });
+      expect(h.events).toContain('child:Address review findings for PR #84');
+      expect(h.events).toContain(`native:REQUEST_CHANGES:${HEAD}`);
+      expect(h.events).toContain('claim:stale');
+    },
+  );
+
   it.skip('never approves a human-codeowner surface and preserves a draft Human hold', async () => {
     const h = harness({ policy: 'human-codeowner', draft: true });
 
