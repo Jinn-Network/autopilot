@@ -413,6 +413,108 @@ describe('active lifecycle controller', () => {
     };
   }
 
+  describe('priority-ordered implementation claims', () => {
+    function priorityIssue(number: number, priority: string) {
+      return {
+        number,
+        title: `Issue ${number}`,
+        body: '',
+        labels: [],
+        shape: 'fix',
+        blockedOn: 'Nothing',
+        blockedByIssues: [],
+        effort: 'Low',
+        priority,
+        status: 'Todo',
+        onBoard: true,
+        author: 'implementation-bot',
+        projectItemId: `PVTI_${number}`,
+        inCurrentSprint: false,
+      };
+    }
+
+    function priorityItem(number: number) {
+      return {
+        kind: 'issue',
+        issueNumber: number,
+        v2Marked: false,
+        projectStatus: 'Todo',
+        labels: [],
+        eligible: true,
+        eligibilityReason: 'eligible',
+      };
+    }
+
+    // Snapshot order is deliberately worst-first: the lowest priority is the
+    // first eligible candidate, so an unsorted scheduler claims it.
+    function mixedPrioritySnapshot(): GitHubLifecycleSnapshot {
+      return {
+        ...snapshot(),
+        issues: [
+          priorityIssue(400, 'P4'),
+          priorityIssue(200, 'P2'),
+          priorityIssue(100, 'P0'),
+        ],
+        lifecycle: {
+          items: [priorityItem(400), priorityItem(200), priorityItem(100)],
+        },
+      };
+    }
+
+    it('claims the highest-priority eligible issue when only one slot is free', async () => {
+      const claimed: number[] = [];
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.executeAction = async (action) => {
+        if (action.kind === 'claim-implementation') claimed.push(action.issueNumber);
+        return { outcome: 'spawned' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(claimed).toEqual([100]);
+    });
+
+    it('resumes stale in-flight work before starting a higher-priority fresh claim', async () => {
+      // Reuses the proven stale-recovery fixture (issue #42, no Priority) and adds
+      // one eligible fresh P0. With a single slot, ordering decides which runs.
+      const base = implementationPrSnapshot('2026-07-20T08:00:00.000Z');
+      const stale: GitHubLifecycleSnapshot = {
+        ...base,
+        issues: [priorityIssue(100, 'P0')],
+        // Fresh P0 placed FIRST: snapshot order alone would claim it.
+      lifecycle: { items: [priorityItem(100), ...base.lifecycle.items] },
+      };
+      const claimed: unknown[] = [];
+      const controller = deps({ readSnapshot: async () => stale });
+      controller.active!.executeAction = async (action) => {
+        if (action.kind === 'claim-implementation') claimed.push(action.intent);
+        return { outcome: 'spawned' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(claimed).toEqual(['stale-recovery']);
+    });
+
+    it('orders every claim by priority when several slots are free', async () => {
+      const claimed: number[] = [];
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 3, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      controller.active!.executeAction = async (action) => {
+        if (action.kind === 'claim-implementation') claimed.push(action.issueNumber);
+        return { outcome: 'spawned' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(claimed).toEqual([100, 200, 400]);
+    });
+  });
+
   it('pins stale implementation recovery to the observed PR, head, branch, and claim', async () => {
     const head = gitOid('1'.repeat(40));
     const actions: unknown[] = [];
