@@ -16,6 +16,7 @@ import {
   repositoryStateKey,
   type AutopilotRepositoryPaths,
 } from './config/config.js';
+import { NEEDS_HUMAN_LABEL } from './lifecycle/human-authority.js';
 
 const STATUS_OPTIONS = {
   todo: 'Todo',
@@ -49,7 +50,7 @@ const REQUIRED_LABELS = {
     color: '1D76DB',
     description: 'Autopilot independent review lifecycle',
   },
-  'autopilot:human': {
+  [NEEDS_HUMAN_LABEL]: {
     color: 'D93F0B',
     description: 'Autopilot requires human attention',
   },

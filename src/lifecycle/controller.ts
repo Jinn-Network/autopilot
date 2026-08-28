@@ -58,6 +58,11 @@ import {
   type GitHubUsage,
 } from './github-usage.js';
 import { exactUtcTimestampMs } from './exact-utc-time.js';
+import {
+  NEEDS_HUMAN_LABEL,
+  externalHumanLabel,
+  hasExternalHumanLabel,
+} from './human-authority.js';
 
 export type LifecycleCliCommand =
   | { readonly kind: 'status' }
@@ -478,8 +483,7 @@ function projectionContext(
       ));
       const humanHold = projectIssue?.blockedOn === 'Human'
         || lifecycleIssue?.humanHold === true
-        || lifecycleIssue?.labels.includes('review:needs-human') === true
-        || lifecycleIssue?.labels.includes('autopilot:human') === true;
+        || hasExternalHumanLabel(lifecycleIssue?.labels ?? []);
       const issueHumanReason = lifecycleIssue?.humanReason;
       const humanReason: HumanReason | undefined = issueHumanReason !== undefined
         ? issueHumanReason.phase === 'eligible'
@@ -491,9 +495,9 @@ function projectionContext(
               code: 'implementation-escalation' as const,
               detail: projectIssue?.blockedOn === 'Human'
                 ? 'Project Blocked on: Human'
-                : lifecycleIssue?.labels.includes('autopilot:human') === true
-                  ? 'Issue label: autopilot:human'
-                  : 'Issue label: review:needs-human',
+                : `Issue label: ${
+                  externalHumanLabel(lifecycleIssue?.labels ?? []) ?? NEEDS_HUMAN_LABEL
+                }`,
             }
           : undefined;
       const state = deriveOrphanImplementationState({

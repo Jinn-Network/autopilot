@@ -15,6 +15,9 @@ import {
   type ReviewClaimRecord,
 } from './types.js';
 import { isCiGreen } from './ci-classifier.js';
+import {
+  hasExternalHumanLabel,
+} from './human-authority.js';
 
 export function timestampMs(value: string): number | null {
   try {
@@ -216,8 +219,7 @@ export function engineApprovalLapsed(item: PullRequestLifecycleItem): boolean {
 
 function humanOverlay(item: LifecycleItem): boolean {
   return item.humanHold === true
-    || item.labels.includes('review:needs-human')
-    || item.labels.includes('autopilot:human')
+    || hasExternalHumanLabel(item.labels)
     || item.humanReason !== undefined
     || (item.kind === 'pull-request'
       && (!branchClaimMatchesItem(item)

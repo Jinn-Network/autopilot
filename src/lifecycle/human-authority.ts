@@ -9,13 +9,30 @@ import type { BlockedOn } from '../dispatcher/types.js';
  */
 export const NEEDS_HUMAN_LABEL = 'review:needs-human';
 
-const HUMAN_LABELS = new Set([
+/**
+ * The pre-convergence alias. Tolerated on read so repositories initialized
+ * before the convergence keep working, but never provisioned and never
+ * written: `autopilot init` creates only NEEDS_HUMAN_LABEL. Remove once no
+ * live repository carries it.
+ */
+export const LEGACY_NEEDS_HUMAN_LABEL = 'autopilot:human';
+
+/** Canonical first, so `externalHumanLabel` reports the canonical name when both are present. */
+export const HUMAN_HOLD_LABELS = [
   NEEDS_HUMAN_LABEL,
-  'autopilot:human',
-]);
+  LEGACY_NEEDS_HUMAN_LABEL,
+] as const;
+
+/** The human-hold label present on `labels`, or undefined. Callers report this
+ *  rather than naming the strings themselves. */
+export function externalHumanLabel(
+  labels: readonly string[],
+): string | undefined {
+  return HUMAN_HOLD_LABELS.find((label) => labels.includes(label));
+}
 
 export function hasExternalHumanLabel(labels: readonly string[]): boolean {
-  return labels.some((label) => HUMAN_LABELS.has(label));
+  return externalHumanLabel(labels) !== undefined;
 }
 
 export function hasExternalHumanAuthority(input: {

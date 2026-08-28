@@ -14,12 +14,13 @@ import {
   type BoardArchiveCandidateItem,
   type BoardArchiveProjectSnapshot,
 } from './board-archive.js';
+import {
+  hasExternalHumanLabel,
+} from './human-authority.js';
 
-/** Issue / PR labels that paint HUMAN and override every other predicate. */
-export const HUMAN_HOLD_LABELS = [
-  'autopilot:human',
-  'review:needs-human',
-] as const;
+/** Issue / PR labels that paint HUMAN and override every other predicate.
+ *  Re-exported from the human-authority module so the set is defined once. */
+export { HUMAN_HOLD_LABELS } from './human-authority.js';
 
 /**
  * Facts the painter reads. Deliberately narrower than full lifecycle
@@ -80,10 +81,6 @@ export interface BoardPaintPlan {
   readonly orphanCloses: readonly OrphanChildClose[];
 }
 
-function hasHumanHold(labels: readonly string[]): boolean {
-  return HUMAN_HOLD_LABELS.some((label) => labels.includes(label));
-}
-
 /**
  * Map authoritative facts → Project Status per spec §3.
  *
@@ -98,7 +95,7 @@ function hasHumanHold(labels: readonly string[]): boolean {
  * HUMAN overrides everything.
  */
 export function derivePaintedStatus(facts: PaintFacts): ProjectStatus {
-  if (hasHumanHold(facts.labels)) return 'Human';
+  if (hasExternalHumanLabel(facts.labels)) return 'Human';
   if (facts.merged || !facts.issueOpen) return 'Done';
   if (facts.hasOpenNonDraftPr || facts.hasOpenChildren) return 'In Review';
   if (facts.hasOpenDraftPr || facts.hasClaimBranch) return 'In Progress';

@@ -56,6 +56,7 @@ import {
   type GitOid,
 } from './types.js';
 import {
+  NEEDS_HUMAN_LABEL,
   hasExternalHumanAuthority,
   hasExternalHumanLabel,
 } from './human-authority.js';
@@ -609,7 +610,7 @@ export function makeProductionReviewSessionPort(
       approvalPolicy,
       humanHold: externalHumanLabel || hasExternalHumanAuthority({
         nativeIssueLabels: nativeIssueHumanAuthority === true
-          ? ['autopilot:human']
+          ? [NEEDS_HUMAN_LABEL]
           : [],
         projectBlockedOn: projectHumanAuthority === true ? 'Human' : null,
       }),
