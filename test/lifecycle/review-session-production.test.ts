@@ -2287,3 +2287,36 @@ describe('production review session reviewed-diff digest', () => {
     }
   });
 });
+
+describe('runaway child guard reaches the Human hold (§6.3)', () => {
+  it('fileFindingChild returns the runaway hold instead of throwing, so review-session can enterHuman', async () => {
+    const marker = '<!-- jinn-autopilot:child pr=84 kind=review-finding -->';
+    const closedChildren = JSON.stringify([1, 2, 3].map((round) => ({
+      number: 9000 + round,
+      title: 'Address review findings for PR #84',
+      body: `${marker}\n\nRound ${round} findings.`,
+      state: 'closed',
+      labels: ['review-finding'],
+    })));
+    const port = makeProductionReviewSessionPort({
+      environment: {
+        GH_TOKEN: 'secret',
+        JINN_AUTOPILOT_SESSION_MANIFEST: '/attempt/manifest.json',
+      },
+      readManifest: () => manifest(),
+      runner: async (cmd, args) => {
+        if (cmd === 'gh' && args[0] === 'issue' && args[1] === 'list') {
+          return args.includes('closed') ? closedChildren : '[]';
+        }
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.fileFindingChild!({
+      parentPr: 84,
+      title: 'Address review findings for PR #84',
+      body: 'Fourth-round findings.',
+      effort: 'medium',
+    })).resolves.toEqual({ runawayHold: true, priorCount: 3 });
+  });
+});

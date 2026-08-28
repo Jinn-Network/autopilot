@@ -1801,3 +1801,40 @@ describe('gh pr view --json field lists', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+describe('runaway child guard reaches the Human hold (§6.3, reconcile path)', () => {
+  it('fileReconcileChild returns the runaway hold instead of throwing, so the executor can record runaway-hold', async () => {
+    const marker = '<!-- jinn-autopilot:child pr=84 kind=reconcile -->';
+    const closedChildren = JSON.stringify([1, 2, 3].map((round) => ({
+      number: 9100 + round,
+      title: 'Reconcile conflicts for PR #84',
+      body: `${marker}\n\nRound ${round}.`,
+      state: 'closed',
+      labels: ['reconcile'],
+    })));
+    const port = makeProductionEnqueueActionPort({
+      readSnapshot: async () => {
+        throw new Error('snapshot must not be read by fileReconcileChild');
+      },
+      authorAllowlist: new Set(['implementation-bot']),
+      runner: async (cmd, args) => {
+        if (cmd === 'gh' && args[0] === 'issue' && args[1] === 'list') {
+          return args.includes('closed') ? closedChildren : '[]';
+        }
+        throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+      },
+    });
+    const selection = selectCredential(new CredentialPool([{
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    }]), { phase: 'merge' });
+    if (selection.status !== 'selected') throw new Error('credential not selected');
+
+    await expect(port.fileReconcileChild!({
+      prNumber: 84,
+      effort: 'medium',
+      credential: selection.credential,
+    })).resolves.toEqual({ runawayHold: true, priorCount: 3 });
+  });
+});
