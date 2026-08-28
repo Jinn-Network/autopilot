@@ -88,6 +88,9 @@ closest installed runtime skill without removing a gate.
 | 7 — Repository validation | repository-configured validation skills and instructions |
 | 8 — Verify + handoff | `superpowers:verification-before-completion` |
 
+Stage 0 below is a precondition gate, not a ninth methodology stage: it
+guards entry to this table rather than appearing in it.
+
 Effort controls depth, not gates:
 
 - Low-effort `docs` or `chore`: compress Stages 1–2 to a short note and plan.
@@ -95,6 +98,19 @@ Effort controls depth, not gates:
 - `refactor`: Stage 1 is always full and uncompressed.
 
 ## Stage flow
+
+### 0. Relevance
+
+Before designing anything, confirm the issue's premise still holds against the
+current base. Read the code paths the issue names and establish that the
+described defect still reproduces, or that the described gap is still absent.
+An issue may have been fixed, superseded, or made obsolete by work that landed
+after it was filed, and the older the issue the likelier that is.
+
+Keep this proportionate: it is a targeted read at the current base, not a
+stage with its own methodology. If the premise holds, continue to Stage 1 and
+carry what you learned into the design note. If it does not, escalate — see
+Finding handling.
 
 ### 1. Design
 
@@ -188,6 +204,11 @@ except return the result; v2 owns cleanup.
 | Fixable implementation/test/review finding | Re-run the responsible implementation context with the findings, commit, checkpoint, then re-run the gate. |
 | Scope, product, or design decision | Escalate immediately. |
 | Non-converging findings | Escalate on judgment. |
+| Issue premise no longer holds (already fixed, superseded, or obsolete) | Escalate immediately with `status: needs-decision`. |
+
+Do not design, implement, or open a fix for a problem that no longer
+exists. A no-op PR costs the full review pipeline and leaves the issue's
+real status unrecorded; the escalation records it.
 
 There is no round-count budget. A legitimate multi-round correction may
 continue; a design wall must not be disguised as another fix round.
