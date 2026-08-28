@@ -971,13 +971,11 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   }
 
   async readIssues(board: IssueBoardState) {
-    const issues = await this.issues.poll(board);
-    if (issues.length >= 200) {
-      throw new Error(
-        'Open issue source reached its 200-item limit; refusing a potentially truncated snapshot',
-      );
-    }
-    return issues;
+    // No count guard: a full page is not evidence of truncation. The source
+    // paginates to a short page and throws `Open issue pagination exceeded
+    // safety limit` if it ever reaches MAX_ISSUE_PAGES, which is the only
+    // condition that can actually truncate the set.
+    return this.issues.poll(board);
   }
 
   private gitRun(args: string[]): Promise<string> {

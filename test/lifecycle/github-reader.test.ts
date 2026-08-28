@@ -392,6 +392,36 @@ describe('GhLifecycleReader', () => {
     expect(reader.githubUsage().restRequests).toBe(1);
   });
 
+  it('reads every open issue in a repository that has more than 200 (regression)', async () => {
+    // 207 open issues: three REST pages. The old guard broke the pagination
+    // loop at 200 and then read that stop as proof of truncation, so a
+    // repository crossing 200 open issues could never complete a full
+    // reconciliation.
+    const rows = Array.from({ length: 207 }, (_, index) => ({
+      number: index + 1,
+      title: `Issue ${index + 1}`,
+      labels: [],
+      body: '',
+      state: 'open',
+      user: { login: 'maintainer' },
+    }));
+    const run = async (_command: string, args: string[]) => {
+      const endpoint = args[1] ?? '';
+      if (endpoint.endsWith('&page=1')) return JSON.stringify(rows.slice(0, 100));
+      if (endpoint.endsWith('&page=2')) return JSON.stringify(rows.slice(100, 200));
+      if (endpoint.endsWith('&page=3')) return JSON.stringify(rows.slice(200));
+      throw new Error(`unexpected call: ${args.join(' ')}`);
+    };
+    const reader = new GhLifecycleReader(run);
+
+    const issues = await reader.readIssues({
+      currentSprintIterationId: null,
+      getIssue: () => null,
+    });
+
+    expect(issues).toHaveLength(207);
+  });
+
   it('counts each explicit REST page used to read open issues', async () => {
     const calls: string[][] = [];
     const rows = Array.from({ length: 101 }, (_, index) => ({
