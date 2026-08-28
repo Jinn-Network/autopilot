@@ -149,3 +149,18 @@ describe('canonical runtime adapters', () => {
     }
   });
 });
+
+describe('implement-issue relevance gate', () => {
+  it('makes confirming the issue premise a stage that precedes Design', () => {
+    expect(doc).toMatch(/###\s*0\.\s*Relevance/);
+    expect(doc).toMatch(/###\s*0\.\s*Relevance[\s\S]*###\s*1\.\s*Design/);
+    expect(doc).toMatch(/premise still holds against the\s+current base/);
+  });
+
+  it('routes a premise that no longer holds to escalation instead of implementation', () => {
+    expect(doc).toContain('| Issue premise no longer holds');
+    expect(doc).toMatch(/Issue premise no longer holds[\s\S]*Escalate immediately/);
+    expect(doc).toContain('needs-decision');
+    expect(doc).toMatch(/Do not design, implement, or open a fix for a problem that no\s+longer\s+exists/);
+  });
+});
