@@ -113,7 +113,6 @@ export interface SessionResult {
   issueNumber: number;
   outcome: 'pr-opened' | 'escalated';
   prNumber?: number;
-  escalationStatus?: 'needs-decision' | 'blocked' | 'stuck';
 }
 
 export interface DispatcherConfig {

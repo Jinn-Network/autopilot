@@ -43,6 +43,7 @@ import {
   type StructuredPullRequestMapping,
 } from './pr-mapping.js';
 import {
+  externalHumanLabel,
   hasExternalHumanAuthority,
   hasExternalHumanLabel,
 } from './human-authority.js';
@@ -722,15 +723,11 @@ function lifecyclePr(
   });
   const humanSource = issue.blockedOn === 'Human'
     ? 'Project Blocked on: Human'
-    : pr.labels.includes('review:needs-human')
-      ? 'PR label: review:needs-human'
-      : pr.labels.includes('autopilot:human')
-        ? 'PR label: autopilot:human'
-        : issueLabels.includes('review:needs-human')
-          ? 'Issue label: review:needs-human'
-          : issueLabels.includes('autopilot:human')
-            ? 'Issue label: autopilot:human'
-            : undefined;
+    : externalHumanLabel(pr.labels) !== undefined
+      ? `PR label: ${externalHumanLabel(pr.labels)}`
+      : externalHumanLabel(issueLabels) !== undefined
+        ? `Issue label: ${externalHumanLabel(issueLabels)}`
+        : undefined;
   const implementationActive = pr.branchClaim?.phase === 'implement'
     && pr.branchClaim.phaseComplete !== true;
   const reviewPhase = reviewClaim !== undefined && reviewClaim.head === pr.headOid
@@ -1169,11 +1166,9 @@ function lifecycleItems(
     const eligible = selectedReady && !sourceHumanHold && followUpBlock === null;
     const holdDetail = issue.blockedOn === 'Human'
       ? 'Project Blocked on is Human'
-      : issueLabels.includes('autopilot:human')
-        ? 'Issue carries autopilot:human'
-        : issueLabels.includes('review:needs-human')
-          ? 'Issue carries review:needs-human'
-          : undefined;
+      : externalHumanLabel(issueLabels) !== undefined
+        ? `Issue carries ${externalHumanLabel(issueLabels)}`
+        : undefined;
     const eligibility = !mappingEvidenceComplete
       ? {
           reason: 'not-selected' as const,

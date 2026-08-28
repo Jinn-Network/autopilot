@@ -127,7 +127,7 @@ function compatibleRunner(calls: string[][]): InitializationRunner {
             labels: {
               nodes: [
                 { name: 'engine:review' },
-                { name: 'autopilot:human' },
+                { name: 'review:needs-human' },
                 { name: 'review-finding' },
                 { name: 'reconcile' },
                 { name: 'ci-failure' },
@@ -613,6 +613,61 @@ describe('autopilot init', () => {
     expect(calls.some((call) => call.join(' ').includes(
       'gh label create engine:review --repo Octo-Labs/widget',
     ))).toBe(true);
+  });
+
+  it('provisions the canonical human-hold label and not the legacy alias', async () => {
+    const root = repository();
+    const calls: string[][] = [];
+    const base = compatibleRunner(calls);
+    let labelCreated = false;
+    const runner: InitializationRunner = async (command, args, options) => {
+      if (command === 'gh' && args[0] === 'label' && args[1] === 'create') {
+        calls.push([command, ...args]);
+        labelCreated = true;
+        return '';
+      }
+      const raw = await base(command, args, options);
+      if (
+        !labelCreated
+        && command === 'gh'
+        && args[0] === 'api'
+        && args[1] === 'graphql'
+      ) {
+        const value = JSON.parse(raw);
+        value.data.repository.labels.nodes = value.data.repository.labels.nodes
+          .filter((entry: { name: string }) => entry.name !== 'review:needs-human');
+        return JSON.stringify(value);
+      }
+      return raw;
+    };
+    const plans: string[][] = [];
+    const interactor: InitializationInteractor = {
+      chooseProject: async () => {
+        throw new Error('unexpected Project selection');
+      },
+      confirm: async (plan) => {
+        plans.push([...plan.changes]);
+        return true;
+      },
+    };
+
+    await initializeAutopilot({
+      cwd: root,
+      nonInteractive: false,
+      project: 'Octo-Labs/73',
+      runner,
+      interactor,
+      environment: {},
+      now: INITIALIZATION_NOW,
+    });
+
+    expect(plans).toEqual([[
+      'Create repository lifecycle label review:needs-human',
+    ]]);
+    expect(calls.some((call) => call.join(' ').includes(
+      'gh label create review:needs-human --repo Octo-Labs/widget',
+    ))).toBe(true);
+    expect(calls.some((call) => call.join(' ').includes('autopilot:human'))).toBe(false);
   });
 
   it('stores environment credentials only in an owner-only local profile', async () => {
