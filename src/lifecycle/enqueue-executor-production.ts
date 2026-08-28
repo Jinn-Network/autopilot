@@ -809,10 +809,11 @@ export function makeProductionEnqueueActionPort(
           effort,
           priority: 'p1',
         });
+        // Return the hold arm the deps contract declares — the executor turns
+        // it into a durable runaway-hold record (§6.3), matching
+        // ci-rerun-production. Throwing here burned the attempt instead.
         if ('runawayHold' in filed && filed.runawayHold) {
-          throw new Error(
-            `Reconcile child runaway hold for PR #${prNumber} (prior=${filed.priorCount})`,
-          );
+          return { runawayHold: true, priorCount: filed.priorCount };
         }
         return { number: filed.number, created: filed.created };
       }),

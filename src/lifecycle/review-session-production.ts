@@ -1051,10 +1051,11 @@ export function makeProductionReviewSessionPort(
         effort: input.effort,
         priority: 'p1',
       });
+      // Return the hold arm the port contract declares — review-session's
+      // pure logic turns it into enterHuman (§6.3). Throwing here escaped
+      // fileFindingChild and burned the attempt with no hold recorded.
       if ('runawayHold' in filed && filed.runawayHold) {
-        throw new Error(
-          `Finding child runaway hold for PR #${input.parentPr} (prior=${filed.priorCount})`,
-        );
+        return { runawayHold: true, priorCount: filed.priorCount };
       }
       return { number: filed.number, created: filed.created };
     },
