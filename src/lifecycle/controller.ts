@@ -731,6 +731,48 @@ function eventFor(
   };
 }
 
+/**
+ * Project Priority, most urgent first. An unset or unrecognized Priority ranks
+ * last so untriaged work can never outrank triaged work. (Eligibility already
+ * requires a Priority; this is defence for a Project that grew a new option.)
+ */
+const PRIORITY_ORDER = ['p0', 'p1', 'p2', 'p3', 'p4'] as const;
+
+function priorityRank(priority: string | null | undefined): number {
+  if (priority === null || priority === undefined) return PRIORITY_ORDER.length;
+  const index = (PRIORITY_ORDER as readonly string[]).indexOf(priority.toLowerCase());
+  return index === -1 ? PRIORITY_ORDER.length : index;
+}
+
+/**
+ * Implementation claims compete for the same scarce slots, so the order the
+ * snapshot happened to produce decided which work ran — a P4 ahead of a P0 for
+ * as long as the backlog stayed larger than the cap. Rank instead by:
+ *
+ * 1. stale recovery before a fresh claim, finishing work already in flight for
+ *    the same reason children outrank fresh claims below; then
+ * 2. Project Priority; then
+ * 3. the original snapshot position, so the order stays deterministic.
+ */
+function orderImplementationClaims(
+  entries: readonly RankedImplementationCandidate[],
+): readonly ActiveCandidate[] {
+  return [...entries]
+    .map((entry, index) => ({ entry, index }))
+    .sort((left, right) => (
+      Number(left.entry.recovery === false) - Number(right.entry.recovery === false)
+      || left.entry.rank - right.entry.rank
+      || left.index - right.index
+    ))
+    .map(({ entry }) => entry.candidate);
+}
+
+interface RankedImplementationCandidate {
+  readonly candidate: ActiveCandidate;
+  readonly rank: number;
+  readonly recovery: boolean;
+}
+
 function activeCandidates(
   snapshot: GitHubLifecycleSnapshot,
   view: ReturnType<typeof deriveLifecycle>,
@@ -764,7 +806,7 @@ function activeCandidates(
     repairingIssues.add(issue.number);
   }
   const childImplementation: ActiveCandidate[] = [];
-  const freshImplementation: ActiveCandidate[] = [];
+  const freshImplementation: RankedImplementationCandidate[] = [];
   const other: ActiveCandidate[] = [];
   // Read once per cycle, next to the children knob it sits beside. Disarming
   // it leaves derivation untouched — a merge-ready PR still reads as
@@ -785,12 +827,20 @@ function activeCandidates(
         body: issueSource?.body,
         labels: item.labels,
       });
-      (isChild ? childImplementation : freshImplementation).push({
+      const freshCandidate: ActiveCandidate = {
         phase: 'implementation',
         intent: 'fresh',
         issueNumber: item.issueNumber,
         ...(isChild ? { isChild: true } : {}),
-      });
+      };
+      if (isChild) childImplementation.push(freshCandidate);
+      else {
+        freshImplementation.push({
+          candidate: freshCandidate,
+          rank: priorityRank(issueSource?.priority),
+          recovery: false,
+        });
+      }
       continue;
     }
     if (item.kind !== 'pull-request' || item.humanHold || item.merged) continue;
@@ -816,13 +866,19 @@ function activeCandidates(
       const pullRequest = byPr.get(item.prNumber);
       if (pullRequest === undefined) continue;
       freshImplementation.push({
-        phase: 'implementation',
-        intent: 'stale-recovery',
-        issueNumber: item.issueNumber,
-        prNumber: item.prNumber,
-        expectedHead: item.head,
-        branch: gitRefName(pullRequest.headRefName),
-        claimAttempt: item.branchClaim.attempt,
+        candidate: {
+          phase: 'implementation',
+          intent: 'stale-recovery',
+          issueNumber: item.issueNumber,
+          prNumber: item.prNumber,
+          expectedHead: item.head,
+          branch: gitRefName(pullRequest.headRefName),
+          claimAttempt: item.branchClaim.attempt,
+        },
+        rank: priorityRank(
+          snapshot.issues.find((candidate) => candidate.number === item.issueNumber)?.priority,
+        ),
+        recovery: true,
       });
     } else if (
       entry.phase === 'awaiting-review'
@@ -956,7 +1012,12 @@ function activeCandidates(
     }
   }
   // Children outrank fresh implementation claims for the remaining slots.
-  return [...repair, ...childImplementation, ...freshImplementation, ...other];
+  return [
+    ...repair,
+    ...childImplementation,
+    ...orderImplementationClaims(freshImplementation),
+    ...other,
+  ];
 }
 
 /**
