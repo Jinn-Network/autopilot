@@ -653,6 +653,30 @@ function toChildRecord(
   };
 }
 
+/**
+ * `gh issue list --limit` truncates silently, so a repository that outgrows it
+ * under-counts children: a missed open child files a duplicate, and a missed
+ * prior child stops the §6.3 runaway guard firing. `--limit` is a cap rather
+ * than a fetch size, so reading generously costs nothing on a repository that
+ * has fewer, and hitting the cap is treated as truncation rather than as a
+ * complete answer.
+ */
+const CHILD_ISSUE_LIST_LIMIT = 1000;
+
+function parseChildIssueListComplete(
+  raw: string,
+  context: string,
+): ReturnType<typeof parseIssueList> {
+  const rows = parseIssueList(raw);
+  if (rows.length >= CHILD_ISSUE_LIST_LIMIT) {
+    throw new Error(
+      `${context} reached its ${CHILD_ISSUE_LIST_LIMIT}-item limit; `
+      + 'refusing a potentially truncated child set',
+    );
+  }
+  return rows;
+}
+
 export function makeProductionChildIssuePort(
   options: ProductionChildIssuePortOptions = {},
 ): ChildIssuePort {
@@ -686,6 +710,9 @@ export function makeProductionChildIssuePort(
   };
 
   const listOpen = async (): Promise<readonly ChildIssueRecord[]> => {
+    // Listed rather than searched on purpose: this backs child dedup, which
+    // needs a read that is immediately consistent with a child filed seconds
+    // ago. GitHub's search index is not.
     const raw = await runner('gh', [
       'issue',
       'list',
@@ -694,11 +721,11 @@ export function makeProductionChildIssuePort(
       '--state',
       'open',
       '--limit',
-      '200',
+      String(CHILD_ISSUE_LIST_LIMIT),
       '--json',
       'number,title,body,state,labels',
     ]);
-    return parseIssueList(raw)
+    return parseChildIssueListComplete(raw, 'Open child issue listing')
       .map(toChildRecord)
       .filter((entry): entry is ChildIssueRecord => entry !== null);
   };
@@ -707,7 +734,13 @@ export function makeProductionChildIssuePort(
     parentPr: number,
     kind: ChildKind,
   ): Promise<readonly ChildIssueRecord[]> => {
-    // Search both open and closed so runaway counting and close sweeps work.
+    // Both states, so runaway counting and close sweeps work. The open half
+    // is listed (immediately consistent, and bounded by open issues); the
+    // closed half is scoped server-side by the marker, because listing every
+    // closed issue to count a handful of children does not scale and silently
+    // truncated at 200. Counting priors tolerates search-index lag; dedup,
+    // which does not, uses `listOpen` above.
+    const markerNeedle = `pr=${parentPr} kind=${kind}`;
     const [openRaw, closedRaw] = await Promise.all([
       runner('gh', [
         'issue',
@@ -717,7 +750,7 @@ export function makeProductionChildIssuePort(
         '--state',
         'open',
         '--limit',
-        '200',
+        String(CHILD_ISSUE_LIST_LIMIT),
         '--json',
         'number,title,body,state,labels',
       ]),
@@ -728,14 +761,18 @@ export function makeProductionChildIssuePort(
         repo,
         '--state',
         'closed',
+        '--search',
+        `in:body "${markerNeedle}"`,
         '--limit',
-        '200',
+        String(CHILD_ISSUE_LIST_LIMIT),
         '--json',
         'number,title,body,state,labels',
       ]),
     ]);
-    const markerNeedle = `pr=${parentPr} kind=${kind}`;
-    return [...parseIssueList(openRaw), ...parseIssueList(closedRaw)]
+    return [
+      ...parseChildIssueListComplete(openRaw, 'Open child issue listing'),
+      ...parseChildIssueListComplete(closedRaw, 'Closed child issue search'),
+    ]
       .map(toChildRecord)
       .filter((entry): entry is ChildIssueRecord => (
         entry !== null

@@ -717,3 +717,69 @@ describe('production port GraphQL type assign contract', () => {
     )).toBe(false);
   });
 });
+
+describe('child listings do not truncate silently (#104)', () => {
+  const MARKER = '<!-- jinn-autopilot:child pr=84 kind=review-finding -->';
+
+  function childRow(number: number, state: 'open' | 'closed') {
+    return {
+      number,
+      title: `Address review findings for PR #84`,
+      body: `${MARKER}\n\nRound ${number}.`,
+      state,
+      labels: [{ name: 'review-finding' }],
+    };
+  }
+
+  it('scopes the closed read by marker instead of listing every closed issue', async () => {
+    const { makeProductionChildIssuePort } = await import(
+      '../../src/lifecycle/child-issues-production.js'
+    );
+    const listCalls: string[][] = [];
+    const port = makeProductionChildIssuePort({
+      runner: async (_cmd, args) => {
+        if (args[0] === 'issue' && args[1] === 'list') {
+          listCalls.push([...args]);
+          if (args.includes('closed')) {
+            return JSON.stringify([1, 2, 3].map((n) => childRow(9000 + n, 'closed')));
+          }
+          return '[]';
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    const listed = await port.listByParentAndKind(84, 'review-finding');
+
+    expect(listed).toHaveLength(3);
+    const closedCall = listCalls.find((args) => args.includes('closed'));
+    expect(closedCall).toBeDefined();
+    // Scoped server-side: a repository with thousands of closed issues must
+    // not be paged through in full to count three children.
+    expect(closedCall!.join(' ')).toContain('--search');
+    expect(closedCall!.join(' ')).toContain('pr=84 kind=review-finding');
+  });
+
+  it('fails loudly when an open listing comes back at its limit', async () => {
+    const { makeProductionChildIssuePort } = await import(
+      '../../src/lifecycle/child-issues-production.js'
+    );
+    let limit = 0;
+    const port = makeProductionChildIssuePort({
+      runner: async (_cmd, args) => {
+        if (args[0] === 'issue' && args[1] === 'list') {
+          const index = args.indexOf('--limit');
+          limit = Number(args[index + 1]);
+          // A full page is indistinguishable from a truncated one.
+          return JSON.stringify(
+            Array.from({ length: limit }, (_unused, n) => childRow(n + 1, 'open')),
+          );
+        }
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+    });
+
+    await expect(port.searchOpenByMarker(MARKER)).rejects.toThrow(/truncat/i);
+    expect(limit).toBeGreaterThan(200);
+  });
+});

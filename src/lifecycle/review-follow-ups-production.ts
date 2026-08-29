@@ -12,6 +12,13 @@ import {
   type ReviewFollowUpType,
 } from './review-follow-ups.js';
 
+/**
+ * Open-issue read cap for follow-up dedup. `--limit` is a cap rather than a
+ * fetch size, so reading generously is free on a smaller repository and a
+ * full page means the answer was cut short rather than complete.
+ */
+const FOLLOW_UP_LIST_LIMIT = 1000;
+
 /** Org-level Issue Type node ids (see file-issue gh-taxonomy). */
 export const CHORE_ISSUE_TYPE_ID = 'IT_kwDODh3-Ac4BvpyJ';
 export const FEAT_ISSUE_TYPE_ID = 'IT_kwDODh3-Ac4BvpyL';
@@ -102,11 +109,19 @@ export function makeProductionReviewFollowUpPort(
       '--state',
       'open',
       '--limit',
-      '200',
+      String(FOLLOW_UP_LIST_LIMIT),
       '--json',
       'number,body',
     ]);
-    openIssuesCache = parseIssueList(raw);
+    const rows = parseIssueList(raw);
+    // Backs follow-up dedup: a truncated read files a duplicate follow-up.
+    if (rows.length >= FOLLOW_UP_LIST_LIMIT) {
+      throw new Error(
+        `Open follow-up issue listing reached its ${FOLLOW_UP_LIST_LIMIT}-item `
+        + 'limit; refusing a potentially truncated set',
+      );
+    }
+    openIssuesCache = rows;
     return openIssuesCache;
   };
 
