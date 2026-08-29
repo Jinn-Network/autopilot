@@ -141,7 +141,22 @@ query($owner: String!, $repository: String!, $number: Int!) {
   }
 }`;
 
-function currentSprintId(raw: string, sprintFieldId: string, now: Date): string {
+/**
+ * The current Project iteration, or `undefined` when none covers `now`.
+ *
+ * A Project with no open iteration is an ordinary state — nobody has started
+ * the next sprint yet — and the engine's own triage path (child issues,
+ * review follow-ups) never writes Sprint at all. Refusing to triage without
+ * one blocked operator triage on a Project the engine works happily, so an
+ * absent iteration skips the Sprint edit rather than failing the whole
+ * mutation. A *mismatched* Sprint field still throws: that is a real
+ * configuration fault, not an empty calendar.
+ */
+function currentSprintId(
+  raw: string,
+  sprintFieldId: string,
+  now: Date,
+): string | undefined {
   const parsed = JSON.parse(raw) as {
     data?: {
       organization?: {
@@ -181,9 +196,7 @@ function currentSprintId(raw: string, sprintFieldId: string, now: Date): string 
       return iteration.id;
     }
   }
-  throw new Error(
-    'No current Sprint iteration is configured; select or create the active iteration before applying triage',
-  );
+  return undefined;
 }
 
 async function applyTriage(
@@ -258,12 +271,12 @@ async function applyTriage(
       '--single-select-option-id',
       config.project.fields.priority.options[input.priority],
     ],
-    [
+    ...(iterationId === undefined ? [] : [[
       '--field-id',
       config.project.fields.sprint.id,
       '--iteration-id',
       iterationId,
-    ],
+    ]]),
   ] as const;
   // Sequential idempotent edits make a partial response safely resumable.
   for (const edit of edits) {
@@ -291,7 +304,7 @@ function mutationDescriptions(
     `set Blocked on to ${input.blockedOn}`,
     `set Effort to ${input.effort}`,
     `set Priority to ${input.priority}`,
-    'set Sprint to the current Project iteration',
+    'set Sprint to the current Project iteration when one is open',
   ];
 }
 
