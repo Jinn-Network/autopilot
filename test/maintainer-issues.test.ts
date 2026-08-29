@@ -48,6 +48,31 @@ function fieldList(): string {
   });
 }
 
+
+function fieldListWithNoCurrentIteration(): string {
+  return JSON.stringify({
+    data: {
+      organization: {
+        projectV2: {
+          sprintField: {
+            id: config.project.fields.sprint.id,
+            configuration: {
+              // Every iteration is in the past — the shape a Project has when
+              // nobody has opened the next sprint yet.
+              iterations: [{
+                id: 'iteration-past',
+                title: 'Sprint 3',
+                startDate: '2026-05-25',
+                duration: 7,
+              }],
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -181,6 +206,70 @@ describe('deterministic maintainer issue helpers', () => {
       now: new Date('2026-07-23T00:00:00Z'),
     })).resolves.toMatchObject({ operation: 'triage', issueNumber: 42 });
     expect(successfulEdits.some((args) => args.includes('iteration-current'))).toBe(true);
+  });
+
+
+  it('applies triage when the Project has no current Sprint iteration', async () => {
+    // The engine's own triage path never sets Sprint, so requiring one here
+    // blocked operator triage on a Project the engine happily works.
+    const inputPath = inputFile({
+      type: 'fix',
+      effort: 'high',
+      priority: 'p1',
+      blockedOn: 'nothing',
+    });
+    const edits: string[][] = [];
+    const runner: CommandRunner = async (_command, args) => {
+      if (args[0] === 'issue' && args[1] === 'view') return 'I_external_42\n';
+      if (args[0] === 'project' && args[1] === 'item-add') return '{"id":"PVTI_external_42"}';
+      if (args[0] === 'api' && args.includes('owner=Octo-Labs')) {
+        return fieldListWithNoCurrentIteration();
+      }
+      if (args[0] === 'project' && args[1] === 'item-edit') edits.push([...args]);
+      return '';
+    };
+
+    await expect(triageMaintainerIssue({
+      issueNumber: 42,
+      inputPath,
+      apply: true,
+      config,
+      runner,
+      now: new Date('2026-08-29T00:00:00Z'),
+    })).resolves.toMatchObject({ operation: 'triage', issueNumber: 42 });
+
+    // Priority is the field eligibility actually requires — it must land.
+    expect(edits.some((args) => args.includes(config.project.fields.priority.id))).toBe(true);
+    // Sprint is skipped rather than guessed at.
+    expect(edits.some((args) => args.includes(config.project.fields.sprint.id))).toBe(false);
+  });
+
+  it('still sets Sprint when a current iteration exists', async () => {
+    const inputPath = inputFile({
+      type: 'fix',
+      effort: 'high',
+      priority: 'p1',
+      blockedOn: 'nothing',
+    });
+    const edits: string[][] = [];
+    const runner: CommandRunner = async (_command, args) => {
+      if (args[0] === 'issue' && args[1] === 'view') return 'I_external_42\n';
+      if (args[0] === 'project' && args[1] === 'item-add') return '{"id":"PVTI_external_42"}';
+      if (args[0] === 'api' && args.includes('owner=Octo-Labs')) return fieldList();
+      if (args[0] === 'project' && args[1] === 'item-edit') edits.push([...args]);
+      return '';
+    };
+
+    await triageMaintainerIssue({
+      issueNumber: 42,
+      inputPath,
+      apply: true,
+      config,
+      runner,
+      now: new Date('2026-07-23T00:00:00Z'),
+    });
+
+    expect(edits.some((args) => args.includes('iteration-current'))).toBe(true);
   });
 
   it('reports missing triage facts and disallowed authors read-only', async () => {
