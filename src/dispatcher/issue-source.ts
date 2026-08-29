@@ -136,7 +136,10 @@ export class GhIssueSource implements IssueSource {
       const rows = JSON.parse(raw) as unknown;
       if (!Array.isArray(rows)) throw new Error('Open issue REST page is malformed');
       ghIssues.push(...(rows as GhIssue[]).filter((row) => row.pull_request === undefined));
-      if (rows.length < ISSUE_PAGE_SIZE || ghIssues.length >= 200) break;
+      // Stop only on a short page — the last one. An item cap here would
+      // silently drop issues, and MAX_ISSUE_PAGES below is the real bound
+      // (it throws rather than returning a truncated set).
+      if (rows.length < ISSUE_PAGE_SIZE) break;
       if (page === MAX_ISSUE_PAGES) throw new Error('Open issue pagination exceeded safety limit');
     }
 
