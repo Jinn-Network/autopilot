@@ -83,6 +83,7 @@ export interface DaemonMetadata {
 export type DaemonClassification =
   | 'already-running'
   | 'stale'
+  | 'binary-drift'
   | 'unsafe-live-mismatch';
 
 export function classifyDaemonRecord(
@@ -95,13 +96,17 @@ export function classifyDaemonRecord(
   },
 ): DaemonClassification {
   if (!actual.processAlive) return 'stale';
-  return (
-    actual.processStartedAt === record.processStartedAt
-    && actual.repository === record.repository
-    && actual.executableFingerprint === record.executableFingerprint
-  )
+  // Process identity is processStartedAt + repository: pid reuse cannot
+  // preserve a start time, so a match here proves the live process IS this
+  // repository's daemon. Only the executable fingerprint may legitimately
+  // drift (e.g. `yarn build` rewrote dist under a still-running daemon), and
+  // that alone downgrades to 'binary-drift' rather than the unsafe verdict.
+  const identityMatches = actual.processStartedAt === record.processStartedAt
+    && actual.repository === record.repository;
+  if (!identityMatches) return 'unsafe-live-mismatch';
+  return actual.executableFingerprint === record.executableFingerprint
     ? 'already-running'
-    : 'unsafe-live-mismatch';
+    : 'binary-drift';
 }
 
 export function shouldRunDaemonCycle(input: {
@@ -315,6 +320,9 @@ export async function startService(input: {
   readonly foreground: boolean;
   readonly doctor: () => Promise<DoctorReport>;
   readonly environment?: NodeJS.ProcessEnv;
+  // Test-only seam: production callers never pass this, so inspectDaemon
+  // (with its real ps/fingerprint reads) is always used outside tests.
+  readonly inspect?: typeof inspectDaemon;
 }): Promise<{ readonly status: 'started' | 'already-running'; readonly pid: number }> {
   const report = await input.doctor();
   if (report.blocking) {
@@ -322,9 +330,15 @@ export async function startService(input: {
   }
   mkdirSync(input.loaded.paths.service, { recursive: true, mode: 0o700 });
   mkdirSync(input.loaded.paths.logs, { recursive: true, mode: 0o700 });
-  const inspected = await inspectDaemon(input);
+  const inspect = input.inspect ?? inspectDaemon;
+  const inspected = await inspect(input);
   if (inspected.classification === 'already-running') {
     return { status: 'already-running', pid: inspected.metadata!.pid };
+  }
+  if (inspected.classification === 'binary-drift') {
+    throw new Error(
+      'Live daemon predates the current build; run autopilot stop (or stop --force) first',
+    );
   }
   if (inspected.classification === 'unsafe-live-mismatch') {
     throw new Error(
@@ -413,6 +427,10 @@ export async function runDaemon(input: {
   let metadata: DaemonMetadata = {
     schemaVersion: 1,
     pid: process.pid,
+    // Deliberately not "fixed": when `ps` is unavailable this fallback can
+    // never match a later real `ps` reading, so such a record legitimately
+    // classifies as unsafe rather than drift or already-running — that is
+    // the correct, conservative outcome for an unverifiable start time.
     processStartedAt: (await processStartedAt(process.pid))
       ?? `pid-${process.pid}`,
     startedAt: new Date().toISOString(),
@@ -539,8 +557,12 @@ export async function stopService(input: {
   readonly loaded: LoadedAutopilotConfig;
   readonly entryPath: string;
   readonly force: boolean;
+  // Test-only seam: production callers never pass this, so inspectDaemon
+  // (with its real ps/fingerprint reads) is always used outside tests.
+  readonly inspect?: typeof inspectDaemon;
 }): Promise<{ readonly status: 'not-running' | 'stopping' | 'forced' }> {
-  const inspected = await inspectDaemon(input);
+  const inspect = input.inspect ?? inspectDaemon;
+  const inspected = await inspect(input);
   if (inspected.classification === 'not-running' || inspected.classification === 'stale') {
     if (inspected.classification === 'stale') {
       rmSync(metadataPath(input.loaded), { force: true });
@@ -551,6 +573,10 @@ export async function stopService(input: {
   if (inspected.classification === 'unsafe-live-mismatch') {
     throw new Error('Refusing to signal a live PID whose daemon identity does not match');
   }
+  // 'already-running' and 'binary-drift' both carry a proven process
+  // identity (processStartedAt + repository matched); only the on-disk
+  // binary may have drifted, and the recorded socket/pid are independent of
+  // that binary, so a plain stop or --force kill is safe on either verdict.
   const metadata = inspected.metadata!;
   if (input.force) {
     process.kill(metadata.pid, 'SIGKILL');
@@ -564,7 +590,7 @@ export async function serviceStatus(input: {
   readonly loaded: LoadedAutopilotConfig;
   readonly entryPath: string;
 }): Promise<{
-  readonly status: 'not-running' | 'running' | 'stale' | 'unsafe';
+  readonly status: 'not-running' | 'running' | 'stale' | 'stale-binary' | 'unsafe';
   readonly daemon?: DaemonMetadata;
 }> {
   const inspected = await inspectDaemon(input);
@@ -573,6 +599,11 @@ export async function serviceStatus(input: {
       return { status: 'not-running' };
     case 'stale':
       return { status: 'stale', daemon: inspected.metadata! };
+    // Distinct from 'unsafe': identity (processStartedAt + repository) is
+    // proven, so an operator can tell "rebuild happened, stop/replace it" —
+    // still live but running last build's binary — apart from "unsafe pid".
+    case 'binary-drift':
+      return { status: 'stale-binary', daemon: inspected.metadata! };
     case 'unsafe-live-mismatch':
       return { status: 'unsafe', daemon: inspected.metadata! };
     case 'already-running':
