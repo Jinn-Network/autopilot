@@ -187,6 +187,7 @@ describe('autopilot init', () => {
       slug: 'Octo-Labs/widget',
       defaultBranch: 'trunk',
       instructionFiles: ['AGENTS.md'],
+      codeOwnerLogins: [],
     });
     expect(config.mergePolicy).toBe('manual');
     expect(config.scheduler).toMatchObject({

@@ -128,6 +128,17 @@ function healthyRunner(): DoctorRunner {
   };
 }
 
+function writeCodeOwnerLogins(repositoryRoot: string, codeOwnerLogins: string[]): void {
+  writeFileSync(
+    join(repositoryRoot, '.autopilot', 'config.json'),
+    `${JSON.stringify({
+      ...fixture,
+      safety: { ...fixture.safety, diskFloorGb: 0 },
+      repository: { ...fixture.repository, codeOwnerLogins },
+    })}\n`,
+  );
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -157,6 +168,64 @@ describe('autopilot doctor', () => {
     expect(report.checks.filter((entry) => entry.status === 'blocking')).toEqual([]);
     expect(report.blocking).toBe(false);
     expect(JSON.stringify(report)).not.toContain('implementation-secret');
+  });
+
+  it('passes an empty configured code-owner login set', async () => {
+    const paths = setup();
+    const report = await runDoctor({
+      ...paths,
+      runner: healthyRunner(),
+      environment: {
+        AUTOPILOT_HOME: paths.autopilotHome,
+        AUTOPILOT_GITHUB_IMPLEMENT_TOKEN: 'implementation-secret',
+        AUTOPILOT_GITHUB_REVIEW_TOKEN: 'review-secret',
+      },
+      nodeVersion: 'v22.18.0',
+      skipCapabilityAttestation: true,
+    });
+
+    expect(report.checks.find((check) => check.id === 'code-owner-logins'))
+      .toMatchObject({ status: 'pass' });
+  });
+
+  it('passes well-formed configured code-owner logins', async () => {
+    const paths = setup();
+    writeCodeOwnerLogins(paths.repositoryRoot, ['Octocat', 'other-user']);
+    const report = await runDoctor({
+      ...paths,
+      runner: healthyRunner(),
+      environment: {
+        AUTOPILOT_HOME: paths.autopilotHome,
+        AUTOPILOT_GITHUB_IMPLEMENT_TOKEN: 'implementation-secret',
+        AUTOPILOT_GITHUB_REVIEW_TOKEN: 'review-secret',
+      },
+      nodeVersion: 'v22.18.0',
+      skipCapabilityAttestation: true,
+    });
+
+    expect(report.checks.find((check) => check.id === 'code-owner-logins'))
+      .toMatchObject({ status: 'pass' });
+  });
+
+  it('blocks a malformed configured code-owner login', async () => {
+    const paths = setup();
+    writeCodeOwnerLogins(paths.repositoryRoot, ['-bad-']);
+    const report = await runDoctor({
+      ...paths,
+      runner: healthyRunner(),
+      environment: {
+        AUTOPILOT_HOME: paths.autopilotHome,
+        AUTOPILOT_GITHUB_IMPLEMENT_TOKEN: 'implementation-secret',
+        AUTOPILOT_GITHUB_REVIEW_TOKEN: 'review-secret',
+      },
+      nodeVersion: 'v22.18.0',
+      skipCapabilityAttestation: true,
+    });
+
+    const check = report.checks.find((entry) => entry.id === 'code-owner-logins');
+    expect(check).toMatchObject({ status: 'blocking' });
+    expect(check?.remedy).toMatch(/codeOwnerLogins/);
+    expect(report.blocking).toBe(true);
   });
 
   it('treats missing plugin registration as blocking with one remedy', async () => {

@@ -4,7 +4,6 @@ import {
   type SelectedCredential,
 } from './credentials.js';
 import type {
-  CompareStatus,
   GitOid,
   GitRefName,
 } from './types.js';
@@ -49,7 +48,6 @@ export interface EnqueueCandidate {
   }[];
   readonly mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   readonly mergeStateStatus: string;
-  readonly compareStatus: CompareStatus;
   readonly changedFilesComplete: boolean;
   readonly codeownersComplete: boolean;
   readonly codeownerSensitive: boolean;
@@ -115,7 +113,10 @@ function codeOwnerApprovedAtHead(candidate: EnqueueCandidate): boolean {
  *
  * Everything that is *not* the queue's job stays exactly as strict as it was.
  */
-export function evaluateEnqueueGate(candidate: EnqueueCandidate): EnqueueGateResult {
+export function evaluateEnqueueGate(
+  candidate: EnqueueCandidate,
+  operatorLogins: ReadonlySet<string>,
+): EnqueueGateResult {
   const reasons: string[] = [];
   if (!candidate.open || candidate.merged) reasons.push('pull-request-not-open');
   if (candidate.draft) reasons.push('draft');
@@ -139,6 +140,22 @@ export function evaluateEnqueueGate(candidate: EnqueueCandidate): EnqueueGateRes
     reasons.push('stacked-base');
   }
   if (!candidate.terminalApprovalMatches) reasons.push('terminal-approval');
+  // `terminalApprovalMatches` proves a signed, head-bound engine approval
+  // exists; it says nothing about whether the account that signed it is one
+  // this deployment actually runs. Without this, a credential file edited (or
+  // a review claim forged) outside the configured operator set would still
+  // read as a legitimate terminal approval. GitHub logins are
+  // case-insensitive, so both sides are folded here — the same treatment
+  // `codeOwnerApprovedAtHead` gives the CODEOWNERS comparison above.
+  if (
+    candidate.terminalApprovalMatches
+    && (
+      candidate.terminalApprovalReviewer === undefined
+      || !operatorLogins.has(candidate.terminalApprovalReviewer.toLowerCase())
+    )
+  ) {
+    reasons.push('terminal-approval-reviewer');
+  }
   if (candidate.effectiveReviews.some((review) => (
     review.commitId === candidate.head && review.state === 'CHANGES_REQUESTED'
   ))) {
@@ -263,6 +280,13 @@ export async function executeEnqueueAction(
   if (!Number.isSafeInteger(action.prNumber) || action.prNumber <= 0) {
     throw new Error('Enqueue action requires a positive PR number');
   }
+  // The accounts this deployment is actually authenticated as. A terminal
+  // approval whose reviewer falls outside this set cannot be a real engine
+  // review this deployment produced. The pool is already in hand for
+  // `selectCredential` below, so deriving it costs nothing extra.
+  const operatorLogins = new Set(
+    deps.credentials.logins().map((login) => login.toLowerCase()),
+  );
   const initial = await deps.readCandidate(action.prNumber);
   if (initial === null) {
     return {
@@ -285,7 +309,7 @@ export async function executeEnqueueAction(
   if (initial.inMergeQueue) {
     return { status: 'already-enqueued', prNumber: action.prNumber, head: initial.head };
   }
-  const initialGate = evaluateEnqueueGate(initial);
+  const initialGate = evaluateEnqueueGate(initial, operatorLogins);
   if (!initialGate.pass) {
     return {
       status: 'ineligible',
@@ -325,7 +349,7 @@ export async function executeEnqueueAction(
   if (current.inMergeQueue) {
     return { status: 'already-enqueued', prNumber: action.prNumber, head: current.head };
   }
-  const gate = evaluateEnqueueGate(current);
+  const gate = evaluateEnqueueGate(current, operatorLogins);
   if (!gate.pass) {
     return {
       status: 'ineligible',

@@ -22,6 +22,11 @@ export type DoctorRunner = (
 export const GIT_REF_CAPABILITIES_REMEDY =
   'Run `autopilot doctor --refresh-capabilities`, then rerun `autopilot doctor`.';
 
+/** The same shape GitHub itself enforces for a login. Shared so a configured
+ * `codeOwnerLogins` entry and a credential's resolved login are judged by the
+ * identical rule. */
+const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+
 export interface DoctorCheck {
   readonly id: string;
   readonly status: 'pass' | 'degraded' | 'blocking';
@@ -159,10 +164,28 @@ async function resolveLogin(
     cwd,
     env: { GH_TOKEN: token },
   })).trim();
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(login)) {
+  if (!GITHUB_LOGIN_PATTERN.test(login)) {
     throw new Error('GitHub credential resolved to an invalid login');
   }
   return login;
+}
+
+/**
+ * Format check only -- no live account lookups. An empty configured set is
+ * the fail-safe the enqueue gate already relies on (see
+ * `repository.codeOwnerLogins` in `src/config/config.ts`), so it passes here
+ * too rather than being flagged as a misconfiguration.
+ */
+function validateCodeOwnerLogins(loaded: LoadedAutopilotConfig): string {
+  const logins = loaded.config.repository.codeOwnerLogins;
+  for (const login of logins) {
+    if (!GITHUB_LOGIN_PATTERN.test(login)) {
+      throw new Error(`configured code-owner login is not a valid GitHub login: ${login}`);
+    }
+  }
+  return logins.length === 0
+    ? 'no code-owner logins are configured (codeowner-sensitive changes fail closed)'
+    : `${logins.length} configured code-owner login(s) are well-formed`;
 }
 
 function validateFieldIds(raw: string, loaded: LoadedAutopilotConfig): void {
@@ -266,6 +289,11 @@ export async function runDoctor(input: {
   const checks: DoctorCheck[] = [
     check('configuration', 'pass', `strict schema v1: ${loaded.configPath}`),
   ];
+  checks.push(await attempt(
+    'code-owner-logins',
+    () => validateCodeOwnerLogins(loaded),
+    'Fix each entry in repository.codeOwnerLogins to a valid GitHub login.',
+  ));
   const nodeVersion = input.nodeVersion ?? process.version;
   checks.push(
     /^v22\./.test(nodeVersion)

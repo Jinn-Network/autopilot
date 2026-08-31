@@ -21,6 +21,7 @@ function validConfig(): unknown {
         url: 'https://github.com/Octo-Labs/widget.git',
       },
       instructionFiles: ['AGENTS.md', 'CONTRIBUTING.md'],
+      codeOwnerLogins: [],
     },
     project: {
       owner: 'Octo-Labs',
@@ -115,6 +116,29 @@ function validConfig(): unknown {
 describe('Autopilot product configuration', () => {
   it('decodes the complete non-Jinn v1 configuration without changing values', () => {
     expect(decodeAutopilotConfig(validConfig())).toEqual(validConfig());
+  });
+
+  // Protects every deployed config: `codeOwnerLogins` did not exist before
+  // this field was added, so every existing `.autopilot/config.json` on disk
+  // omits the key. `.default([])` must keep parsing those files rather than
+  // rejecting them, and the empty set is the same fail-safe the enqueue gate
+  // already gives an unconfigured owner set.
+  it('defaults code-owner logins to the empty fail-safe set when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      repository: { codeOwnerLogins?: string[] };
+    };
+    delete input.repository.codeOwnerLogins;
+
+    expect(decodeAutopilotConfig(input).repository.codeOwnerLogins).toEqual([]);
+  });
+
+  it('round-trips configured code-owner logins', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      repository: { codeOwnerLogins: string[] };
+    };
+    input.repository.codeOwnerLogins = ['Owner-One', 'owner-two'];
+
+    expect(decodeAutopilotConfig(input)).toEqual(input);
   });
 
   it('rejects unknown keys instead of silently accepting policy drift', () => {

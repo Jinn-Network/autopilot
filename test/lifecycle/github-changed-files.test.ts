@@ -7,7 +7,7 @@ import {
 import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff-digest.js';
 import { chooseIntegrationLadderAction } from '../../src/lifecycle/integration-ladder.js';
 import { evaluateEnqueueGate, type EnqueueCandidate } from '../../src/lifecycle/enqueue-executor.js';
-import { gitOid, gitRefName, type CompareStatus } from '../../src/lifecycle/types.js';
+import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
 const BASE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -340,7 +340,7 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
     };
   }
 
-  function gateCandidate(compareStatus: CompareStatus): EnqueueCandidate {
+  function gateCandidate(): EnqueueCandidate {
     return {
       issueNumber: 2080,
       prNumber: 2081,
@@ -365,7 +365,6 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
       mergeable: 'MERGEABLE',
       mergeStateStatus: 'CLEAN',
-      compareStatus,
       changedFilesComplete: true,
       codeownersComplete: true,
       codeownerSensitive: false,
@@ -374,6 +373,8 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       inMergeQueue: false,
     };
   }
+
+  const OPERATOR_LOGINS = new Set(['review-bot']);
 
   it('resolves diverged, not ahead, when the base branch has moved past the fork point', async () => {
     const calls: string[] = [];
@@ -431,7 +432,12 @@ describe('stale-base merge safety (mono#2081 regression)', () => {
       expectedBaseRefName: 'next',
       repositorySlug: 'Jinn-Network/mono',
     });
-    const gate = evaluateEnqueueGate(gateCandidate(status));
+    expect(['behind', 'diverged', 'unknown']).toContain(status);
+
+    // The enqueue gate's candidate no longer carries a compare status at
+    // all -- the field was retired once the merge queue took over rebasing,
+    // so nothing about this PR's stale-base shape can refuse it here.
+    const gate = evaluateEnqueueGate(gateCandidate(), OPERATOR_LOGINS);
 
     expect(gate.reasons).not.toContain('behind');
     expect(gate).toEqual({ pass: true, reasons: [] });
