@@ -2259,4 +2259,93 @@ describe('merge-queue snapshot evidence', () => {
     expect(page.nodes[0]?.compareStatus).toBe('behind');
     expect(page.nodes[0]?.compareBaseTipOid).toBe(base);
   });
+
+  const MOVED_HEAD = '9'.repeat(40);
+  const SIBLING_HEAD = 'e'.repeat(40);
+
+  /**
+   * A concurrent worker pushing to one PR's head between the GraphQL listing
+   * and that PR's REST reread is routine. It used to abort the whole page —
+   * the refusal was a bare `Error`, and the per-PR isolation only tolerates
+   * `PrEvidenceInconsistentError` — so one racing push cost the entire cycle.
+   * The refusal now lands on the racing PR alone, as `unknown` compare
+   * evidence, which derives `blocked` downstream.
+   */
+  function racingHeadRun(): { run: CommandRunner; endpoints: string[] } {
+    const endpoints: string[] = [];
+    const base = 'b'.repeat(40);
+    const racing = queueAwarePr({ mergeStateStatus: 'BLOCKED' });
+    const sibling = {
+      ...graphQlPr({ number: 102, state: 'OPEN', head: SIBLING_HEAD }),
+      id: 'PR_kwDOABCD456',
+      isInMergeQueue: false,
+      mergeQueueEntry: null,
+      mergeStateStatus: 'BLOCKED',
+    };
+    const run: CommandRunner = async (command, args) => {
+      if (command === 'git') return '';
+      if (args[0] === 'api' && args[1] !== 'graphql') {
+        const endpoint = args[1]!;
+        endpoints.push(endpoint);
+        if (endpoint.includes('/compare/')) {
+          return JSON.stringify({ status: 'behind', base_commit: { sha: base } });
+        }
+        return JSON.stringify({
+          // PR #101's head moved under us; PR #102's reread is consistent.
+          head: { sha: endpoint.endsWith('/pulls/101') ? MOVED_HEAD : SIBLING_HEAD },
+          base: { ref: 'next', sha: base },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [racing, sibling],
+            },
+          },
+        },
+      });
+    };
+    return { run, endpoints };
+  }
+
+  it('keeps the snapshot complete when a concurrent push moves the head mid-compare', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, endpoints } = racingHeadRun();
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(page.nodes.map((pr) => pr.number)).toEqual([101, 102]);
+    // The racing PR is refused per-PR, not by invalidating the page's evidence.
+    expect(page.nodes[0]?.evidenceIncompleteReason).toBeUndefined();
+    // Stamped explicitly: an omitted compareStatus on a queue-eligible PR
+    // derives `clean`, which would be a fail-open.
+    expect(page.nodes[0]?.compareStatus).toBe('unknown');
+    expect(page.nodes[0]).not.toHaveProperty('compareBaseTipOid');
+    // The unaffected sibling still gets real compare evidence.
+    expect(page.nodes[1]?.compareStatus).toBe('behind');
+
+    const compares = endpoints.filter((endpoint) => endpoint.includes('/compare/'));
+    expect(compares).toHaveLength(1);
+    expect(compares[0]).toContain(SIBLING_HEAD);
+    // Zero extra API calls are spent on a head that is already known stale.
+    expect(compares[0]).not.toContain(OPEN_HEAD);
+    warnSpy.mockRestore();
+  });
+
+  it('warns which PR lost head authority instead of failing silently', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run } = racingHeadRun();
+
+    await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('#101'));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('head-authority-moved'),
+    );
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('#102'));
+    warnSpy.mockRestore();
+  });
 });

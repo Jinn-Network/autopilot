@@ -130,17 +130,31 @@ describe('readExactCompareEvidence', () => {
     expect(result).not.toHaveProperty('reviewedDiffDigest');
   });
 
-  it('still refuses a compare whose head or base authority moved', async () => {
+  /**
+   * A concurrent worker pushing to the head between the listing and this reread
+   * is routine, not a broken snapshot. The refusal is still total — no compare
+   * is issued and no status is asserted — but it is expressed as the fail-closed
+   * `unknown` this PR's own evidence, so it cannot abort the whole page.
+   */
+  it('reports an unreadable compare rather than throwing when head authority moved', async () => {
+    const calls: string[] = [];
     await expect(readExactCompareEvidence({
-      run: async () => JSON.stringify({
-        head: { sha: 'f'.repeat(40) },
-        base: { ref: 'next', sha: BASE },
-      }),
+      run: async (_command, args) => {
+        calls.push(args[1]!);
+        return JSON.stringify({
+          head: { sha: 'f'.repeat(40) },
+          base: { ref: 'next', sha: BASE },
+        });
+      },
       prNumber: 101,
       expectedHead: HEAD,
       expectedBaseRefName: 'next',
       repositorySlug: 'Jinn-Network/mono',
-    })).rejects.toThrow(/lost exact PR authority/);
+    })).resolves.toEqual({ status: 'unknown', unavailableReason: 'head-authority-moved' });
+
+    // The stale authority is refused before the compare is built, so the racing
+    // PR costs exactly one request instead of two.
+    expect(calls).toEqual(['repos/Jinn-Network/mono/pulls/101']);
   });
 });
 
@@ -194,17 +208,23 @@ describe('readExactCompareStatus', () => {
     expect(calls[1]).toBe(`repos/Jinn-Network/mono/compare/heads/next...${HEAD}`);
   });
 
-  it('rejects a compare when the fresh PR reread no longer has the expected head or base', async () => {
+  it('reports unknown when the fresh PR reread no longer has the expected head or base', async () => {
+    const calls: string[] = [];
     await expect(readExactCompareStatus({
-      run: async () => JSON.stringify({
-        head: { sha: 'cccccccccccccccccccccccccccccccccccccccc' },
-        base: { ref: 'next', sha: BASE },
-      }),
+      run: async (_command, args) => {
+        calls.push(args[1]!);
+        return JSON.stringify({
+          head: { sha: 'cccccccccccccccccccccccccccccccccccccccc' },
+          base: { ref: 'next', sha: BASE },
+        });
+      },
       prNumber: 101,
       expectedHead: HEAD,
       expectedBaseRefName: 'next',
       repositorySlug: 'Jinn-Network/mono',
-    })).rejects.toThrow(/exact PR authority/i);
+    })).resolves.toBe('unknown');
+
+    expect(calls).toEqual(['repos/Jinn-Network/mono/pulls/101']);
   });
 
   /**

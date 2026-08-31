@@ -1593,15 +1593,31 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
             expectedBaseRefName: pr.baseRefName,
             repositorySlug: this.repositorySlug,
             proveReviewedDiff: reviewedDiffCarryInQuestion(reviewClaim, pr.headRefOid),
-          }).then((evidence) => ({
-            compareStatus: evidence.status,
-            ...(evidence.compareBaseTipOid === undefined
-              ? {}
-              : { compareBaseTipOid: evidence.compareBaseTipOid }),
-            ...(evidence.reviewedDiffDigest === undefined
-              ? {}
-              : { reviewedDiffDigest: evidence.reviewedDiffDigest }),
-          }))
+          }).then((evidence) => {
+            if (evidence.unavailableReason !== undefined) {
+              // A concurrent push moved this head between the GraphQL listing
+              // and the REST reread. The compare refused, so `status` is the
+              // fail-closed `unknown` and this PR derives `blocked` until a
+              // later cycle reads a settled head — the rest of the page is
+              // unaffected.
+              console.warn(
+                `[github-reader] refusing compare evidence for PR #${pr.number} `
+                  + `(continuing): ${evidence.unavailableReason}`,
+              );
+            }
+            // `compareStatus` is stamped unconditionally, `unknown` included:
+            // omitting it on a queue-eligible PR derives `clean`, which would
+            // turn this refusal into a fail-open.
+            return {
+              compareStatus: evidence.status,
+              ...(evidence.compareBaseTipOid === undefined
+                ? {}
+                : { compareBaseTipOid: evidence.compareBaseTipOid }),
+              ...(evidence.reviewedDiffDigest === undefined
+                ? {}
+                : { reviewedDiffDigest: evidence.reviewedDiffDigest }),
+            };
+          })
         : {}),
     };
   }
