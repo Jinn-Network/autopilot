@@ -36,6 +36,11 @@ const GENERATION = '22222222-2222-4222-8222-222222222222';
 const ATTEMPT = '33333333-3333-4333-8333-333333333333';
 const INTENT = '44444444-4444-4444-8444-444444444444';
 const REVIEWER = 'review-bot';
+// The operator identities this deployment is authenticated as, for the gate's
+// terminal-approval-reviewer check. Every fixture in this file signs its
+// engine approval as REVIEWER, so this is the set every passing-gate
+// assertion below needs.
+const OPERATOR_LOGINS = new Set([REVIEWER]);
 const MARKER = '<!-- jinn-autopilot-review:v2 '
   + 'generation=22222222-2222-4222-8222-222222222222 '
   + 'attempt=33333333-3333-4333-8333-333333333333 '
@@ -269,11 +274,16 @@ describe('production head-pinned enqueue port', () => {
       expectedBaseRefName: gitRefName('stack/base'),
     }, {
       ...port,
-      credentials: new CredentialPool([{
-        login: 'implementation-bot',
-        normalizedLogin: 'implementation-bot',
-        implementationToken: 'selected-secret',
-      }]),
+      credentials: new CredentialPool([
+        {
+          login: 'implementation-bot',
+          normalizedLogin: 'implementation-bot',
+          implementationToken: 'selected-secret',
+        },
+        // The approving reviewer's login: `executeEnqueueAction` now derives
+        // its operator-login set from this same pool.
+        { login: REVIEWER, normalizedLogin: REVIEWER },
+      ]),
       enqueueAtHead: async ({ head }) => {
         mergeCalls += 1;
         return { status: 'enqueued', head };
@@ -316,11 +326,16 @@ describe('production head-pinned enqueue port', () => {
       expectedBaseRefName: gitRefName('stack/base'),
     }, {
       ...port,
-      credentials: new CredentialPool([{
-        login: 'implementation-bot',
-        normalizedLogin: 'implementation-bot',
-        implementationToken: 'selected-secret',
-      }]),
+      credentials: new CredentialPool([
+        {
+          login: 'implementation-bot',
+          normalizedLogin: 'implementation-bot',
+          implementationToken: 'selected-secret',
+        },
+        // The approving reviewer's login: `executeEnqueueAction` now derives
+        // its operator-login set from this same pool.
+        { login: REVIEWER, normalizedLogin: REVIEWER },
+      ]),
       enqueueAtHead: async ({ head }) => {
         mergeCalls += 1;
         return { status: 'enqueued', head };
@@ -896,7 +911,7 @@ describe('approval carry across an update-branch head', () => {
     expect(candidate).not.toBeNull();
     expect(candidate!.head).toBe(CARRIED_HEAD);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateEnqueueGate(candidate!)).toEqual({ pass: true, reasons: [] });
+    expect(evaluateEnqueueGate(candidate!, OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
   });
 
   it('enqueues at the new head under the carried approval', async () => {
@@ -908,11 +923,16 @@ describe('approval carry across an update-branch head', () => {
       },
       {
         ...carriedPort(carriedSnapshot(), REVIEWED_FILES),
-        credentials: new CredentialPool([{
-          login: 'implementation-bot',
-          normalizedLogin: 'implementation-bot',
-          implementationToken: 'selected-secret',
-        }]),
+        credentials: new CredentialPool([
+          {
+            login: 'implementation-bot',
+            normalizedLogin: 'implementation-bot',
+            implementationToken: 'selected-secret',
+          },
+          // The approving reviewer's login: `executeEnqueueAction` now derives
+          // its operator-login set from this same pool.
+          { login: REVIEWER, normalizedLogin: REVIEWER },
+        ]),
         enqueueAtHead: async () => ({ status: 'enqueued', head: CARRIED_HEAD }),
       },
     );
@@ -928,7 +948,7 @@ describe('approval carry across an update-branch head', () => {
     }];
     const candidate = await carriedPort(carriedSnapshot(), rebased).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!, OPERATOR_LOGINS).reasons).toContain('terminal-approval');
   });
 
   it('does not carry when a worker pushed a real code change', async () => {
@@ -949,7 +969,7 @@ describe('approval carry across an update-branch head', () => {
       ['GREETING.md', 'src/backdoor.ts'],
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!, OPERATOR_LOGINS).reasons).toContain('terminal-approval');
   });
 
   it('does not carry a claim written before digests existed', async () => {
@@ -958,7 +978,7 @@ describe('approval carry across an update-branch head', () => {
       REVIEWED_FILES,
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!, OPERATOR_LOGINS).reasons).toContain('terminal-approval');
   });
 
   it.each([
@@ -984,7 +1004,7 @@ describe('approval carry across an update-branch head', () => {
       filenames,
     ).readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(false);
-    expect(evaluateEnqueueGate(candidate!).reasons).toContain('terminal-approval');
+    expect(evaluateEnqueueGate(candidate!, OPERATOR_LOGINS).reasons).toContain('terminal-approval');
   });
 
   it('does not carry a digest that matches some other PR head state', async () => {
@@ -1086,7 +1106,7 @@ describe('approval carry across an update-branch head', () => {
     ).readCandidate(84);
     // The approval itself still carries — only the independent reason blocks.
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    const gate = evaluateEnqueueGate(candidate!);
+    const gate = evaluateEnqueueGate(candidate!, OPERATOR_LOGINS);
     expect(gate.pass).toBe(false);
     expect(gate.reasons).toContain(reason);
     expect(gate.reasons).not.toContain('terminal-approval');
@@ -1101,7 +1121,7 @@ describe('approval carry across an update-branch head', () => {
     });
     const candidate = await port.readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateEnqueueGate(candidate!).reasons).toContain('author');
+    expect(evaluateEnqueueGate(candidate!, OPERATOR_LOGINS).reasons).toContain('author');
   });
 
   /**
@@ -1124,7 +1144,7 @@ describe('approval carry across an update-branch head', () => {
     });
     const candidate = await port.readCandidate(84);
     expect(candidate!.terminalApprovalMatches).toBe(true);
-    expect(evaluateEnqueueGate(candidate!)).toEqual({ pass: true, reasons: [] });
+    expect(evaluateEnqueueGate(candidate!, OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
   });
 });
 

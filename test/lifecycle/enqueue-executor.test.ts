@@ -10,6 +10,12 @@ import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
 
+// Matches the default `terminalApprovalReviewer` in `candidate()` below, plus
+// the alternate reviewer the self-review test substitutes. Every gate test in
+// this file that is not itself exercising the new reviewer-authority check
+// passes this so the new refusal reason stays out of its way.
+const OPERATOR_LOGINS = new Set(['review-bot', 'implementation-bot']);
+
 function candidate(overrides: Partial<EnqueueCandidate> = {}): EnqueueCandidate {
   return {
     issueNumber: 42,
@@ -35,7 +41,6 @@ function candidate(overrides: Partial<EnqueueCandidate> = {}): EnqueueCandidate 
     checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     mergeable: 'MERGEABLE',
     mergeStateStatus: 'CLEAN',
-    compareStatus: 'ahead',
     changedFilesComplete: true,
     codeownersComplete: true,
     codeownerSensitive: false,
@@ -47,11 +52,23 @@ function candidate(overrides: Partial<EnqueueCandidate> = {}): EnqueueCandidate 
 }
 
 function pool(): CredentialPool {
-  return new CredentialPool([{
-    login: 'implementation-bot',
-    normalizedLogin: 'implementation-bot',
-    implementationToken: 'selected-secret',
-  }]);
+  return new CredentialPool([
+    {
+      login: 'implementation-bot',
+      normalizedLogin: 'implementation-bot',
+      implementationToken: 'selected-secret',
+    },
+    // The default candidate's `terminalApprovalReviewer`. `executeEnqueueAction`
+    // now derives its operator-login set from this same pool, so the reviewer
+    // that terminally approved the candidate must be a registered identity
+    // here too — exactly as it would be in production, where only a
+    // configured review credential can produce a signed engine approval.
+    {
+      login: 'review-bot',
+      normalizedLogin: 'review-bot',
+      reviewToken: 'review-secret',
+    },
+  ]);
 }
 
 function harness(overrides: Partial<EnqueueExecutorDeps> = {}) {
@@ -92,7 +109,7 @@ describe('head-pinned enqueue executor', () => {
     ['CODEOWNER path with no owner approval', { codeownerSensitive: true }],
     ['wrong base', { baseRefName: gitRefName('main') }],
   ])('fails closed for %s', (_name, override) => {
-    expect(evaluateEnqueueGate(candidate(override))).toMatchObject({ pass: false });
+    expect(evaluateEnqueueGate(candidate(override), OPERATOR_LOGINS)).toMatchObject({ pass: false });
   });
 
   /**
@@ -102,14 +119,11 @@ describe('head-pinned enqueue executor', () => {
    * these is refusing the queue's ordinary input.
    */
   it.each([
-    ['a behind head', { compareStatus: 'behind' as const }],
-    ['a diverged head', { compareStatus: 'diverged' as const }],
-    ['an unreadable compare', { compareStatus: 'unknown' as const }],
     ['a BEHIND merge state', { mergeStateStatus: 'BEHIND' }],
     ['a BLOCKED merge state', { mergeStateStatus: 'BLOCKED' }],
     ['a merge state the queue owns', { mergeStateStatus: 'UNSTABLE' }],
   ])('lets the queue handle %s', (_name, override) => {
-    expect(evaluateEnqueueGate(candidate(override))).toEqual({ pass: true, reasons: [] });
+    expect(evaluateEnqueueGate(candidate(override), OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
   });
 
   /**
@@ -122,11 +136,11 @@ describe('head-pinned enqueue executor', () => {
     expect(evaluateEnqueueGate(candidate({
       author: 'implementation-bot',
       terminalApprovalReviewer: 'implementation-bot',
-    }))).toEqual({ pass: true, reasons: [] });
+    }), OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
   });
 
   it('names an unreadable mergeability as a wait, not a conflict', () => {
-    expect(evaluateEnqueueGate(candidate({ mergeable: 'UNKNOWN' })).reasons)
+    expect(evaluateEnqueueGate(candidate({ mergeable: 'UNKNOWN' }), OPERATOR_LOGINS).reasons)
       .toEqual(['mergeability-unknown']);
   });
 
@@ -134,16 +148,16 @@ describe('head-pinned enqueue executor', () => {
     ['a CONFLICTING mergeable', { mergeable: 'CONFLICTING' as const }],
     ['a DIRTY merge state', { mergeStateStatus: 'DIRTY' }],
   ])('names %s a conflict', (_name, override) => {
-    expect(evaluateEnqueueGate(candidate(override)).reasons).toEqual(['conflicting']);
+    expect(evaluateEnqueueGate(candidate(override), OPERATOR_LOGINS).reasons).toEqual(['conflicting']);
   });
 
   it('waits, rather than refusing, while checks have not reported', () => {
-    expect(evaluateEnqueueGate(candidate({ checks: [] })).reasons)
+    expect(evaluateEnqueueGate(candidate({ checks: [] }), OPERATOR_LOGINS).reasons)
       .toEqual(['checks-missing']);
   });
 
   it('refuses a candidate GitHub cannot be told to enqueue', () => {
-    expect(evaluateEnqueueGate(candidate({ graphqlId: undefined })).reasons)
+    expect(evaluateEnqueueGate(candidate({ graphqlId: undefined }), OPERATOR_LOGINS).reasons)
       .toEqual(['pull-request-node-id-missing']);
   });
 
@@ -157,7 +171,7 @@ describe('head-pinned enqueue executor', () => {
       expect(evaluateEnqueueGate(candidate({
         codeownerSensitive: true,
         codeOwnerLogins: new Set(['owner-one']),
-      })).reasons).toEqual(['codeowner-approval-missing']);
+      }), OPERATOR_LOGINS).reasons).toEqual(['codeowner-approval-missing']);
     });
 
     it('passes when a configured code owner approved this head', () => {
@@ -168,7 +182,7 @@ describe('head-pinned enqueue executor', () => {
           { reviewer: 'review-bot', state: 'APPROVED', commitId: HEAD },
           { reviewer: 'owner-one', state: 'APPROVED', commitId: HEAD },
         ],
-      }))).toEqual({ pass: true, reasons: [] });
+      }), OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
     });
 
     it('does not accept a code owner approval bound to an older head', () => {
@@ -179,7 +193,7 @@ describe('head-pinned enqueue executor', () => {
           { reviewer: 'review-bot', state: 'APPROVED', commitId: HEAD },
           { reviewer: 'owner-one', state: 'APPROVED', commitId: gitOid('5'.repeat(40)) },
         ],
-      })).reasons).toEqual(['codeowner-approval-missing']);
+      }), OPERATOR_LOGINS).reasons).toEqual(['codeowner-approval-missing']);
     });
 
     it('does not accept a non-approving code owner review', () => {
@@ -190,7 +204,7 @@ describe('head-pinned enqueue executor', () => {
           { reviewer: 'review-bot', state: 'APPROVED', commitId: HEAD },
           { reviewer: 'owner-one', state: 'COMMENTED', commitId: HEAD },
         ],
-      })).reasons).toEqual(['codeowner-approval-missing']);
+      }), OPERATOR_LOGINS).reasons).toEqual(['codeowner-approval-missing']);
     });
 
     // An unconfigured owner set cannot prove anyone is an owner, so it must
@@ -202,14 +216,71 @@ describe('head-pinned enqueue executor', () => {
         effectiveReviews: [
           { reviewer: 'anyone', state: 'APPROVED', commitId: HEAD },
         ],
-      })).reasons).toEqual(['codeowner-approval-missing']);
+      }), OPERATOR_LOGINS).reasons).toEqual(['codeowner-approval-missing']);
     });
 
     it('ignores the owner set entirely when nothing sensitive was touched', () => {
       expect(evaluateEnqueueGate(candidate({
         codeownerSensitive: false,
         codeOwnerLogins: new Set<string>(),
-      }))).toEqual({ pass: true, reasons: [] });
+      }), OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
+    });
+  });
+
+  /**
+   * `terminalApprovalMatches` proves a signed, head-bound engine approval
+   * exists; it says nothing about whether the account that signed it is one
+   * this deployment actually runs. A credential file edited outside the
+   * configured operator set, or a review claim for an identity this
+   * deployment never authenticated as, must not read as a legitimate
+   * terminal approval.
+   */
+  describe('terminal approval reviewer authority', () => {
+    it('refuses when the approving reviewer is outside the operator set', () => {
+      expect(evaluateEnqueueGate(candidate({
+        terminalApprovalReviewer: 'outsider-bot',
+      }), OPERATOR_LOGINS).reasons).toContain('terminal-approval-reviewer');
+    });
+
+    it('passes when the approving reviewer is inside the operator set', () => {
+      const result = evaluateEnqueueGate(candidate({
+        terminalApprovalReviewer: 'review-bot',
+      }), OPERATOR_LOGINS);
+      expect(result.reasons).not.toContain('terminal-approval-reviewer');
+    });
+
+    it('folds login casing the same way the codeowner comparison does', () => {
+      const result = evaluateEnqueueGate(
+        candidate({ terminalApprovalReviewer: 'RitsuKai2000' }),
+        new Set(['ritsukai2000']),
+      );
+      expect(result.reasons).not.toContain('terminal-approval-reviewer');
+    });
+
+    it('refuses a reviewer login the operator set spells with different casing', () => {
+      const result = evaluateEnqueueGate(
+        candidate({ terminalApprovalReviewer: 'RitsuKai2000' }),
+        new Set(['someone-else']),
+      );
+      expect(result.reasons).toContain('terminal-approval-reviewer');
+    });
+
+    it('refuses a matched approval whose reviewer is unknown', () => {
+      expect(evaluateEnqueueGate(candidate({
+        terminalApprovalMatches: true,
+        terminalApprovalReviewer: undefined,
+      }), OPERATOR_LOGINS).reasons).toContain('terminal-approval-reviewer');
+    });
+
+    // Guards against the reason firing for an already-refused candidate: the
+    // existing `terminal-approval` reason should stand alone when the marker
+    // never matched in the first place, whatever the reviewer field says.
+    it('does not pile on when the terminal approval itself already failed', () => {
+      const result = evaluateEnqueueGate(candidate({
+        terminalApprovalMatches: false,
+        terminalApprovalReviewer: 'outsider-bot',
+      }), OPERATOR_LOGINS);
+      expect(result.reasons).toEqual(['terminal-approval']);
     });
   });
 
@@ -231,13 +302,13 @@ describe('head-pinned enqueue executor', () => {
         baseRefName: gitRefName('autopilot/2083'),
         expectedBaseRefName: gitRefName('autopilot/2083'),
         defaultBaseRefName: gitRefName('next'),
-      })).reasons).toEqual(['stacked-base']);
+      }), OPERATOR_LOGINS).reasons).toEqual(['stacked-base']);
     });
 
     it('passes a root pull request targeting the default branch', () => {
       expect(evaluateEnqueueGate(candidate({
         defaultBaseRefName: gitRefName('next'),
-      }))).toEqual({ pass: true, reasons: [] });
+      }), OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
     });
 
     // Not a licence, an absence of evidence. Every production path configures
@@ -246,7 +317,7 @@ describe('head-pinned enqueue executor', () => {
       expect(evaluateEnqueueGate(candidate({
         baseRefName: gitRefName('autopilot/2083'),
         expectedBaseRefName: gitRefName('autopilot/2083'),
-      }))).toEqual({ pass: true, reasons: [] });
+      }), OPERATOR_LOGINS)).toEqual({ pass: true, reasons: [] });
     });
 
     it('still names a retargeted base separately from a stacked one', () => {
@@ -254,7 +325,7 @@ describe('head-pinned enqueue executor', () => {
         baseRefName: gitRefName('autopilot/2083'),
         expectedBaseRefName: gitRefName('next'),
         defaultBaseRefName: gitRefName('next'),
-      })).reasons).toEqual(['base', 'stacked-base']);
+      }), OPERATOR_LOGINS).reasons).toEqual(['base', 'stacked-base']);
     });
   });
 
@@ -293,7 +364,15 @@ describe('head-pinned enqueue executor', () => {
   });
 
   it('reports an unavailable credential as ineligible without mutating', async () => {
-    const h = harness({ credentials: new CredentialPool([]) });
+    // The reviewer login is registered (so the gate's operator-authority check
+    // passes) but carries no token of either kind, so `selectCredential` still
+    // has nothing to select from for the merge phase.
+    const h = harness({
+      credentials: new CredentialPool([{
+        login: 'review-bot',
+        normalizedLogin: 'review-bot',
+      }]),
+    });
 
     await expect(
       executeEnqueueAction({
@@ -460,7 +539,7 @@ describe('head-pinned enqueue executor', () => {
 // a missing head-bound engine approval.
 describe('enqueue gate approval authority is not loosened', () => {
   it('still refuses to enqueue when the engine approval is not bound to the head', () => {
-    expect(evaluateEnqueueGate(candidate({ terminalApprovalMatches: false }))).toEqual({
+    expect(evaluateEnqueueGate(candidate({ terminalApprovalMatches: false }), OPERATOR_LOGINS)).toEqual({
       pass: false,
       reasons: ['terminal-approval'],
     });
@@ -473,7 +552,7 @@ describe('enqueue gate approval authority is not loosened', () => {
     const result = evaluateEnqueueGate(candidate({
       terminalApprovalMatches: false,
       effectiveReviews: [{ reviewer: 'review-bot', state: 'APPROVED', commitId: HEAD }],
-    }));
+    }), OPERATOR_LOGINS);
     expect(result.pass).toBe(false);
     expect(result.reasons).toContain('terminal-approval');
   });

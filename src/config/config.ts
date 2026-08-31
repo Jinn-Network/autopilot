@@ -98,6 +98,12 @@ export const autopilotConfigSchema = z.object({
       url: z.string().url(),
     }).strict(),
     instructionFiles: z.array(repositoryRelativePath),
+    // Logins the repository's CODEOWNERS policy names, compared
+    // case-insensitively by the enqueue gate. `.default([])` keeps every
+    // existing operator's `.autopilot/config.json` parsing -- absent means
+    // nobody is configured as a proven owner, which is the same fail-safe
+    // refusal a sensitive change already got before this field existed.
+    codeOwnerLogins: z.array(nonEmpty).default([]),
   }).strict(),
   project: z.object({
     owner: nonEmpty,

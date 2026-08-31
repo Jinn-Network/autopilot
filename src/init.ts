@@ -1358,6 +1358,7 @@ export async function initializeAutopilot(input: {
       restDatabaseId,
       remote: { name: remoteName, url: canonicalRemote(slug) },
       instructionFiles: instructionFiles(repositoryRoot),
+      codeOwnerLogins: [],
     },
     project: {
       owner: projectRef.owner,

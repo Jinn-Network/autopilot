@@ -416,11 +416,17 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
     repositoryUrl: `https://github.com/${SLUG}.git`,
     worktreeBase: '/worktrees',
     runnerId: 'runner-a',
-    credentials: new CredentialPool([{
-      login: 'implementation-bot',
-      normalizedLogin: 'implementation-bot',
-      implementationToken: 'secret',
-    }]),
+    credentials: new CredentialPool([
+      {
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'secret',
+      },
+      // The approving reviewer's login: the enqueue gate now asserts the
+      // terminal-approval reviewer is one of this deployment's own
+      // authenticated identities, drawn from this same pool.
+      { login: REVIEWER, normalizedLogin: REVIEWER },
+    ]),
     authorAllowlist: new Set(['implementation-bot']),
     readReviewSnapshot: async () => snapshot,
     readReservedReviewSnapshot: async () => snapshot,

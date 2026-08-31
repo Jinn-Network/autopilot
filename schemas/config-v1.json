@@ -46,6 +46,10 @@
         "instructionFiles": {
           "type": "array",
           "items": { "$ref": "#/$defs/repositoryRelativePath" }
+        },
+        "codeOwnerLogins": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
         }
       }
     },

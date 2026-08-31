@@ -838,6 +838,7 @@ export async function runAutopilotV2(
         repositorySlug: loaded.config.repository.slug,
         repositoryUrl: loaded.config.repository.remote.url,
         defaultBranch: loaded.config.repository.defaultBranch,
+        codeOwnerLogins: new Set(loaded.config.repository.codeOwnerLogins),
         projectMapping: loaded.config.project,
         newWorkPaused: diskBelowFloor,
         ...(marketplaceTaskAdapter === undefined

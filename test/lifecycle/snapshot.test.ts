@@ -180,6 +180,7 @@ describe('view and merge gate agree on a carried approval', () => {
     + 'reviewer=reviewer '
     + `head=${OLD_HEAD} `
     + 'verdict=APPROVE -->';
+  const OPERATOR_LOGINS = new Set(['reviewer']);
   const COMPARE_FILES = [{
     filename: 'src/a.ts',
     status: 'modified',
@@ -291,7 +292,7 @@ describe('view and merge gate agree on a carried approval', () => {
     const candidate = await mergePort(snapshot, compareFiles).readCandidate(101);
     const gate = candidate === null
       ? { pass: false, reasons: ['pull-request-missing'] }
-      : evaluateEnqueueGate(candidate);
+      : evaluateEnqueueGate(candidate, OPERATOR_LOGINS);
     return { view, gate, candidate };
   }
 

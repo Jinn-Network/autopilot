@@ -29,7 +29,7 @@ import type {
   NativeReviewSnapshot,
   PullRequestSnapshot,
 } from './snapshot.js';
-import { decodeCompareStatus, gitOid, gitRefName, type GitOid } from './types.js';
+import { gitOid, gitRefName, type GitOid } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import { hasExternalHumanAuthority } from './human-authority.js';
 
@@ -420,8 +420,7 @@ export function makeProductionEnqueueActionPort(
     const compare = JSON.parse(await runner('gh', [
       'api',
       `repos/${repositorySlug}/compare/heads/${compareBaseRefName}...${pr.headOid}`,
-    ])) as { status?: unknown; files?: unknown };
-    const compareStatus = decodeCompareStatus(compare.status);
+    ])) as { files?: unknown };
     const effectiveReviews = effectiveCurrentHeadReviews(pr);
     const reviewClaim = lifecycle.reviewClaim;
     // The approval is anchored to the head the reviewer read, which is the head
@@ -525,7 +524,6 @@ export function makeProductionEnqueueActionPort(
       checks: pr.checks.map((check) => ({ ...check })),
       mergeable: pr.mergeability,
       mergeStateStatus: pr.mergeStateStatus,
-      compareStatus,
       changedFilesComplete: changedFiles.complete,
       codeownersComplete: true,
       codeownerSensitive: touchesCodeOwnedPath(
