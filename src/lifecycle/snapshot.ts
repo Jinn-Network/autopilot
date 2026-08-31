@@ -74,6 +74,7 @@ export interface NativeReviewSnapshot {
   readonly submittedAt: string;
 }
 
+import type { EnqueueHoldKind } from './enqueue-hold.js';
 export type { CheckSummary } from './types.js';
 import type { CheckSummary } from './types.js';
 
@@ -166,6 +167,15 @@ export interface PullRequestSnapshot {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
+  /**
+   * A durable enqueue hold is recorded on the canonical remote for THIS pull
+   * request at THIS head. Stamped only by the full reader's ref listing, so
+   * absence is never proof there is no hold — under incremental snapshots the
+   * flag is simply missing and the enqueue is derived and attempted exactly as
+   * it is today. That degradation is the fail-safe direction: the cost is one
+   * expensive cycle, never a wrong decision.
+   */
+  readonly enqueueHold?: EnqueueHoldKind;
   readonly reviews: readonly NativeReviewSnapshot[];
   /**
    * Non-comment PR evidence could not be read completely. This is a machine
@@ -223,6 +233,7 @@ export interface RawPullRequest {
   readonly reviewedDiffDigest?: string;
   readonly checks: readonly CheckSummary[];
   readonly ciRerunRecorded?: boolean;
+  readonly enqueueHold?: EnqueueHoldKind;
   readonly reviews: readonly RawNativeReview[];
   readonly evidenceIncompleteReason?: string;
   readonly branchClaimTrailers: string | null;
@@ -503,6 +514,7 @@ export function decodePullRequestSnapshot(raw: RawPullRequest): PullRequestSnaps
         : {}),
       checks: raw.checks.map((check) => ({ ...check })),
       ...(raw.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
+      ...(raw.enqueueHold === undefined ? {} : { enqueueHold: raw.enqueueHold }),
       reviews,
       ...(raw.evidenceIncompleteReason === undefined
         ? {}
@@ -837,6 +849,7 @@ function lifecyclePr(
     mergeState: deriveMergeState(pr),
     checks: [...pr.checks],
     ...(pr.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
+    ...(pr.enqueueHold === undefined ? {} : { enqueueHold: pr.enqueueHold }),
     ...(pr.mergeQueue?.enqueued === true ? { inMergeQueue: true } : {}),
     ...(openChildKinds.length === 0 ? {} : { openChildKinds: [...openChildKinds] }),
     ...(pr.branchClaim === undefined ? {} : { branchClaim: pr.branchClaim }),

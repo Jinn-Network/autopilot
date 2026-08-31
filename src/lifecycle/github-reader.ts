@@ -37,6 +37,11 @@ import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import { readExactCompareEvidence } from './github-changed-files.js';
 import { gitOid, gitRefName, type GitOid, type GitRefName } from './types.js';
 import {
+  ENQUEUE_HOLD_REF_GLOB,
+  parseEnqueueHoldRef,
+  type EnqueueHoldKind,
+} from './enqueue-hold.js';
+import {
   GitHubUsageMeter,
   makeGitHubUsageCommandRunner,
   TARGETED_RELATION_RESERVE,
@@ -1007,6 +1012,35 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     return this.listReviewClaimRefs();
   }
 
+  /**
+   * The enqueue-hold namespace, as one listing per page read — the same shape,
+   * and for the same reason, as the ci-rerun listing beside it: a per-pull-
+   * request ref read would be one network round trip per PR for a namespace
+   * that is empty in the ordinary case.
+   *
+   * Keyed by `<prNumber>/<head>` so the caller's stamp is head-exact. A ref the
+   * strict parser refuses is simply not in the map: the glob is a prefix match
+   * and sees every ref anyone puts under the namespace, and none of those may
+   * cause a head to be skipped.
+   *
+   * Public because the transient-retry suite drives it to prove the argv this
+   * emits is still on the idempotent-read allowlist.
+   */
+  async listEnqueueHoldHeads(): Promise<Map<string, EnqueueHoldKind>> {
+    const raw = await this.gitRun(['ls-remote', this.remoteName, ENQUEUE_HOLD_REF_GLOB]);
+    const trimmed = raw.trimEnd();
+    const held = new Map<string, EnqueueHoldKind>();
+    if (trimmed.length === 0) return held;
+    for (const line of trimmed.split('\n')) {
+      const [, ref] = line.split('\t');
+      if (ref === undefined) continue;
+      const parsed = parseEnqueueHoldRef(ref);
+      if (parsed === null) continue;
+      held.set(`${parsed.prNumber}/${parsed.head}`, parsed.kind);
+    }
+    return held;
+  }
+
   private async listCiRerunRecordedHeads(): Promise<Set<string>> {
     const raw = await this.gitRun(['ls-remote', this.remoteName, CI_RERUN_REF_GLOB]);
     const trimmed = raw.trimEnd();
@@ -1841,6 +1875,7 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     // GraphQL ref read per PR.
     const reviewClaimListing = await this.listReviewClaimRefs();
     const ciRerunRecorded = await this.listCiRerunRecordedHeads();
+    const enqueueHolds = await this.listEnqueueHoldHeads();
     const openNodes = await Promise.all(connection.nodes.map((pr) => (
       this.rawPullRequest(pr, true, reviewClaimListing).catch((error: unknown) => {
         if (!(error instanceof PrEvidenceInconsistentError)) throw error;
@@ -1848,9 +1883,14 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       })
     ))).then((nodes) => nodes.map((pr) => {
       const key = `${pr.number}/${pr.headOid}`;
+      const enqueueHold = enqueueHolds.get(key);
       return {
         ...pr,
         ...(ciRerunRecorded.has(key) ? { ciRerunRecorded: true as const } : {}),
+        // Head-exact by construction: a hold left behind at a head this pull
+        // request has since replaced is not at `key`, so it stamps nothing and
+        // the enqueue proceeds. That is the entire release mechanism.
+        ...(enqueueHold === undefined ? {} : { enqueueHold }),
       };
     }));
     const mergedOutcomes = cursor === null

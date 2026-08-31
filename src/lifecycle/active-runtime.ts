@@ -9,6 +9,14 @@ export interface ActiveRuntimeResult {
   readonly detail?: string;
   readonly reason?: string;
   readonly reasons?: readonly string[];
+  /**
+   * An enqueue was refused for a reason that belongs to the repository, not to
+   * this pull request — the merge queue is not enabled, or this credential
+   * cannot use it. Carried through the `{outcome, reason}` collapse below
+   * because the controller's per-cycle latch reads it: every remaining enqueue
+   * would pay a full candidate derivation to reach the identical refusal.
+   */
+  readonly repositoryRefusal?: true;
 }
 
 export interface ActiveRuntimeHandlers {
@@ -205,6 +213,7 @@ export function makeActiveRuntime(
       return {
         outcome: result.status,
         ...(detail === undefined ? {} : { reason: detail }),
+        ...(result.repositoryRefusal === true ? { repositoryRefusal: true as const } : {}),
       };
     },
   };

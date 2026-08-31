@@ -204,9 +204,26 @@ export type ExactEnqueueOutcome =
       readonly reason?: string;
     }
   | {
+      readonly status: 'rejected';
+      readonly head: GitOid;
+      readonly reason?: string;
+      /**
+       * The refusal is a property of the REPOSITORY, not of this pull request
+       * or this head: the merge queue is not enabled, or the credential cannot
+       * use it. Every other enqueue this cycle would be refused the same way,
+       * so the caller stops issuing them until the next cycle re-probes.
+       *
+       * Absent means only "not proven repository-wide", never "proven
+       * pull-request-scoped": an unclassified refusal simply costs another
+       * cycle. Set exclusively by the post-mutation classification — the
+       * pre-mutation `rejected` returns are transient races between two reads
+       * and prove nothing about the repository.
+       */
+      readonly repositoryRefusal?: true;
+    }
+  | {
       readonly status:
       | 'already-merged'
-      | 'rejected'
       | 'changed-head'
       | 'ambiguous'
       | 'flake-hold';
@@ -263,7 +280,15 @@ export type EnqueueExecutionResult =
       readonly head: GitOid;
     }
   | {
-      readonly status: 'already-merged' | 'rejected' | 'ambiguous' | 'flake-hold';
+      readonly status: 'rejected';
+      readonly prNumber: number;
+      readonly head: GitOid;
+      readonly reason?: string;
+      /** See {@link ExactEnqueueOutcome}'s `rejected` variant. */
+      readonly repositoryRefusal?: true;
+    }
+  | {
+      readonly status: 'already-merged' | 'ambiguous' | 'flake-hold';
       readonly prNumber: number;
       readonly head: GitOid;
       readonly reason?: string;
@@ -371,6 +396,19 @@ export async function executeEnqueueAction(
   });
   if (outcome.status === 'changed-head') {
     return { status: 'changed-head', prNumber: action.prNumber, head: outcome.head };
+  }
+  // Carried explicitly rather than through the spread below, because
+  // `repositoryRefusal` is meaningful on exactly one variant and the caller's
+  // per-cycle latch reads it: a spread that silently widened it onto every
+  // status would be a latch armed by the wrong outcome.
+  if (outcome.status === 'rejected') {
+    return {
+      status: 'rejected',
+      prNumber: action.prNumber,
+      head: outcome.head,
+      ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+      ...(outcome.repositoryRefusal === true ? { repositoryRefusal: true as const } : {}),
+    };
   }
   return {
     status: outcome.status,

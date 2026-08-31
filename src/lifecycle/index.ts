@@ -34,6 +34,7 @@ export * from './review-session-production.js';
 export * from './enqueue-executor.js';
 export * from './enqueue-executor-production.js';
 export * from './enqueue-record.js';
+export * from './enqueue-hold.js';
 export * from './child-issues.js';
 export * from './child-issues-production.js';
 export * from './integration-ladder.js';

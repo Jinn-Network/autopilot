@@ -13,6 +13,7 @@ const OPEN_HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const MERGED_HEAD = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const REVIEW_CLAIM_GLOB = 'refs/jinn-autopilot/review-claims/v1/*';
 const CI_RERUN_REF_GLOB = 'refs/jinn-autopilot/ci-reruns/v1/pr-*';
+const ENQUEUE_HOLD_GLOB = 'refs/jinn-autopilot/enqueue-holds/v1/*';
 const AUTOPILOT_BRANCH_GLOB = 'refs/heads/autopilot/*';
 
 /**
@@ -2136,6 +2137,7 @@ describe('GhLifecycleReader', () => {
         gitCalls.push(rest);
         if (rest[0] === 'ls-remote' && rest[2] === REVIEW_CLAIM_GLOB) return `${oid}\t${ref}\n`;
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
+        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_HOLD_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') return ''; // object already present locally
         if (rest[0] === 'cat-file' && rest[1] === '-p') return payload;
         throw new Error(`unexpected git call: ${rest.join(' ')}`);
@@ -2164,6 +2166,7 @@ describe('GhLifecycleReader', () => {
           return `${currentOid}\t${ref}\n`;
         }
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
+        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_HOLD_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') {
           if (localObjects.has(rest[2] ?? '')) return '';
           throw new Error('object not found locally');
@@ -2229,6 +2232,7 @@ describe('GhLifecycleReader', () => {
           return `${oid101}\t${ref101}\n${oid102}\t${ref102}\n`;
         }
         if (rest[0] === 'ls-remote' && rest[2] === CI_RERUN_REF_GLOB) return '';
+        if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_HOLD_GLOB) return '';
         if (rest[0] === 'cat-file' && rest[1] === '-e') {
           if (localObjects.has(rest[2] ?? '')) return '';
           throw new Error('object not found locally');
@@ -2274,6 +2278,86 @@ describe('GhLifecycleReader', () => {
 
       await expect(new GhLifecycleReader(run).readPullRequests(null))
         .rejects.toThrow(/Malformed git ls-remote output/);
+    });
+
+    /**
+     * The enqueue-hold namespace is read the same way and for the same reason
+     * as the ci-rerun one: one `ls-remote` per page serves every pull request
+     * on it. The stamp is keyed by `<number>/<head>`, so a hold left behind at
+     * a head that has since been replaced stamps nothing — which is the whole
+     * release mechanism, restated at the reader.
+     */
+    describe('enqueue hold stamps', () => {
+      function holdRun(listing: string, onListing?: (args: string[]) => void): CommandRunner {
+        return async (command, args) => {
+          if (command !== 'git') {
+            return openPrPage(graphQlPr({ number: 84, state: 'OPEN', head: OPEN_HEAD }));
+          }
+          const rest = args.slice(2);
+          if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_HOLD_GLOB) {
+            onListing?.(rest);
+            return listing;
+          }
+          return '';
+        };
+      }
+
+      it('stamps a hold recorded at the current head', async () => {
+        const ref = `refs/jinn-autopilot/enqueue-holds/v1/flake/pr-84/${OPEN_HEAD}`;
+
+        const page = await new GhLifecycleReader(holdRun(`${'d'.repeat(40)}\t${ref}\n`))
+          .readPullRequests(null);
+
+        expect(page.nodes[0]?.enqueueHold).toBe('flake');
+      });
+
+      it('stamps the rejected class distinctly from the flake class', async () => {
+        const ref = `refs/jinn-autopilot/enqueue-holds/v1/rejected/pr-84/${OPEN_HEAD}`;
+
+        const page = await new GhLifecycleReader(holdRun(`${'d'.repeat(40)}\t${ref}\n`))
+          .readPullRequests(null);
+
+        expect(page.nodes[0]?.enqueueHold).toBe('rejected');
+      });
+
+      it('stamps nothing for a hold recorded at some other head', async () => {
+        const ref = `refs/jinn-autopilot/enqueue-holds/v1/flake/pr-84/${MERGED_HEAD}`;
+
+        const page = await new GhLifecycleReader(holdRun(`${'d'.repeat(40)}\t${ref}\n`))
+          .readPullRequests(null);
+
+        expect(page.nodes[0]?.enqueueHold).toBeUndefined();
+      });
+
+      it('stamps nothing for a foreign ref under the namespace', async () => {
+        const ref = `refs/jinn-autopilot/enqueue-holds/v1/stuck/pr-84/${OPEN_HEAD}`;
+
+        const page = await new GhLifecycleReader(holdRun(`${'d'.repeat(40)}\t${ref}\n`))
+          .readPullRequests(null);
+
+        expect(page.nodes[0]?.enqueueHold).toBeUndefined();
+      });
+
+      it('lists the hold namespace exactly once per page read', async () => {
+        const listings: string[][] = [];
+        const run: CommandRunner = async (command, args) => {
+          if (command !== 'git') {
+            return openPrPage(
+              graphQlPr({ number: 101, state: 'OPEN', head: '1'.repeat(40), headRefName: 'feature/101' }),
+              graphQlPr({ number: 102, state: 'OPEN', head: '2'.repeat(40), headRefName: 'feature/102' }),
+              graphQlPr({ number: 103, state: 'OPEN', head: '3'.repeat(40), headRefName: 'feature/103' }),
+            );
+          }
+          const rest = args.slice(2);
+          if (rest[0] === 'ls-remote' && rest[2] === ENQUEUE_HOLD_GLOB) listings.push(rest);
+          return '';
+        };
+
+        const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+        expect(page.nodes).toHaveLength(3);
+        expect(listings).toHaveLength(1);
+      });
     });
 
     it('performs exactly one review-claim ls-remote listing for a snapshot with several PRs', async () => {

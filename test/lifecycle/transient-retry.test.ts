@@ -395,9 +395,14 @@ describe('argv derived from production call sites', () => {
 
     await reader.readReviewClaimRefs();
     await reader.readBranchHeadForReconciliation('autopilot/84');
+    // The enqueue-hold namespace listing is the third `ls-remote` the reader
+    // emits per snapshot. It is a glob operand rather than a fully-qualified
+    // ref, so its admission is worth proving from the real call site rather
+    // than assumed from the two above.
+    await reader.listEnqueueHoldHeads();
 
     const observed = recording.admitted();
-    expect(observed).toHaveLength(2);
+    expect(observed).toHaveLength(3);
     expect(observed.filter(([, verdict]) => verdict !== 'retryable')).toEqual([]);
   });
 });

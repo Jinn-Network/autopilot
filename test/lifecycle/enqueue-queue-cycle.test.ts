@@ -8,6 +8,10 @@ import {
   encodeEnqueueRecord,
   enqueueRef,
 } from '../../src/lifecycle/enqueue-record.js';
+import {
+  enqueueHoldRef,
+  type EnqueueHoldKind,
+} from '../../src/lifecycle/enqueue-hold.js';
 import { phaseStatus } from '../../src/lifecycle/projection.js';
 import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
 import { deriveMergeState } from '../../src/lifecycle/snapshot.js';
@@ -22,6 +26,7 @@ import { gitOid, gitRefName, isoTimestamp } from '../../src/lifecycle/types.js';
 import type { CompareStatus, GitOid } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
+const NEW_HEAD = gitOid('4'.repeat(40));
 const FORK_POINT = gitOid('3'.repeat(40));
 const NOW = new Date('2026-07-20T12:00:00.000Z');
 const SLUG = 'Jinn-Network/mono';
@@ -125,7 +130,17 @@ interface Fixture {
   readonly openChildKinds?: readonly ChildKind[];
 }
 
-function snapshotFor(fixture: Fixture = {}): GitHubLifecycleSnapshot {
+/**
+ * `holdAtHead` stands in for the reader's `listEnqueueHoldHeads` stamp, and is
+ * resolved against the SAME remote ref map the executor pushes hold refs into.
+ * That keeps the two halves of the mechanism honest in one fixture: a hold this
+ * cycle writes is a hold the next cycle's snapshot carries, and a hold recorded
+ * at a head that has since been replaced stamps nothing.
+ */
+function snapshotFor(
+  fixture: Fixture = {},
+  holdAtHead: (head: GitOid) => EnqueueHoldKind | undefined = () => undefined,
+): GitHubLifecycleSnapshot {
   const head = fixture.head ?? HEAD;
   const state = fixture.state ?? 'OPEN';
   const baseRefName = fixture.baseRefName ?? DEFAULT_BRANCH;
@@ -231,6 +246,7 @@ function snapshotFor(fixture: Fixture = {}): GitHubLifecycleSnapshot {
         approved: true,
         mergeState,
         checks,
+        ...(holdAtHead(head) === undefined ? {} : { enqueueHold: holdAtHead(head) }),
         ...(fixture.mergeQueue?.enqueued === true ? { inMergeQueue: true } : {}),
         ...(fixture.openChildKinds === undefined
           ? {}
@@ -267,15 +283,36 @@ interface HarnessOptions {
   readonly seedRecord?: { readonly attempts: number; readonly linkedIssue?: number };
   /** Answer of the pre-mutation GraphQL authority read. */
   readonly authorityInMergeQueue?: boolean;
+  /** Seeds a durable enqueue hold on the remote, as an earlier cycle would. */
+  readonly seedHold?: { readonly kind: EnqueueHoldKind; readonly head?: GitOid };
 }
 
 function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
   let current = fixture;
-  let snapshot = snapshotFor(current);
   const head = fixture.head ?? HEAD;
   const baseRefName = fixture.baseRefName ?? DEFAULT_BRANCH;
   const remoteRefs = new Map<string, string>();
   const objects = new Map<string, string>();
+  const holdAtHead = (candidate: GitOid): EnqueueHoldKind | undefined => (
+    (['flake', 'rejected'] as const).find(
+      (kind) => remoteRefs.has(enqueueHoldRef(kind, 84, candidate)),
+    )
+  );
+  if (options.seedHold !== undefined) {
+    const message = 'Autopilot enqueue hold';
+    const oid = oidFor(message);
+    objects.set(oid, message);
+    remoteRefs.set(
+      enqueueHoldRef(options.seedHold.kind, 84, options.seedHold.head ?? head),
+      oid,
+    );
+  }
+  let snapshot = snapshotFor(current, holdAtHead);
+  // The head GitHub itself would report. Tracks `advance`, so a fixture that
+  // pushes a new commit is answered as a new commit by every read the executor
+  // takes — otherwise the enqueue would refuse on a changed head rather than
+  // proving the hold released.
+  let liveHead = head;
   if (options.seedRecord !== undefined) {
     const message = encodeEnqueueRecord({
       prNumber: 84,
@@ -300,7 +337,7 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
     if (endpoint === `repos/${SLUG}/pulls/84`) {
       return JSON.stringify({
         changed_files: 1,
-        head: { sha: head },
+        head: { sha: liveHead },
         base: { ref: baseRefName, sha: FORK_POINT },
       });
     }
@@ -328,7 +365,7 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
             repository: {
               pullRequest: {
                 state: current.state ?? 'OPEN',
-                headRefOid: head,
+                headRefOid: liveHead,
                 baseRefName,
                 isInMergeQueue: options.authorityInMergeQueue
                   ?? current.mergeQueue?.enqueued
@@ -434,7 +471,7 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
     reserveReviewCohort: async () => {},
     readPullRequestByNumber: async () => null,
     readProjectItemForReconciliation: async () => null,
-    readBranchHeadByName: async () => head,
+    readBranchHeadByName: async () => liveHead,
     readBranchClaimByName: async () => null,
     readIssueByNumber: async () => null,
     readBlockedByIssueNumbers: async () => [],
@@ -482,9 +519,10 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
   return {
     get snapshot() { return snapshot; },
     /** Advance to the next cycle's snapshot, as a fresh read would produce it. */
-    advance(next: Fixture) {
+    advance(next: Fixture = {}) {
       current = { ...current, ...next };
-      snapshot = snapshotFor(current);
+      liveHead = current.head ?? HEAD;
+      snapshot = snapshotFor(current, holdAtHead);
     },
     remoteRefs,
     objects,
@@ -647,6 +685,83 @@ describe('enqueue queue cycle', () => {
     // noise, and an unbounded supply of it.
     expect(exhausted.childIssueCreates).toEqual([]);
     expect(recordAt(exhausted)).toContain('attempts=3');
+  });
+
+  /**
+   * The cost the hold exists to remove. Today a terminal hold is re-derived
+   * every cycle: two full `readCandidate` passes (each a targeted GraphQL read
+   * plus `pulls/84`, `pulls/84/files`, the CODEOWNERS blob and a compare), a
+   * third snapshot read, and the attempt-ledger read LAST — after everything
+   * else has already been spent. A stamped hold makes the whole of that zero.
+   */
+  it('pays nothing for a head on a terminal flake hold', async () => {
+    const held = harness({ mergeQueue: { enqueued: false } }, {
+      seedHold: { kind: 'flake' },
+    });
+
+    const report = await held.run();
+
+    expect(report.items[0]).toMatchObject({ phase: 'merge-ready', enqueueHold: 'flake' });
+    expect(held.executed).toEqual([]);
+    expect(held.enqueueMutations).toEqual([]);
+    expect(held.commands.filter((call) => call.join(' ').includes('pulls/84'))).toEqual([]);
+    expect(held.commands.filter((call) => call.join(' ').includes('CODEOWNERS'))).toEqual([]);
+    expect(held.commands.filter((call) => call.join(' ').includes('compare/'))).toEqual([]);
+  });
+
+  it('pays nothing for a head on a durable rejected hold either', async () => {
+    const held = harness({ mergeQueue: { enqueued: false } }, {
+      seedHold: { kind: 'rejected' },
+    });
+
+    await held.run();
+
+    expect(held.executed).toEqual([]);
+    expect(held.commands.filter((call) => call.join(' ').includes('pulls/84'))).toEqual([]);
+  });
+
+  /**
+   * The invariant, end to end: the hold ref is never stickier than the decision
+   * it caches. The hold names a head, so a push mints a head the hold does not
+   * name and the enqueue runs again — no expiry, no sweeper, no release path to
+   * get wrong.
+   */
+  it('releases the hold when a new head is pushed', async () => {
+    const released = harness({ mergeQueue: { enqueued: false } }, {
+      seedHold: { kind: 'flake' },
+    });
+
+    await released.run();
+    expect(released.enqueueMutations).toEqual([]);
+
+    released.advance({ head: NEW_HEAD });
+    const report = await released.run();
+
+    expect(report.items[0]).toMatchObject({ phase: 'merge-ready' });
+    expect(report.items[0]).not.toHaveProperty('enqueueHold');
+    expect(released.enqueueMutations).toEqual([`expectedHeadOid=${NEW_HEAD}`]);
+  });
+
+  /**
+   * The write and the read, in one run. The sanctioned retry ejects, the hold
+   * becomes terminal, and the ref this cycle publishes is what the NEXT cycle's
+   * snapshot reads to skip the candidate entirely.
+   */
+  it('writes the hold when the sanctioned retry also ejects, and pays nothing next cycle', async () => {
+    const exhausted = harness({ mergeQueue: { enqueued: false } }, {
+      seedRecord: { attempts: 3, linkedIssue: 9001 },
+    });
+
+    await exhausted.run();
+    expect(exhausted.executed[0]!.result).toMatchObject({ outcome: 'flake-hold' });
+    expect(exhausted.remoteRefs.has(enqueueHoldRef('flake', 84, HEAD))).toBe(true);
+
+    const before = exhausted.commands.length;
+    exhausted.advance();
+    await exhausted.run();
+
+    expect(exhausted.executed).toHaveLength(1);
+    expect(exhausted.commands.slice(before)).toEqual([]);
   });
 
   it('derives blocked-by-child while the ci-failure child is open', async () => {
