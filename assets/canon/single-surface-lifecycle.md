@@ -176,15 +176,34 @@ follow-ups in the same session command:
   corruption, and it is reported as its own reason rather than as a parent-PR
   block). The hold applies to eligibility only; it never sets a hold label,
   files a dependency, or moves the board.
-  A parent that is MERGED, or absent from the snapshot (which carries only
-  OPEN and MERGED PRs, so closed-unmerged and pruned-merged parents are
-  indistinguishable), does not gate: the follow-up returns to ordinary
-  eligibility rather than stalling forever.
+  The hold has a second positive state. A parent that was **closed unmerged**
+  never delivered its code anywhere, so releasing its follow-up sends an
+  implementation session against a base that never received the parent's work.
+  Such a parent is nonetheless absent from the PR nodes, indistinguishable
+  there from "merged and pruned" and from "never existed" — so the evidence is
+  taken from where it survives: the `closedByPullRequestsReferences` connection
+  of the board issues, the exact inverse of `closingIssuesReferences`, already
+  read for every non-Done issue on the merged-outcome path. A follow-up is not
+  ELIGIBLE while the PR named by its `pr=` appears as a CLOSED node on that
+  connection for an **unresolved** issue. Because the connection is queried
+  only for non-Done issues, the exit is structural: the parent leaves the set
+  as soon as every issue evidencing it reaches Done — no timeout, no persisted
+  state, no second lookup, and no test of who authored the PR (humans author
+  marker-named `autopilot/*` PRs too). The evidence is positive proof of
+  membership, never an inference from absence, and a cycle that cannot produce
+  it (an incremental read, which performs no merged-outcome read) releases
+  exactly as it did before the state existed.
+  A parent that is MERGED, or genuinely absent — not OPEN, and named by no
+  unresolved issue's connection — does not gate: the follow-up returns to
+  ordinary eligibility rather than stalling forever. Blocking on absence alone
+  was measured against live history at an 87% permanent-strand rate, which is
+  why the boundary is drawn at positive evidence.
   The hold has no timeout, escalation, or human door of its own; it is bounded
   by the parent's own lifecycle instead. The parent leaves OPEN by merging or
-  by being closed, and either outcome releases the follow-up on the next
-  cycle — merged parents are pruned once their issues reach Done, and closed
-  parents are dropped by the reader. If a parent is never terminal — a human
+  by being closed; merging releases the follow-up on the next cycle (merged
+  parents are pruned once their issues reach Done), and closing releases it
+  once the issues that parent evidenced are resolved. If a parent is never
+  terminal — a human
   parks it under the §6.3 overlay, whose exit is explicit human action only,
   and no engine path closes a PR — the follow-up stalls for exactly as long as
   the parent does. That stall is silent apart from the eligibility explainer,

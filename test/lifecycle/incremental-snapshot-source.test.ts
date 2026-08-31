@@ -217,6 +217,7 @@ class FakeLifecycleReader implements GitHubLifecycleReader {
   quotaRemaining = 3_999;
   quotaProbeCalls = 0;
   closingPullRequestNumbers = new Map<number, readonly number[]>();
+  closedUnmergedParentPrs: readonly number[] = [];
   closingRelationCalls: number[][] = [];
   branchClaims: RawBranchClaim[] = [];
   quotaResponses: number[] = [];
@@ -248,6 +249,9 @@ class FakeLifecycleReader implements GitHubLifecycleReader {
   readPullRequests = async () => ({
     nodes: this.fullPrs,
     pageInfo: { hasNextPage: false, endCursor: null },
+    ...(this.closedUnmergedParentPrs.length === 0
+      ? {}
+      : { closedUnmergedParentPrs: this.closedUnmergedParentPrs }),
   });
 
   readBranchClaims = async () => {
@@ -982,6 +986,73 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     expect(probes).toEqual([101]);
     expect(reader.branchReads).toBe(2);
     expect(reader.reviewRefReads).toBe(1);
+  });
+
+  // Issue #62. The closed-unmerged parent evidence is produced by the full
+  // oracle's merged-outcome read, which the incremental path deliberately does
+  // not perform. Two things are pinned here. The full read must carry the
+  // evidence through its own re-compositions (terminal-claim backfill, parity
+  // annotation) or the hold would exist only inside `buildGitHubLifecycleSnapshot`
+  // and be dropped before anything consumed it. And the incremental cycle,
+  // which has no such evidence, must derive exactly what it derived before the
+  // gate existed: release. Absence of evidence never blocks — a stale set could
+  // otherwise hold a follow-up whose parent's issue had already reached Done.
+  it('holds a closed-unmerged parent through the full oracle and fails open on incremental reuse', async () => {
+    const { source, reader, rest, setNow } = harness();
+    const marker = `<!-- jinn-autopilot:review-follow-up pr=909 head=${HEAD_A} index=0 -->`;
+    const boardItems = [
+      ...project().items,
+      {
+        id: 'PVTI_50',
+        number: 50,
+        contentType: 'Issue' as const,
+        status: 'Todo' as const,
+        priority: 'P1' as const,
+        effort: 'Medium' as const,
+        blockedOn: 'Nothing' as const,
+        issueType: 'feat' as const,
+        blockedByIssues: [],
+        sprintIterationId: 'sprint',
+      },
+    ];
+    const board = { ...project(), items: boardItems };
+    reader.project = board;
+    rest.project = board;
+    reader.closedUnmergedParentPrs = [909];
+    reader.issues = [issue(), {
+      ...issue('Todo'),
+      number: 50,
+      title: 'Follow-up from review',
+      projectItemId: 'PVTI_50',
+      body: `${marker}\n\nFollow-up from PR #909 review.`,
+    }];
+    rest.issues = [issueIndex(), {
+      number: 50,
+      title: 'Follow-up from review',
+      body: `${marker}\n\nFollow-up from PR #909 review.`,
+      updatedAt: '2026-07-22T09:00:00.000Z',
+      author: 'oaksprout',
+      labels: [],
+    }];
+
+    const full = await source.read({ mode: 'full', rateLimitFloor: 500 });
+
+    expect(full.closedUnmergedParentPrs).toEqual([909]);
+    expect(full.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+      eligibilityDetail:
+        'Review follow-up is blocked by closed-unmerged parent PR #909 until its issue resolves',
+    });
+
+    setNow('2026-07-22T10:10:00.000Z');
+    const incremental = await source.read({ mode: 'incremental', rateLimitFloor: 500 });
+
+    expect(incremental.closedUnmergedParentPrs).toBeUndefined();
+    expect(incremental.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
   });
 
   it('backfills an unresolved retained branch from one exact merged PR and carries it across incremental restart', async () => {

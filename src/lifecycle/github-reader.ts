@@ -1628,12 +1628,24 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   ): Promise<{
     readonly nodes: readonly RawPullRequest[];
     readonly closingIssueEvidenceIncomplete: boolean;
+    readonly closedUnmergedParentPrs: readonly number[];
   }> {
     const unique = [...new Set(nonDoneIssueNumbers)].sort((left, right) => left - right);
     for (const number of unique) {
       if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Invalid issue number');
     }
     const merged: RawPullRequest[] = [];
+    // Issue #62. A closed-unmerged PR is not an active lifecycle item and never
+    // becomes one, so it stays out of `merged` — but discarding its *number*
+    // collapsed "closed unmerged", "merged and pruned" and "never existed" into
+    // one indistinguishable absence, and the review-follow-up hold fails open on
+    // absence. This connection is the exact inverse of `closingIssuesReferences`,
+    // survives close-unmerged, and is already read for every non-Done board
+    // issue — so the numbers are collected here at zero additional API cost.
+    // Because the query covers only non-Done issues, a parent leaves this set
+    // as soon as every issue it evidences reaches Done: the query *is* the
+    // resolution predicate, and needs no separate lookup or persisted state.
+    const closedUnmergedParentPrs = new Set<number>();
     let closingIssueEvidenceIncomplete = false;
     for (let offset = 0; offset < unique.length; offset += MERGED_ISSUE_BATCH_SIZE) {
       const batch = unique.slice(offset, offset + MERGED_ISSUE_BATCH_SIZE);
@@ -1670,7 +1682,10 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
             );
             continue;
           }
-          if (pr.state === 'CLOSED') continue;
+          if (pr.state === 'CLOSED') {
+            closedUnmergedParentPrs.add(pr.number);
+            continue;
+          }
           // A single merged PR's evidence (truncated pagination, or a head
           // commit that no longer matches headRefOid — e.g. a garbage-collected
           // branch, see PR #1710) must not abort the whole snapshot. Skip just
@@ -1689,7 +1704,11 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
         }
       }
     }
-    return { nodes: merged, closingIssueEvidenceIncomplete };
+    return {
+      nodes: merged,
+      closingIssueEvidenceIncomplete,
+      closedUnmergedParentPrs: [...closedUnmergedParentPrs].sort((left, right) => left - right),
+    };
   }
 
   private async readPullRequestByNumber(prNumber: number): Promise<GraphQlPr> {
@@ -1836,7 +1855,11 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     }));
     const mergedOutcomes = cursor === null
       ? await this.readMergedOutcomes(nonDoneIssueNumbers, reviewClaimListing)
-      : { nodes: [], closingIssueEvidenceIncomplete: false };
+      : {
+          nodes: [],
+          closingIssueEvidenceIncomplete: false,
+          closedUnmergedParentPrs: [] as readonly number[],
+        };
     const byNumber = new Map<number, RawPullRequest>();
     for (const pr of [...openNodes, ...mergedOutcomes.nodes]) {
       if (!byNumber.has(pr.number)) byNumber.set(pr.number, pr);
@@ -1847,6 +1870,9 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       ...(mergedOutcomes.closingIssueEvidenceIncomplete
         ? { closingIssueEvidenceIncomplete: true as const }
         : {}),
+      ...(mergedOutcomes.closedUnmergedParentPrs.length === 0
+        ? {}
+        : { closedUnmergedParentPrs: mergedOutcomes.closedUnmergedParentPrs }),
     };
   }
 

@@ -296,6 +296,14 @@ function composeTargeted(
     pullRequests: evidence.pullRequests ?? cycle.pullRequests,
     branches: cycle.branches,
     terminalClaims: cycle.terminalClaims,
+    // Carried like `branches`/`terminalClaims`: this refines one cycle's
+    // snapshot with fresher targeted evidence, so dropping the cycle's
+    // closed-unmerged parents would let a targeted re-derivation release a
+    // review follow-up the same cycle held (canon §5.1). A cycle that never
+    // produced the evidence still carries none, and still releases.
+    ...(cycle.closedUnmergedParentPrs === undefined
+      ? {}
+      : { closedUnmergedParentPrs: cycle.closedUnmergedParentPrs }),
   }, {
     authorAllowlist,
     machineAuthorLogins,
