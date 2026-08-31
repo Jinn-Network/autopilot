@@ -13,6 +13,11 @@ import type {
 } from './enqueue-executor.js';
 import { emptyTreeOid } from './ci-rerun.js';
 import {
+  encodeEnqueueHoldRecord,
+  enqueueHoldRef,
+  type EnqueueHoldKind,
+} from './enqueue-hold.js';
+import {
   decideReEnqueue,
   decodeEnqueueRecord,
   encodeEnqueueRecord,
@@ -177,6 +182,54 @@ export function classifyEnqueueFailure(text: string): EnqueueFailureClass {
   return 'undetermined';
 }
 
+/**
+ * How WIDE a `rejected` failure is durable for. Read only after
+ * {@link classifyEnqueueFailure} has already said `rejected`; it answers a
+ * different question — not "will a retry help" (it will not) but "what is this
+ * refusal a property OF".
+ *
+ * `pull-request` is durable for this pull request at this head and nothing
+ * else: GraphQL cannot resolve the node id, or the REST layer answered 404. A
+ * new head is a different mutation, so the refusal may safely be cached against
+ * the head — which is exactly what the hold-ref namespace does.
+ *
+ * `repository` is durable for every pull request in the repository at once: the
+ * merge queue is not enabled, or the credential cannot use it. Writing a
+ * per-head hold for that would be both wasteful (one ref per PR for a fact that
+ * is not about any of them) and wrong (no push to any branch releases it), so
+ * this class writes no ref and instead latches the *cycle* — see
+ * `repositoryRefusal` on the outcome.
+ *
+ * `unscoped` is everything else, INCLUDING `not mergeable` / `merge conflict`.
+ * That is deliberate, and it is the fail-safe: a conflicting head heals when the
+ * BASE moves, with no new commit on the PR, so a head-keyed hold would strand it
+ * until someone pushed a commit they did not need. Anything unrecognised lands
+ * here too, so an unfamiliar refusal costs one more expensive cycle rather than
+ * a wrong hold.
+ *
+ * Ordering is load-bearing in the same way `classifyEnqueueFailure`'s is: the
+ * `pull-request` probes run first, because `Could not resolve to a …` and HTTP
+ * 404 are the two shapes a repository-wide permission problem can also produce
+ * when the credential cannot see the repository at all — and reading one of
+ * those as repository-wide would latch the whole cycle off one unresolvable id.
+ */
+export type DurableRejectionScope = 'repository' | 'pull-request' | 'unscoped';
+
+export function classifyDurableRejection(text: string): DurableRejectionScope {
+  if (/could\s+not\s+resolve\s+to\s+a\s+\w+/i.test(text)
+    || /HTTP 404/i.test(text)) {
+    return 'pull-request';
+  }
+  if (/merge\s+queue\s+is\s+not\s+enabled|queue\s+is\s+not\s+enabled|no\s+merge\s+queue/i
+    .test(text)
+    || /HTTP 40[13]/i.test(text)
+    || /bad credentials|requires authentication|not authorized|unauthorized/i.test(text)
+    || /resource not accessible|must have|permission|protected branch|forbidden/i.test(text)) {
+    return 'repository';
+  }
+  return 'unscoped';
+}
+
 export type ProductionEnqueueActionPort = Pick<
 EnqueueExecutorDeps,
 'readCandidate' | 'enqueueAtHead' | 'fileReconcileChild'
@@ -286,6 +339,49 @@ async function publishEnqueueRecord(
     const observed = await remoteRefOid(transport, ref).catch(() => null);
     return observed === published ? 'already-applied' : 'lost';
   }
+}
+
+/**
+ * Publish a head-keyed enqueue hold, so a later cycle can drop this pull
+ * request's enqueue candidate before it pays for the merge-readiness derivation
+ * again (~2 GraphQL + 8-10 REST reads, of which the attempt-ledger read is the
+ * LAST — everything else has already been spent by the time the hold would be
+ * consulted at the executor).
+ *
+ * Best-effort, and every caller swallows its failure. That asymmetry is the
+ * design: a hold that fails to publish costs one more expensive cycle, while a
+ * hold that could alter an outcome would be a wrong decision. Nothing here may
+ * ever do the second.
+ *
+ * The lease names the ref as ABSENT rather than reading it first. A hold this
+ * code is about to write is a hold the reader did not see this cycle, so the
+ * ref is expected to be absent; if it is not, the hold already stands and this
+ * push is redundant, which is exactly the case the lease refuses. Reading the
+ * ref first would spend a network round trip to learn nothing that changes the
+ * decision.
+ *
+ * The commit message is forensics: see `enqueue-hold.ts`, nothing decodes it.
+ */
+async function publishEnqueueHold(
+  transport: RecordTransport,
+  kind: EnqueueHoldKind,
+  prNumber: number,
+  head: GitOid,
+  reason: string,
+): Promise<void> {
+  const ref = enqueueHoldRef(kind, prNumber, head);
+  const published = gitOid((await transport.run('git', [
+    ...gitPublicationArgs(transport.askpass, []),
+    '-C', transport.repositoryPath,
+    'commit-tree', emptyTreeOid(),
+    '-m', encodeEnqueueHoldRecord(reason, new Date().toISOString()),
+  ], { env: transport.environment })).trim());
+  await transport.run('git', [
+    ...gitPublicationArgs(transport.askpass, []),
+    '-C', transport.repositoryPath,
+    'push', `--force-with-lease=${ref}:`,
+    transport.repositoryUrl, `${published}:${ref}`,
+  ], { env: transport.environment });
 }
 
 function effectiveCurrentHeadReviews(
@@ -646,12 +742,19 @@ export function makeProductionEnqueueActionPort(
           // touched, so the hold simply stands and points at the issue that
           // already exists.
           if (existing.linkedIssue !== undefined) {
-            return {
-              status: 'flake-hold',
-              head,
-              reason: `Enqueue held after ${existing.attempts} attempts at this head;`
-                + ` see #${existing.linkedIssue}`,
-            };
+            const reason = `Enqueue held after ${existing.attempts} attempts at this head;`
+              + ` see #${existing.linkedIssue}`;
+            // Terminal for this head, and re-derived from a full candidate read
+            // every cycle until someone pushes a commit. Cache it against the
+            // head so the next cycle never gets as far as this ledger read.
+            //
+            // Only THIS arm publishes. The arm below still has its sanctioned
+            // retry — a human closing the linked child buys one more enqueue —
+            // and a hold ref would suppress the candidate and take that exit
+            // away.
+            await publishEnqueueHold(transport, 'flake', prNumber, head, reason)
+              .catch(() => {});
+            return { status: 'flake-hold', head, reason };
           }
           // Two failed attempts at one head is a signal. Stop feeding the
           // queue, file the child that explains it, and write the child's
@@ -732,7 +835,23 @@ export function makeProductionEnqueueActionPort(
             : { status: 'ambiguous', head, reason: failureText };
         }
         if (failure === 'rejected') {
-          return { status: 'rejected', head, reason: failureText };
+          // Durable, but not always durable for the same thing. A refusal that
+          // belongs to this pull request at this head is cached against the
+          // head; a repository-wide one is reported to the caller, which
+          // latches the rest of the cycle instead of minting one dead ref per
+          // pull request. Everything else earns nothing — see
+          // `classifyDurableRejection`.
+          const scope = classifyDurableRejection(failureText);
+          if (scope === 'pull-request' && transport !== null) {
+            await publishEnqueueHold(transport, 'rejected', prNumber, head, failureText)
+              .catch(() => {});
+          }
+          return {
+            status: 'rejected',
+            head,
+            reason: failureText,
+            ...(scope === 'repository' ? { repositoryRefusal: true as const } : {}),
+          };
         }
         if (failure === 'undetermined') {
           // A dropped connection is not proof the mutation did not land. Only

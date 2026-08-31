@@ -256,6 +256,77 @@ describe('active runtime boundary', () => {
     expect(received).toEqual([action]);
   });
 
+  /**
+   * The latch that stops a cycle's remaining enqueues lives in the controller,
+   * so the executor's `repositoryRefusal` has to survive the collapse from an
+   * `ActiveRuntimeResult` to the controller's `{outcome, reason}` pair. Nothing
+   * else in that collapse carries a boolean, which is exactly why it is worth
+   * pinning: a spread that dropped it would disarm the latch silently, and the
+   * only symptom would be a cycle that costs eight times what it should.
+   */
+  it('carries a repository refusal through to the controller result', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({
+          status: 'rejected',
+          reason: 'GraphQL: Merge queue is not enabled for this branch',
+          repositoryRefusal: true,
+        }),
+      },
+    });
+    const action = {
+      kind: 'enqueue' as const,
+      issueNumber: 42,
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+    };
+
+    await expect(runtime.executeAction(action, {} as never)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'GraphQL: Merge queue is not enabled for this branch',
+      repositoryRefusal: true,
+    });
+  });
+
+  it('does not invent a repository refusal for an ordinary rejection', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({
+          status: 'rejected',
+          reason: 'GraphQL: Pull request is not mergeable',
+        }),
+      },
+    });
+
+    await expect(runtime.executeAction({
+      kind: 'enqueue' as const,
+      issueNumber: 42,
+      prNumber: 84,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+    }, {} as never)).resolves.toEqual({
+      outcome: 'rejected',
+      reason: 'GraphQL: Pull request is not mergeable',
+    });
+  });
+
   // The handler is gone, and so is the action kind. An `update-branch` that
   // somehow reaches the runtime must fall through to the unwired arm rather
   // than quietly finding a handler that still knows how to move a PR head.

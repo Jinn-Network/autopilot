@@ -297,6 +297,19 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
   /** True when a CAS-fenced CI rerun record exists for this PR head. */
   readonly ciRerunRecorded?: boolean;
   /**
+   * A durable enqueue hold is recorded for this PR head: the terminal flake
+   * hold (`flake`), or a merge-queue refusal that is durable for this pull
+   * request (`rejected`). Head-keyed, so pushing a commit releases it.
+   *
+   * Distinct from `LifecycleStatusItem.enqueueHolds`, which names the
+   * *repository-wide kill switches* engaged this cycle. This one is a fact
+   * about this head, read from the remote.
+   *
+   * Absent is not proof there is no hold — only the full reader stamps it — so
+   * absence reproduces today's behaviour rather than asserting anything.
+   */
+  readonly enqueueHold?: 'flake' | 'rejected';
+  /**
    * The PR is sitting in GitHub's merge queue. Absent means *not proven
    * queued*, never "proven not queued": an unreadable membership must not
    * license a second enqueue, and a proven one must not be enqueued again.

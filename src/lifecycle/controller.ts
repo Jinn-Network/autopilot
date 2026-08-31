@@ -144,7 +144,18 @@ export interface LifecycleControllerDeps {
     executeAction(
       action: NewWorkAction,
       snapshot: GitHubLifecycleSnapshot,
-    ): Promise<{ readonly outcome: string; readonly reason?: string }>;
+    ): Promise<{
+      readonly outcome: string;
+      readonly reason?: string;
+      /**
+       * The enqueue was refused for a reason that belongs to the REPOSITORY —
+       * the merge queue is not enabled, or this credential cannot use it. Every
+       * remaining enqueue this cycle would pay the same full derivation to reach
+       * the identical refusal, so the pass stops issuing them until the next
+       * cycle re-probes.
+       */
+      readonly repositoryRefusal?: true;
+    }>;
     executeReviewActions?(
       actions: readonly Extract<NewWorkAction, { kind: 'claim-review' }>[],
       snapshot: GitHubLifecycleSnapshot,
@@ -180,6 +191,16 @@ export interface LifecycleStatusItem {
    * the explanation must never invent.
    */
   readonly enqueueHolds?: readonly EnqueueHold[];
+  /**
+   * A durable hold recorded on the remote for this pull request's exact head,
+   * which is why the enqueue was not even attempted this cycle.
+   *
+   * Per-item and singular, unlike `enqueueHolds` above: that names the
+   * repository-wide kill switches engaged this cycle and says nothing about any
+   * particular head. Both can be absent, both can be present, and they mean
+   * different things.
+   */
+  readonly enqueueHold?: 'flake' | 'rejected';
   readonly desiredActions: readonly ProjectionAction[];
 }
 
@@ -636,6 +657,7 @@ function statusItems(
               head: item.head,
               ...(item.inMergeQueue === true ? { inMergeQueue: true } : {}),
               ...(enqueueHolds.length === 0 ? {} : { enqueueHolds }),
+              ...(item.enqueueHold === undefined ? {} : { enqueueHold: item.enqueueHold }),
             }
           : {}),
         ...(claimGeneration === undefined ? {} : { claimGeneration }),
@@ -999,6 +1021,13 @@ function activeCandidates(
       // action; an unreadable membership falls through to an enqueue the
       // executor re-checks against GitHub before it mutates.
       if (item.inMergeQueue === true || pr.mergeQueue?.enqueued === true) continue;
+      // A durable hold recorded for this exact head. Re-deriving the decision
+      // costs ~2 GraphQL + 8-10 REST reads per cycle and cannot come out any
+      // differently until the head changes, so the candidate is dropped here —
+      // before a single call is made. Absence is not proof there is no hold
+      // (only the full reader stamps it), which is why absence keeps today's
+      // behaviour: derive, attempt, and let the executor re-check.
+      if (item.enqueueHold !== undefined) continue;
       other.push({
         phase: 'enqueue',
         issueNumber: item.issueNumber,
@@ -1303,6 +1332,11 @@ async function executeActivePass(
     outcome: result.outcome,
     ...(result.reason === undefined ? {} : { reason: logSafeReason(result.reason) }),
   });
+  // Latched by the first enqueue that proves the refusal is repository-wide,
+  // and reset by the cycle ending — never persisted. Re-enabling the merge
+  // queue therefore releases on the next cycle with no restart and no ref to
+  // clean up, which is exactly right for a fact that is not about any head.
+  let enqueueRepositoryRefused = false;
   for (let index = 0; index < scheduling.actions.length;) {
     const action = scheduling.actions[index]!;
     if (
@@ -1333,8 +1367,22 @@ async function executeActivePass(
       }
       continue;
     }
+    if (action.kind === 'enqueue' && enqueueRepositoryRefused) {
+      // Skipped BEFORE `executeAction`, so nothing is spent: no candidate
+      // derivation, no authority read, no mutation. The event still names its
+      // own subject, so the log says which pull requests went unattempted.
+      actionEvents.push(actionEvent(action, {
+        outcome: 'skipped',
+        reason: 'enqueue-repository-refused',
+      }));
+      index += 1;
+      continue;
+    }
     try {
       const result = await deps.active!.executeAction(action, snapshot);
+      if (action.kind === 'enqueue' && result.repositoryRefusal === true) {
+        enqueueRepositoryRefused = true;
+      }
       actionEvents.push(actionEvent(action, result));
     } catch (error) {
       actionEvents.push(actionEvent(action, {
@@ -1751,6 +1799,27 @@ function explanation(item: LifecycleStatusItem): string {
       if (item.inMergeQueue === true) {
         return `${identity} is in GitHub's merge queue; the queue builds and lands the merge, `
           + 'and Done arrives from a later cycle reading the merged fact.';
+      }
+      // Named before the kill switches, because it is the more specific answer:
+      // the switches would have withheld ANY enqueue, while this one head has a
+      // recorded refusal of its own. Both exits are stated, because a hold that
+      // names no way out reads as a dead end.
+      if (item.enqueueHold !== undefined) {
+        const cause = item.enqueueHold === 'flake'
+          ? 'the merge queue rejected or ejected this head until its attempts were spent'
+          : 'GitHub durably refused the enqueue mutation for this pull request at this head';
+        // Named honestly per class. A flake hold always has its explaining child
+        // — that is what makes it terminal — while a rejected hold has none, and
+        // claiming one would send an operator looking for an issue that does not
+        // exist.
+        const diagnosis = item.enqueueHold === 'flake'
+          ? 'The ci-failure child filed on this pull request carries the diagnosis.'
+          : 'No ci-failure child is filed for a rejected hold; the refusal text is on the '
+            + 'enqueue event in the cycle log.';
+        return `${identity} is ready to be enqueued into GitHub's merge queue, but a durable `
+          + `${item.enqueueHold} hold is recorded for this exact head, so no enqueue is `
+          + `attempted: ${cause}. The hold names a head, so pushing a new commit to the pull `
+          + `request releases it. ${diagnosis}`;
       }
       const holds = item.enqueueHolds ?? [];
       return holds.length === 0

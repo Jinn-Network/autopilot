@@ -3209,6 +3209,193 @@ describe('enqueue stage scheduling', () => {
     expect(explanation).not.toContain('ready to be enqueued');
   });
 
+  /**
+   * The whole point of the hold. A held head has already had this exact
+   * decision derived and refused, and the derivation is the expensive part:
+   * ~2 GraphQL + 8-10 REST reads per candidate, of which the attempt ledger —
+   * the only thing that could have stopped it — is read LAST. Suppressing at
+   * the candidate emission is what makes a held head cost nothing at all.
+   */
+  it.each(['flake', 'rejected'] as const)(
+    'schedules no enqueue for a head on a %s hold',
+    async (kind) => {
+      const harness = cycle(approved({ enqueueHold: kind }));
+      const report = await harness.run();
+
+      expect(report.items[0]).toMatchObject({ phase: 'merge-ready' });
+      expect(harness.actions).toEqual([]);
+    },
+  );
+
+  /**
+   * A held pull request that says nothing has simply stopped moving as far as
+   * an operator can see. The explanation names the hold class and BOTH exits,
+   * because the hold has exactly two: a new commit (which mints a new ref) and
+   * the linked ci-failure child on this pull request.
+   */
+  it.each(['flake', 'rejected'] as const)(
+    'explains a %s hold and names both exits',
+    async (kind) => {
+      const harness = cycle(approved({ enqueueHold: kind }));
+      const report = await harness.run();
+      const explanation = explainPullRequest(report, 101);
+
+      expect(explanation).toContain(kind);
+      expect(explanation).toContain('pushing a new commit');
+      expect(explanation).toContain('ci-failure');
+      expect(explanation).not.toContain('nothing is withholding');
+      // Honest per class: a flake hold always has its explaining child, a
+      // rejected hold has none, and naming one that does not exist sends an
+      // operator looking for an issue nobody filed.
+      expect(explanation.includes('No ci-failure child is filed'))
+        .toBe(kind === 'rejected');
+    },
+  );
+
+  it('reports the hold on the status item so an operator can filter for it', async () => {
+    const harness = cycle(approved({ enqueueHold: 'flake' }));
+    const report = await harness.run();
+
+    expect(report.items[0]).toMatchObject({ enqueueHold: 'flake' });
+  });
+
+  /**
+   * "The merge queue is not enabled" / "this credential cannot use it" is one
+   * fact about the repository, and every merge-ready pull request in the cycle
+   * would learn it the same expensive way: a full candidate derivation, a
+   * GraphQL authority read, and a mutation, each ending in the identical
+   * refusal. The first one that proves it latches the rest of the cycle.
+   *
+   * Per-cycle, deliberately. Re-enabling the queue must not need a restart, so
+   * the next cycle re-probes with a single enqueue.
+   */
+  describe('repository refusal latch', () => {
+    function approvedAt(prNumber: number, issueNumber: number) {
+      const base = approved();
+      return {
+        ...base,
+        prNumber,
+        issueNumber,
+        reviewClaim: { ...base.reviewClaim, prNumber },
+        branchClaim: { ...base.branchClaim, prNumber, issueNumber },
+      };
+    }
+
+    function threeMergeReady(execute: (action: unknown) => Promise<unknown>) {
+      const items = [
+        approvedAt(101, 42),
+        approvedAt(102, 43),
+        approvedAt(103, 44),
+      ];
+      const built = snapshot(items[0]!);
+      built.lifecycle = { items };
+      built.pullRequests = items.map((item) => ({
+        number: item.prNumber,
+        title: 'feat: lifecycle',
+        body: `Closes #${item.issueNumber}`,
+        author: 'trusted',
+        baseRefName: 'next',
+        headRefName: `autopilot/${item.issueNumber}`,
+        headOid: item.head,
+        headCommittedAt: item.headChangedAt,
+        isDraft: false,
+        state: 'OPEN',
+        labels: item.labels,
+        closingIssueNumbers: [item.issueNumber],
+        mergeability: 'MERGEABLE',
+        mergeStateStatus: 'CLEAN',
+        compareStatus: 'ahead',
+        checks: item.checks,
+        reviews: [],
+        branchClaim: item.branchClaim,
+      }));
+      const actions: unknown[] = [];
+      const noOpWriter = new Proxy({} as ReconciliationWriter, {
+        get() { return async () => null; },
+      });
+      return {
+        actions,
+        run: () => runLifecycleCycle('active', {
+          ...deps(items[0]!, [], noOpWriter),
+          readSnapshot: async () => built,
+          mergePolicy: 'safe-auto',
+          active: {
+            preflight: async () => ({ ok: true }),
+            readLocalState: () => ({
+              remaining: { implementation: 1, review: 1 },
+              availableLogins: ['implementation-bot'],
+              implementationPreferredLogin: 'implementation-bot',
+            }),
+            implementationBackpressureThreshold: 10,
+            executeAction: async (action: unknown) => {
+              actions.push(action);
+              return execute(action);
+            },
+          },
+        }),
+      };
+    }
+
+    it('schedules three enqueues and executes all of them when nothing refuses', async () => {
+      const harness = threeMergeReady(async () => ({ outcome: 'enqueued' }));
+      await harness.run();
+
+      expect(harness.actions).toHaveLength(3);
+    });
+
+    it('stops the cycle after the first repository-wide refusal', async () => {
+      const harness = threeMergeReady(async () => ({
+        outcome: 'rejected',
+        reason: 'GraphQL: Merge queue is not enabled for this branch',
+        repositoryRefusal: true,
+      }));
+      const report = await harness.run();
+
+      expect(harness.actions).toHaveLength(1);
+      const enqueueEvents = report.events.filter((event) => event.action === 'enqueue');
+      expect(enqueueEvents.map((event) => event.outcome))
+        .toEqual(['rejected', 'skipped', 'skipped']);
+      expect(enqueueEvents.slice(1).map((event) => event.reason))
+        .toEqual(['enqueue-repository-refused', 'enqueue-repository-refused']);
+      // The skipped events still name their own subject, so an operator reads
+      // which pull requests went unattempted rather than a count.
+      expect(enqueueEvents.map((event) => event.subject))
+        .toEqual(['issue:42/pr:101', 'issue:43/pr:102', 'issue:44/pr:103']);
+    });
+
+    /**
+     * A plain `rejected` is a fact about ONE pull request — a conflict, an
+     * unresolvable node id. Latching the cycle on it would strand every other
+     * merge-ready pull request behind an unrelated failure.
+     */
+    it('does not latch on a rejection that is not repository-wide', async () => {
+      const harness = threeMergeReady(async () => ({
+        outcome: 'rejected',
+        reason: 'GraphQL: Pull request is not mergeable',
+      }));
+      await harness.run();
+
+      expect(harness.actions).toHaveLength(3);
+    });
+
+    it('re-probes with one enqueue on the next cycle', async () => {
+      let cycles = 0;
+      const harness = threeMergeReady(async () => {
+        cycles += 1;
+        return {
+          outcome: 'rejected',
+          reason: 'GraphQL: Merge queue is not enabled for this branch',
+          repositoryRefusal: true,
+        };
+      });
+
+      await harness.run();
+      await harness.run();
+
+      expect(cycles).toBe(2);
+    });
+  });
+
   it('schedules no enqueue at all when JINN_AUTOPILOT_ENQUEUE is off', async () => {
     const previous = process.env.JINN_AUTOPILOT_ENQUEUE;
     process.env.JINN_AUTOPILOT_ENQUEUE = '0';

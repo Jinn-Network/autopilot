@@ -362,6 +362,12 @@ const pullRequestSchema = z.object({
     runAttempt: z.number().int().positive().optional(),
   }).strict()),
   ciRerunRecorded: z.literal(true).optional(),
+  // Additive-optional, and no `version` bump for the same reason the digest
+  // above needed none: a cache written before this field existed simply has no
+  // hold, and "no hold" is byte-for-byte today's behaviour — the enqueue is
+  // derived and attempted exactly as it was. There is no wrong value to
+  // discard, so discarding every cache would buy nothing.
+  enqueueHold: z.enum(['flake', 'rejected']).optional(),
   // Deprecated: no code threads this into a written cache entry any more
   // (the `listEnqueueRecordedHeads` reader and its GitHubReader/snapshot
   // threading were removed as dead plumbing -- review finding N2, nothing

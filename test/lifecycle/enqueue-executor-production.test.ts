@@ -3,6 +3,7 @@ import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  classifyDurableRejection,
   classifyEnqueueFailure,
   makeProductionEnqueueActionPort,
 } from '../../src/lifecycle/enqueue-executor-production.js';
@@ -21,6 +22,8 @@ import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff
 import {
   CANONICAL_GITHUB_HTTPS_REMOTE,
 } from '../../src/lifecycle/implementation-executor.js';
+import { enqueueHoldRef } from '../../src/lifecycle/enqueue-hold.js';
+import { enqueueRef } from '../../src/lifecycle/enqueue-record.js';
 
 /**
  * `PullRequest` fields GitHub serves only over GraphQL. `gh pr view --json`
@@ -1188,6 +1191,8 @@ describe('enqueue mutation', () => {
     readonly pushFails?: boolean;
     readonly onPush?: (args: readonly string[]) => void;
     readonly childNumber?: number;
+    /** Overrides the canonical snapshot the port re-reads before it mutates. */
+    readonly readSnapshot?: () => Promise<GitHubLifecycleSnapshot>;
   } = {}): EnqueueHarness {
     let views = 0;
     const calls: Array<{
@@ -1312,7 +1317,7 @@ describe('enqueue mutation', () => {
     return {
       calls,
       port: makeProductionEnqueueActionPort({
-        readSnapshot: async () => snapshot(),
+        readSnapshot: input.readSnapshot ?? (async () => snapshot()),
         authorAllowlist: new Set(['implementation-bot']),
         expectedBaseRefName: 'stack/base',
         repositoryPath: '/tmp/repo',
@@ -1427,6 +1432,56 @@ describe('enqueue mutation', () => {
     expect(classifyEnqueueFailure(text)).toBe(expected);
   });
 
+  /**
+   * A `rejected` failure is durable, but it is not always durable for the same
+   * *thing*. `pull-request` is durable for this PR at this head and nothing
+   * else, so it is safe to cache against the head. `repository` is durable for
+   * every PR in the repository at once, so caching it per head would be both
+   * wasteful and wrong — the latch handles it for the cycle instead. Everything
+   * else, `unscoped`, earns no hold at all: default-to-no-hold is the fail-safe,
+   * and a conflicting head in particular can heal when the *base* moves, with
+   * no new head to release a head-keyed hold.
+   */
+  it.each([
+    ['queue not enabled', 'GraphQL: Merge queue is not enabled for this branch', 'repository'],
+    ['the shorter queue phrasing', 'GraphQL: queue is not enabled', 'repository'],
+    ['no merge queue at all', 'GraphQL: no merge queue configured for next', 'repository'],
+    ['a 403 refusal', 'gh: HTTP 403: Resource not accessible by integration', 'repository'],
+    ['a 401 refusal', 'gh: HTTP 401: Unauthorized', 'repository'],
+    ['bad credentials', 'GraphQL: Bad credentials', 'repository'],
+    ['a protected branch refusal', 'GraphQL: protected branch update failed', 'repository'],
+    ['a missing permission', 'GraphQL: you must have write permission', 'repository'],
+    [
+      'an unresolvable node id',
+      "GraphQL: Could not resolve to a node with the global id of 'PR_kwDOABCD84'",
+      'pull-request',
+    ],
+    [
+      'an unresolvable PullRequest',
+      'GraphQL: Could not resolve to a PullRequest with the number 84',
+      'pull-request',
+    ],
+    ['a 404', 'gh: HTTP 404: Not Found', 'pull-request'],
+    ['a conflict', 'GraphQL: Pull request is not mergeable', 'unscoped'],
+    ['a merge conflict', 'GraphQL: merge conflict', 'unscoped'],
+    ['prose nobody has classified', 'gh: something nobody has seen before', 'unscoped'],
+  ] as const)('scopes %s as %s', (_name, text, expected) => {
+    expect(classifyDurableRejection(text)).toBe(expected);
+  });
+
+  /**
+   * Ordering, pinned. GitHub serves *secondary* rate limits as HTTP 403, and
+   * `classifyEnqueueFailure` already puts the throttle probe ahead of the
+   * permission probe for exactly that reason. A throttle never reaches
+   * `classifyDurableRejection` — it classifies as `undetermined`, not
+   * `rejected` — so the two classifiers must not disagree about it.
+   */
+  it('never reaches the durable scope for a secondary rate limit', () => {
+    const text = 'HTTP 403: You have exceeded a secondary rate limit';
+
+    expect(classifyEnqueueFailure(text)).toBe('undetermined');
+  });
+
   it('reports an already-queued refusal as success, not as a rejection', async () => {
     const harness = enqueuePort({
       mutation: async () => { throw new Error('GraphQL: Pull request is already queued'); },
@@ -1465,6 +1520,129 @@ describe('enqueue mutation', () => {
       status: 'rejected',
       reason: expect.stringMatching(/merge queue is not enabled/i),
     });
+  });
+
+  /**
+   * A durable refusal that is a property of THIS pull request at THIS head
+   * publishes a head-keyed hold, so the next cycle can refuse the enqueue
+   * candidate before it pays ~2 GraphQL + 8-10 REST calls to re-derive a
+   * merge-readiness the queue has already refused. The hold is not stickier
+   * than the decision it caches: a new head is a new ref.
+   */
+  it('publishes a head-keyed hold for a pull-request-scoped rejection', async () => {
+    const pushes: string[][] = [];
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error(
+          "GraphQL: Could not resolve to a node with the global id of 'PR_kwDOABCD84'",
+        );
+      },
+      onPush: (args) => pushes.push([...args]),
+    });
+
+    const outcome = await enqueue(harness);
+
+    expect(outcome).toMatchObject({ status: 'rejected' });
+    expect(outcome).not.toHaveProperty('repositoryRefusal');
+    expect(pushes.map((args) => args.at(-1))).toEqual([
+      `${'e'.repeat(40)}:${enqueueHoldRef('rejected', 84, HEAD)}`,
+    ]);
+    // Not an enqueue-attempt record: the mutation never reached the queue, so
+    // nothing may bump `attempts` for it.
+    expect(pushes.join(' ')).not.toContain('refs/jinn-autopilot/enqueues/');
+  });
+
+  /**
+   * "The merge queue is not enabled" is not a fact about this head, this pull
+   * request, or any commit anyone could push. A head-keyed hold would mint one
+   * useless ref per pull request and release on a push that changes nothing, so
+   * the refusal is reported to the caller instead and latched for the cycle.
+   */
+  it('writes no hold for a repository-scoped rejection and reports it', async () => {
+    const pushes: string[][] = [];
+    const harness = enqueuePort({
+      mutation: async () => {
+        throw new Error('GraphQL: Merge queue is not enabled for this branch');
+      },
+      onPush: (args) => pushes.push([...args]),
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({
+      status: 'rejected',
+      repositoryRefusal: true,
+    });
+    expect(pushes).toEqual([]);
+  });
+
+  /**
+   * A conflicting head can heal when the BASE moves, with no new commit on the
+   * pull request. A head-keyed hold has nothing to release it, so this class
+   * writes none — default-to-no-hold is the fail-safe.
+   */
+  it('writes no hold for an unscoped rejection', async () => {
+    const pushes: string[][] = [];
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('GraphQL: Pull request is not mergeable'); },
+      onPush: (args) => pushes.push([...args]),
+    });
+
+    const outcome = await enqueue(harness);
+
+    expect(outcome).toMatchObject({ status: 'rejected' });
+    expect(outcome).not.toHaveProperty('repositoryRefusal');
+    expect(pushes).toEqual([]);
+  });
+
+  /**
+   * Best-effort by construction. A hold that cannot be published costs one more
+   * expensive cycle; a hold that could change the outcome would be a wrong
+   * decision, so the write may never do that.
+   */
+  it('still reports the rejection when the hold push fails', async () => {
+    const harness = enqueuePort({
+      mutation: async () => { throw new Error('gh: HTTP 404: Not Found'); },
+      pushFails: true,
+    });
+
+    await expect(enqueue(harness)).resolves.toMatchObject({ status: 'rejected' });
+  });
+
+  /**
+   * The two pre-mutation `rejected` returns are transient races, not durable
+   * refusals: the canonical mapping or the base authority moved between the
+   * scheduler's read and this one. Nothing about a head is settled by either,
+   * so neither may write a hold or latch the cycle.
+   */
+  it.each([
+    [
+      'the canonical mapping authority changed',
+      {
+        readSnapshot: async (): Promise<GitHubLifecycleSnapshot> => ({
+          ...snapshot(),
+          snapshotComplete: false,
+        } as GitHubLifecycleSnapshot),
+      },
+    ],
+    [
+      'the base authority changed',
+      {
+        authority: async () => ({
+          state: 'CLOSED',
+          headRefOid: HEAD,
+          baseRefName: 'stack/base',
+          isInMergeQueue: false,
+        }),
+      },
+    ],
+  ] as const)('writes no hold when %s before the mutation', async (_name, overrides) => {
+    const pushes: string[][] = [];
+    const harness = enqueuePort({ ...overrides, onPush: (args) => pushes.push([...args]) });
+
+    const outcome = await enqueue(harness);
+
+    expect(outcome).toMatchObject({ status: 'rejected' });
+    expect(outcome).not.toHaveProperty('repositoryRefusal');
+    expect(pushes).toEqual([]);
   });
 
   /**
@@ -1784,6 +1962,53 @@ describe('enqueue mutation', () => {
         call.command === 'gh' && call.args[0] === 'issue' && call.args[1] === 'create'
       ));
       expect(created).toEqual([]);
+    });
+
+    /**
+     * The terminal hold is the expensive one. It is re-derived every cycle from
+     * a full `readCandidate` pair, and it can never change without a new head —
+     * so it publishes a head-keyed hold ref that lets the next cycle drop the
+     * enqueue candidate before it reads anything at all.
+     */
+    it('publishes the flake hold ref once the hold is terminal', async () => {
+      const pushes: string[][] = [];
+      const harness = enqueuePort({
+        refs: { [ref]: 'd'.repeat(40) },
+        catFile: () => [
+          'Autopilot enqueue record',
+          '',
+          `<!-- jinn-autopilot:enqueue:v1 pr=84 head=${HEAD} attempts=3 -->`,
+          'enqueued-at=2026-07-20T12:00:00.000Z',
+          'linked-issue=4242',
+        ].join('\n'),
+        onPush: (args) => pushes.push([...args]),
+      });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({ status: 'flake-hold' });
+
+      expect(pushes.map((args) => args.at(-1))).toEqual([
+        `${'e'.repeat(40)}:${enqueueHoldRef('flake', 84, HEAD)}`,
+      ]);
+    });
+
+    /**
+     * The sanctioned-retry exit is a HUMAN exit and must stay open. At two
+     * attempts with no linked issue the engine files the child that explains
+     * the hold, and closing that child buys exactly one more enqueue. A hold ref
+     * here would suppress the enqueue candidate entirely and take that exit
+     * away.
+     */
+    it('publishes no hold ref while the sanctioned retry is still available', async () => {
+      const pushes: string[][] = [];
+      const harness = twoAttempts({ onPush: (args) => pushes.push([...args]) });
+
+      await expect(enqueue(harness)).resolves.toMatchObject({ status: 'flake-hold' });
+
+      expect(pushes.join(' ')).not.toContain('refs/jinn-autopilot/enqueue-holds/');
+      // The child link is still published: this hold is explained, not cached.
+      expect(pushes.map((args) => args.at(-1))).toEqual([
+        `${'e'.repeat(40)}:${enqueueRef(84, HEAD)}`,
+      ]);
     });
   });
 });
