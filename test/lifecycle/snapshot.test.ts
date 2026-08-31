@@ -2624,7 +2624,11 @@ describe('buildGitHubLifecycleSnapshot', () => {
   // `'OPEN' | 'MERGED'`, so a CLOSED parent can only be produced by driving a
   // real `state: 'CLOSED'` node through GhLifecycleReader — which is where the
   // drop actually lives (github-reader.ts, `if (pr.state === 'CLOSED') continue`).
-  it('drops a CLOSED parent PR in the reader, leaving its review follow-up eligible', async () => {
+  // Issue #62: the drop from `nodes` stays (a closed-unmerged PR is not an
+  // active lifecycle item), but the number is now *also* carried out of the
+  // reader as positive proof, so the follow-up holds instead of implementing
+  // against a base that never received the parent's code.
+  it('drops a CLOSED parent PR from the snapshot but holds its review follow-up', async () => {
     const run = async (command: string, args: string[]): Promise<string> => {
       if (command === 'git') return '';
       const query = args.find((arg) => arg.startsWith('query=')) ?? '';
@@ -2657,8 +2661,10 @@ describe('buildGitHubLifecycleSnapshot', () => {
       });
     };
     const page = await new GhLifecycleReader(run).readPullRequests(null, [50]);
-    // The reader, not the gate, is what makes a closed-unmerged parent absent.
+    // The reader still drops a closed-unmerged parent from the PR nodes...
     expect(page.nodes.some((pr) => pr.number === 101)).toBe(false);
+    // ...and now reports it as evidence instead of discarding it entirely.
+    expect(page.closedUnmergedParentPrs).toEqual([101]);
 
     const source = reader({
       readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(101)],
@@ -2671,6 +2677,189 @@ describe('buildGitHubLifecycleSnapshot', () => {
 
     expect(snapshot.pullRequests.some((pr) => pr.number === 101)).toBe(false);
     expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+      eligibilityDetail:
+        'Review follow-up is blocked by closed-unmerged parent PR #101 until its issue resolves',
+    });
+  });
+
+  // Issue #62, the gate itself, stated over the one input it has: membership of
+  // `marker.parentPr` in the closed-unmerged set the reader now carries. The
+  // set is positive proof (the parent is a CLOSED node on the
+  // `closedByPullRequestsReferences` connection of an unresolved board issue),
+  // which is why this is a strict narrowing of the fail-open above and not a
+  // return to the disproved "absence blocks" rule.
+  it('holds a review follow-up whose parent PR is a closed-unmerged parent', async () => {
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(101)],
+      readPullRequests: async () => ({
+        nodes: [],
+        closedUnmergedParentPrs: [101],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    const followUp = snapshot.lifecycle.items.find((item) => item.issueNumber === 50);
+    expect(followUp).toMatchObject({
+      kind: 'issue',
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+    });
+    expect(followUp?.eligibilityDetail).toBe(
+      'Review follow-up is blocked by closed-unmerged parent PR #101 until its issue resolves',
+    );
+  });
+
+  // OPEN wins: an open parent is still reported as an open parent, in the
+  // wording the operator already knows. The two causes never blur.
+  it('reports an open parent as open even when the closed-unmerged set names it', async () => {
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(101)],
+      readPullRequests: async (cursor) => ({
+        ...page(cursor),
+        // The merged-outcome read that produces the set runs on the first page.
+        ...(cursor === null ? { closedUnmergedParentPrs: [101] } : {}),
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.pullRequests.find((pr) => pr.number === 101)?.state).toBe('OPEN');
+    expect(
+      snapshot.lifecycle.items.find((item) => item.issueNumber === 50)?.eligibilityDetail,
+    ).toBe('Review follow-up is blocked by open parent PR #101');
+  });
+
+  // The other half of the narrowing, asserted explicitly rather than only as
+  // the untouched absence case above: a set that exists but does not name this
+  // parent releases exactly as an absent set does.
+  it('releases a review follow-up when the closed-unmerged set names other PRs', async () => {
+    const source = reader({
+      readIssues: async () => [{ ...issue(), status: 'Todo' }, followUpIssue(909)],
+      readPullRequests: async () => ({
+        nodes: [],
+        closedUnmergedParentPrs: [101, 2219],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 50)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
+  // The machine exit, end to end and structural: the connection is queried only
+  // for non-Done board issues, so the parent leaves the set the moment the
+  // issue it closed reaches Done. No resolution lookup, no persisted state, and
+  // no author test anywhere — the same fixture is driven twice, differing only
+  // in the Project Status of the parent's issue.
+  it('releases the follow-up once the closed-unmerged parent\'s issue reaches Done', async () => {
+    const buildRun = () => async (command: string, args: string[]): Promise<string> => {
+      if (command === 'git') return '';
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('closedByPullRequestsReferences')) {
+        return JSON.stringify({
+          data: {
+            rateLimit: { cost: 1, remaining: 4_999, resetAt: '2026-07-20T13:00:00.000Z' },
+            repository: {
+              // A Done issue is never asked about, so its parents cannot be
+              // reported: the query itself is the resolution predicate.
+              ...(query.includes('issue42: issue(number: 42)')
+                ? {
+                    issue42: {
+                      closedByPullRequestsReferences: {
+                        pageInfo: { hasNextPage: false },
+                        nodes: [{ number: 101, state: 'CLOSED' }],
+                      },
+                    },
+                  }
+                : {}),
+              issue50: {
+                closedByPullRequestsReferences: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [],
+                },
+              },
+            },
+          },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: { cost: 1, remaining: 4_999, resetAt: '2026-07-20T13:00:00.000Z' },
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    };
+    const board = (parentStatus: 'In Review' | 'Done') => ({
+      items: [{
+        id: 'PVTI_42',
+        number: 42,
+        contentType: 'Issue' as const,
+        status: parentStatus,
+        priority: 'P1' as const,
+        effort: 'Medium' as const,
+        blockedOn: 'Nothing' as const,
+        issueType: 'feat' as const,
+        blockedByIssues: [],
+        sprintIterationId: 'sprint',
+      }, {
+        id: 'PVTI_50',
+        number: 50,
+        contentType: 'Issue' as const,
+        status: 'Todo' as const,
+        priority: 'P1' as const,
+        effort: 'Medium' as const,
+        blockedOn: 'Nothing' as const,
+        issueType: 'feat' as const,
+        blockedByIssues: [],
+        sprintIterationId: 'sprint',
+      }],
+      rateLimit: { remaining: 4_000, used: 1_000, resetAt: '2026-07-20T13:00:00.000Z' },
+      currentSprintIterationId: 'sprint',
+    });
+    const derive = async (parentStatus: 'In Review' | 'Done') => {
+      const live = new GhLifecycleReader(buildRun());
+      const source = reader({
+        readProjectSnapshot: async () => board(parentStatus),
+        readIssues: async () => [
+          { ...issue(), status: parentStatus },
+          followUpIssue(101),
+        ],
+        readPullRequests: async (cursor, nonDoneIssueNumbers) => (
+          live.readPullRequests(cursor, nonDoneIssueNumbers)
+        ),
+      });
+      const snapshot = await buildGitHubLifecycleSnapshot(source, {
+        authorAllowlist: new Set(['trusted']),
+      });
+      return snapshot.lifecycle.items.find((item) => item.issueNumber === 50);
+    };
+
+    expect(await derive('In Review')).toMatchObject({
+      eligible: false,
+      eligibilityReason: 'dependency-blocked',
+      eligibilityDetail:
+        'Review follow-up is blocked by closed-unmerged parent PR #101 until its issue resolves',
+    });
+    expect(await derive('Done')).toMatchObject({
       eligible: true,
       eligibilityReason: 'eligible',
     });

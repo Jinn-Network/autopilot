@@ -248,6 +248,14 @@ export interface PullRequestPage {
    * so no global lifecycle action may rely on the resulting issue closure.
    */
   readonly closingIssueEvidenceIncomplete?: true;
+  /**
+   * PR numbers observed as CLOSED (unmerged) nodes on the
+   * `closedByPullRequestsReferences` connection of a *non-Done* board issue
+   * (canon §5.1, issue #62). Positive proof, never an inference from absence:
+   * a reader that does not report it leaves the review-follow-up hold exactly
+   * as fail-open as it was before the field existed.
+   */
+  readonly closedUnmergedParentPrs?: readonly number[];
   readonly pageInfo: {
     readonly hasNextPage: boolean;
     readonly endCursor: string | null;
@@ -321,6 +329,14 @@ export interface GitHubLifecycleSnapshot {
   readonly scopedIssueNumbers?: readonly number[];
   /** Validated global count used to preserve fresh-work backpressure in a scoped view. */
   readonly globalOpenPipelineBacklog?: number;
+  /**
+   * Closed-unmerged parents evidenced by an unresolved board issue (canon
+   * §5.1). Carried on the snapshot so a re-composition of an already-derived
+   * snapshot (the full-oracle reconciliation path) keeps the evidence it was
+   * derived from; a composition that has none simply releases, which is the
+   * behaviour that predates the field.
+   */
+  readonly closedUnmergedParentPrs?: readonly number[];
 }
 
 export function decodeBranchClaimSnapshot(raw: RawBranchClaim): BranchClaimSnapshot {
@@ -983,26 +999,47 @@ function resolveMappings(
 
 type ReviewFollowUpBlock =
   | { readonly cause: 'parent-open'; readonly parentPr: number }
+  | { readonly cause: 'parent-closed-unmerged'; readonly parentPr: number }
   | { readonly cause: 'unparseable-marker' };
 
 /**
  * Review follow-up (canon §3, §5.1): held while the parent PR named by its
  * machine marker is still OPEN in this snapshot, because the reviewed code
  * exists only on that branch. Marker `pr=` and PR state are the only inputs.
- * A marker-shaped comment that does not parse fails closed. Absence of the
- * parent does not gate — canon §5.1 carries that boundary and its argument.
+ * A marker-shaped comment that does not parse fails closed.
+ *
+ * Issue #62 adds the second positive state. A parent that was CLOSED unmerged
+ * never delivered its code anywhere, so a follow-up released against it
+ * implements on a base that never received the parent's work — but the parent
+ * is also absent from the snapshot, indistinguishable from "merged and pruned"
+ * and from "never existed". `closedUnmergedParentPrs` is the missing evidence:
+ * PR numbers read as CLOSED nodes on the `closedByPullRequestsReferences`
+ * connection of a *non-Done* board issue. Two properties matter here.
+ * Membership is positive proof, so absence still releases — blocking on
+ * absence was measured at an 87% permanent-strand rate and is not what this
+ * does. And the set is a query over unresolved issues only, so a parent leaves
+ * it as soon as the issues it evidences reach Done: the hold's exit is
+ * structural, needing no timeout, no persisted state and no second lookup.
+ * The set may name PRs that are nobody's parent (a cross-linked child, say);
+ * that is harmless and deliberately not filtered, because it is consulted only
+ * through `marker.parentPr` membership. Nothing here reads a PR author:
+ * humans author marker-named `autopilot/*` PRs too.
  */
 function reviewFollowUpBlock(
   issue: PolledIssue,
   openPrNumbers: ReadonlySet<number>,
+  closedUnmergedParentPrs: ReadonlySet<number>,
 ): ReviewFollowUpBlock | null {
   const body = issue.body ?? '';
   const marker = parseReviewFollowUpMarker(body);
   if (marker === null) {
     return hasReviewFollowUpMarkerTag(body) ? { cause: 'unparseable-marker' } : null;
   }
-  return openPrNumbers.has(marker.parentPr)
-    ? { cause: 'parent-open', parentPr: marker.parentPr }
+  if (openPrNumbers.has(marker.parentPr)) {
+    return { cause: 'parent-open', parentPr: marker.parentPr };
+  }
+  return closedUnmergedParentPrs.has(marker.parentPr)
+    ? { cause: 'parent-closed-unmerged', parentPr: marker.parentPr }
     : null;
 }
 
@@ -1059,15 +1096,27 @@ function eligibilityEvidence(
   // Below the whole cascade on purpose: an untriaged, author-disallowed or
   // already-claimed follow-up must report *that* failure, not the parent PR.
   if (followUpBlock !== null) {
-    return followUpBlock.cause === 'parent-open'
-      ? {
-          reason: 'dependency-blocked',
-          detail: `Review follow-up is blocked by open parent PR #${followUpBlock.parentPr}`,
-        }
-      : {
-          reason: 'not-selected',
-          detail: 'Review follow-up marker is present but could not be parsed',
-        };
+    if (followUpBlock.cause === 'parent-open') {
+      return {
+        reason: 'dependency-blocked',
+        detail: `Review follow-up is blocked by open parent PR #${followUpBlock.parentPr}`,
+      };
+    }
+    // Named apart from the open-parent hold on purpose: the exits differ. An
+    // open parent leaves OPEN on its own; a closed-unmerged parent releases
+    // only when the issue that evidences it reaches Done.
+    if (followUpBlock.cause === 'parent-closed-unmerged') {
+      return {
+        reason: 'dependency-blocked',
+        detail: `Review follow-up is blocked by closed-unmerged parent PR #${
+          followUpBlock.parentPr
+        } until its issue resolves`,
+      };
+    }
+    return {
+      reason: 'not-selected',
+      detail: 'Review follow-up marker is present but could not be parsed',
+    };
   }
   return {
     reason: 'not-selected',
@@ -1098,6 +1147,7 @@ function lifecycleItems(
   project: ProjectSnapshot,
   defaultBranch: string,
   closingIssueEvidenceComplete: boolean,
+  closedUnmergedParentPrs: ReadonlySet<number>,
 ): {
   readonly items: readonly LifecycleItem[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
@@ -1162,7 +1212,11 @@ function lifecycleItems(
     });
     const selectedReady = ready.has(issue.number);
     // Review follow-ups wait on their parent PR's branch (canon §5.1).
-    const followUpBlock = reviewFollowUpBlock(issue, openPrNumbers);
+    const followUpBlock = reviewFollowUpBlock(
+      issue,
+      openPrNumbers,
+      closedUnmergedParentPrs,
+    );
     const eligible = selectedReady && !sourceHumanHold && followUpBlock === null;
     const holdDetail = issue.blockedOn === 'Human'
       ? 'Project Blocked on is Human'
@@ -1242,6 +1296,16 @@ export function composeGitHubLifecycleSnapshot(
     readonly pullRequests: readonly PullRequestSnapshot[];
     readonly branches: readonly BranchClaimSnapshot[];
     readonly terminalClaims?: readonly TerminalClaimEvidence[];
+    /**
+     * Closed-unmerged parents evidenced by an unresolved board issue (canon
+     * §5.1). Optional, and its absence must stay indistinguishable from an
+     * empty set: every composition that cannot produce this evidence —
+     * incremental reuse, a cache written before the field existed, a targeted
+     * view — must derive exactly what it derived before, which is release.
+     * Because `GitHubLifecycleSnapshot` carries the same field, re-composing
+     * an already-derived snapshot preserves it without a second read.
+     */
+    readonly closedUnmergedParentPrs?: readonly number[];
   },
   options: {
     readonly authorAllowlist: ReadonlySet<string>;
@@ -1275,6 +1339,9 @@ export function composeGitHubLifecycleSnapshot(
       pr.closingIssueNumbersIncomplete !== true
       && pr.evidenceIncompleteReason === undefined
     ));
+  const closedUnmergedParentPrs = [
+    ...new Set(evidence.closedUnmergedParentPrs ?? []),
+  ].sort((left, right) => left - right);
   const lifecycle = lifecycleItems(
     evidence.issues,
     evidence.pullRequests,
@@ -1286,6 +1353,7 @@ export function composeGitHubLifecycleSnapshot(
     evidence.project,
     options.defaultBranch ?? 'next',
     mappingEvidenceComplete,
+    new Set(closedUnmergedParentPrs),
   );
   return deepFreeze({
     project: evidence.project,
@@ -1293,6 +1361,7 @@ export function composeGitHubLifecycleSnapshot(
     pullRequests: [...evidence.pullRequests],
     branches: [...evidence.branches],
     terminalClaims: [...(evidence.terminalClaims ?? [])],
+    ...(closedUnmergedParentPrs.length === 0 ? {} : { closedUnmergedParentPrs }),
     diagnostics: lifecycle.diagnostics,
     pullRequestMappings: lifecycle.mappings,
     lifecycle: { items: lifecycle.items },
@@ -1370,6 +1439,7 @@ export async function buildGitHubLifecycleSnapshot(
     .map((item) => item.number);
   const rawPrs: RawPullRequest[] = [];
   let closingIssueEvidenceIncomplete = false;
+  const closedUnmergedParentPrs = new Set<number>();
   const maxPages = options.maxPages ?? 100;
   let cursor: string | null = null;
   const seen = new Set<string>();
@@ -1379,6 +1449,9 @@ export async function buildGitHubLifecycleSnapshot(
     rawPrs.push(...page.nodes);
     if (page.closingIssueEvidenceIncomplete === true) {
       closingIssueEvidenceIncomplete = true;
+    }
+    for (const parentPr of page.closedUnmergedParentPrs ?? []) {
+      closedUnmergedParentPrs.add(parentPr);
     }
     if (!page.pageInfo.hasNextPage) break;
     const next = page.pageInfo.endCursor;
@@ -1422,7 +1495,13 @@ export async function buildGitHubLifecycleSnapshot(
     if (!(error instanceof GitHubRateLimitReserveError)) throw error;
     throw new LifecycleRateLimitError(error.remaining, error.required, error.reserve);
   }
-  return composeGitHubLifecycleSnapshot({ project, issues, pullRequests, branches }, {
+  return composeGitHubLifecycleSnapshot({
+    project,
+    issues,
+    pullRequests,
+    branches,
+    closedUnmergedParentPrs: [...closedUnmergedParentPrs],
+  }, {
     authorAllowlist: options.authorAllowlist,
     ...(options.machineAuthorLogins === undefined
       ? {}

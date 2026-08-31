@@ -1428,6 +1428,64 @@ describe('targeted action reader', () => {
     ]));
   });
 
+  // Issue #62. A targeted read re-derives one cycle's snapshot with fresher
+  // evidence for a single issue; it must not release a review follow-up that
+  // the same cycle held. The closed-unmerged parents are carried across the
+  // re-composition exactly like `branches` and `terminalClaims`.
+  it('keeps a closed-unmerged parent hold across a targeted issue re-derivation', async () => {
+    const base = cycleSnapshot();
+    const head = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const cycle: GitHubLifecycleSnapshot = {
+      ...base,
+      closedUnmergedParentPrs: [909],
+      project: {
+        ...base.project,
+        items: [{ ...base.project.items[0]!, status: 'Todo' }],
+      },
+      issues: [{
+        ...base.issues[0]!,
+        status: 'Todo',
+        title: 'Follow-up from review',
+        body: `<!-- jinn-autopilot:review-follow-up pr=909 head=${head} index=0 -->\n\n`
+          + 'Follow-up from PR #909 review.',
+      }],
+    };
+    const reader = makeTargetedActionReader({
+      authorAllowlist: new Set(['oaksprout']),
+      rateLimitFloor: 500,
+      readGraphQlRemaining: async () => 510,
+      readPullRequest: async () => null,
+      readProjectItem: async () => ({
+        id: 'item-42',
+        status: 'Todo',
+        priority: 'P1',
+        effort: 'Medium',
+        blockedOn: 'Nothing',
+        issueType: 'fix',
+      }),
+      readIssue: async (number) => ({
+        number,
+        title: 'Follow-up from review',
+        open: true,
+        author: 'oaksprout',
+        labels: [],
+      }),
+      readBlockedByIssueNumbers: async () => [],
+    });
+
+    const result = await reader.readIssue(cycle, 42);
+
+    expect(result?.snapshot.lifecycle.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'issue',
+        issueNumber: 42,
+        eligible: false,
+        eligibilityDetail:
+          'Review follow-up is blocked by closed-unmerged parent PR #909 until its issue resolves',
+      }),
+    ]));
+  });
+
   it.each([
     ['branch', { headRefName: 'autopilot/other' }],
     ['closing relation', { closingIssueNumbers: [8] }],

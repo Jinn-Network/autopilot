@@ -994,6 +994,164 @@ describe('GhLifecycleReader', () => {
     ]);
   });
 
+  // Issue #62. The CLOSED nodes of this connection were discarded outright, so
+  // "closed unmerged", "merged and pruned" and "never existed" all reached the
+  // snapshot as absence, and a review follow-up whose parent was closed
+  // unmerged was released to implement against a base that never received the
+  // parent's code. The connection is queried only for non-Done board issues,
+  // costs nothing extra, and survives close-unmerged — so the numbers are
+  // collected here rather than discarded, and the resolution predicate is the
+  // query itself. MERGED and OPEN nodes keep their existing handling.
+  it('reports CLOSED closing-PR nodes as closed-unmerged parents', async () => {
+    const run: CommandRunner = async (command, args) => {
+      const stub = noReviewClaimRefs(command);
+      if (stub !== undefined) return stub;
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('closedByPullRequestsReferences')) {
+        return JSON.stringify({
+          data: {
+            rateLimit: rateLimit(),
+            repository: {
+              issue42: {
+                closedByPullRequestsReferences: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [graphQlPr({
+                    number: 99,
+                    state: 'MERGED',
+                    head: MERGED_HEAD,
+                  }), graphQlPr({
+                    number: 98,
+                    state: 'CLOSED',
+                    head: 'cccccccccccccccccccccccccccccccccccccccc',
+                  })],
+                },
+              },
+              issue43: {
+                closedByPullRequestsReferences: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [graphQlPr({
+                    number: 97,
+                    state: 'CLOSED',
+                    head: 'dddddddddddddddddddddddddddddddddddddddd',
+                  })],
+                },
+              },
+            },
+          },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    };
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null, [42, 43]);
+
+    // Only CLOSED nodes, sorted, and none of them enters the PR node list.
+    expect(page.closedUnmergedParentPrs).toEqual([97, 98]);
+    expect(page.nodes.map((pr) => [pr.number, pr.state])).toEqual([[99, 'MERGED']]);
+  });
+
+  it('reports no closed-unmerged parents when every closing PR merged', async () => {
+    const run: CommandRunner = async (command, args) => {
+      const stub = noReviewClaimRefs(command);
+      if (stub !== undefined) return stub;
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      if (query.includes('closedByPullRequestsReferences')) {
+        return JSON.stringify({
+          data: {
+            rateLimit: rateLimit(),
+            repository: {
+              issue42: {
+                closedByPullRequestsReferences: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [graphQlPr({
+                    number: 99,
+                    state: 'MERGED',
+                    head: MERGED_HEAD,
+                  })],
+                },
+              },
+            },
+          },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    };
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null, [42]);
+
+    expect(page.closedUnmergedParentPrs).toBeUndefined();
+    expect(page.nodes.map((pr) => [pr.number, pr.state])).toEqual([[99, 'MERGED']]);
+  });
+
+  // Structural, not a filter: a Done issue is never in `nonDoneIssueNumbers`,
+  // so the query never asks about it and its parents cannot be reported. That
+  // is the whole machine exit for the follow-up hold.
+  it('never asks a Done issue for closing PRs, so its parents cannot be reported', async () => {
+    const queries: string[] = [];
+    const run: CommandRunner = async (command, args) => {
+      const stub = noReviewClaimRefs(command);
+      if (stub !== undefined) return stub;
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      queries.push(query);
+      if (query.includes('closedByPullRequestsReferences')) {
+        return JSON.stringify({
+          data: {
+            rateLimit: rateLimit(),
+            repository: {
+              issue43: {
+                closedByPullRequestsReferences: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [],
+                },
+              },
+            },
+          },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [],
+            },
+          },
+        },
+      });
+    };
+
+    // #42 is Done, so the caller leaves it out of the non-Done list entirely.
+    const page = await new GhLifecycleReader(run).readPullRequests(null, [43]);
+
+    const mergedQuery = queries.find((query) => (
+      query.includes('closedByPullRequestsReferences')
+    ));
+    expect(mergedQuery).toContain('issue43: issue(number: 43)');
+    expect(mergedQuery).not.toContain('issue42: issue(number: 42)');
+    expect(page.closedUnmergedParentPrs).toBeUndefined();
+  });
+
   it('retains exact mapping-comment and current Human label/draft timeline provenance', async () => {
     const generation = '22222222-2222-4222-8222-222222222222';
     const marker = '<!-- jinn-autopilot-human:v2 issue=42 pr=101 '
