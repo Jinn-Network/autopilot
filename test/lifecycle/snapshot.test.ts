@@ -2996,6 +2996,98 @@ describe('buildGitHubLifecycleSnapshot', () => {
     }, 'active')).toEqual([]);
   });
 
+  /**
+   * The counterweight to the two tests above (issue #98). Incomplete *evidence*
+   * must invalidate the whole cycle; a PR whose head moved between the listing
+   * and its compare reread is not incomplete evidence, it is a PR whose compare
+   * answer is `unknown`. That refusal is fail-closed for the racing PR alone —
+   * it derives `blocked` and schedules nothing — and every sibling keeps acting.
+   */
+  it('refuses one PR whose compare authority moved without stalling the cycle', async () => {
+    const SIBLING_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
+    const terminalClaim = (prNumber: number, head: string) => ({
+      oid: REVIEW_REF,
+      payload: JSON.stringify({
+        protocolVersion: 2,
+        prNumber,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'reviewer',
+        head,
+        state: 'terminal-approved',
+        recordedAt: '2026-07-20T09:00:00.000Z',
+        verdict: {
+          marker: '44444444-4444-4444-8444-444444444444',
+          state: 'APPROVE',
+        },
+      }),
+    });
+    const base = page('page-2').nodes[0]!;
+    // Exactly what the reader now stamps for a head that moved mid-read: the
+    // fail-closed compare status, no base tip, and no evidence-incompleteness.
+    const racing = {
+      ...base,
+      compareStatus: 'unknown' as const,
+      reviewClaim: terminalClaim(101, HEAD),
+    };
+    const sibling = {
+      ...base,
+      number: 102,
+      headRefName: 'autopilot/43',
+      headOid: SIBLING_HEAD,
+      headCommittedAt: '2026-07-20T09:00:00.000Z',
+      closingIssueNumbers: [43],
+      compareStatus: 'ahead' as const,
+      reviews: [{
+        ...base.reviews[0]!,
+        commitId: SIBLING_HEAD,
+        body: base.reviews[0]!.body.replace(HEAD, SIBLING_HEAD),
+      }],
+      reviewClaim: terminalClaim(102, SIBLING_HEAD),
+    };
+    const source = reader({
+      readIssues: async () => [
+        { ...issue(), status: 'In Review' },
+        {
+          ...issue(), number: 43, status: 'In Review', projectItemId: 'PVTI_43',
+        },
+      ],
+      readPullRequests: async () => ({
+        nodes: [racing, sibling],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.snapshotComplete).toBe(true);
+    expect(snapshot.pullRequestMappings).not.toEqual([]);
+    expect(snapshot.lifecycle.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'pull-request', prNumber: 101, mergeState: 'blocked' }),
+      expect.objectContaining({ kind: 'pull-request', prNumber: 102, mergeState: 'clean' }),
+    ]));
+
+    const actions = planCycle(deriveLifecycle(
+      snapshot.lifecycle,
+      new Date('2026-07-20T12:00:00.000Z'),
+      2 * 60 * 60_000,
+    ), {
+      implementationSlots: 2,
+      reviewSlots: 2,
+      usableCredentialLanes: 2,
+    }, 'active');
+
+    expect(actions).toEqual([{
+      kind: 'enqueue',
+      issueNumber: 43,
+      prNumber: 102,
+      head: SIBLING_HEAD,
+      expectedBaseRefName: 'next',
+    }]);
+  });
+
   it('invalidates global action authority when merged outcome pagination is incomplete', async () => {
     const source = reader({
       readIssues: async () => [{ ...issue(), status: 'Todo' }],

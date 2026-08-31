@@ -147,6 +147,36 @@ export async function readExactChangedFiles(
  * comparison. `gitRefName` is likewise load-bearing: it rejects `..`, which is
  * what stops a base branch named `x...y` from injecting a second `...`
  * separator and changing which comparison is performed.
+ *
+ * ## The refusal contract
+ *
+ * When the reread says the head or base moved, this function refuses — but it
+ * refuses by *returning* `'unknown'` (with `unavailableReason`), never by
+ * throwing. The refusal is total either way: no compare request is issued, and
+ * no status is asserted about a head this reading no longer holds authority
+ * over. Only its blast radius differs.
+ *
+ * `'unknown'` is the fail-closed value, and it is fail-closed at every consumer
+ * rather than by convention here: `deriveMergeState` maps it to `blocked`, the
+ * merge-queue projection in the controller forces `blocked` over any queue
+ * state, `derivePhase` schedules no integration action for a blocked head, and
+ * the REST evidence cache treats it as "not proven" and forces a fresh read on
+ * the next cycle — which is the exit, since the losing race is transient.
+ *
+ * Throwing was the fail-*open* option in practice. A concurrent worker pushing
+ * mid-read is routine, and the sole caller reads every open PR of a page
+ * concurrently, so a bare throw took down the whole snapshot and no-op'd the
+ * entire cycle — including every PR that read cleanly. Widening that into an
+ * evidence-incompleteness signal is not the fix either: `snapshotComplete`
+ * gates the cycle globally, so it produces the same cycle-wide no-op through a
+ * tidier route. The refusal has to stay scoped to the PR that lost the race.
+ *
+ * Not every refusal in this module belongs on this contract. The exact
+ * changed-file read still throws, because its callers are per-action isolated
+ * and because at the review gate the throw *is* the authority that stops a
+ * verdict binding to unproven files. An unsafe base ref likewise still throws
+ * from `gitRefName` below: that is URL-safety, not a race, and its input is not
+ * something a retry can fix.
  */
 export async function readExactCompareStatus(
   options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
@@ -172,6 +202,13 @@ export interface ExactCompareEvidence {
    * exact head identity when it is absent.
    */
   readonly reviewedDiffDigest?: string;
+  /**
+   * Why `status` is `'unknown'` because the read refused rather than because
+   * GitHub answered something undecodable. Log-only: nothing downstream branches
+   * on it — `'unknown'` already carries the whole decision — it exists so the
+   * refusal is visible in the snapshot's output instead of silent.
+   */
+  readonly unavailableReason?: 'head-authority-moved';
 }
 
 export interface ReadExactCompareEvidenceOptions
@@ -233,7 +270,10 @@ export async function readExactCompareEvidence(
     || typeof metadata.base.ref !== 'string'
     || typeof metadata.base.sha !== 'string'
   ) {
-    throw new Error('Compare metadata lost exact PR authority');
+    // Refuse this PR's compare, and only this PR's — see "The refusal contract"
+    // above. Returning here rather than after the compare also means a head
+    // already known stale costs no second request.
+    return { status: 'unknown', unavailableReason: 'head-authority-moved' };
   }
   // Validated before the request is built, so an unsafe ref never reaches the
   // network at all.
