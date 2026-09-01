@@ -1322,4 +1322,134 @@ describe('enqueue stage derivation', () => {
       }
     }
   });
+
+  /**
+   * #120, phase layer. `underlyingPhase` asked the same question in the same
+   * wrong order the integration ladder did: CI before conflict. A conflicted
+   * head has no merge ref, so GitHub never computes a merge commit, no
+   * `pull_request` workflow runs, and the rollup is empty — `total=0`, live on
+   * mono #3060 and #3285. `isCiGreen([])` is false, so the pull request derived
+   * `ci-blocked`, and the conflict fall-through twenty lines below — the one
+   * that says the reconcile child still owns the next mutation — was
+   * unreachable for exactly the heads that needed it.
+   */
+  describe('conflict before CI (#120)', () => {
+    const MISSING_CI = [];
+
+    // The live #3060 shape: approved, conflicted, and no checks at all.
+    it('derives awaiting-review for a conflicted head with no CI', () => {
+      const [view] = deriveLifecycle(
+        snapshot(approvedAtHead({ mergeState: 'conflict', checks: MISSING_CI })),
+        NOW,
+        STALE_AFTER,
+      ).items;
+
+      expect(view.phase).toBe('awaiting-review');
+    });
+
+    // Red checks are just as suppressed-looking on a conflicted head, and mean
+    // the same thing: the conflict has to clear before CI can say anything.
+    it('derives awaiting-review for a conflicted head with red CI', () => {
+      const [view] = deriveLifecycle(
+        snapshot(approvedAtHead({
+          mergeState: 'conflict',
+          checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+        })),
+        NOW,
+        STALE_AFTER,
+      ).items;
+
+      expect(view.phase).toBe('awaiting-review');
+    });
+
+    it('still derives awaiting-review for a conflicted head with green CI', () => {
+      const [view] = deriveLifecycle(
+        snapshot(approvedAtHead({ mergeState: 'conflict', checks: [...GREEN] })),
+        NOW,
+        STALE_AFTER,
+      ).items;
+
+      expect(view.phase).toBe('awaiting-review');
+    });
+
+    // Only the conflicted path may move. Every head the conflict test does not
+    // answer must derive exactly what it derived before.
+    it.each(['clean', 'behind', 'blocked'])(
+      'still derives ci-blocked for a %s head with missing CI',
+      (mergeState) => {
+        const [view] = deriveLifecycle(
+          snapshot(approvedAtHead({ mergeState, checks: MISSING_CI })),
+          NOW,
+          STALE_AFTER,
+        ).items;
+
+        expect(view.phase).toBe('ci-blocked');
+      },
+    );
+
+    it.each(['clean', 'behind', 'blocked'])(
+      'still derives ci-blocked for a %s head with red CI',
+      (mergeState) => {
+        const [view] = deriveLifecycle(
+          snapshot(approvedAtHead({
+            mergeState,
+            checks: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+          })),
+          NOW,
+          STALE_AFTER,
+        ).items;
+
+        expect(view.phase).toBe('ci-blocked');
+      },
+    );
+
+    it.each(['clean', 'behind'])(
+      'still derives merge-ready for a %s head with green CI',
+      (mergeState) => {
+        const [view] = deriveLifecycle(
+          snapshot(approvedAtHead({ mergeState, checks: [...GREEN] })),
+          NOW,
+          STALE_AFTER,
+        ).items;
+
+        expect(view.phase).toBe('merge-ready');
+      },
+    );
+
+    // An unreviewed or unapproved head never reaches the conflict test at all —
+    // the `approved && !needsReview` guard above it is untouched — so a
+    // conflicted head still awaiting a verdict stays on the review side.
+    it('leaves an unapproved conflicted head on the review side', () => {
+      const [view] = deriveLifecycle(
+        snapshot(approvedAtHead({
+          mergeState: 'conflict',
+          checks: MISSING_CI,
+          approved: false,
+          needsReview: true,
+          reviewClaim: undefined,
+          terminalVerdict: undefined,
+        })),
+        NOW,
+        STALE_AFTER,
+      ).items;
+
+      expect(view.phase).toBe('awaiting-review');
+    });
+
+    // Rungs above the approved branch keep outranking it: an open child still
+    // parks the parent, whatever the merge state or the checks say.
+    it('still derives blocked-by-child for a conflicted head with an open child', () => {
+      const [view] = deriveLifecycle(
+        snapshot(approvedAtHead({
+          mergeState: 'conflict',
+          checks: MISSING_CI,
+          openChildKinds: ['reconcile'],
+        })),
+        NOW,
+        STALE_AFTER,
+      ).items;
+
+      expect(view.phase).toBe('blocked-by-child');
+    });
+  });
 });
