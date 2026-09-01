@@ -366,6 +366,8 @@ describe('implementation action executor', () => {
     await expect(executeImplementationAction(freshAction(), deps))
       .resolves.toMatchObject({ status: 'spawned', prNumber: 84 });
     expect(initialClaim).not.toHaveProperty('prNumber');
+    // Fresh implementation work carries no child kind: absent is the fresh lane.
+    expect(createdAttempt).not.toHaveProperty('childKind');
 
     const manifest: AttemptManifest = {
       version: 2,
@@ -1219,6 +1221,8 @@ describe('implementation action executor', () => {
       });
       const starts: unknown[] = [];
       const claimCommits: BranchClaim[] = [];
+      const attemptInputs:
+        Array<Parameters<ImplementationExecutorDeps['createAttempt']>[0]> = [];
       const { deps, claims } = harness({
         readIssue: async () => issue({
           number: 2069,
@@ -1229,6 +1233,19 @@ describe('implementation action executor', () => {
         createClaimCommit: async ({ claim }) => {
           claimCommits.push(claim);
           return CLAIM_A;
+        },
+        createAttempt: async (input) => {
+          attemptInputs.push(input);
+          return {
+            attemptId: input.attemptId,
+            paths: {
+              worktree: `/tmp/${input.attemptId}/worktree`,
+              manifest: `/tmp/${input.attemptId}/manifest.json`,
+              log: `/tmp/${input.attemptId}/session.log`,
+              ghConfigDir: `/tmp/${input.attemptId}/gh-config`,
+              askpass: `/tmp/${input.attemptId}/askpass`,
+            },
+          };
         },
         startSession: async (request) => {
           starts.push(request);
@@ -1249,6 +1266,9 @@ describe('implementation action executor', () => {
         issueNumber: 2069,
         prNumber: 2065,
       });
+      // The attempt manifest records the lane the work actually belongs to,
+      // read from the issue's own child marker rather than any schedule-time tag.
+      expect(attemptInputs[0]).toMatchObject({ childKind });
       expect(claims[0]).toMatchObject({
         branch: parent.headRefName,
         candidateParent: parent.head,

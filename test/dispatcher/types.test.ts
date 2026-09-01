@@ -22,6 +22,10 @@ describe('review-loop types', () => {
     expect(DEFAULT_CONFIG.reviewBotLogin).toBe('');
   });
 
+  it('DEFAULT_CONFIG gives machine-child work its own lane', () => {
+    expect(DEFAULT_CONFIG.childCap).toBe(1);
+  });
+
   it('ReviewablePr narrows PolledPr', () => {
     const pr: ReviewablePr = {
       number: 42, title: 't', headRefName: 'feat/42-x', headRefOid: 'abc',

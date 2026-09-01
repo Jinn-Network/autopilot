@@ -49,9 +49,10 @@ import type {
   LifecycleView,
   LifecycleViewItem,
   NewWorkAction,
+  NewWorkLane,
   CompareStatus,
 } from './types.js';
-import { gitRefName } from './types.js';
+import { gitRefName, laneForNewWorkAction } from './types.js';
 import {
   EMPTY_GITHUB_USAGE,
   EXPECTED_ACCOUNTING_APPROXIMATION_PREFIX,
@@ -123,6 +124,8 @@ export interface LifecycleControllerDeps {
     readLocalState(): {
       readonly remaining: {
         readonly implementation: number;
+        /** Machine-child work, capped separately from fresh claims (#122). */
+        readonly child: number;
         readonly review: number;
       };
       readonly newWorkPaused: boolean;
@@ -837,7 +840,7 @@ function activeCandidates(
     });
     repairingIssues.add(issue.number);
   }
-  const childImplementation: ActiveCandidate[] = [];
+  const childImplementation: RankedImplementationCandidate[] = [];
   const freshImplementation: RankedImplementationCandidate[] = [];
   const other: ActiveCandidate[] = [];
   // Read once per cycle, next to the children knob it sits beside. Disarming
@@ -865,14 +868,13 @@ function activeCandidates(
         issueNumber: item.issueNumber,
         ...(isChild ? { isChild: true } : {}),
       };
-      if (isChild) childImplementation.push(freshCandidate);
-      else {
-        freshImplementation.push({
-          candidate: freshCandidate,
-          rank: priorityRank(issueSource?.priority),
-          recovery: false,
-        });
-      }
+      // Both lanes rank the same way (#102): the child lane has its own cap
+      // now, so the order it walks its own queue in decides which child runs.
+      (isChild ? childImplementation : freshImplementation).push({
+        candidate: freshCandidate,
+        rank: priorityRank(issueSource?.priority),
+        recovery: false,
+      });
       continue;
     }
     if (item.kind !== 'pull-request' || item.humanHold || item.merged) continue;
@@ -897,6 +899,16 @@ function activeCandidates(
     ) {
       const pullRequest = byPr.get(item.prNumber);
       if (pullRequest === undefined) continue;
+      const recoveryIssue = snapshot.issues.find((candidate) =>
+        candidate.number === item.issueNumber);
+      // A machine child's stale claim is not recoverable this way: the
+      // executor refuses stale recovery for any child categorically, so this
+      // candidate is a guaranteed `ineligible` that costs a real GitHub read
+      // and burns one of the fresh lane's five fall-through attempts. The
+      // child's own claim path re-derives it from the child issue instead.
+      if (isMachineChildIssue({ body: recoveryIssue?.body, labels: item.labels })) {
+        continue;
+      }
       freshImplementation.push({
         candidate: {
           phase: 'implementation',
@@ -907,9 +919,7 @@ function activeCandidates(
           branch: gitRefName(pullRequest.headRefName),
           claimAttempt: item.branchClaim.attempt,
         },
-        rank: priorityRank(
-          snapshot.issues.find((candidate) => candidate.number === item.issueNumber)?.priority,
-        ),
+        rank: priorityRank(recoveryIssue?.priority),
         recovery: true,
       });
     } else if (
@@ -1050,10 +1060,12 @@ function activeCandidates(
       // implementation claims are scheduled from the child issue itself.
     }
   }
-  // Children outrank fresh implementation claims for the remaining slots.
+  // Children outrank fresh implementation claims, and now draw from their own
+  // capacity as well: the order below is what the scheduler's child pass and
+  // fresh pass each walk.
   return [
     ...repair,
-    ...childImplementation,
+    ...orderImplementationClaims(childImplementation),
     ...orderImplementationClaims(freshImplementation),
     ...other,
   ];
@@ -1354,21 +1366,26 @@ async function executeActivePass(
   // with no manual step and no cache to invalidate.
   const remainingBackups = {
     implementation: [...scheduling.backups.implementation],
+    child: [...scheduling.backups.child],
     review: [...scheduling.backups.review],
   };
+  const scheduledInLane = (lane: NewWorkLane): number => scheduling.actions.filter(
+    (action) => laneForNewWorkAction(action) === lane,
+  ).length;
   const laneCandidates = {
-    implementation: scheduling.actions.filter((action) => (
-      action.kind === 'claim-implementation'
-    )).length + scheduling.backups.implementation.length,
-    review: scheduling.actions.filter((action) => (
-      action.kind === 'claim-review'
-    )).length + scheduling.backups.review.length,
+    implementation: scheduledInLane('implementation')
+      + scheduling.backups.implementation.length,
+    child: scheduledInLane('child') + scheduling.backups.child.length,
+    review: scheduledInLane('review') + scheduling.backups.review.length,
   };
-  const spawnedByLane = { implementation: 0, review: 0 };
-  const fallThroughAttempts = { implementation: 0, review: 0 };
-  const fallThroughExhausted = { implementation: false, review: false };
+  const spawnedByLane = { implementation: 0, child: 0, review: 0 };
+  // One budget per lane, not one shared between them: a child queue that
+  // spends five refusals must not leave fresh work with none, or either lane
+  // can silently consume the other's release valve.
+  const fallThroughAttempts = { implementation: 0, child: 0, review: 0 };
+  const fallThroughExhausted = { implementation: false, child: false, review: false };
   const promoteBackup = <T extends NewWorkAction>(
-    lane: 'implementation' | 'review',
+    lane: NewWorkLane,
     queue: T[],
   ): T | undefined => {
     if (queue.length === 0) return undefined;
@@ -1472,9 +1489,7 @@ async function executeActivePass(
       // slot was used, so the lane keeps reaching down its own priority order
       // until something spawns or the bounded budget is spent. Every other
       // outcome — spawned, failed, human, lost — did consume the attempt.
-      const lane = action.kind === 'claim-implementation'
-        ? 'implementation' as const
-        : 'review' as const;
+      const lane = laneForNewWorkAction(action)!;
       let attempt: NewWorkAction | undefined = action;
       while (attempt !== undefined) {
         const result = await runAction(attempt);
@@ -1484,9 +1499,9 @@ async function executeActivePass(
           break;
         }
         if (result.outcome !== 'ineligible') break;
-        attempt = lane === 'implementation'
-          ? promoteBackup('implementation', remainingBackups.implementation)
-          : promoteBackup('review', remainingBackups.review);
+        attempt = lane === 'review'
+          ? promoteBackup('review', remainingBackups.review)
+          : promoteBackup(lane, remainingBackups[lane]);
       }
       index += 1;
       continue;
@@ -1498,8 +1513,10 @@ async function executeActivePass(
     actionEvents.push(actionEvent(action, result));
     index += 1;
   }
-  for (const lane of ['implementation', 'review'] as const) {
-    const phase: LifecyclePhase = lane === 'implementation' ? 'eligible' : 'awaiting-review';
+  for (const lane of ['implementation', 'child', 'review'] as const) {
+    // Both implementation lanes claim eligible issues; only their capacity
+    // differs, so they share the phase and are told apart by the subject.
+    const phase: LifecyclePhase = lane === 'review' ? 'awaiting-review' : 'eligible';
     if (fallThroughExhausted[lane]) {
       actionEvents.push({
         cycleId,

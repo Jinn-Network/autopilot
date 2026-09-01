@@ -481,7 +481,7 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
     spawn: () => {
       throw new Error('the enqueue stage must not spawn a session');
     },
-    caps: { implementation: 0, review: 0 },
+    caps: { implementation: 0, child: 0, review: 0 },
     implementationBackpressureThreshold: 30,
     staleAfterMs: 2 * 60 * 60_000,
     repositorySlug: SLUG,

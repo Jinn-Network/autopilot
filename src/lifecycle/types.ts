@@ -415,6 +415,15 @@ export type ImplementationClaimAction =
       readonly kind: 'claim-implementation';
       readonly intent: 'fresh';
       readonly issueNumber: number;
+      /**
+       * Schedule-time lane tag: this claim was admitted under the `child`
+       * concurrency lane rather than the implementation one (#122). Advisory
+       * only — it decides which lane's slot and fall-through budget the claim
+       * spends, never what the executor does. Execution authority stays with
+       * the issue's own child marker, which is also the sole source for the
+       * attempt manifest's `childKind`.
+       */
+      readonly child?: true;
     }
   | {
       readonly kind: 'claim-implementation';
@@ -475,6 +484,26 @@ export type NewWorkAction =
       readonly head: GitOid;
       readonly expectedBaseRefName: GitRefName;
     };
+
+/** The three capped concurrency lanes new work draws its slots from. */
+export type NewWorkLane = 'implementation' | 'child' | 'review';
+
+/**
+ * Which lane an action spends a slot from, or `null` for the uncapped
+ * actions (machine-child repair, child filing, rerun, enqueue).
+ *
+ * One definition for the two places that must agree — the runtime's
+ * per-action capacity guard and the controller's fall-through bookkeeping.
+ * They disagreeing is how a claim gets refused against one lane's capacity and
+ * charged to another lane's budget.
+ */
+export function laneForNewWorkAction(action: NewWorkAction): NewWorkLane | null {
+  if (action.kind === 'claim-review') return 'review';
+  if (action.kind !== 'claim-implementation') return null;
+  return action.intent === 'fresh' && action.child === true
+    ? 'child'
+    : 'implementation';
+}
 
 export type RecoveryAction =
   | {

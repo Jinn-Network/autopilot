@@ -343,6 +343,7 @@ function dispatcherConfig(
     ),
     authorAllowlist: [...allowlist],
     concurrencyCap: product.scheduler.implementationConcurrency,
+    childCap: product.scheduler.childConcurrency,
     reviewCap: product.scheduler.reviewConcurrency,
     openPrBackpressure: product.scheduler.openPrBackpressure,
     reviewBotLogin: environment.JINN_REVIEW_BOT_LOGIN ?? '',
@@ -818,6 +819,11 @@ export async function runAutopilotV2(
             env.JINN_AUTOPILOT_IMPLEMENTATION_CAP,
             config.concurrencyCap,
             'JINN_AUTOPILOT_IMPLEMENTATION_CAP',
+          ),
+          child: positiveEnvironmentInteger(
+            env.JINN_AUTOPILOT_CHILD_CAP,
+            config.childCap,
+            'JINN_AUTOPILOT_CHILD_CAP',
           ),
           review: positiveEnvironmentInteger(
             env.JINN_AUTOPILOT_REVIEW_CAP,

@@ -27,6 +27,7 @@ import {
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
+import { CHILD_KINDS, type ChildKind } from './child-issues.js';
 import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
   persistMarketplaceTaskRequest,
@@ -144,6 +145,16 @@ export interface AttemptManifest {
   readonly runnerId: string;
   readonly host: string;
   readonly phase: AttemptPhase;
+  /**
+   * Which machine-child kind this implementation attempt is healing, absent on
+   * a fresh implementation claim. The scheduler's `child` lane counts live
+   * attempts off this field (#122), so it is deliberately a *narrower*
+   * discriminator than the phase: an absent value means "fresh", which is the
+   * fail-safe reading for the manifests written before this field existed —
+   * it over-counts the implementation lane and can never over-run the child
+   * lane. Valid only when `phase === 'implement'`.
+   */
+  readonly childKind?: ChildKind;
   readonly execution: AttemptExecution;
   readonly subject: string;
   readonly issueNumber: number;
@@ -170,6 +181,8 @@ export interface CreateAttemptOptions {
   readonly worktreeBase: string;
   readonly runnerId?: string;
   readonly phase: AttemptPhase;
+  /** See `AttemptManifest.childKind`: implementation attempts only. */
+  readonly childKind?: ChildKind;
   readonly execution?: AttemptExecution;
   readonly subject: string;
   readonly issueNumber: number;
@@ -276,6 +289,16 @@ function positiveInteger(value: unknown, name: string): number {
   return value;
 }
 
+function attemptChildKind(value: unknown): ChildKind {
+  if (
+    typeof value !== 'string'
+    || !(CHILD_KINDS as readonly string[]).includes(value)
+  ) {
+    throw new Error('Invalid attempt child kind');
+  }
+  return value as ChildKind;
+}
+
 function nullablePid(value: unknown): number | null {
   if (value === null) return null;
   return positiveInteger(value, 'PID');
@@ -299,6 +322,7 @@ function exactKeys(
       'reviewApprovalPolicy',
       'targetBaseOid',
       'terminalHead',
+      'childKind',
       'childStartedAt',
       'childExitedAt',
     ].includes(key));
@@ -703,6 +727,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'runnerId',
     'host',
     'phase',
+    'childKind',
     'execution',
     'subject',
     'issueNumber',
@@ -727,6 +752,12 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const phase = manifest.phase;
   if (phase !== 'implement' && phase !== 'review') {
     throw new Error('Invalid attempt phase');
+  }
+  const childKind = manifest.childKind === undefined
+    ? undefined
+    : attemptChildKind(manifest.childKind);
+  if (childKind !== undefined && phase !== 'implement') {
+    throw new Error('Attempt child kind is valid only for implementation attempts');
   }
   const paths = decodePaths(manifest.paths);
   const execution = Object.hasOwn(manifest, 'execution')
@@ -866,6 +897,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     runnerId,
     host,
     phase,
+    ...(childKind === undefined ? {} : { childKind }),
     execution,
     subject,
     issueNumber,
@@ -2928,6 +2960,7 @@ export async function createAttemptWorkspace(
       runnerId,
       host,
       phase: options.phase,
+      ...(options.childKind === undefined ? {} : { childKind: options.childKind }),
       execution,
       subject,
       issueNumber: options.issueNumber,

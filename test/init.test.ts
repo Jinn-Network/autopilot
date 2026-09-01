@@ -194,6 +194,7 @@ describe('autopilot init', () => {
       pollSeconds: 600,
       fullReconcileSeconds: 3600,
       implementationConcurrency: 1,
+      childConcurrency: 1,
       reviewConcurrency: 1,
     });
     expect(config.triage.allowedAuthors).toEqual(['octocat']);

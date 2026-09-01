@@ -161,6 +161,13 @@ interface CreateAttemptInput {
   readonly selectedLogin: string;
   readonly credential: SelectedCredential;
   readonly marketplacePreparation?: MarketplaceAttemptPreparation;
+  /**
+   * Set on machine-child claims from the issue's own child marker — the
+   * execution-authority ground truth — never from the scheduler's advisory
+   * lane tag. Absent on fresh implementation claims, which is what the
+   * capacity accounting reads as the implementation lane (#122).
+   */
+  readonly childKind?: NonNullable<ImplementationIssue['child']>['kind'];
 }
 
 export interface SpawnImplementationInput {
@@ -1069,6 +1076,7 @@ async function executeChildImplementationAction(
     prNumber: parent.number,
     selectedLogin: selection.login,
     credential: selection.credential,
+    childKind: issue.child.kind,
     ...(preparation === undefined
       ? {}
       : { marketplacePreparation: preparation }),

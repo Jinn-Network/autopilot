@@ -346,6 +346,26 @@ describe('production implementation action port', () => {
       targetBaseOid: HEAD,
       marketplacePreparation: preparation,
     });
+    expect(workspaceOptions).not.toHaveProperty('childKind');
+
+    await port.createAttempt({
+      attemptId,
+      issueNumber: 43,
+      branch: gitRefName('autopilot/42'),
+      targetBase: gitRefName('next'),
+      expectedHead: CLAIM,
+      claimOid: CLAIM,
+      prNumber: 84,
+      selectedLogin: 'implementation-bot',
+      credential: selection.credential,
+      childKind: 'reconcile',
+    });
+
+    expect(workspaceOptions).toMatchObject({
+      phase: 'implement',
+      subject: 'issue-43',
+      childKind: 'reconcile',
+    });
   });
 
   it('derives stale recovery target authority independently of a PR-only retarget', async () => {

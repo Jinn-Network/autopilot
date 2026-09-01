@@ -1,7 +1,7 @@
 import type { AttemptManifest } from './attempt-workspace.js';
 import type { LifecycleControllerDeps } from './controller.js';
 import type { CredentialPool } from './credentials.js';
-import type { NewWorkAction } from './types.js';
+import { laneForNewWorkAction, type NewWorkAction } from './types.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
 
 export interface ActiveRuntimeResult {
@@ -67,6 +67,8 @@ export interface ActiveRuntimeOptions {
   readonly credentials: CredentialPool;
   readonly caps: {
     readonly implementation: number;
+    /** Machine-child work, capped separately from fresh claims (#122). */
+    readonly child: number;
     readonly review: number;
   };
   readonly implementationPreferredLogin: string;
@@ -110,21 +112,34 @@ export function makeActiveRuntime(
 ): NonNullable<LifecycleControllerDeps['active']> {
   const caps = {
     implementation: nonNegative(options.caps.implementation, 'implementation cap'),
+    child: nonNegative(options.caps.child, 'child cap'),
     review: nonNegative(options.caps.review, 'review cap'),
   };
   const readLocalState = () => {
     const newWorkPaused = options.newWorkPaused?.() ?? false;
     const attempts = options.readLocalAttempts();
-    const activeByPhase = {
-      implementation: attempts.filter((attempt) => attempt.phase === 'implement').length,
+    // Both lanes write `implement`-phase manifests, so the split is the
+    // manifest's own `childKind`. An attempt written before that field existed
+    // has none and counts as fresh: over-booking the implementation lane is
+    // recoverable, over-running the child lane is not visible at all.
+    const activeByLane = {
+      implementation: attempts.filter((attempt) => (
+        attempt.phase === 'implement' && attempt.childKind === undefined
+      )).length,
+      child: attempts.filter((attempt) => (
+        attempt.phase === 'implement' && attempt.childKind !== undefined
+      )).length,
       review: attempts.filter((attempt) => attempt.phase === 'review').length,
     };
     return {
+      // The disk floor pauses every lane: a floor that only stopped fresh
+      // claims would keep filling the same disk with child and review work.
       remaining: newWorkPaused
-        ? { implementation: 0, review: 0 }
+        ? { implementation: 0, child: 0, review: 0 }
         : {
-            implementation: Math.max(0, caps.implementation - activeByPhase.implementation),
-            review: Math.max(0, caps.review - activeByPhase.review),
+            implementation: Math.max(0, caps.implementation - activeByLane.implementation),
+            child: Math.max(0, caps.child - activeByLane.child),
+            review: Math.max(0, caps.review - activeByLane.review),
           },
       newWorkPaused,
       availableLogins: options.credentials.logins(),
@@ -174,12 +189,8 @@ export function makeActiveRuntime(
     },
     async executeAction(action, snapshot) {
       const local = readLocalState();
-      const phase = action.kind === 'claim-implementation'
-        ? 'implementation'
-        : action.kind === 'claim-review'
-          ? 'review'
-          : null;
-      if (phase !== null && local.remaining[phase] === 0) {
+      const lane = laneForNewWorkAction(action);
+      if (lane !== null && local.remaining[lane] === 0) {
         return { outcome: 'skipped', reason: 'local phase capacity is full' };
       }
       const credentials = options.credentials;

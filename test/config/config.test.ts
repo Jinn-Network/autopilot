@@ -92,6 +92,7 @@ function validConfig(): unknown {
       pollSeconds: 600,
       fullReconcileSeconds: 3600,
       implementationConcurrency: 1,
+      childConcurrency: 1,
       reviewConcurrency: 1,
       openPrBackpressure: 30,
     },
@@ -139,6 +140,32 @@ describe('Autopilot product configuration', () => {
     input.repository.codeOwnerLogins = ['Owner-One', 'owner-two'];
 
     expect(decodeAutopilotConfig(input)).toEqual(input);
+  });
+
+  // Same additive contract `codeOwnerLogins` established: every deployed
+  // `.autopilot/config.json` predates `childConcurrency`, so an absent key
+  // must keep parsing. The default is 1 — one machine child at a time is the
+  // behaviour these deployments already have.
+  it('defaults the child concurrency lane to one when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      scheduler: { childConcurrency?: number };
+    };
+    delete input.scheduler.childConcurrency;
+
+    expect(decodeAutopilotConfig(input).scheduler.childConcurrency).toBe(1);
+  });
+
+  it('honours an explicit child concurrency lane and refuses a zero-width one', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      scheduler: { childConcurrency?: number };
+    };
+    input.scheduler.childConcurrency = 2;
+
+    expect(decodeAutopilotConfig(input).scheduler.childConcurrency).toBe(2);
+    // A zero-width child lane cannot drain the child backlog, and children are
+    // exactly the work that unblocks everything downstream: unrepresentable.
+    input.scheduler.childConcurrency = 0;
+    expect(() => decodeAutopilotConfig(input)).toThrow();
   });
 
   it('rejects unknown keys instead of silently accepting policy drift', () => {

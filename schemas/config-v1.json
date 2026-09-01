@@ -121,6 +121,7 @@
         "pollSeconds": { "type": "integer", "minimum": 1 },
         "fullReconcileSeconds": { "type": "integer", "minimum": 1 },
         "implementationConcurrency": { "type": "integer", "minimum": 1 },
+        "childConcurrency": { "type": "integer", "minimum": 1, "default": 1 },
         "reviewConcurrency": { "type": "integer", "minimum": 1 },
         "openPrBackpressure": { "type": "integer", "minimum": 1 }
       }

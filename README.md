@@ -85,17 +85,28 @@ Edit `<target>/.autopilot/config.json`:
   "pollSeconds": 600,
   "fullReconcileSeconds": 3600,
   "implementationConcurrency": 1,
+  "childConcurrency": 1,
   "reviewConcurrency": 1,
   "openPrBackpressure": 30
 }
 ```
 
-`init` defaults both concurrency fields to `1`. After changing them, restart
-the daemon (`autopilot stop` then `autopilot start`) so the new config loads.
+Three independent lanes. `implementationConcurrency` bounds fresh claims on
+new issues; `childConcurrency` bounds machine-child work (review-finding,
+reconcile, and CI-failure fixes on branches that already exist);
+`reviewConcurrency` bounds review sessions. They are separate so a burst in
+one lane cannot starve the others — a deep child queue is the moment the
+engine most needs children to run and least needs new branches opened.
+
+`init` defaults every concurrency field to `1`, and `childConcurrency` is
+optional: a config written before the lane existed keeps loading and gets the
+same `1`. After changing them, restart the daemon (`autopilot stop` then
+`autopilot start`) so the new config loads.
 
 Optional one-off overrides:
 
 - `JINN_AUTOPILOT_IMPLEMENTATION_CAP`
+- `JINN_AUTOPILOT_CHILD_CAP`
 - `JINN_AUTOPILOT_REVIEW_CAP`
 - `JINN_AUTOPILOT_BACKPRESSURE`
 
