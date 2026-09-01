@@ -1050,6 +1050,7 @@ export function makeProductionReviewSessionPort(
         body: input.body,
         effort: input.effort,
         priority: 'p1',
+        ...(input.parentBase === undefined ? {} : { parentBase: input.parentBase }),
       });
       // Return the hold arm the port contract declares — review-session's
       // pure logic turns it into enterHuman (§6.3). Throwing here escaped

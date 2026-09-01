@@ -26,6 +26,7 @@ import {
 import { withSelectedCredential } from './production-auth.js';
 import type { GitHubLifecycleSnapshot } from './snapshot.js';
 import { gitOid, gitRefName } from './types.js';
+import type { GitRefName } from './types.js';
 import type { ProjectMapping } from '../config/config.js';
 import type { SelfClaimHeadTransition } from './self-claim-transition.js';
 
@@ -308,6 +309,21 @@ export function makeProductionImplementationActionPort(
       );
     }
     const marker = parseChildMarker(source.body ?? '');
+    // A recorded base that is not a legal ref name is corrupt evidence, and
+    // corrupt evidence must refuse rather than be silently dropped: dropping
+    // it would skip the retarget check entirely, turning a hand-edited marker
+    // into a way past it. Refusing is recoverable — fix the marker.
+    let recordedBase: GitRefName | undefined;
+    if (marker?.base !== undefined) {
+      try {
+        recordedBase = gitRefName(marker.base);
+      } catch {
+        return issueRefusal(
+          `issue #${issueNumber} carries a child marker whose recorded parent `
+          + `base '${marker.base}' is not a valid ref name`,
+        );
+      }
+    }
     const childKindLabel = hasChildKindLabel(source.labels);
     let eligible = lifecycle.kind === 'issue'
       && lifecycle.eligible
@@ -337,7 +353,15 @@ export function makeProductionImplementationActionPort(
       effort: source.effort,
       ...(marker === null
         ? {}
-        : { child: { parentPr: marker.parentPr, kind: marker.kind } }),
+        : {
+            child: {
+              parentPr: marker.parentPr,
+              kind: marker.kind,
+              // Filing-time evidence for the executor's retarget check (#114).
+              // Absent on markers filed before it was recorded.
+              ...(recordedBase === undefined ? {} : { recordedBase }),
+            },
+          }),
     } };
   };
   const openImplementationPullRequests = (

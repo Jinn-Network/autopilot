@@ -1,3 +1,8 @@
+// `stack-authority.ts` imports nothing, so this keeps the leaf-module shape:
+// the stack vocabulary has exactly one definition and both the lifecycle and
+// the dispatcher can reach it without a cycle.
+import type { StackVerdict } from './stack-authority.js';
+
 export type Brand<Value, Name extends string> = Value & { readonly __brand: Name };
 
 export type GitOid = Brand<string, 'GitOid'>;
@@ -309,6 +314,26 @@ export interface PullRequestLifecycleItem extends LifecycleItemBase {
    * absence reproduces today's behaviour rather than asserting anything.
    */
   readonly enqueueHold?: 'flake' | 'rejected';
+  /**
+   * Where this pull request sits in the dependency-stack graph (issue #114),
+   * derived by `stack-authority.ts` from the head/base/state of every pull
+   * request in the same snapshot: `root` when it is based on the default
+   * branch, `stacked-valid` when its base chain reaches the default branch
+   * through open pull requests, `stacked-broken` when the chain reaches a ref
+   * no open pull request owns, or a cycle.
+   *
+   * Recomputed every cycle and never persisted as a decision, so a stack
+   * releases on its own the moment its root merges and GitHub retargets the
+   * children. Absent means *not derived* — a scoped snapshot, or a reader that
+   * never composed one — and must never be read as `stacked-broken`.
+   */
+  readonly stackVerdict?: StackVerdict;
+  /**
+   * Bottom-most open pull request of this one's stack: the root that has to
+   * land first. The pull request itself when it is already the root. Absent
+   * whenever `stackVerdict` is absent or `stacked-broken`.
+   */
+  readonly stackRootPr?: number;
   /**
    * The PR is sitting in GitHub's merge queue. Absent means *not proven
    * queued*, never "proven not queued": an unreadable membership must not

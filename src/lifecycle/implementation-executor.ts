@@ -78,6 +78,12 @@ export interface ImplementationIssue {
   readonly child?: {
     readonly parentPr: number;
     readonly kind: 'review-finding' | 'reconcile' | 'ci-failure';
+    /**
+     * The base the parent pull request carried when this child was filed, read
+     * back from the child marker (issue #114). Absent on children filed before
+     * the marker recorded it.
+     */
+    readonly recordedBase?: GitRefName;
   };
 }
 
@@ -911,7 +917,7 @@ export async function executeImplementationAction(
 
 async function executeChildImplementationAction(
   issue: ImplementationIssue & {
-    readonly child: { readonly parentPr: number; readonly kind: 'review-finding' | 'reconcile' | 'ci-failure' };
+    readonly child: NonNullable<ImplementationIssue['child']>;
   },
   deps: ImplementationExecutorDeps,
 ): Promise<ImplementationExecutionResult> {
@@ -946,14 +952,48 @@ async function executeChildImplementationAction(
       detail: `Parent pull request #${issue.child.parentPr} is not open.`,
     };
   }
-  if (parent.baseRefName !== issue.targetBase) {
+  /*
+   * Retarget check, issue #114.
+   *
+   * This compared the parent's live base against `issue.targetBase` — the
+   * repository default branch — and so refused every *legitimately stacked*
+   * parent as "retargeted". Dependency stacking is a designed dispatcher
+   * feature, and mono #3437 (born on #3424's head branch by design) made its
+   * child #3462 permanently ineligible for nine hours.
+   *
+   * The honest comparison is against the base the parent carried **when the
+   * child was filed**, recorded on the child marker. Two checks, two failure
+   * modes: this one catches someone moving the pull request; the snapshot's
+   * stack verdict catches the stack dying underneath it.
+   *
+   * LEGACY MARKERS (filed before the base was recorded) make no claim about
+   * where the parent used to sit, so this check makes none either. It is
+   * *skipped*, not defaulted — inventing "the parent must sit on the default
+   * branch" is precisely the assumption that stranded #3462, and it would
+   * strand every pre-existing child of a stacked parent permanently. The
+   * refusal these children still get is the one that is actually derivable
+   * from live state: `eligible` is false whenever the snapshot reads the
+   * parent's chain as `stacked-broken`, and this function already refuses on
+   * `!issue.eligible` above. Nothing is lost that live evidence can prove.
+   */
+  const recordedBase = issue.child.recordedBase;
+  if (recordedBase !== undefined && parent.baseRefName !== recordedBase) {
     return {
       status: 'ineligible',
       issueNumber,
       detail: `Parent pull request #${issue.child.parentPr} is retargeted: base is `
-        + `${parent.baseRefName}, expected ${issue.targetBase}.`,
+        + `${parent.baseRefName}, expected ${recordedBase}.`,
     };
   }
+  /*
+   * Everything downstream needs the base the parent actually carries, not the
+   * repository default the child issue was filed against. While the check
+   * above compared against `issue.targetBase` the two were necessarily equal,
+   * so this is a no-op for a root parent and the correction for a stacked one:
+   * the marketplace base-head read, the claim record, and the attempt would
+   * otherwise all name `next` for a pull request sitting on `autopilot/3218`.
+   */
+  const childTargetBase = parent.baseRefName;
 
   const selection = selectCredential(deps.credentials, { phase: 'implement' });
   if (selection.status !== 'selected') {
@@ -963,7 +1003,7 @@ async function executeChildImplementationAction(
   const branch = parent.headRefName;
   const candidateParent = parent.head;
   const targetBaseOid = executionBackend === 'marketplace'
-    ? await deps.readTargetBaseHead(issue.targetBase, selection.credential)
+    ? await deps.readTargetBaseHead(childTargetBase, selection.credential)
     : undefined;
   const attemptId = deps.nextAttemptId();
   const claimedAt = deps.now().toISOString();
@@ -978,7 +1018,7 @@ async function executeChildImplementationAction(
     runner: deps.runnerId,
     login: selection.login,
     expectedHead: gitOid(candidateParent),
-    targetBase: issue.targetBase,
+    targetBase: childTargetBase,
     claimedAt,
   };
   const claimOid = await deps.createClaimCommit({
@@ -1009,7 +1049,7 @@ async function executeChildImplementationAction(
         issue,
         pullRequest: parent,
         branch,
-        targetBase: issue.targetBase,
+        targetBase: childTargetBase,
         targetBaseOid: targetBaseOid!,
         baseSha: candidateParent,
         claimOid,
@@ -1022,7 +1062,7 @@ async function executeChildImplementationAction(
     attemptId,
     issueNumber,
     branch,
-    targetBase: issue.targetBase,
+    targetBase: childTargetBase,
     ...(targetBaseOid === undefined ? {} : { targetBaseOid }),
     expectedHead: claimOid,
     claimOid,
@@ -1046,7 +1086,7 @@ async function executeChildImplementationAction(
         issueNumber,
         prNumber: parent.number,
         branch,
-        targetBase: issue.targetBase,
+        targetBase: childTargetBase,
         worktreePath: attempt.paths.worktree,
         logPath: attempt.paths.log,
       })
@@ -1059,7 +1099,7 @@ async function executeChildImplementationAction(
         issueNumber,
         prNumber: parent.number,
         branch,
-        targetBase: issue.targetBase,
+        targetBase: childTargetBase,
         worktreePath: attempt.paths.worktree,
         logPath: attempt.paths.log,
         local: {
@@ -1068,7 +1108,7 @@ async function executeChildImplementationAction(
             issue,
             prNumber: parent.number,
             branch,
-            targetBase: issue.targetBase,
+            targetBase: childTargetBase,
             environment: buildSanitizedChildEnv(
               deps.ambientEnvironment,
               selection.credential,

@@ -783,3 +783,71 @@ describe('child listings do not truncate silently (#104)', () => {
     expect(limit).toBeGreaterThan(200);
   });
 });
+
+describe('recorded parent base on the child marker', () => {
+  it('records the parent base at filing time and parses it back', () => {
+    const marker = formatChildMarker(3437, 'review-finding', 'autopilot/3218');
+
+    expect(marker).toBe(
+      '<!-- jinn-autopilot:child pr=3437 kind=review-finding base=autopilot/3218 -->',
+    );
+    expect(parseChildMarker(marker)).toEqual({
+      parentPr: 3437,
+      kind: 'review-finding',
+      base: 'autopilot/3218',
+    });
+  });
+
+  it('leaves a legacy marker without a recorded base parseable and base-less', () => {
+    expect(parseChildMarker('<!-- jinn-autopilot:child pr=3437 kind=review-finding -->'))
+      .toEqual({ parentPr: 3437, kind: 'review-finding' });
+  });
+
+  it('rejects a malformed recorded base', () => {
+    expect(parseChildMarker(
+      '<!-- jinn-autopilot:child pr=3437 kind=review-finding base= -->',
+    )).toBeNull();
+  });
+
+  it('dedupes on parent and kind alone so a moved base cannot file a duplicate', async () => {
+    const port = fakePort([
+      record({
+        number: 3462,
+        parentPr: 3437,
+        kind: 'review-finding',
+        body: '<!-- jinn-autopilot:child pr=3437 kind=review-finding base=autopilot/3218 -->\n\nfindings',
+      }),
+    ]);
+
+    const filed = await fileChildIssue(port, {
+      parentPr: 3437,
+      kind: 'review-finding',
+      title: 'Address review findings for PR #3437',
+      body: 'more findings',
+      effort: 'medium',
+      priority: 'p1',
+      parentBase: 'next',
+    });
+
+    expect(filed).toEqual({ number: 3462, created: false });
+    expect(port.created).toEqual([]);
+  });
+
+  it('writes the recorded base into the created child body', async () => {
+    const port = fakePort();
+
+    await fileChildIssue(port, {
+      parentPr: 3437,
+      kind: 'review-finding',
+      title: 'Address review findings for PR #3437',
+      body: 'findings',
+      effort: 'medium',
+      priority: 'p1',
+      parentBase: 'autopilot/3218',
+    });
+
+    expect(port.created[0]!.body).toContain(
+      '<!-- jinn-autopilot:child pr=3437 kind=review-finding base=autopilot/3218 -->',
+    );
+  });
+});

@@ -1301,7 +1301,7 @@ describe('implementation action executor', () => {
       readIssue: async () => issue({
         number: 2069,
         targetBase: gitRefName('next'),
-        child: { parentPr: 2065, kind: 'reconcile' },
+        child: { parentPr: 2065, kind: 'reconcile', recordedBase: gitRefName('next') },
       }),
       readParentPullRequest: async () => pr({
         number: 2065,
@@ -1317,6 +1317,139 @@ describe('implementation action executor', () => {
     });
     expect(claims).toEqual([]);
     expect(events).toEqual([]);
+  });
+
+  // Issue #114: dependency stacking is a designed dispatcher feature, so a
+  // parent PR born on another PR's head branch is not "retargeted". The live
+  // incident (mono #3437 stacked on #3424) made child #3462 permanently
+  // ineligible against `issue.targetBase`, the repository default branch.
+  it('claims a legitimately stacked parent whose base matches the recorded base', async () => {
+    const parent = pr({
+      number: 3437,
+      headRefName: gitRefName('autopilot/3219'),
+      head: ADOPTED_HEAD,
+      baseRefName: gitRefName('autopilot/3218'),
+      draft: false,
+    });
+    const claimCommits: BranchClaim[] = [];
+    const { deps, claims } = harness({
+      readIssue: async () => issue({
+        number: 3462,
+        targetBase: gitRefName('next'),
+        child: {
+          parentPr: 3437,
+          kind: 'review-finding',
+          recordedBase: gitRefName('autopilot/3218'),
+        },
+      }),
+      readParentPullRequest: async () => parent,
+      createClaimCommit: async ({ claim }) => {
+        claimCommits.push(claim);
+        return CLAIM_A;
+      },
+    });
+
+    await expect(executeImplementationAction(freshAction(3462), deps)).resolves.toMatchObject({
+      status: 'spawned',
+      issueNumber: 3462,
+      prNumber: 3437,
+      branch: parent.headRefName,
+    });
+    expect(claims[0]).toMatchObject({ branch: gitRefName('autopilot/3219') });
+    // The claim records the base the parent actually carries, not the
+    // repository default the child issue was filed against.
+    expect(claimCommits[0]).toMatchObject({ targetBase: gitRefName('autopilot/3218') });
+  });
+
+  it('still refuses a child whose parent moved off its recorded base', async () => {
+    const { deps, claims, events } = harness({
+      readIssue: async () => issue({
+        number: 3462,
+        targetBase: gitRefName('next'),
+        child: {
+          parentPr: 3437,
+          kind: 'review-finding',
+          recordedBase: gitRefName('autopilot/3218'),
+        },
+      }),
+      readParentPullRequest: async () => pr({
+        number: 3437,
+        headRefName: gitRefName('autopilot/3219'),
+        baseRefName: gitRefName('autopilot/9999'),
+      }),
+    });
+
+    await expect(executeImplementationAction(freshAction(3462), deps)).resolves.toEqual({
+      status: 'ineligible',
+      issueNumber: 3462,
+      detail: 'Parent pull request #3437 is retargeted: base is autopilot/9999, '
+        + 'expected autopilot/3218.',
+    });
+    expect(claims).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  // The recorded base is evidence, never a latch: it is re-read from the
+  // marker every cycle and compared to live state, so moving the parent back
+  // restores the claim with no operator step.
+  it('claims again once a retargeted parent is moved back to its recorded base', async () => {
+    let live = gitRefName('autopilot/9999');
+    const { deps } = harness({
+      readIssue: async () => issue({
+        number: 3462,
+        targetBase: gitRefName('next'),
+        child: {
+          parentPr: 3437,
+          kind: 'review-finding',
+          recordedBase: gitRefName('autopilot/3218'),
+        },
+      }),
+      readParentPullRequest: async () => pr({
+        number: 3437,
+        headRefName: gitRefName('autopilot/3219'),
+        head: ADOPTED_HEAD,
+        draft: false,
+        baseRefName: live,
+      }),
+    });
+
+    await expect(executeImplementationAction(freshAction(3462), deps)).resolves.toMatchObject({
+      status: 'ineligible',
+    });
+
+    live = gitRefName('autopilot/3218');
+
+    await expect(executeImplementationAction(freshAction(3462), deps)).resolves.toMatchObject({
+      status: 'spawned',
+      prNumber: 3437,
+    });
+  });
+
+  // Children filed before #114 carry no recorded base. There is nothing to
+  // compare against, so the executor makes no retarget claim at all and defers
+  // to the snapshot's live stack verdict, which already refuses a broken chain.
+  it('claims a stacked parent for a legacy child that recorded no base', async () => {
+    const { deps, claims } = harness({
+      readIssue: async () => issue({
+        number: 3462,
+        targetBase: gitRefName('next'),
+        child: { parentPr: 3437, kind: 'review-finding' },
+      }),
+      readParentPullRequest: async () => pr({
+        number: 3437,
+        headRefName: gitRefName('autopilot/3219'),
+        head: ADOPTED_HEAD,
+        draft: false,
+        baseRefName: gitRefName('autopilot/3218'),
+      }),
+    });
+
+    await expect(executeImplementationAction(freshAction(3462), deps)).resolves.toMatchObject({
+      status: 'spawned',
+      issueNumber: 3462,
+      prNumber: 3437,
+    });
+    expect(claims[0]).toMatchObject({ branch: gitRefName('autopilot/3219') });
   });
 
   it('builds an immutable ordinary marketplace request from claim authority without constructing local spawn data', async () => {
