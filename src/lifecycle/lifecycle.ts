@@ -265,6 +265,25 @@ function underlyingPhase(item: LifecycleItem): Exclude<LifecyclePhase, 'human'> 
   }
 
   if (item.approved && !item.needsReview) {
+    // Answered before CI on purpose (#120), and this is what makes the
+    // conflict fall-through at the bottom of this branch reachable rather than
+    // aspirational — it has always said the reconcile child owns the next
+    // mutation, but a conflicted head could never get there.
+    //
+    // A conflicted head has no merge ref. GitHub will not compute a merge
+    // commit for a head that does not merge, so `pull_request` workflows never
+    // run and the rollup is empty — `classifyCiChecks([])` is `missing`, so
+    // `isCiGreen` is false *because of* the conflict. Deriving `ci-blocked`
+    // from that put the pull request in a phase the integration ladder is
+    // never consulted for (`activeCandidates` routes only `awaiting-review`
+    // and `merge-ready` there), while the ci-blocked handler schedules only on
+    // a *failed* classification and so swallowed it. Nothing ran, every cycle.
+    //
+    // Only the conflicted head moves. `clean`, `behind` and `blocked` fall
+    // through to the unchanged CI gate below and derive exactly what they
+    // derived before: a non-conflicted pull request can have CI, so red or
+    // missing checks there are a real refusal.
+    if (item.mergeState === 'conflict') return 'awaiting-review';
     if (!isCiGreen(item.checks ?? [])) return 'ci-blocked';
     // A native APPROVED that the engine did not sign at this exact head cannot
     // pass the enqueue gate (`terminal-approval`), so calling it merge-ready
@@ -289,10 +308,12 @@ function underlyingPhase(item: LifecycleItem): Exclude<LifecyclePhase, 'human'> 
     ) {
       return 'merge-ready';
     }
-    // Conflict (and the unknown-compare `blocked` projection): the queue cannot
-    // build a candidate from a head that does not merge, so the reconcile child
-    // still owns the next mutation. The view stays awaiting-review to keep
-    // review enrollment closed while that happens.
+    // The unknown-compare `blocked` projection, and the conflict already
+    // returned above: the queue cannot build a candidate from a head that does
+    // not merge, so the reconcile child still owns the next mutation. The view
+    // stays awaiting-review to keep review enrollment closed while that
+    // happens — `reviewEnrollmentEligible` and `activeCandidates`' review rung
+    // both refuse an `approved && !needsReview` item outright.
     return 'awaiting-review';
   }
   return 'awaiting-review';

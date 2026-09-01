@@ -1787,6 +1787,172 @@ describe('lifecycle controller', () => {
     }]);
   });
 
+  /**
+   * #120, end to end. This is the live shape of mono #3060: approved, no
+   * outstanding review, conflicted — and no CI at all, because a conflicted
+   * head has no merge ref for GitHub to build a merge commit from, so no
+   * `pull_request` workflow ever runs and the check rollup is literally empty.
+   *
+   * Both layers gated on CI before the conflict, and both had to move for this
+   * to compose. `underlyingPhase` derived `ci-blocked`, which `activeCandidates`
+   * never routes to the integration ladder (its branch takes `awaiting-review`
+   * and `merge-ready` only), and the `ci-blocked` handler itself only schedules
+   * on a *failed* classification — an empty rollup classifies as `missing`, so
+   * it swallowed the pull request and scheduled nothing. Then the ladder,
+   * reached at last, still had to answer the conflict before its own CI gate.
+   *
+   * Seven approved mono PRs sat in exactly this state, some since 2026-08-27.
+   */
+  it('files a reconcile child for an approved conflicted PR that has no CI at all', async () => {
+    const conflictedWithoutCi = implementation({
+      projectStatus: 'In Review',
+      approved: true,
+      needsReview: false,
+      mergeState: 'conflict',
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      // total=0. Not failing checks — no checks, the way GitHub reports a head
+      // it cannot compute a merge commit for.
+      checks: [],
+    });
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+    const active = {
+      preflight: async () => ({ ok: true }),
+      readLocalState: () => ({
+        remaining: { implementation: 1, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      }),
+      implementationBackpressureThreshold: 10,
+      executeAction: async (action: unknown) => {
+        actions.push(action);
+        return { outcome: 'spawned' };
+      },
+    };
+    const dirty = snapshot(conflictedWithoutCi);
+    dirty.pullRequests[0] = {
+      ...dirty.pullRequests[0]!,
+      mergeability: 'CONFLICTING',
+      mergeStateStatus: 'DIRTY',
+      compareStatus: 'diverged',
+      checks: [],
+    };
+
+    await runLifecycleCycle('active', {
+      ...deps(conflictedWithoutCi, [], noOpWriter),
+      readSnapshot: async () => dirty,
+      mergePolicy: 'safe-auto',
+      active,
+    });
+
+    expect(actions).toEqual([{
+      kind: 'file-reconcile-child',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+      expectedBaseRefName: 'next',
+      effort: 'medium',
+    }]);
+    // Emphatically not a re-review. The approved branch of the phase
+    // derivation excludes review enrollment by construction, and the ladder —
+    // not the re-review rung — owns the next mutation while a head conflicts.
+    expect(actions.every(
+      (action) => (action as { kind: string }).kind !== 'claim-review',
+    )).toBe(true);
+  });
+
+  /**
+   * The CI gate is untouched for every head the conflict test does not answer.
+   * A non-conflicted pull request *can* have CI, so red CI there is a real
+   * refusal, and it must still park the PR in ci-blocked rather than reach the
+   * ladder.
+   */
+  it('still holds an approved non-conflicted PR with red CI at ci-blocked', async () => {
+    const redCi = implementation({
+      projectStatus: 'In Review',
+      approved: true,
+      needsReview: false,
+      mergeState: 'clean',
+      branchClaim: {
+        kind: 'branch-claim',
+        protocolVersion: 2,
+        phase: 'implement',
+        phaseComplete: true,
+        issueNumber: 42,
+        prNumber: 101,
+        attempt: '11111111-1111-4111-8111-111111111111',
+        runner: 'runner-a',
+        login: 'implementer',
+        expectedHead: HEAD,
+        targetBase: gitRefName('next'),
+        claimedAt: '2026-07-20T11:00:00.000Z',
+      },
+      checks: [{
+        source: 'check-run',
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'FAILURE',
+        runId: 7,
+      }],
+    });
+    const actions: unknown[] = [];
+    const noOpWriter = new Proxy({} as ReconciliationWriter, {
+      get() {
+        return async () => null;
+      },
+    });
+    const active = {
+      preflight: async () => ({ ok: true }),
+      readLocalState: () => ({
+        remaining: { implementation: 1, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      }),
+      implementationBackpressureThreshold: 10,
+      executeAction: async (action: unknown) => {
+        actions.push(action);
+        return { outcome: 'spawned' };
+      },
+    };
+    const clean = snapshot(redCi);
+    clean.pullRequests[0] = {
+      ...clean.pullRequests[0]!,
+      mergeability: 'MERGEABLE',
+      mergeStateStatus: 'CLEAN',
+      compareStatus: 'ahead',
+      checks: redCi.checks!,
+    };
+
+    const report = await runLifecycleCycle('active', {
+      ...deps(redCi, [], noOpWriter),
+      readSnapshot: async () => clean,
+      mergePolicy: 'safe-auto',
+      active,
+    });
+
+    expect(report.items.find((item) => item.prNumber === 101)?.phase).toBe('ci-blocked');
+    expect(actions.every(
+      (action) => (action as { kind: string }).kind !== 'file-reconcile-child',
+    )).toBe(true);
+  });
+
   it.skip('reports legacy stale-looking items without reaping them', async () => {
     const calls: string[] = [];
     const legacy = implementation({
