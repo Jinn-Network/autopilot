@@ -767,6 +767,155 @@ describe('active lifecycle controller', () => {
     });
   });
 
+  describe('the machine-child lane', () => {
+    // `review-finding` carries no default triage expectation, so these children
+    // are never candidates for machine-child repair and reach the claim lane
+    // directly at whatever Priority the fixture gives them.
+    function childIssue(number: number, priority: string) {
+      return {
+        ...priorityIssue(number, priority),
+        body: formatChildMarker(3000 + number, 'review-finding'),
+        labels: ['review-finding'],
+      };
+    }
+
+    function childLaneSnapshot(
+      children: readonly (readonly [number, string])[],
+      fresh: readonly (readonly [number, string])[],
+    ): GitHubLifecycleSnapshot {
+      const issues = [
+        ...children.map(([number, priority]) => childIssue(number, priority)),
+        ...fresh.map(([number, priority]) => priorityIssue(number, priority)),
+      ];
+      return {
+        ...snapshot(),
+        issues,
+        lifecycle: { items: issues.map((issue) => priorityItem(issue.number)) },
+      };
+    }
+
+    const ladder = (count: number, base: number) => Array.from(
+      { length: count },
+      (_unused, index) => [base + index, 'P1'] as const,
+    );
+
+    it('logs a starved child lane on its own subject', async () => {
+      const controller = deps({
+        readSnapshot: async () => childLaneSnapshot([[9001, 'P1']], [[100, 'P0']]),
+      });
+      controller.active!.executeAction = async (action) => (
+        action.child === true
+          ? { outcome: 'ineligible', reason: 'Parent pull request #3000 is not open.' }
+          : { outcome: 'spawned' }
+      );
+
+      const report = await runLifecycleCycle('active', controller);
+
+      // The implementation lane spawned, so only the child lane starved — the
+      // failure #113 surfaces was previously absorbed into `lane:implementation`.
+      expect(report.events.filter((event) => event.outcome === 'starved'))
+        .toEqual([expect.objectContaining({
+          phase: 'eligible',
+          action: 'schedule',
+          subject: 'lane:child',
+          outcome: 'starved',
+        })]);
+    });
+
+    it('gives each implementation lane its own fall-through budget', async () => {
+      const attempted: number[] = [];
+      const controller = deps({
+        readSnapshot: async () => childLaneSnapshot(ladder(10, 9000), ladder(10, 100)),
+      });
+      controller.active!.executeAction = async (action) => {
+        attempted.push(action.issueNumber);
+        return { outcome: 'ineligible', reason: 'permanently ineligible' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      // One scheduled claim plus a bounded five fall-throughs, in EACH lane —
+      // children and fresh work verifiably shared one budget before.
+      expect(attempted).toEqual([
+        9000, 9001, 9002, 9003, 9004, 9005,
+        100, 101, 102, 103, 104, 105,
+      ]);
+      for (const lane of ['child', 'implementation']) {
+        expect(report.events).toContainEqual(expect.objectContaining({
+          action: 'schedule',
+          subject: `lane:${lane}`,
+          outcome: 'fallthrough-exhausted',
+        }));
+      }
+    });
+
+    it('promotes only child backups when a child claim refuses late', async () => {
+      const attempted: number[] = [];
+      const controller = deps({
+        readSnapshot: async () => childLaneSnapshot(
+          [[9001, 'P1'], [9002, 'P1']],
+          [[100, 'P0'], [200, 'P2']],
+        ),
+      });
+      controller.active!.executeAction = async (action) => {
+        attempted.push(action.issueNumber);
+        return action.issueNumber === 9001
+          ? { outcome: 'ineligible', reason: 'Parent pull request #3000 is not open.' }
+          : { outcome: 'spawned' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      // The refusal reaches down the child lane's own queue, never across into
+      // the fresh one, which keeps its slot for its own highest-priority claim.
+      expect(attempted).toEqual([9001, 9002, 100]);
+    });
+
+    it('ranks child claims by Priority like every other implementation claim', async () => {
+      const claimed: number[] = [];
+      // Snapshot order is worst-first: an unranked child lane claims 9002.
+      const controller = deps({
+        readSnapshot: async () => childLaneSnapshot([[9002, 'P2'], [9001, 'P1']], []),
+      });
+      controller.active!.executeAction = async (action) => {
+        claimed.push(action.issueNumber);
+        return { outcome: 'spawned' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(claimed).toEqual([9001]);
+    });
+
+    it('emits no stale-recovery candidate for a machine child', async () => {
+      const base = implementationPrSnapshot('2026-07-20T08:00:00.000Z');
+      const actions: unknown[] = [];
+      const controller = deps({
+        readSnapshot: async () => ({
+          ...base,
+          issues: [{
+            ...priorityIssue(42, 'P1'),
+            body: formatChildMarker(2140, 'review-finding'),
+            labels: ['review-finding'],
+          }],
+        }),
+      });
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'spawned' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      // The executor refuses stale recovery for a child categorically, so the
+      // candidate is a guaranteed `ineligible` that spends a real GitHub read
+      // and a fall-through attempt from the fresh lane's budget. Do not emit it.
+      expect(actions).toEqual([]);
+      expect(report.events.some((event) => event.action === 'claim-implementation'))
+        .toBe(false);
+    });
+  });
+
   describe('priority-ordered implementation claims', () => {
     it('claims the highest-priority eligible issue when only one slot is free', async () => {
       const claimed: number[] = [];
