@@ -14,6 +14,11 @@ import {
 import { parseChildMarker, isMachineChildIssue, type ChildKind } from './child-issues.js';
 import { isReviewedDiffDigest } from './reviewed-diff-digest.js';
 import {
+  describeStackBreak,
+  resolveStackChains,
+  type StackChainRecord,
+} from './stack-authority.js';
+import {
   hasReviewFollowUpMarkerTag,
   parseReviewFollowUpMarker,
 } from './review-follow-ups.js';
@@ -740,6 +745,7 @@ function lifecyclePr(
   expectedBaseRefName: string,
   machineAuthorLogins: ReadonlySet<string>,
   openChildKinds: readonly ChildKind[] = [],
+  stackChain?: StackChainRecord,
 ): Extract<LifecycleItem, { kind: 'pull-request' }> {
   const decisive = latestDecisiveReview(pr);
   const reviewClaim = pr.reviewClaim?.record;
@@ -850,6 +856,8 @@ function lifecyclePr(
     checks: [...pr.checks],
     ...(pr.ciRerunRecorded === true ? { ciRerunRecorded: true } : {}),
     ...(pr.enqueueHold === undefined ? {} : { enqueueHold: pr.enqueueHold }),
+    ...(stackChain === undefined ? {} : { stackVerdict: stackChain.verdict }),
+    ...(stackChain?.rootPr === undefined ? {} : { stackRootPr: stackChain.rootPr }),
     ...(pr.mergeQueue?.enqueued === true ? { inMergeQueue: true } : {}),
     ...(openChildKinds.length === 0 ? {} : { openChildKinds: [...openChildKinds] }),
     ...(pr.branchClaim === undefined ? {} : { branchClaim: pr.branchClaim }),
@@ -1056,6 +1064,30 @@ function reviewFollowUpBlock(
     : null;
 }
 
+/**
+ * A machine child implements on its parent pull request's own branch, so it
+ * inherits that pull request's dependency stack (issue #114). A parent that is
+ * `root` or `stacked-valid` is a perfectly good place to work; one whose chain
+ * is `stacked-broken` is not, because the base it sits on is going nowhere.
+ *
+ * Only a *positive* break blocks. No chain record at all — a scoped snapshot,
+ * a parent outside this pull-request set, a parent that is not open — leaves
+ * the child exactly as eligible as it was before this gate existed. The whole
+ * point of #114 is that a stack the lifecycle cannot see must not be mistaken
+ * for a stack that is broken.
+ */
+function childStackBlock(
+  issue: PolledIssue,
+  stackChains: ReadonlyMap<number, StackChainRecord>,
+): { readonly parentPr: number; readonly record: StackChainRecord } | null {
+  const marker = parseChildMarker(issue.body ?? '');
+  if (marker === null) return null;
+  const record = stackChains.get(marker.parentPr);
+  return record?.verdict === 'stacked-broken'
+    ? { parentPr: marker.parentPr, record }
+    : null;
+}
+
 function eligibilityEvidence(
   issue: PolledIssue,
   eligible: boolean,
@@ -1063,6 +1095,7 @@ function eligibilityEvidence(
   stackReady: ReadonlyMap<number, unknown>,
   hasClaimBranch = false,
   followUpBlock: ReviewFollowUpBlock | null = null,
+  stackBlock: { readonly parentPr: number; readonly record: StackChainRecord } | null = null,
 ): { readonly reason: IssueEligibilityReason; readonly detail: string } {
   if (eligible) return { reason: 'eligible', detail: 'All implementation admission gates pass' };
   if (issue.blockedOn === 'Another issue' && !stackReady.has(issue.number)) {
@@ -1084,6 +1117,15 @@ function eligibilityEvidence(
     return {
       reason: 'not-selected',
       detail: `Issue has an in-flight claim branch autopilot/${issue.number}`,
+    };
+  }
+  // Above the generic child arm on purpose: "machine child issue is not
+  // currently selectable" names nothing an operator can act on, and a broken
+  // parent stack is the single most actionable thing a child can be waiting on.
+  if (stackBlock !== null) {
+    return {
+      reason: 'dependency-blocked',
+      detail: describeStackBreak(stackBlock.parentPr, stackBlock.record),
     };
   }
   if (isMachineChildIssue(issue)) {
@@ -1161,6 +1203,7 @@ function lifecycleItems(
   defaultBranch: string,
   closingIssueEvidenceComplete: boolean,
   closedUnmergedParentPrs: ReadonlySet<number>,
+  stackChains: ReadonlyMap<number, StackChainRecord>,
 ): {
   readonly items: readonly LifecycleItem[];
   readonly diagnostics: readonly LifecycleMappingDiagnostic[];
@@ -1230,7 +1273,13 @@ function lifecycleItems(
       openPrNumbers,
       closedUnmergedParentPrs,
     );
-    const eligible = selectedReady && !sourceHumanHold && followUpBlock === null;
+    // A machine child works on its parent's branch, so a parent sitting on a
+    // dead stack has nowhere to deliver (issue #114).
+    const stackBlock = childStackBlock(issue, stackChains);
+    const eligible = selectedReady
+      && !sourceHumanHold
+      && followUpBlock === null
+      && stackBlock === null;
     const holdDetail = issue.blockedOn === 'Human'
       ? 'Project Blocked on is Human'
       : externalHumanLabel(issueLabels) !== undefined
@@ -1250,6 +1299,7 @@ function lifecycleItems(
         stackReady,
         claimBranchIssues.has(issue.number),
         followUpBlock,
+        stackBlock,
       );
     const sourceHumanReason: HumanReason | undefined = sourceHumanHold
       ? {
@@ -1283,6 +1333,7 @@ function lifecycleItems(
         mappings.expectedBaseByPr.get(pr.number) ?? defaultBranch,
         machineAuthorLogins,
         childrenByParent.get(pr.number) ?? [],
+        stackChains.get(pr.number),
       ));
     }
   }
@@ -1355,6 +1406,28 @@ export function composeGitHubLifecycleSnapshot(
   const closedUnmergedParentPrs = [
     ...new Set(evidence.closedUnmergedParentPrs ?? []),
   ].sort((left, right) => left - right);
+  /*
+   * Dependency-stack verdicts (issue #114), recomputed from live head/base/
+   * state on every composition — no extra API call, and nothing durable.
+   *
+   * The verdict is stamped onto the derived `lifecycle.items`, never onto
+   * `pullRequests`. Two reasons, and they agree. It is a fact about the *set*
+   * of pull requests, not about any one of them, so a per-pull-request cache
+   * entry would go stale the moment a sibling merged — and the discovery cache
+   * requires each OPEN entry in `evidence.pullRequests` to be byte-identical
+   * to its `openPullRequestEvidence` row, an invariant that exists precisely
+   * to keep persisted evidence free of derivation. Recomputing costs one pass
+   * over an array the caller already holds.
+   *
+   * Only a *global* pull-request set can prove "no open pull request owns that
+   * ref". A scoped view is a deliberately partial read, so it derives no
+   * chains at all and every consumer sees `undefined`, which is "unknown" and
+   * blocks nothing. Refusing work because a pull request the reader never
+   * asked for is missing is the exact failure this issue removes.
+   */
+  const stackChains = options.snapshotAuthority === undefined
+    ? resolveStackChains(evidence.pullRequests, options.defaultBranch ?? 'next')
+    : new Map<number, StackChainRecord>();
   const lifecycle = lifecycleItems(
     evidence.issues,
     evidence.pullRequests,
@@ -1367,6 +1440,7 @@ export function composeGitHubLifecycleSnapshot(
     options.defaultBranch ?? 'next',
     mappingEvidenceComplete,
     new Set(closedUnmergedParentPrs),
+    stackChains,
   );
   return deepFreeze({
     project: evidence.project,

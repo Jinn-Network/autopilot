@@ -853,8 +853,21 @@ describe('production implementation action port', () => {
     expect(mutations).toBe(0);
   });
 
-  it('resolves machine children from issue bodies in incremental snapshots', async () => {
-    const marker = '<!-- jinn-autopilot:child pr=2065 kind=review-finding -->';
+  it.each([
+    {
+      label: 'a legacy marker with no recorded base',
+      marker: '<!-- jinn-autopilot:child pr=2065 kind=review-finding -->',
+      child: { parentPr: 2065, kind: 'review-finding' },
+    },
+    {
+      label: 'a marker recording the parent base at filing time',
+      marker: '<!-- jinn-autopilot:child pr=2065 kind=review-finding base=next -->',
+      child: { parentPr: 2065, kind: 'review-finding', recordedBase: 'next' },
+    },
+  ])('resolves machine children from issue bodies in incremental snapshots ($label)', async ({
+    marker,
+    child,
+  }) => {
     const current: GitHubLifecycleSnapshot = {
       ...snapshot(),
       issues: [{
@@ -918,13 +931,63 @@ describe('production implementation action port', () => {
 
     await expect(port.readIssue(2069)).resolves.toMatchObject({
       eligible: true,
-      child: { parentPr: 2065, kind: 'review-finding' },
+      child,
     });
     await expect(port.readParentPullRequest!(2065)).resolves.toMatchObject({
       number: 2065,
       headRefName: 'autopilot/2044',
       head: HEAD,
     });
+  });
+
+  // Corrupt recorded evidence must refuse, not be dropped: dropping it would
+  // skip the retarget check, turning a hand-edited marker into a way past it.
+  it('withholds a child whose recorded parent base is not a valid ref name', async () => {
+    const marker = '<!-- jinn-autopilot:child pr=2065 kind=review-finding base=../evil -->';
+    const current: GitHubLifecycleSnapshot = {
+      ...snapshot(),
+      issues: [{
+        number: 2069,
+        title: 'Address review findings for PR #2065',
+        body: `${marker}\n\nFindings`,
+        labels: ['review-finding'],
+        shape: 'fix',
+        blockedOn: 'Nothing',
+        blockedByIssues: [],
+        effort: 'Low',
+        priority: 'P2',
+        status: 'Todo',
+        onBoard: true,
+        author: 'ritsukai',
+        projectItemId: 'PVTI_child',
+        inCurrentSprint: false,
+      }],
+      lifecycle: {
+        items: [{
+          kind: 'issue',
+          issueNumber: 2069,
+          v2Marked: true,
+          projectStatus: 'Todo',
+          labels: ['review-finding'],
+          eligible: true,
+          eligibilityReason: 'eligible',
+        }],
+      },
+    };
+    const port = makeProductionImplementationActionPort({
+      repositoryPath: '/repo',
+      worktreeBase: '/attempts',
+      runnerId: 'runner-a',
+      credentials: new CredentialPool([{
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'selected-secret',
+      }]),
+      authorAllowlist: new Set(['ritsukai']),
+      readSnapshot: async () => current,
+    });
+
+    await expect(port.readIssue(2069)).resolves.toBeNull();
   });
 
   it('fails closed when a child kind label is present without a body marker', async () => {

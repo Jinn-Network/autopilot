@@ -136,6 +136,13 @@ export interface ReviewSessionPort {
     readonly title: string;
     readonly body: string;
     readonly effort: 'low' | 'medium' | 'high';
+    /**
+     * The base the parent pull request carries at filing time (issue #114).
+     * Recorded on the child marker so the executor's retarget check compares
+     * live base against recorded base rather than against the repository
+     * default, which also fired on every legitimately stacked parent.
+     */
+    readonly parentBase?: string;
   }): Promise<
     | { readonly number: number; readonly created: boolean; readonly runawayHold?: undefined }
     | { readonly runawayHold: true; readonly priorCount: number }
@@ -885,6 +892,9 @@ async function reviewFindings(
     title: `Address review findings for PR #${manifest.prNumber}`,
     body: findings.trim(),
     effort: 'medium',
+    // Read from the exact pull request this attempt holds authority over, so
+    // the recorded base is the one the parent carried at this instant.
+    parentBase: pullRequest.baseRefName,
   });
   if (child.runawayHold === true) {
     return enterHuman(

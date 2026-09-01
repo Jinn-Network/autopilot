@@ -161,6 +161,7 @@ function harness(options: {
       }]
     : [];
   const events: string[] = [];
+  const filedChildren: { readonly parentPr: number; readonly parentBase?: string }[] = [];
   const humanChecks = [...(options.humanChecks ?? [])];
   const comments = new Set<string>();
 
@@ -234,9 +235,10 @@ function harness(options: {
       events.push(`draft:${next}`);
       draft = next;
     },
-    fileFindingChild: async ({ title, body }) => {
-      events.push(`child:${title}`);
-      expect(body.length).toBeGreaterThan(0);
+    fileFindingChild: async (input) => {
+      events.push(`child:${input.title}`);
+      filedChildren.push(input);
+      expect(input.body.length).toBeGreaterThan(0);
       return { number: 9001, created: true };
     },
     hasHumanComment: async (
@@ -266,6 +268,7 @@ function harness(options: {
     port,
     protocol: makeReviewSessionProtocol(port),
     events,
+    filedChildren,
     get manifest() { return currentManifest; },
     get authority() { return authority; },
     set authority(next: ReviewSessionAuthority) { authority = next; },
@@ -329,6 +332,9 @@ describe('review session protocol', () => {
     expect(h.events).toContain('claim:stale');
     expect(h.labels.has('review:changes-requested')).toBe(true);
     expect(h.events).not.toContain('draft:true');
+    // Issue #114: the base the parent actually carries at filing time is the
+    // only evidence a later retarget check can honestly compare against.
+    expect(h.filedChildren[0]).toMatchObject({ parentPr: 84, parentBase: 'next' });
   });
 
   it(
