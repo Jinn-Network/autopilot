@@ -39,18 +39,39 @@ export interface IntegrationLadderInput {
 export function chooseIntegrationLadderAction(
   input: IntegrationLadderInput,
 ): IntegrationLadderAction {
+  // Parked, human-held and unreviewed heads stay above everything below. A
+  // reconcile child is real work pushed to the branch, so none of these three
+  // may reach the conflict rung and have one filed.
   if (input.draft) return { kind: 'blocked', reasons: ['draft'] };
   if (input.humanHold) return { kind: 'blocked', reasons: ['human'] };
   if (!input.approved) return { kind: 'blocked', reasons: ['not-approved'] };
-  if (!input.ciGreen) return { kind: 'blocked', reasons: ['ci'] };
-  if (input.openFindingChild || input.openReconcileChild) {
-    return { kind: 'blocked', reasons: ['open-child'] };
-  }
+
+  const openChild = input.openFindingChild || input.openReconcileChild;
 
   const conflicting = input.mergeable === 'CONFLICTING'
     || input.mergeStateStatus === 'DIRTY';
 
   if (conflicting) {
+    // Answered before CI on purpose (#120). A conflicted head has no merge ref
+    // — GitHub will not compute a merge commit for a head that does not merge —
+    // so `pull_request` workflows never run and the check rollup is empty, not
+    // failing. `ciGreen` is false *because of* the conflict. Gating the
+    // reconcile child on CI therefore waited on a signal the conflict itself
+    // suppressed: conflict -> no merge ref -> zero check runs -> blocked on CI
+    // -> no reconcile child -> conflict. A closed loop with no machine exit.
+    // The conflict is the thing that has to clear first; once the reconcile
+    // child lands its merge, GitHub computes a merge ref, checks run, and the
+    // pull request meets the unchanged CI gate below on a later cycle.
+    //
+    // The open-child guard travels with it, whole, because it is the only thing
+    // standing between a CI-less cycle and a duplicate child. Finding children
+    // are held to the same rule as reconcile children: a review-finding child
+    // is real work on this same branch, and a reconcile filed alongside it puts
+    // two agents on one head and would be redone anyway once the finding
+    // child's merge moved it. Unlike the CI gate this hold is not
+    // self-perpetuating — children close, and the next cycle files the
+    // reconcile — so it is a wait, not a wedge.
+    if (openChild) return { kind: 'blocked', reasons: ['open-child'] };
     // The one thing the queue genuinely cannot do. A reconcile child is the
     // only way out, so disarming children is a hold — never a licence to hand
     // the queue a head that does not merge.
@@ -58,6 +79,12 @@ export function chooseIntegrationLadderAction(
     if (!childrenOn) return { kind: 'blocked', reasons: ['children-disarmed'] };
     return { kind: 'file-reconcile-child', effort: 'medium' };
   }
+
+  // Unchanged for every head the conflict rung did not answer: a non-conflicted
+  // pull request can have CI, so red CI is a real refusal and still outranks the
+  // open-child hold exactly as it did before.
+  if (!input.ciGreen) return { kind: 'blocked', reasons: ['ci'] };
+  if (openChild) return { kind: 'blocked', reasons: ['open-child'] };
 
   // An unreadable compare cannot rule out a state that disqualifies the head,
   // and an unfinished mergeability computation is not an answer yet. Both mean
