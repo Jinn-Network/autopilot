@@ -136,8 +136,29 @@ function activeMutation(view: LifecycleViewItem): boolean {
   ) {
     return true;
   }
+  // Head-pinned, like every other review-claim check in the engine (issue
+  // #118). A REQUEST_CHANGES verdict describes the diff at the head it was
+  // recorded against; once the PR advances past that head the verdict has been
+  // answered — by definition, since the only way to answer it is to push — and
+  // must not keep drafting the new head. Without the pin this branch was the
+  // engine's one unbounded latch: `verdict-intent`/`REQUEST_CHANGES` has no
+  // completion path (only APPROVE completes, below), so the claim stayed in
+  // that state forever, the PR was re-drafted every cycle, drafts are not
+  // review-claimable, and the superseding review that would have replaced the
+  // verdict could never run. Manual `gh pr ready` was reverted within one
+  // cycle. Measured on Jinn-Network/mono: 142/142 APPROVE verdict intents
+  // completed, 0/6 REQUEST_CHANGES ones did, and all six sat at a stale head.
+  //
+  // The pin is also the machine exit, and the only one this shape needs: push a
+  // fix -> the head moves -> the latch releases -> `reviewEnrollmentEligible`
+  // re-opens review enrollment on the now-undrafted PR at its new head. The
+  // claim record is left behind at its old head deliberately; it is
+  // `supersededReview` from that moment on, and every other consumer of a
+  // review claim — the merge gate included — is already head-pinned, so a
+  // stranded `verdict-intent` authorizes nothing.
   return item.kind === 'pull-request'
-    && item.reviewClaim?.state === 'verdict-intent'
+    && item.reviewClaim?.head === item.head
+    && item.reviewClaim.state === 'verdict-intent'
     && item.reviewClaim.verdict.state === 'REQUEST_CHANGES';
 }
 
