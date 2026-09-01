@@ -134,6 +134,13 @@ export interface DispatcherConfig {
   /** Max simultaneous review-pr sessions. Separate from concurrencyCap so a PR
    *  flood cannot starve new implementation work (or vice-versa). */
   reviewCap: number;
+  /** Max simultaneous machine-child sessions (review-finding / reconcile /
+   *  ci-failure fixes). Separate from concurrencyCap for the same reason
+   *  reviewCap is: a child flood cannot starve new implementation work, or be
+   *  starved by it (#122). Children heal existing branches and drain the
+   *  open-PR backlog, so a deep child queue is the moment the engine most needs
+   *  them to run and least needs new branches opened. */
+  childCap: number;
   /** The opt-in label that gates review-pr participation. */
   engineReviewLabel: string;
   /**
@@ -229,6 +236,7 @@ export const DEFAULT_CONFIG: DispatcherConfig = {
   wallClockMs: 4 * 60 * 60 * 1000,
   authorAllowlist: [],
   reviewCap: 3,
+  childCap: 1,
   engineReviewLabel: 'engine:review',
   reviewBotLogin: '',
   implGhToken: '',

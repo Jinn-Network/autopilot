@@ -121,6 +121,21 @@ export const autopilotConfigSchema = z.object({
     pollSeconds: positiveSeconds,
     fullReconcileSeconds: positiveSeconds,
     implementationConcurrency: positiveInteger,
+    /**
+     * Machine-child work (review-finding / reconcile / ci-failure fixes) gets
+     * its own lane, separate from `implementationConcurrency` so a burst of
+     * children cannot starve fresh implementation work — or be starved by it
+     * (#122). Children heal branches that already exist and shrink the open-PR
+     * backlog; fresh claims open new ones. Sharing a cap throttles the
+     * conflict-healing work against the conflict-creating work, which is
+     * exactly backwards when the child queue is deep.
+     *
+     * Defaulted, not required: every `.autopilot/config.json` written before
+     * this field existed omits the key and must keep parsing. `positiveInteger`
+     * rejects 0, so a zero-width child lane — which would deadlock the very
+     * work that unblocks the pipeline — is unrepresentable.
+     */
+    childConcurrency: positiveInteger.default(1),
     reviewConcurrency: positiveInteger,
     openPrBackpressure: positiveInteger,
   }).strict(),

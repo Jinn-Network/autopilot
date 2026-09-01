@@ -343,6 +343,7 @@ function dispatcherConfig(
     ),
     authorAllowlist: [...allowlist],
     concurrencyCap: product.scheduler.implementationConcurrency,
+    childCap: product.scheduler.childConcurrency,
     reviewCap: product.scheduler.reviewConcurrency,
     openPrBackpressure: product.scheduler.openPrBackpressure,
     reviewBotLogin: environment.JINN_REVIEW_BOT_LOGIN ?? '',
