@@ -1629,11 +1629,15 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
             proveReviewedDiff: reviewedDiffCarryInQuestion(reviewClaim, pr.headRefOid),
           }).then((evidence) => {
             if (evidence.unavailableReason !== undefined) {
-              // A concurrent push moved this head between the GraphQL listing
-              // and the REST reread. The compare refused, so `status` is the
-              // fail-closed `unknown` and this PR derives `blocked` until a
-              // later cycle reads a settled head — the rest of the page is
-              // unaffected.
+              // The compare refused: either a concurrent push moved this head
+              // between the GraphQL listing and the REST reread (transient —
+              // self-heals next cycle), or this PR's base ref is unsafely
+              // named (durable — see #108, stays refused until the branch is
+              // renamed). Either way `status` is the fail-closed `unknown` and
+              // this PR derives `blocked`; the rest of the page is unaffected.
+              // `readExactCompareEvidence` already warned with the offending
+              // ref for the unsafe-base-ref case; this one is the generic,
+              // reason-agnostic backstop.
               console.warn(
                 `[github-reader] refusing compare evidence for PR #${pr.number} `
                   + `(continuing): ${evidence.unavailableReason}`,

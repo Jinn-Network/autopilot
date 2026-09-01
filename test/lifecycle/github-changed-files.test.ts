@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   readExactChangedFiles,
   readExactCompareEvidence,
@@ -156,6 +156,40 @@ describe('readExactCompareEvidence', () => {
     // PR costs exactly one request instead of two.
     expect(calls).toEqual(['repos/Jinn-Network/mono/pulls/101']);
   });
+
+  /**
+   * An unsafe base ref is not a race — no retry fixes a badly-named branch —
+   * but per #108 it must still refuse per-PR rather than throw past this
+   * reader's per-page isolation. `'unknown'` (not a Human diagnostic) is the
+   * deliberate choice, matching #107's head-authority-moved refusal: every
+   * consumer already treats `'unknown'` as durably blocked and re-reads it
+   * every cycle, and the warn is what makes the (permanent, until renamed)
+   * stall operator-visible instead of silent.
+   */
+  it('reports an unreadable compare rather than throwing for an unsafe base ref', async () => {
+    const calls: string[] = [];
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await expect(readExactCompareEvidence({
+      run: async (_command, args) => {
+        calls.push(args[1]!);
+        return JSON.stringify({
+          head: { sha: HEAD },
+          base: { ref: 'a..b', sha: BASE },
+        });
+      },
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'a..b',
+      repositorySlug: 'Jinn-Network/mono',
+    })).resolves.toEqual({ status: 'unknown', unavailableReason: 'unsafe-base-ref' });
+
+    // Validated before the request is built, so an unsafe ref never reaches
+    // the network at all — the refusal costs exactly one request.
+    expect(calls).toEqual(['repos/Jinn-Network/mono/pulls/101']);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('#101'));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('a..b'));
+    warnSpy.mockRestore();
+  });
 });
 
 describe('readExactCompareStatus', () => {
@@ -242,6 +276,12 @@ describe('readExactCompareStatus', () => {
     ['reflog syntax', 'a@{1}'],
   ])('refuses to issue a compare for an unsafe base ref (%s)', async (_name, ref) => {
     const calls: string[] = [];
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // #108: the throw is contained to a per-PR 'unknown' refusal rather than
+    // escaping past the reader's per-page isolation — see
+    // `readExactCompareEvidence`'s "unsafe base ref" test above for the full
+    // evidence shape. `gitRefName` itself is unweakened; only its blast
+    // radius here changed.
     await expect(readExactCompareStatus({
       run: async (_command, args) => {
         calls.push(args[1]!);
@@ -251,10 +291,11 @@ describe('readExactCompareStatus', () => {
       expectedHead: HEAD,
       expectedBaseRefName: ref,
       repositorySlug: 'Jinn-Network/mono',
-    })).rejects.toThrow(/Invalid Git ref name/i);
+    })).resolves.toBe('unknown');
 
     // The PR reread happened; the compare never did.
     expect(calls).toEqual(['repos/Jinn-Network/mono/pulls/101']);
+    warnSpy.mockRestore();
   });
 
   it('refuses to return changed files for an unsafe base ref', async () => {
