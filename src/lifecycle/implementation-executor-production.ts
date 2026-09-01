@@ -644,6 +644,7 @@ export function makeProductionImplementationActionPort(
         worktreeBase: options.worktreeBase,
         runnerId: options.runnerId,
         phase: 'implement',
+        ...(input.childKind === undefined ? {} : { childKind: input.childKind }),
         subject: `issue-${input.issueNumber}`,
         issueNumber: input.issueNumber,
         prNumber: input.prNumber,

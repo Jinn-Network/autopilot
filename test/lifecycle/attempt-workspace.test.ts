@@ -917,6 +917,93 @@ describe('attempt workspace and manifest', () => {
       .not.toContain('token');
   });
 
+  it('records an optional child kind on implementation manifests and nowhere else', async () => {
+    const fixture = repositoryFixture();
+    const uuid = (digit: string) => `${digit.repeat(8)}-${digit.repeat(4)}`
+      + `-4${digit.repeat(3)}-8${digit.repeat(3)}-${digit.repeat(12)}`;
+
+    // A fresh implementation claim writes no `childKind` at all, and a manifest
+    // that predates the field decodes unchanged: absent means fresh.
+    const fresh = await createAttemptWorkspace(options(fixture), defaultRunner);
+    expect(fresh.childKind).toBeUndefined();
+    expect(Object.keys(
+      JSON.parse(readFileSync(fresh.paths.manifest, 'utf8')) as Record<string, unknown>,
+    )).not.toContain('childKind');
+    expect(readAttemptManifest(fresh.paths.manifest)).toEqual(fresh);
+
+    // All three machine-child kinds round-trip create -> disk -> strict decode.
+    const kinds = ['review-finding', 'reconcile', 'ci-failure'] as const;
+    for (const [index, childKind] of kinds.entries()) {
+      const attempt = await createAttemptWorkspace(options(fixture, {
+        attemptId: uuid(String(index + 4)),
+        childKind,
+      }), defaultRunner);
+      expect(attempt.childKind).toBe(childKind);
+      expect(readAttemptManifest(attempt.paths.manifest).childKind).toBe(childKind);
+      expect((JSON.parse(
+        readFileSync(attempt.paths.manifest, 'utf8'),
+      ) as Record<string, unknown>).childKind).toBe(childKind);
+      // The lane tag never leaks into the phase, subject, or on-disk layout.
+      expect(attempt.phase).toBe('implement');
+      expect(attempt.subject).toBe('issue-42');
+      expect(attempt.paths.attemptDir).toContain(join('implement', 'issue-42-'));
+    }
+
+    // Unknown values are rejected outright.
+    const raw = JSON.parse(
+      readFileSync(fresh.paths.manifest, 'utf8'),
+    ) as Record<string, unknown>;
+    expect(() => decodeAttemptManifest({ ...raw, childKind: 'merge-prep' }))
+      .toThrow(/child kind/i);
+    expect(() => decodeAttemptManifest({ ...raw, childKind: 7 }))
+      .toThrow(/child kind/i);
+
+    // And a child kind on a review attempt is a contradiction, not a tag.
+    const review = await createAttemptWorkspace(options(fixture, {
+      attemptId: uuid('7'),
+      phase: 'review',
+      subject: 'pr-7',
+      prNumber: 7,
+      reviewGeneration: UUID_C,
+      reviewRefOid: fixture.oid,
+      reviewApprovalPolicy: 'approve-eligible',
+    }), defaultRunner);
+    const reviewRaw = JSON.parse(
+      readFileSync(review.paths.manifest, 'utf8'),
+    ) as Record<string, unknown>;
+    expect(() => decodeAttemptManifest({ ...reviewRaw, childKind: 'reconcile' }))
+      .toThrow(/child kind/i);
+    await expect(createAttemptWorkspace(options(fixture, {
+      attemptId: uuid('8'),
+      phase: 'review',
+      subject: 'pr-7',
+      prNumber: 7,
+      reviewGeneration: UUID_C,
+      reviewRefOid: fixture.oid,
+      reviewApprovalPolicy: 'approve-eligible',
+      childKind: 'reconcile',
+    }), defaultRunner)).rejects.toThrow(/child kind/i);
+  });
+
+  it('locks the child kind against atomic manifest updates', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture, {
+      childKind: 'ci-failure',
+    }), defaultRunner);
+
+    expect(() => updateAttemptManifest(manifest.paths.manifest, (current) => ({
+      ...current,
+      childKind: 'reconcile',
+    }))).toThrow(/static attempt fields/);
+    expect(() => updateAttemptManifest(manifest.paths.manifest, (current) => {
+      const { childKind: _childKind, ...withoutChildKind } = current;
+      return withoutChildKind;
+    })).toThrow(/static attempt fields/);
+    expect(readAttemptManifest(manifest.paths.manifest).childKind).toBe('ci-failure');
+    expect(markAttemptRunning(manifest.paths.manifest, 4242, () =>
+      new Date('2026-07-20T00:01:00.000Z')).childKind).toBe('ci-failure');
+  });
+
   it('normalizes absent execution metadata to the local backend and writes local executions', async () => {
     const fixture = repositoryFixture();
     const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
