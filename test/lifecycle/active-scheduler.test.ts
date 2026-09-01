@@ -22,7 +22,7 @@ function input(overrides: Partial<ActiveSchedulingInput> = {}): ActiveScheduling
         expectedBaseRefName: gitRefName('autopilot/4'),
       },
     ],
-    remaining: { implementation: 1, review: 1 },
+    remaining: { implementation: 1, child: 1, review: 1 },
     availableLogins: [
       'implementation-bot',
       'review-bot',
@@ -67,7 +67,7 @@ describe('active local scheduler', () => {
         expectedBaseRefName: gitRefName('stack/custom-parent'),
         ...(phase === 'file-reconcile-child' ? { effort: 'medium' as const } : {}),
       }],
-      remaining: { implementation: 0, review: 0 },
+      remaining: { implementation: 0, child: 1, review: 0 },
     }));
 
     expect(plan.actions).toEqual([expected]);
@@ -88,7 +88,7 @@ describe('active local scheduler', () => {
         { phase: 'implementation', intent: 'fresh', issueNumber: 42 },
         { phase: 'implementation', intent: 'fresh', issueNumber: 43 },
       ],
-      remaining: { implementation: 1, review: 0 },
+      remaining: { implementation: 1, child: 1, review: 0 },
     }));
 
     expect(plan.actions).toEqual([
@@ -138,10 +138,10 @@ describe('active local scheduler', () => {
         },
       ],
       openPipelineBacklog: 10,
-      remaining: { implementation: 2, review: 1 },
+      remaining: { implementation: 2, child: 1, review: 1 },
     }));
     expect(plan.actions).toEqual([
-      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 99 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 99, child: true },
       {
         kind: 'claim-review',
         issueNumber: 3,
@@ -178,7 +178,7 @@ describe('active local scheduler', () => {
         { phase: 'implementation', intent: 'fresh', issueNumber: 43 },
       ],
       openPipelineBacklog: 10,
-      remaining: { implementation: 2, review: 0 },
+      remaining: { implementation: 2, child: 1, review: 0 },
     }));
 
     expect(plan.actions).toEqual([{
@@ -204,7 +204,7 @@ describe('active local scheduler', () => {
         { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
       ],
       availableLogins: ['implementation-bot'],
-      remaining: { implementation: 1, review: 1 },
+      remaining: { implementation: 1, child: 1, review: 1 },
     }));
     expect(plan.actions.map((action) => action.kind)).toEqual([
       'claim-implementation',
@@ -221,7 +221,7 @@ describe('active local scheduler', () => {
         { phase: 'implementation', intent: 'fresh', issueNumber: 4 },
       ],
       availableLogins: ['implementation-bot'],
-      remaining: { implementation: 3, review: 0 },
+      remaining: { implementation: 3, child: 1, review: 0 },
     }));
     expect(plan.actions).toEqual([
       { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 },
@@ -268,9 +268,140 @@ describe('active local scheduler', () => {
 
   it('derives no global or other-runner capacity signal', () => {
     expect(Object.keys(input().remaining).sort()).toEqual([
+      'child',
       'implementation',
       'review',
     ]);
+  });
+
+  // The 2026-09-01 incident: eight ~27-minute children filed at once queued
+  // through the single implementation slot alongside ~203 eligible fresh
+  // issues, and the review lane sat idle behind both. With its own lane each
+  // side gets a slot in the same cycle instead of taking turns for hours.
+  it('schedules a child and a fresh claim in the same cycle from separate lanes', () => {
+    const children = Array.from({ length: 8 }, (_unused, index) => ({
+      phase: 'implementation' as const,
+      intent: 'fresh' as const,
+      issueNumber: 3500 + index,
+      isChild: true,
+    }));
+    const fresh = Array.from({ length: 5 }, (_unused, index) => ({
+      phase: 'implementation' as const,
+      intent: 'fresh' as const,
+      issueNumber: 100 + index,
+    }));
+    const plan = scheduleActiveActions(input({
+      candidates: [...children, ...fresh],
+      remaining: { implementation: 1, child: 1, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([
+      // Children still outrank fresh work in the emitted order.
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 3500, child: true },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 100 },
+    ]);
+    expect(plan.backups.child.map((action) => action.issueNumber))
+      .toEqual([3501, 3502, 3503, 3504, 3505, 3506, 3507]);
+    expect(plan.backups.implementation.map((action) => action.issueNumber))
+      .toEqual([101, 102, 103, 104]);
+    // Every child backup keeps the lane tag it was ranked under.
+    expect(plan.backups.child.every((action) => action.child === true)).toBe(true);
+    expect(plan.backups.implementation.some((action) => 'child' in action)).toBe(false);
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:3501',
+      reason: 'capacity',
+    });
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:101',
+      reason: 'capacity',
+    });
+  });
+
+  it('gives each lane its own capacity so neither can starve the other', () => {
+    const candidates = [
+      { phase: 'implementation' as const, intent: 'fresh' as const, issueNumber: 1 },
+      { phase: 'implementation' as const, intent: 'fresh' as const, issueNumber: 2 },
+      {
+        phase: 'implementation' as const,
+        intent: 'fresh' as const,
+        issueNumber: 90,
+        isChild: true,
+      },
+      {
+        phase: 'implementation' as const,
+        intent: 'fresh' as const,
+        issueNumber: 91,
+        isChild: true,
+      },
+    ];
+
+    // A full child lane leaves the implementation lane untouched.
+    expect(scheduleActiveActions(input({
+      candidates,
+      remaining: { implementation: 2, child: 0, review: 0 },
+    })).actions).toEqual([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2 },
+    ]);
+
+    // And a full implementation lane leaves the child lane untouched.
+    expect(scheduleActiveActions(input({
+      candidates,
+      remaining: { implementation: 0, child: 2, review: 0 },
+    })).actions).toEqual([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 90, child: true },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 91, child: true },
+    ]);
+  });
+
+  it('keeps the review cohort contiguous behind both implementation lanes', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [
+        { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
+        { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
+        {
+          phase: 'implementation',
+          intent: 'fresh',
+          issueNumber: 90,
+          isChild: true,
+        },
+        { phase: 'review', issueNumber: 4, prNumber: 40, head: HEAD, author: 'other' },
+      ],
+      remaining: { implementation: 1, child: 1, review: 2 },
+    }));
+
+    // The controller batches a contiguous run of claim-review actions into one
+    // quota-reserved cohort; an implementation claim landing between two of
+    // them would split that cohort into two reservations.
+    expect(plan.actions.map((action) => action.kind)).toEqual([
+      'claim-implementation',
+      'claim-implementation',
+      'claim-review',
+      'claim-review',
+    ]);
+  });
+
+  it('refuses children on the credential lane it never exempts them from', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [{
+        phase: 'implementation',
+        intent: 'fresh',
+        issueNumber: 90,
+        isChild: true,
+      }],
+      availableLogins: [],
+      remaining: { implementation: 1, child: 1, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([]);
+    expect(plan.backups.child).toEqual([]);
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:90',
+      reason: 'credential-lane',
+    });
   });
 
   describe('ineligible-claim fall-through backups', () => {
@@ -281,7 +412,7 @@ describe('active local scheduler', () => {
           { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
           { phase: 'implementation', intent: 'fresh', issueNumber: 3 },
         ],
-        remaining: { implementation: 1, review: 0 },
+        remaining: { implementation: 1, child: 1, review: 0 },
       }));
 
       expect(plan.actions).toEqual([
@@ -313,16 +444,18 @@ describe('active local scheduler', () => {
           { phase: 'implementation', intent: 'fresh', issueNumber: 2, isChild: true },
         ],
         openPipelineBacklog: 10,
-        remaining: { implementation: 1, review: 0 },
+        remaining: { implementation: 1, child: 1, review: 0 },
       }));
 
       expect(plan.actions).toEqual([
-        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 99 },
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 99, child: true },
       ]);
       // Issue 1 is a fresh claim under backpressure: it was never eligible to
-      // run this cycle, so promoting it would defeat the threshold.
-      expect(plan.backups.implementation).toEqual([
-        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2 },
+      // run this cycle, so promoting it would defeat the threshold. The child
+      // surplus is promotable, because backpressure never gated it.
+      expect(plan.backups.implementation).toEqual([]);
+      expect(plan.backups.child).toEqual([
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2, child: true },
       ]);
     });
 
@@ -333,7 +466,7 @@ describe('active local scheduler', () => {
           { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
         ],
         availableLogins: [],
-        remaining: { implementation: 1, review: 0 },
+        remaining: { implementation: 1, child: 1, review: 0 },
       }));
 
       expect(plan.actions).toEqual([]);
@@ -354,7 +487,7 @@ describe('active local scheduler', () => {
           { phase: 'review', issueNumber: 5, prNumber: 50, head: HEAD, author: 'other' },
         ],
         availableLogins: ['implementation-bot'],
-        remaining: { implementation: 0, review: 1 },
+        remaining: { implementation: 0, child: 1, review: 1 },
       }));
 
       expect(plan.actions).toEqual([
@@ -369,23 +502,37 @@ describe('active local scheduler', () => {
 
     it('emits no backups at all while new work is paused', () => {
       const plan = scheduleActiveActions(input({
-        remaining: { implementation: 0, review: 0 },
+        candidates: [
+          ...input().candidates,
+          { phase: 'implementation', intent: 'fresh', issueNumber: 90, isChild: true },
+        ],
+        remaining: { implementation: 0, child: 0, review: 0 },
         newWorkPaused: true,
       }));
 
-      expect(plan.backups).toEqual({ implementation: [], review: [] });
+      expect(plan.backups).toEqual({ implementation: [], child: [], review: [] });
     });
   });
 
-  it('reports disk-floor skips when new work is paused', () => {
+  it('reports disk-floor skips in every lane when new work is paused', () => {
     const plan = scheduleActiveActions(input({
-      remaining: { implementation: 0, review: 0 },
+      candidates: [
+        ...input().candidates,
+        { phase: 'implementation', intent: 'fresh', issueNumber: 90, isChild: true },
+      ],
+      remaining: { implementation: 0, child: 0, review: 0 },
       newWorkPaused: true,
     }));
     expect(plan.actions.map((action) => action.kind)).toEqual(['enqueue']);
     expect(plan.skips).toContainEqual({
       phase: 'implementation',
       subject: 'issue:1',
+      reason: 'disk-floor',
+    });
+    // The disk floor is not a slot shortage in one lane; it pauses all three.
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:90',
       reason: 'disk-floor',
     });
     expect(plan.skips).toContainEqual({

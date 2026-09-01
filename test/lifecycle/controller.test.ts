@@ -421,7 +421,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1, mergePrep: 1 },
+          remaining: { implementation: 1, child: 1, review: 1, mergePrep: 1 },
           availableLogins: ['bot'],
           implementationPreferredLogin: 'bot',
         }),
@@ -701,7 +701,7 @@ describe('lifecycle controller', () => {
     const active = {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['bot'],
         implementationPreferredLogin: 'bot',
       }),
@@ -774,7 +774,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1 },
+          remaining: { implementation: 1, child: 1, review: 1 },
           availableLogins: ['reviewer-bot'], // ≠ pr.author ('trusted')
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -813,7 +813,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1 },
+          remaining: { implementation: 1, child: 1, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -879,7 +879,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1 },
+          remaining: { implementation: 1, child: 1, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -971,7 +971,7 @@ describe('lifecycle controller', () => {
         active: {
           preflight: async () => ({ ok: true }),
           readLocalState: () => ({
-            remaining: { implementation: 1, review: 0 },
+            remaining: { implementation: 1, child: 1, review: 0 },
             availableLogins: ['implementer'],
             implementationPreferredLogin: 'implementer',
           }),
@@ -1035,7 +1035,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 0, review: 1 },
+          remaining: { implementation: 0, child: 0, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -1108,7 +1108,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 0, review: 1 },
+          remaining: { implementation: 0, child: 0, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -1162,7 +1162,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 0, review: 1 },
+          remaining: { implementation: 0, child: 0, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -1220,7 +1220,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 0, review: 1 },
+          remaining: { implementation: 0, child: 0, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -1291,7 +1291,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 0, review: 2 },
+          remaining: { implementation: 0, child: 0, review: 2 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -1379,7 +1379,7 @@ describe('lifecycle controller', () => {
     const active = {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -1465,7 +1465,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 0, review: 1 },
+          remaining: { implementation: 0, child: 0, review: 1 },
           availableLogins: ['review-bot'],
           implementationPreferredLogin: 'review-bot',
         }),
@@ -1546,7 +1546,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 0, review: 1 },
+          remaining: { implementation: 0, child: 0, review: 1 },
           availableLogins: ['review-bot'],
           implementationPreferredLogin: 'review-bot',
         }),
@@ -1603,7 +1603,7 @@ describe('lifecycle controller', () => {
     const active = {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -1678,7 +1678,7 @@ describe('lifecycle controller', () => {
     const active = {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -1750,7 +1750,7 @@ describe('lifecycle controller', () => {
     const active = {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -1836,7 +1836,7 @@ describe('lifecycle controller', () => {
     const active = {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -1921,7 +1921,7 @@ describe('lifecycle controller', () => {
     const active = {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -2494,7 +2494,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1 },
+          remaining: { implementation: 1, child: 1, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -2661,7 +2661,7 @@ describe('lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1 },
+          remaining: { implementation: 1, child: 1, review: 1 },
           availableLogins: ['reviewer-bot'],
           implementationPreferredLogin: 'reviewer-bot',
         }),
@@ -3240,7 +3240,7 @@ describe('enqueue stage scheduling', () => {
         active: {
           preflight: async () => ({ ok: true }),
           readLocalState: () => ({
-            remaining: { implementation: 1, review: 1 },
+            remaining: { implementation: 1, child: 1, review: 1 },
             availableLogins: ['implementation-bot'],
             implementationPreferredLogin: 'implementation-bot',
           }),
@@ -3488,7 +3488,7 @@ describe('enqueue stage scheduling', () => {
           active: {
             preflight: async () => ({ ok: true }),
             readLocalState: () => ({
-              remaining: { implementation: 1, review: 1 },
+              remaining: { implementation: 1, child: 1, review: 1 },
               availableLogins: ['implementation-bot'],
               implementationPreferredLogin: 'implementation-bot',
             }),

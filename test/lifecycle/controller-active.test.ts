@@ -81,7 +81,7 @@ function deps(
     active: {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -107,7 +107,7 @@ describe('active lifecycle controller', () => {
       active: {
         preflight: async () => ({ ok: false, detail: 'atomic multi-ref unsupported' }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1 },
+          remaining: { implementation: 1, child: 1, review: 1 },
           availableLogins: ['implementation-bot'],
           implementationPreferredLogin: 'implementation-bot',
         }),
@@ -289,8 +289,11 @@ describe('active lifecycle controller', () => {
 
     await runLifecycleCycle('active', controller);
 
+    // The child leads, tagged with the lane that admitted it; the fresh claim
+    // follows on its own lane's slot rather than waiting behind the child.
     expect(actions).toEqual([
-      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2141 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2141, child: true },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 42 },
     ]);
   });
 
@@ -650,7 +653,7 @@ describe('active lifecycle controller', () => {
         readSnapshot: async () => awaitingReviewSnapshot([101, 102, 103]),
       });
       controller.active!.readLocalState = () => ({
-        remaining: { implementation: 0, review: 1 },
+        remaining: { implementation: 0, child: 0, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       });
@@ -712,7 +715,7 @@ describe('active lifecycle controller', () => {
     it('logs no starvation when the lane is genuinely full', async () => {
       const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
       controller.active!.readLocalState = () => ({
-        remaining: { implementation: 0, review: 0 },
+        remaining: { implementation: 0, child: 0, review: 0 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       });
@@ -743,7 +746,7 @@ describe('active lifecycle controller', () => {
         readSnapshot: async () => awaitingReviewSnapshot([101, 102]),
       });
       controller.active!.readLocalState = () => ({
-        remaining: { implementation: 0, review: 1 },
+        remaining: { implementation: 0, child: 0, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       });
@@ -804,7 +807,7 @@ describe('active lifecycle controller', () => {
       const claimed: number[] = [];
       const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
       controller.active!.readLocalState = () => ({
-        remaining: { implementation: 3, review: 1 },
+        remaining: { implementation: 3, child: 3, review: 1 },
         availableLogins: ['implementation-bot'],
         implementationPreferredLogin: 'implementation-bot',
       });
@@ -1017,7 +1020,7 @@ describe('active lifecycle controller', () => {
     return {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 1, review: 1 },
+        remaining: { implementation: 1, child: 1, review: 1 },
         availableLogins: ['review-bot'],
         implementationPreferredLogin: 'review-bot',
       }),
@@ -1134,7 +1137,7 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
     return {
       preflight: async () => ({ ok: true }),
       readLocalState: () => ({
-        remaining: { implementation: 2, review: 2 },
+        remaining: { implementation: 2, child: 2, review: 2 },
         availableLogins: ['implementation-bot', 'implementation-bot-2'],
         implementationPreferredLogin: 'implementation-bot',
       }),
@@ -1311,7 +1314,7 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 2, review: 2 },
+          remaining: { implementation: 2, child: 2, review: 2 },
           availableLogins: ['review-bot-1', 'review-bot-2'],
           implementationPreferredLogin: 'review-bot-1',
         }),

@@ -75,6 +75,14 @@ export interface ActiveSchedulingInput {
   readonly candidates: readonly ActiveCandidate[];
   readonly remaining: {
     readonly implementation: number;
+    /**
+     * Machine-child work has its own lane (#122). Children heal branches that
+     * already exist and shrink the open-PR backlog; fresh claims open new
+     * ones. Sharing one cap throttled the conflict-healing work against the
+     * conflict-creating work, which is exactly backwards when the child queue
+     * is deep.
+     */
+    readonly child: number;
     readonly review: number;
   };
   readonly availableLogins: readonly string[];
@@ -112,6 +120,8 @@ export interface ActiveSchedulingPlan {
   readonly backups: {
     readonly implementation:
       readonly Extract<NewWorkAction, { kind: 'claim-implementation' }>[];
+    readonly child:
+      readonly Extract<NewWorkAction, { kind: 'claim-implementation' }>[];
     readonly review: readonly Extract<NewWorkAction, { kind: 'claim-review' }>[];
   };
 }
@@ -143,7 +153,15 @@ function implementationAction(
   return {
     kind: 'claim-implementation',
     ...candidate.intent === 'fresh'
-      ? { intent: 'fresh', issueNumber: candidate.issueNumber }
+      ? {
+          intent: 'fresh',
+          issueNumber: candidate.issueNumber,
+          // Advisory lane tag, not execution authority: it records which lane
+          // admitted the claim so the runtime charges the right slot and the
+          // controller the right fall-through budget. What the claim then
+          // does is decided by the issue's own child marker.
+          ...(candidate.isChild === true ? { child: true as const } : {}),
+        }
       : {
           intent: 'stale-recovery',
           issueNumber: candidate.issueNumber,
@@ -184,6 +202,8 @@ export function scheduleActiveActions(
   const skips: ActiveSchedulingSkip[] = [];
   const implementationBackups:
     Extract<NewWorkAction, { kind: 'claim-implementation' }>[] = [];
+  const childBackups:
+    Extract<NewWorkAction, { kind: 'claim-implementation' }>[] = [];
   const reviewBackups: Extract<NewWorkAction, { kind: 'claim-review' }>[] = [];
   const configuredLogins = new Set(
     input.availableLogins.map((login) => login.toLowerCase()),
@@ -204,30 +224,54 @@ export function scheduleActiveActions(
       expectedPriority: candidate.expectedPriority,
     });
   }
-  let scheduledImplementation = 0;
-  for (const candidate of implementation) {
-    const gate = implementationGate(candidate, input, configuredLogins);
-    if (scheduledImplementation >= input.remaining.implementation) {
-      skips.push({
-        phase: candidate.phase,
-        subject: subject(candidate),
-        reason: capacitySkipReason(input),
-      });
-      // Paused new work is not a slot shortage, so nothing behind it is a
-      // backup: promoting one would spend the very capacity the disk floor
-      // withheld.
-      if (gate === null && input.newWorkPaused !== true) {
-        implementationBackups.push(implementationAction(candidate));
+  const isChildCandidate = (
+    candidate: Extract<ActiveCandidate, { phase: 'implementation' }>,
+  ): boolean => candidate.intent === 'fresh' && candidate.isChild === true;
+  // One loop body, walked once per lane against that lane's own remaining
+  // capacity and its own backup queue. Children go first, which is the
+  // "children outrank fresh implementation claims" order the caller already
+  // ranked them in; the fresh pass then sees exactly the candidates it saw
+  // before, in exactly the same order, minus the ones this lane took.
+  const scheduleLane = (
+    laneCandidates: readonly Extract<ActiveCandidate, { phase: 'implementation' }>[],
+    remaining: number,
+    backups: Extract<NewWorkAction, { kind: 'claim-implementation' }>[],
+  ): void => {
+    let scheduled = 0;
+    for (const candidate of laneCandidates) {
+      const gate = implementationGate(candidate, input, configuredLogins);
+      if (scheduled >= remaining) {
+        skips.push({
+          phase: candidate.phase,
+          subject: subject(candidate),
+          reason: capacitySkipReason(input),
+        });
+        // Paused new work is not a slot shortage, so nothing behind it is a
+        // backup: promoting one would spend the very capacity the disk floor
+        // withheld.
+        if (gate === null && input.newWorkPaused !== true) {
+          backups.push(implementationAction(candidate));
+        }
+        continue;
       }
-      continue;
+      if (gate !== null) {
+        skips.push({ phase: candidate.phase, subject: subject(candidate), reason: gate });
+        continue;
+      }
+      actions.push(implementationAction(candidate));
+      scheduled += 1;
     }
-    if (gate !== null) {
-      skips.push({ phase: candidate.phase, subject: subject(candidate), reason: gate });
-      continue;
-    }
-    actions.push(implementationAction(candidate));
-    scheduledImplementation += 1;
-  }
+  };
+  scheduleLane(
+    implementation.filter(isChildCandidate),
+    input.remaining.child,
+    childBackups,
+  );
+  scheduleLane(
+    implementation.filter((candidate) => !isChildCandidate(candidate)),
+    input.remaining.implementation,
+    implementationBackups,
+  );
 
   let scheduledReview = 0;
   for (const candidate of input.candidates) {
@@ -317,6 +361,10 @@ export function scheduleActiveActions(
   return {
     actions,
     skips,
-    backups: { implementation: implementationBackups, review: reviewBackups },
+    backups: {
+      implementation: implementationBackups,
+      child: childBackups,
+      review: reviewBackups,
+    },
   };
 }
