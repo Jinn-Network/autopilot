@@ -2590,4 +2590,93 @@ describe('merge-queue snapshot evidence', () => {
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('#102'));
     warnSpy.mockRestore();
   });
+
+  const UNSAFE_BASE_REF = 'a..b';
+
+  /**
+   * Issue #108, the same defect class as the head race above but durable: an
+   * unsafe base ref is not something a retry fixes, so it needs a branch
+   * rename rather than self-healing next cycle. It must still refuse per-PR
+   * rather than aborting the whole page — one PR opened against a badly-named
+   * base branch must not no-op every other PR's cycle too.
+   */
+  function unsafeBaseRefRun(): { run: CommandRunner; endpoints: string[] } {
+    const endpoints: string[] = [];
+    const base = 'b'.repeat(40);
+    const racing = {
+      ...queueAwarePr({ mergeStateStatus: 'BLOCKED' }),
+      baseRefName: UNSAFE_BASE_REF,
+    };
+    const sibling = {
+      ...graphQlPr({ number: 102, state: 'OPEN', head: SIBLING_HEAD }),
+      id: 'PR_kwDOABCD456',
+      isInMergeQueue: false,
+      mergeQueueEntry: null,
+      mergeStateStatus: 'BLOCKED',
+    };
+    const run: CommandRunner = async (command, args) => {
+      if (command === 'git') return '';
+      if (args[0] === 'api' && args[1] !== 'graphql') {
+        const endpoint = args[1]!;
+        endpoints.push(endpoint);
+        if (endpoint.includes('/compare/')) {
+          return JSON.stringify({ status: 'behind', base_commit: { sha: base } });
+        }
+        const isRacing = endpoint.endsWith('/pulls/101');
+        return JSON.stringify({
+          head: { sha: isRacing ? OPEN_HEAD : SIBLING_HEAD },
+          base: { ref: isRacing ? UNSAFE_BASE_REF : 'next', sha: base },
+        });
+      }
+      return JSON.stringify({
+        data: {
+          rateLimit: rateLimit(),
+          repository: {
+            pullRequests: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [racing, sibling],
+            },
+          },
+        },
+      });
+    };
+    return { run, endpoints };
+  }
+
+  it('keeps the snapshot complete when a PR has an unsafe base ref', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, endpoints } = unsafeBaseRefRun();
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(page.nodes.map((pr) => pr.number)).toEqual([101, 102]);
+    // The unsafe-base-ref PR is refused per-PR, not by invalidating the page.
+    expect(page.nodes[0]?.evidenceIncompleteReason).toBeUndefined();
+    // Stamped explicitly: an omitted compareStatus on a queue-eligible PR
+    // derives `clean`, which would be a fail-open.
+    expect(page.nodes[0]?.compareStatus).toBe('unknown');
+    expect(page.nodes[0]).not.toHaveProperty('compareBaseTipOid');
+    // The unaffected sibling still gets real compare evidence.
+    expect(page.nodes[1]?.compareStatus).toBe('behind');
+
+    const compares = endpoints.filter((endpoint) => endpoint.includes('/compare/'));
+    expect(compares).toHaveLength(1);
+    expect(compares[0]).toContain(SIBLING_HEAD);
+    // No compare request is ever built from the unvalidated ref.
+    expect(compares[0]).not.toContain(UNSAFE_BASE_REF);
+    warnSpy.mockRestore();
+  });
+
+  it('warns which PR has an unsafe base ref instead of failing silently', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run } = unsafeBaseRefRun();
+
+    await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('#101'));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('unsafe-base-ref'));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(UNSAFE_BASE_REF));
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('#102'));
+    warnSpy.mockRestore();
+  });
 });

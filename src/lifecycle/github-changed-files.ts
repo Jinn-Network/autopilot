@@ -174,9 +174,20 @@ export async function readExactChangedFiles(
  * Not every refusal in this module belongs on this contract. The exact
  * changed-file read still throws, because its callers are per-action isolated
  * and because at the review gate the throw *is* the authority that stops a
- * verdict binding to unproven files. An unsafe base ref likewise still throws
- * from `gitRefName` below: that is URL-safety, not a race, and its input is not
- * something a retry can fix.
+ * verdict binding to unproven files.
+ *
+ * An unsafe base ref (see `gitRefName` below) is different: it is durable
+ * rather than transient — no retry fixes a badly-named branch, so `'unknown'`
+ * persists every cycle until someone renames it, unlike the race above, which
+ * self-heals on the next read. But per #108 it shares this contract's blast-
+ * radius problem: the sole production call site has no `catch`, so a bare
+ * throw here would abort the whole snapshot page for every PR, not just the
+ * one with the badly-named base. `'unknown'` is already fail-closed at every
+ * consumer and already forces a fresh read every cycle (see above), and the
+ * `unavailableReason: 'unsafe-base-ref'` warn is what makes the stall
+ * operator-visible instead of silent. `gitRefName` itself is unweakened by
+ * this — only its blast radius here is contained, the same way it is for the
+ * head/base race.
  */
 export async function readExactCompareStatus(
   options: Omit<ReadExactChangedFilesOptions, 'context' | 'readFiles'>,
@@ -208,7 +219,7 @@ export interface ExactCompareEvidence {
    * on it — `'unknown'` already carries the whole decision — it exists so the
    * refusal is visible in the snapshot's output instead of silent.
    */
-  readonly unavailableReason?: 'head-authority-moved';
+  readonly unavailableReason?: 'head-authority-moved' | 'unsafe-base-ref';
 }
 
 export interface ReadExactCompareEvidenceOptions
@@ -276,8 +287,21 @@ export async function readExactCompareEvidence(
     return { status: 'unknown', unavailableReason: 'head-authority-moved' };
   }
   // Validated before the request is built, so an unsafe ref never reaches the
-  // network at all.
-  const compareBase = gitRefName(metadata.base.ref);
+  // network at all. Per #108: unlike the head/base race above, an unsafe base
+  // ref is durable — no retry fixes a badly-named branch — but it still must
+  // not throw past this function's sole, uncaught production call site and
+  // abort the whole snapshot page, so it joins the same 'unknown' refusal
+  // contract instead.
+  let compareBase: GitRefName;
+  try {
+    compareBase = gitRefName(metadata.base.ref);
+  } catch {
+    console.warn(
+      `[github-reader] refusing compare evidence for PR #${options.prNumber} `
+        + `(continuing): unsafe-base-ref ${JSON.stringify(metadata.base.ref)}`,
+    );
+    return { status: 'unknown', unavailableReason: 'unsafe-base-ref' };
+  }
   const compare = JSON.parse(await options.run('gh', [
     'api',
     `repos/${repositorySlug}/compare/heads/${compareBase}...${options.expectedHead}`,
