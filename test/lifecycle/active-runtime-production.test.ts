@@ -69,7 +69,7 @@ function marketplaceRuntime(overrides: Record<string, unknown> = {}) {
     spawn: vi.fn(() => {
       throw new Error('local spawn must remain untouched');
     }),
-    caps: { implementation: 1, review: 1 },
+    caps: { implementation: 1, child: 1, review: 1 },
     implementationBackpressureThreshold: 30,
     staleAfterMs: 60_000,
     repositorySlug: 'Jinn-Network/mono',

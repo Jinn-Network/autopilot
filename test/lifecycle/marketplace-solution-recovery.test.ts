@@ -336,7 +336,7 @@ describe('marketplace solution recovery', () => {
       active: {
         preflight: async () => ({ ok: true }),
         readLocalState: () => ({
-          remaining: { implementation: 1, review: 1 },
+          remaining: { implementation: 1, child: 1, review: 1 },
           newWorkPaused: false,
           availableLogins: ['jinn-autopilot'],
           implementationPreferredLogin: 'jinn-autopilot',

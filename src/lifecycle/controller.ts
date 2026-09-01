@@ -123,6 +123,8 @@ export interface LifecycleControllerDeps {
     readLocalState(): {
       readonly remaining: {
         readonly implementation: number;
+        /** Machine-child work, capped separately from fresh claims (#122). */
+        readonly child: number;
         readonly review: number;
       };
       readonly newWorkPaused: boolean;

@@ -820,6 +820,11 @@ export async function runAutopilotV2(
             config.concurrencyCap,
             'JINN_AUTOPILOT_IMPLEMENTATION_CAP',
           ),
+          child: positiveEnvironmentInteger(
+            env.JINN_AUTOPILOT_CHILD_CAP,
+            config.childCap,
+            'JINN_AUTOPILOT_CHILD_CAP',
+          ),
           review: positiveEnvironmentInteger(
             env.JINN_AUTOPILOT_REVIEW_CAP,
             config.reviewCap,

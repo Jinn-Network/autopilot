@@ -27,10 +27,12 @@ function pool(): CredentialPool {
 function attempt(
   phase: AttemptManifest['phase'],
   selectedLogin: string,
+  childKind?: AttemptManifest['childKind'],
 ): AttemptManifest {
   return {
     phase,
     selectedLogin,
+    ...(childKind === undefined ? {} : { childKind }),
   } as AttemptManifest;
 }
 
@@ -44,7 +46,7 @@ describe('active runtime boundary', () => {
     }>();
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 1, review: 2 },
+      caps: { implementation: 1, child: 1, review: 2 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
@@ -85,7 +87,7 @@ describe('active runtime boundary', () => {
     const calls: string[] = [];
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 1, review: 1 },
+      caps: { implementation: 1, child: 1, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
@@ -115,7 +117,7 @@ describe('active runtime boundary', () => {
   it('derives only this runner’s phase capacity from injected local attempts', () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 2, review: 1 },
+      caps: { implementation: 2, child: 2, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [attempt('implement', 'implementation-bot')],
@@ -128,17 +130,87 @@ describe('active runtime boundary', () => {
     });
 
     expect(runtime.readLocalState()).toEqual({
-      remaining: { implementation: 1, review: 1 },
+      remaining: { implementation: 1, child: 2, review: 1 },
       newWorkPaused: false,
       availableLogins: ['implementation-bot', 'review-bot'],
       implementationPreferredLogin: 'implementation-bot',
     });
   });
 
-  it('zeros implementation and review remaining when new work is paused', () => {
+  it('bills a child attempt to the child lane and an unmarked one to implementation', () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 2, review: 1 },
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [
+        // Written before `childKind` existed: no marker at all. Counting it as
+        // fresh over-books the implementation lane and can never over-run the
+        // child lane, which is the safe direction to be wrong in.
+        attempt('implement', 'implementation-bot'),
+        attempt('implement', 'implementation-bot', 'reconcile'),
+        attempt('review', 'review-bot'),
+      ],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    expect(runtime.readLocalState().remaining).toEqual({
+      implementation: 1,
+      child: 1,
+      review: 1,
+    });
+  });
+
+  it('gates each claim on its own lane, so one full lane never blocks the other', async () => {
+    const lanes = (attempts: readonly AttemptManifest[]) => makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, child: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => attempts,
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const childClaim = {
+      kind: 'claim-implementation' as const,
+      intent: 'fresh' as const,
+      issueNumber: 7,
+      child: true as const,
+    };
+    const freshClaim = {
+      kind: 'claim-implementation' as const,
+      intent: 'fresh' as const,
+      issueNumber: 8,
+    };
+
+    // Child lane full, implementation lane free.
+    const childFull = lanes([attempt('implement', 'implementation-bot', 'ci-failure')]);
+    await expect(childFull.executeAction(childClaim, {} as never))
+      .resolves.toMatchObject({ outcome: 'skipped' });
+    await expect(childFull.executeAction(freshClaim, {} as never))
+      .resolves.toMatchObject({ outcome: 'spawned' });
+
+    // And the mirror image: implementation lane full, child lane free.
+    const implementationFull = lanes([attempt('implement', 'implementation-bot')]);
+    await expect(implementationFull.executeAction(freshClaim, {} as never))
+      .resolves.toMatchObject({ outcome: 'skipped' });
+    await expect(implementationFull.executeAction(childClaim, {} as never))
+      .resolves.toMatchObject({ outcome: 'spawned' });
+  });
+
+  it('zeros implementation, child, and review remaining when new work is paused', () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
@@ -152,7 +224,7 @@ describe('active runtime boundary', () => {
     });
 
     expect(runtime.readLocalState()).toEqual({
-      remaining: { implementation: 0, review: 0 },
+      remaining: { implementation: 0, child: 0, review: 0 },
       newWorkPaused: true,
       availableLogins: ['implementation-bot', 'review-bot'],
       implementationPreferredLogin: 'implementation-bot',
@@ -163,7 +235,7 @@ describe('active runtime boundary', () => {
     const selected: string[][] = [];
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 1, review: 1 },
+      caps: { implementation: 1, child: 1, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [attempt('implement', 'implementation-bot')],
@@ -192,7 +264,7 @@ describe('active runtime boundary', () => {
     const received: unknown[] = [];
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 0, review: 0 },
+      caps: { implementation: 0, child: 0, review: 0 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
@@ -227,7 +299,7 @@ describe('active runtime boundary', () => {
     const received: unknown[] = [];
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 1, review: 1 },
+      caps: { implementation: 1, child: 1, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
@@ -267,7 +339,7 @@ describe('active runtime boundary', () => {
   it('carries a repository refusal through to the controller result', async () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 1, review: 1 },
+      caps: { implementation: 1, child: 1, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
@@ -300,7 +372,7 @@ describe('active runtime boundary', () => {
   it('does not invent a repository refusal for an ordinary rejection', async () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 1, review: 1 },
+      caps: { implementation: 1, child: 1, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
@@ -333,7 +405,7 @@ describe('active runtime boundary', () => {
   it('has no update-branch handler left to reach', async () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),
-      caps: { implementation: 1, review: 1 },
+      caps: { implementation: 1, child: 1, review: 1 },
       implementationPreferredLogin: 'implementation-bot',
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],

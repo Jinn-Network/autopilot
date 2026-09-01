@@ -204,6 +204,8 @@ export interface ProductionActiveRuntimeOptions {
   readonly spawn: SpawnFn;
   readonly caps: {
     readonly implementation: number;
+    /** Machine-child work, capped separately from fresh claims (#122). */
+    readonly child: number;
     readonly review: number;
   };
   readonly implementationBackpressureThreshold: number;

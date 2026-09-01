@@ -1200,7 +1200,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
       spawn: vi.fn(() => {
         throw new Error('mapping escalation must not spawn a review');
       }),
-      caps: { implementation: 0, review: 1 },
+      caps: { implementation: 0, child: 0, review: 1 },
       implementationBackpressureThreshold: 30,
       staleAfterMs: 2 * 60 * 60_000,
       makeReviewActionPort,
@@ -1740,7 +1740,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
           once: vi.fn(),
         };
       }),
-      caps: { implementation: 0, review: 1 },
+      caps: { implementation: 0, child: 0, review: 1 },
       implementationBackpressureThreshold: 30,
       staleAfterMs: 2 * 60 * 60_000,
       makeReviewActionPort: productionReviewActionFactory,
