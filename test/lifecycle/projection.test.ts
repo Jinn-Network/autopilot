@@ -1,6 +1,6 @@
 // @ts-nocheck — Stage 5: deleted merge-prep/review-fix/project-status fixtures.
 import { describe, expect, it } from 'vitest';
-import { deriveLifecycle } from '../../src/lifecycle/lifecycle.js';
+import { deriveLifecycle, planCycle } from '../../src/lifecycle/lifecycle.js';
 import {
   planProjection,
   type ProjectionContext,
@@ -566,5 +566,166 @@ describe('planProjection', () => {
       orphanBranchClaims: [],
       mappingDiagnostics: [],
     }).actions).toEqual([]);
+  });
+});
+
+// Regression: issue #118. `activeMutation`'s REQUEST_CHANGES branch was the one
+// review-claim check in the engine that was NOT head-pinned, so a verdict
+// recorded against a head the PR had already moved past kept re-drafting the PR
+// every cycle. Drafts are not review-claimable, so the superseding review that
+// would have replaced the verdict could never run — a sealed loop with no
+// machine exit (manual `gh pr ready` was reverted within one cycle). Live on
+// Jinn-Network/mono: PRs #3424, #3286, #2959, #3450 — every REQUEST_CHANGES
+// verdict-intent ever written (6 of 6) was wedged this way, while all 142
+// APPROVE verdict-intents completed.
+describe('changes-requested draft latch is head-pinned', () => {
+  const STALE_HEAD = gitOid('cccccccccccccccccccccccccccccccccccccccc');
+  const MARKER = '44444444-4444-4444-8444-444444444444';
+
+  function changesRequested(
+    overrides: Partial<Extract<LifecycleItem, { kind: 'pull-request' }>> = {},
+    claimHead = STALE_HEAD,
+  ): Extract<LifecycleItem, { kind: 'pull-request' }> {
+    return item({
+      branchClaim: undefined,
+      labels: ['engine:review'],
+      isDraft: true,
+      headChangedAt: '2026-07-20T11:30:00.000Z',
+      reviewClaim: {
+        kind: 'review-claim',
+        protocolVersion: 2,
+        prNumber: 101,
+        generation: '22222222-2222-4222-8222-222222222222',
+        attempt: '33333333-3333-4333-8333-333333333333',
+        reviewer: 'reviewer',
+        head: claimHead,
+        state: 'verdict-intent',
+        recordedAt: '2026-07-20T11:00:00.000Z',
+        verdict: { marker: MARKER, state: 'REQUEST_CHANGES' },
+      },
+      // `terminalVerdict.head` is `claim.head` by definition (snapshot.ts).
+      terminalVerdict: {
+        head: claimHead,
+        state: 'REQUEST_CHANGES',
+        marker: MARKER,
+        recordedAt: '2026-07-20T11:00:00.000Z',
+      },
+      ...overrides,
+    });
+  }
+
+  it('releases the draft when the PR head has advanced past the verdict', () => {
+    // PR #3424's exact shape: PR head 4bf6eb6dd3, claim head 84181b7f5c.
+    const plan = planProjection(context(changesRequested(), REVIEW_OID));
+
+    expect(plan.actions).toContainEqual({
+      kind: 'set-pr-draft',
+      prNumber: 101,
+      expectedHead: HEAD,
+      draft: false,
+    });
+    expect(plan.actions).not.toContainEqual({
+      kind: 'set-pr-draft',
+      prNumber: 101,
+      expectedHead: HEAD,
+      draft: true,
+    });
+  });
+
+  it('still holds the draft while the verdict names the current head', () => {
+    const plan = planProjection(
+      context(changesRequested({ isDraft: false }, HEAD), REVIEW_OID),
+    );
+
+    expect(plan.actions).toContainEqual({
+      kind: 'set-pr-draft',
+      prNumber: 101,
+      expectedHead: HEAD,
+      draft: true,
+    });
+  });
+
+  it('makes the PR review-claimable once the head advances, with no manual step', () => {
+    // The machine exit, end to end: push a fix -> head moves -> the projection
+    // undrafts -> `planCycle` claims a fresh review at the new head.
+    const wedged = changesRequested();
+    expect(planProjection(context(wedged, REVIEW_OID)).actions).toContainEqual({
+      kind: 'set-pr-draft',
+      prNumber: 101,
+      expectedHead: HEAD,
+      draft: false,
+    });
+
+    const released = { ...wedged, isDraft: false };
+    const view = deriveLifecycle({ items: [released] }, NOW, 2 * 60 * 60 * 1000);
+    expect(view.items[0]).toMatchObject({ phase: 'awaiting-review', stale: false });
+    expect(planCycle(view, {
+      implementationSlots: 0,
+      reviewSlots: 1,
+      mergePrepSlots: 0,
+      usableCredentialLanes: 1,
+    }, 'active')).toEqual([{
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 101,
+      head: HEAD,
+    }]);
+  });
+
+  it('never lets a superseded changes-requested verdict reach the merge queue', () => {
+    const released = { ...changesRequested({ isDraft: false }), mergeState: 'clean' as const };
+    const view = deriveLifecycle({ items: [released] }, NOW, 2 * 60 * 60 * 1000);
+
+    expect(view.items[0]?.phase).not.toBe('merge-ready');
+    expect(planCycle(view, {
+      implementationSlots: 0,
+      reviewSlots: 1,
+      mergePrepSlots: 0,
+      usableCredentialLanes: 1,
+    }, 'active').some((action) => action.kind === 'enqueue')).toBe(false);
+  });
+
+  it('leaves the APPROVE completion path exactly as it was', () => {
+    const approved = changesRequested({}, HEAD);
+    const intent = {
+      ...approved,
+      isDraft: true,
+      reviewClaim: { ...approved.reviewClaim!, verdict: { marker: MARKER, state: 'APPROVE' } },
+      terminalVerdict: { ...approved.terminalVerdict!, state: 'APPROVE' },
+    };
+
+    const plan = planProjection(context(intent, REVIEW_OID));
+
+    expect(plan.actions).toContainEqual({
+      kind: 'complete-verdict-intent',
+      prNumber: 101,
+      expectedHead: HEAD,
+      expectedReviewRefOid: REVIEW_OID,
+      state: 'terminal-approved',
+    });
+    // An APPROVE verdict never latched the draft, and still does not.
+    expect(plan.actions).toContainEqual({
+      kind: 'set-pr-draft',
+      prNumber: 101,
+      expectedHead: HEAD,
+      draft: false,
+    });
+  });
+
+  it('completes an APPROVE verdict-intent only at the head it names', () => {
+    const plan = planProjection(context({
+      ...changesRequested({ isDraft: false }),
+      reviewClaim: {
+        ...changesRequested().reviewClaim!,
+        verdict: { marker: MARKER, state: 'APPROVE' },
+      },
+      terminalVerdict: {
+        ...changesRequested().terminalVerdict!,
+        state: 'APPROVE',
+      },
+    }, REVIEW_OID));
+
+    expect(plan.actions.some((action) => action.kind === 'complete-verdict-intent'))
+      .toBe(false);
   });
 });
