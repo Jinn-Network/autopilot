@@ -754,6 +754,16 @@ function eventFor(
 }
 
 /**
+ * Fall-through budget: how many displaced candidates one lane may promote in a
+ * single cycle after a claim refuses late. Each promotion costs real GitHub
+ * reads (a child claim reads its parent pull request before it can refuse), so
+ * the release valve is bounded rather than a whole-backlog scan. Spending the
+ * budget is logged distinctly; the untried remainder is simply reconsidered
+ * next cycle, in priority order, from a fresh snapshot.
+ */
+const LANE_FALLTHROUGH_ATTEMPT_LIMIT = 5;
+
+/**
  * Project Priority, most urgent first. An unset or unrecognized Priority ranks
  * last so untriaged work can never outrank triaged work. (Eligibility already
  * requires a Priority; this is defence for a Project that grew a new option.)
@@ -1337,6 +1347,66 @@ async function executeActivePass(
   // queue therefore releases on the next cycle with no restart and no ref to
   // clean up, which is exactly right for a fact that is not about any head.
   let enqueueRepositoryRefused = false;
+  // The surplus the cap displaced, consumed strictly in the plan's own priority
+  // order when an executed claim refuses late. Cycle-scoped and nothing else: a
+  // candidate that refuses is not remembered, so it is claimable again the
+  // moment GitHub state changes (the stack collapses, the base is retargeted)
+  // with no manual step and no cache to invalidate.
+  const remainingBackups = {
+    implementation: [...scheduling.backups.implementation],
+    review: [...scheduling.backups.review],
+  };
+  const laneCandidates = {
+    implementation: scheduling.actions.filter((action) => (
+      action.kind === 'claim-implementation'
+    )).length + scheduling.backups.implementation.length,
+    review: scheduling.actions.filter((action) => (
+      action.kind === 'claim-review'
+    )).length + scheduling.backups.review.length,
+  };
+  const spawnedByLane = { implementation: 0, review: 0 };
+  const fallThroughAttempts = { implementation: 0, review: 0 };
+  const fallThroughExhausted = { implementation: false, review: false };
+  const promoteBackup = <T extends NewWorkAction>(
+    lane: 'implementation' | 'review',
+    queue: T[],
+  ): T | undefined => {
+    if (queue.length === 0) return undefined;
+    if (fallThroughAttempts[lane] >= LANE_FALLTHROUGH_ATTEMPT_LIMIT) {
+      fallThroughExhausted[lane] = true;
+      return undefined;
+    }
+    fallThroughAttempts[lane] += 1;
+    const promoted = queue.shift()!;
+    // The candidate was already logged as a capacity skip, which was true of
+    // the plan. This says the cycle came back for it, so the two lines about
+    // the same subject read as one story instead of a contradiction.
+    actionEvents.push({
+      cycleId,
+      runnerId: deps.runnerId,
+      mode: 'active',
+      phase: phaseForAction(promoted),
+      subject: subjectForAction(promoted),
+      action: 'schedule',
+      outcome: 'promoted',
+      reason: 'ineligible-fall-through',
+    });
+    return promoted;
+  };
+  const runAction = async (action: NewWorkAction): Promise<{
+    readonly outcome: string;
+    readonly reason?: string;
+    readonly repositoryRefusal?: true;
+  }> => {
+    try {
+      return await deps.active!.executeAction(action, snapshot);
+    } catch (error) {
+      return {
+        outcome: 'failed',
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  };
   for (let index = 0; index < scheduling.actions.length;) {
     const action = scheduling.actions[index]!;
     if (
@@ -1351,19 +1421,38 @@ async function executeActivePass(
         >);
         index += 1;
       }
-      try {
-        const results = await deps.active!.executeReviewActions(cohort, snapshot);
-        if (results.length !== cohort.length) {
-          throw new Error('review cohort returned a result count different from its schedule');
+      // Each round replaces exactly the claims that refused late with the next
+      // backups, so the cohort never grows past the capacity the first one was
+      // admitted under: a refusal spawns nothing.
+      let batch = cohort;
+      while (batch.length > 0) {
+        let results: readonly { readonly outcome: string; readonly reason?: string }[];
+        try {
+          results = await deps.active!.executeReviewActions(batch, snapshot);
+          if (results.length !== batch.length) {
+            throw new Error('review cohort returned a result count different from its schedule');
+          }
+        } catch (error) {
+          actionEvents.push(...batch.map((candidate) => actionEvent(candidate, {
+            outcome: 'failed',
+            reason: error instanceof Error ? error.message : String(error),
+          })));
+          break;
         }
-        actionEvents.push(...cohort.map((candidate, offset) => (
+        actionEvents.push(...batch.map((candidate, offset) => (
           actionEvent(candidate, results[offset]!)
         )));
-      } catch (error) {
-        actionEvents.push(...cohort.map((candidate) => actionEvent(candidate, {
-          outcome: 'failed',
-          reason: error instanceof Error ? error.message : String(error),
-        })));
+        spawnedByLane.review += results.filter((result) => (
+          result.outcome === 'spawned'
+        )).length;
+        const refused = results.filter((result) => result.outcome === 'ineligible').length;
+        const next: Extract<NewWorkAction, { kind: 'claim-review' }>[] = [];
+        for (let slot = 0; slot < refused; slot += 1) {
+          const promoted = promoteBackup('review', remainingBackups.review);
+          if (promoted === undefined) break;
+          next.push(promoted);
+        }
+        batch = next;
       }
       continue;
     }
@@ -1378,19 +1467,74 @@ async function executeActivePass(
       index += 1;
       continue;
     }
-    try {
-      const result = await deps.active!.executeAction(action, snapshot);
-      if (action.kind === 'enqueue' && result.repositoryRefusal === true) {
-        enqueueRepositoryRefused = true;
+    if (action.kind === 'claim-implementation' || action.kind === 'claim-review') {
+      // An `ineligible` claim is a fact about the candidate, not evidence the
+      // slot was used, so the lane keeps reaching down its own priority order
+      // until something spawns or the bounded budget is spent. Every other
+      // outcome — spawned, failed, human, lost — did consume the attempt.
+      const lane = action.kind === 'claim-implementation'
+        ? 'implementation' as const
+        : 'review' as const;
+      let attempt: NewWorkAction | undefined = action;
+      while (attempt !== undefined) {
+        const result = await runAction(attempt);
+        actionEvents.push(actionEvent(attempt, result));
+        if (result.outcome === 'spawned') {
+          spawnedByLane[lane] += 1;
+          break;
+        }
+        if (result.outcome !== 'ineligible') break;
+        attempt = lane === 'implementation'
+          ? promoteBackup('implementation', remainingBackups.implementation)
+          : promoteBackup('review', remainingBackups.review);
       }
-      actionEvents.push(actionEvent(action, result));
-    } catch (error) {
-      actionEvents.push(actionEvent(action, {
-        outcome: 'failed',
-        reason: error instanceof Error ? error.message : String(error),
-      }));
+      index += 1;
+      continue;
     }
+    const result = await runAction(action);
+    if (action.kind === 'enqueue' && result.repositoryRefusal === true) {
+      enqueueRepositoryRefused = true;
+    }
+    actionEvents.push(actionEvent(action, result));
     index += 1;
+  }
+  for (const lane of ['implementation', 'review'] as const) {
+    const phase: LifecyclePhase = lane === 'implementation' ? 'eligible' : 'awaiting-review';
+    if (fallThroughExhausted[lane]) {
+      actionEvents.push({
+        cycleId,
+        runnerId: deps.runnerId,
+        mode: 'active',
+        phase,
+        subject: `lane:${lane}`,
+        action: 'schedule',
+        outcome: 'fallthrough-exhausted',
+        reason: `${LANE_FALLTHROUGH_ATTEMPT_LIMIT} fall-through attempts spent, every one `
+          + `ineligible; ${remainingBackups[lane].length} candidate(s) left unattempted`,
+      });
+    }
+    // A lane holding free slots and eligible candidates that spawned nothing is
+    // the failure #113 documents, and it is invisible in a log where every
+    // queued candidate reads `skipped (capacity)` exactly like a busy lane's
+    // does. One line per cycle per lane, derived and never counted across
+    // cycles, so nothing has to be persisted or reset.
+    if (
+      local.remaining[lane] > 0
+      && laneCandidates[lane] > 0
+      && spawnedByLane[lane] === 0
+    ) {
+      actionEvents.push({
+        cycleId,
+        runnerId: deps.runnerId,
+        mode: 'active',
+        phase,
+        subject: `lane:${lane}`,
+        action: 'schedule',
+        outcome: 'starved',
+        reason: `${local.remaining[lane]} slot(s) free and ${laneCandidates[lane]} eligible `
+          + 'candidate(s), but nothing spawned this cycle',
+      });
+    }
   }
   return {
     items,

@@ -337,13 +337,23 @@ describe('active lifecycle controller', () => {
     const report = await runLifecycleCycle('active', controller);
     expect(report.status).toBe('ok');
     if (report.status !== 'ok') throw new Error('expected active report');
-    expect(report.events).toEqual([expect.objectContaining({
-      mode: 'active',
-      phase: 'eligible',
-      action: 'claim-implementation',
-      outcome: 'failed',
-      reason: 'claim lost without token material',
-    })]);
+    expect(report.events).toEqual([
+      expect.objectContaining({
+        mode: 'active',
+        phase: 'eligible',
+        action: 'claim-implementation',
+        outcome: 'failed',
+        reason: 'claim lost without token material',
+      }),
+      // The lane held a free slot and an eligible candidate and still spawned
+      // nothing, which is exactly what the starvation line reports — a failed
+      // claim is no more productive than an ineligible one.
+      expect.objectContaining({
+        subject: 'lane:implementation',
+        action: 'schedule',
+        outcome: 'starved',
+      }),
+    ]);
   });
 
   function implementationPrSnapshot(headChangedAt: string): GitHubLifecycleSnapshot {
@@ -413,54 +423,348 @@ describe('active lifecycle controller', () => {
     };
   }
 
+  function priorityIssue(number: number, priority: string) {
+    return {
+      number,
+      title: `Issue ${number}`,
+      body: '',
+      labels: [],
+      shape: 'fix',
+      blockedOn: 'Nothing',
+      blockedByIssues: [],
+      effort: 'Low',
+      priority,
+      status: 'Todo',
+      onBoard: true,
+      author: 'implementation-bot',
+      projectItemId: `PVTI_${number}`,
+      inCurrentSprint: false,
+    };
+  }
+
+  function priorityItem(number: number) {
+    return {
+      kind: 'issue',
+      issueNumber: number,
+      v2Marked: false,
+      projectStatus: 'Todo',
+      labels: [],
+      eligible: true,
+      eligibilityReason: 'eligible',
+    };
+  }
+
+  // Snapshot order is deliberately worst-first: the lowest priority is the
+  // first eligible candidate, so an unsorted scheduler claims it.
+  function mixedPrioritySnapshot(): GitHubLifecycleSnapshot {
+    return {
+      ...snapshot(),
+      issues: [
+        priorityIssue(400, 'P4'),
+        priorityIssue(200, 'P2'),
+        priorityIssue(100, 'P0'),
+      ],
+      lifecycle: {
+        items: [priorityItem(400), priorityItem(200), priorityItem(100)],
+      },
+    };
+  }
+
+  /**
+   * N eligible issues at the same Priority, so the claim order is exactly the
+   * snapshot order and a fall-through sequence is readable as a list.
+   */
+  function eligibleSnapshot(numbers: readonly number[]): GitHubLifecycleSnapshot {
+    return {
+      ...snapshot(),
+      issues: numbers.map((number) => priorityIssue(number, 'P1')),
+      lifecycle: { items: numbers.map((number) => priorityItem(number)) },
+    };
+  }
+
+  function awaitingReviewPr(issueNumber: number, prNumber: number) {
+    const head = gitOid(`${prNumber}`.padStart(40, '0'));
+    const branchClaim = {
+      kind: 'branch-claim',
+      protocolVersion: 2,
+      phase: 'implement',
+      phaseComplete: true,
+      issueNumber,
+      prNumber,
+      attempt: '11111111-1111-4111-8111-111111111111',
+      runner: 'runner-a',
+      login: 'implementer',
+      expectedHead: head,
+      targetBase: gitRefName('next'),
+      claimedAt: '2026-07-20T11:00:00.000Z',
+    };
+    return {
+      item: {
+        kind: 'pull-request',
+        issueNumber,
+        prNumber,
+        v2Marked: true,
+        projectStatus: 'In Review',
+        labels: ['engine:review'],
+        head,
+        expectedBaseRefName: 'next',
+        headChangedAt: '2026-07-20T11:00:00.000Z',
+        isDraft: false,
+        merged: false,
+        needsReview: true,
+        approved: false,
+        mergeState: 'blocked',
+        branchClaim,
+      },
+      pullRequest: {
+        number: prNumber,
+        title: 'feat: lifecycle',
+        body: `Closes #${issueNumber}`,
+        author: 'implementer',
+        baseRefName: 'next',
+        headRefName: `autopilot/${issueNumber}`,
+        headOid: head,
+        headCommittedAt: '2026-07-20T11:00:00.000Z',
+        isDraft: false,
+        state: 'OPEN',
+        labels: ['engine:review'],
+        closingIssueNumbers: [issueNumber],
+        mergeability: 'UNKNOWN',
+        mergeStateStatus: 'BLOCKED',
+        checks: [],
+        reviews: [],
+        branchClaim,
+      },
+    };
+  }
+
+  function awaitingReviewSnapshot(prNumbers: readonly number[]): GitHubLifecycleSnapshot {
+    const built = prNumbers.map((prNumber) => awaitingReviewPr(prNumber - 60, prNumber));
+    return {
+      ...snapshot(),
+      issues: [],
+      pullRequests: built.map((entry) => entry.pullRequest),
+      lifecycle: { items: built.map((entry) => entry.item) },
+    };
+  }
+
+  describe('ineligible claim fall-through', () => {
+    it('attempts the next candidate when a claim refuses as ineligible', async () => {
+      const attempted: number[] = [];
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.executeAction = async (action) => {
+        attempted.push(action.issueNumber);
+        return action.issueNumber === 100
+          ? {
+              outcome: 'ineligible',
+              reason: 'Parent pull request #3437 is retargeted: base is autopilot/3218.',
+            }
+          : { outcome: 'spawned' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(attempted).toEqual([100, 200]);
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'claim-implementation',
+        subject: 'issue:200',
+        outcome: 'spawned',
+      }));
+      // The third candidate never runs: the cap still bounds SPAWNED work.
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'schedule',
+        subject: 'issue:400',
+        outcome: 'skipped',
+        reason: 'capacity',
+      }));
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'schedule',
+        subject: 'issue:200',
+        outcome: 'promoted',
+        reason: 'ineligible-fall-through',
+      }));
+    });
+
+    it('consumes fall-through backups in priority order', async () => {
+      const attempted: number[] = [];
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.executeAction = async (action) => {
+        attempted.push(action.issueNumber);
+        return { outcome: 'ineligible', reason: 'permanently ineligible' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(attempted).toEqual([100, 200, 400]);
+    });
+
+    it('bounds fall-through attempts per lane per cycle and logs the exhaustion', async () => {
+      const attempted: number[] = [];
+      const controller = deps({
+        readSnapshot: async () => eligibleSnapshot([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+      });
+      controller.active!.executeAction = async (action) => {
+        attempted.push(action.issueNumber);
+        return { outcome: 'ineligible', reason: 'permanently ineligible' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.status).toBe('ok');
+      // One scheduled claim plus a bounded five fall-through attempts.
+      expect(attempted).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'schedule',
+        subject: 'lane:implementation',
+        outcome: 'fallthrough-exhausted',
+      }));
+    });
+
+    it('re-attempts next cycle a candidate that was ineligible this cycle', async () => {
+      const cycles: number[][] = [];
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      let current: number[] = [];
+      controller.active!.executeAction = async (action) => {
+        current.push(action.issueNumber);
+        return { outcome: 'ineligible', reason: 'the stack has not collapsed yet' };
+      };
+      await runLifecycleCycle('active', controller);
+      cycles.push(current);
+
+      // Nothing is persisted, so the same head candidate is claimable again the
+      // moment GitHub state changes — no manual step, no cache to clear.
+      current = [];
+      controller.active!.executeAction = async (action) => {
+        current.push(action.issueNumber);
+        return { outcome: 'spawned' };
+      };
+      await runLifecycleCycle('active', controller);
+      cycles.push(current);
+
+      expect(cycles).toEqual([[100, 200, 400], [100]]);
+    });
+
+    it('falls through a review cohort that refuses late', async () => {
+      const cohorts: number[][] = [];
+      const controller = deps({
+        readSnapshot: async () => awaitingReviewSnapshot([101, 102, 103]),
+      });
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 0, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      controller.active!.executeAction = async () => {
+        throw new Error('review cohort must not use the sequential action port');
+      };
+      controller.active!.executeReviewActions = async (actions) => {
+        cohorts.push(actions.map((action) => action.prNumber));
+        return actions.map((action) => (
+          action.prNumber === 101
+            ? { outcome: 'ineligible', reason: 'Pull request head changed after scheduling.' }
+            : { outcome: 'spawned' }
+        ));
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(cohorts).toEqual([[101], [102]]);
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'claim-review',
+        subject: 'issue:42/pr:102',
+        outcome: 'spawned',
+      }));
+    });
+  });
+
+  describe('lane starvation surfacing', () => {
+    const starvation = (report: Awaited<ReturnType<typeof runLifecycleCycle>>) => (
+      report.events.filter((event) => event.outcome === 'starved')
+    );
+
+    it('logs a starved implementation lane distinctly from a capacity skip', async () => {
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.executeAction = async () => ({
+        outcome: 'ineligible',
+        reason: 'permanently ineligible',
+      });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(starvation(report)).toEqual([expect.objectContaining({
+        mode: 'active',
+        phase: 'eligible',
+        action: 'schedule',
+        subject: 'lane:implementation',
+        outcome: 'starved',
+      })]);
+      // Distinct from the high-volume line an operator already greps past.
+      expect(starvation(report)[0]!.reason).not.toBe('capacity');
+    });
+
+    it('logs no starvation when the lane spawned work', async () => {
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.executeAction = async () => ({ outcome: 'spawned' });
+
+      expect(starvation(await runLifecycleCycle('active', controller))).toEqual([]);
+    });
+
+    it('logs no starvation when the lane is genuinely full', async () => {
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 0, review: 0 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      controller.active!.executeAction = async () => ({ outcome: 'spawned' });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(starvation(report)).toEqual([]);
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'schedule',
+        subject: 'issue:100',
+        outcome: 'skipped',
+        reason: 'capacity',
+      }));
+    });
+
+    it('logs no starvation when the lane has no candidates', async () => {
+      const controller = deps({
+        readSnapshot: async () => ({ ...snapshot(), lifecycle: { items: [] } }),
+      });
+      controller.active!.executeAction = async () => ({ outcome: 'spawned' });
+
+      expect(starvation(await runLifecycleCycle('active', controller))).toEqual([]);
+    });
+
+    it('logs a starved review lane on its own subject', async () => {
+      const controller = deps({
+        readSnapshot: async () => awaitingReviewSnapshot([101, 102]),
+      });
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 0, review: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      controller.active!.executeAction = async () => ({ outcome: 'spawned' });
+      controller.active!.executeReviewActions = async (actions) => actions.map(() => ({
+        outcome: 'ineligible',
+        reason: 'Draft pull requests are not claimable for review.',
+      }));
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(starvation(report)).toEqual([expect.objectContaining({
+        phase: 'awaiting-review',
+        action: 'schedule',
+        subject: 'lane:review',
+        outcome: 'starved',
+      })]);
+    });
+  });
+
   describe('priority-ordered implementation claims', () => {
-    function priorityIssue(number: number, priority: string) {
-      return {
-        number,
-        title: `Issue ${number}`,
-        body: '',
-        labels: [],
-        shape: 'fix',
-        blockedOn: 'Nothing',
-        blockedByIssues: [],
-        effort: 'Low',
-        priority,
-        status: 'Todo',
-        onBoard: true,
-        author: 'implementation-bot',
-        projectItemId: `PVTI_${number}`,
-        inCurrentSprint: false,
-      };
-    }
-
-    function priorityItem(number: number) {
-      return {
-        kind: 'issue',
-        issueNumber: number,
-        v2Marked: false,
-        projectStatus: 'Todo',
-        labels: [],
-        eligible: true,
-        eligibilityReason: 'eligible',
-      };
-    }
-
-    // Snapshot order is deliberately worst-first: the lowest priority is the
-    // first eligible candidate, so an unsorted scheduler claims it.
-    function mixedPrioritySnapshot(): GitHubLifecycleSnapshot {
-      return {
-        ...snapshot(),
-        issues: [
-          priorityIssue(400, 'P4'),
-          priorityIssue(200, 'P2'),
-          priorityIssue(100, 'P0'),
-        ],
-        lifecycle: {
-          items: [priorityItem(400), priorityItem(200), priorityItem(100)],
-        },
-      };
-    }
-
     it('claims the highest-priority eligible issue when only one slot is free', async () => {
       const claimed: number[] = [];
       const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
