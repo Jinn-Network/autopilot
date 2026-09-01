@@ -93,6 +93,27 @@ export interface ActiveSchedulingSkip {
 export interface ActiveSchedulingPlan {
   readonly actions: readonly NewWorkAction[];
   readonly skips: readonly ActiveSchedulingSkip[];
+  /**
+   * The surplus the concurrency cap displaced, in exactly the order the plan
+   * itself used — so consuming one preserves the priority ranking that decided
+   * `actions`.
+   *
+   * A claim can still refuse at execution time (a retargeted parent, a head
+   * that moved, a draft) long after scheduling proved it worthy of a slot. That
+   * refusal spends no concurrency, so the cycle must be able to reach past it:
+   * the cap bounds SPAWNED work, not attempted evaluations. Every candidate
+   * here has already cleared the same gates a scheduled action cleared —
+   * backpressure, credential lane, reviewer identity — so promoting one is
+   * never a way around a gate, only around an empty slot.
+   *
+   * These are still reported as capacity skips: a backup that is never promoted
+   * did not run, and the log must keep saying so.
+   */
+  readonly backups: {
+    readonly implementation:
+      readonly Extract<NewWorkAction, { kind: 'claim-implementation' }>[];
+    readonly review: readonly Extract<NewWorkAction, { kind: 'claim-review' }>[];
+  };
 }
 
 export function applyMergePolicy(
@@ -116,11 +137,54 @@ function capacitySkipReason(input: ActiveSchedulingInput): ActiveSchedulingSkip[
   return input.newWorkPaused === true ? 'disk-floor' : 'capacity';
 }
 
+function implementationAction(
+  candidate: Extract<ActiveCandidate, { phase: 'implementation' }>,
+): Extract<NewWorkAction, { kind: 'claim-implementation' }> {
+  return {
+    kind: 'claim-implementation',
+    ...candidate.intent === 'fresh'
+      ? { intent: 'fresh', issueNumber: candidate.issueNumber }
+      : {
+          intent: 'stale-recovery',
+          issueNumber: candidate.issueNumber,
+          prNumber: candidate.prNumber,
+          expectedHead: candidate.expectedHead,
+          branch: candidate.branch,
+          claimAttempt: candidate.claimAttempt,
+        },
+  };
+}
+
+/**
+ * Every implementation gate other than capacity, so the same verdict decides a
+ * skip reason for a candidate inside the cap and backup eligibility for one
+ * outside it. Capacity stays the caller's first question: a surplus candidate
+ * is reported as a capacity skip whatever this returns.
+ */
+function implementationGate(
+  candidate: Extract<ActiveCandidate, { phase: 'implementation' }>,
+  input: ActiveSchedulingInput,
+  configuredLogins: ReadonlySet<string>,
+): Exclude<ActiveSchedulingSkip['reason'], 'capacity' | 'disk-floor'> | null {
+  // Fresh work only: child fixes/reconciles/ci-failures reduce backlog and
+  // must still claim under backpressure (capacity remaining still applies).
+  if (
+    candidate.intent === 'fresh'
+    && candidate.isChild !== true
+    && input.openPipelineBacklog >= input.implementationBackpressureThreshold
+  ) return 'backpressure';
+  if (configuredLogins.size === 0) return 'credential-lane';
+  return null;
+}
+
 export function scheduleActiveActions(
   input: ActiveSchedulingInput,
 ): ActiveSchedulingPlan {
   const actions: NewWorkAction[] = [];
   const skips: ActiveSchedulingSkip[] = [];
+  const implementationBackups:
+    Extract<NewWorkAction, { kind: 'claim-implementation' }>[] = [];
+  const reviewBackups: Extract<NewWorkAction, { kind: 'claim-review' }>[] = [];
   const configuredLogins = new Set(
     input.availableLogins.map((login) => login.toLowerCase()),
   );
@@ -140,58 +204,53 @@ export function scheduleActiveActions(
       expectedPriority: candidate.expectedPriority,
     });
   }
+  let scheduledImplementation = 0;
   for (const candidate of implementation) {
-    if (actions.filter((action) => action.kind === 'claim-implementation').length
-      >= input.remaining.implementation) {
+    const gate = implementationGate(candidate, input, configuredLogins);
+    if (scheduledImplementation >= input.remaining.implementation) {
       skips.push({
         phase: candidate.phase,
         subject: subject(candidate),
         reason: capacitySkipReason(input),
       });
+      // Paused new work is not a slot shortage, so nothing behind it is a
+      // backup: promoting one would spend the very capacity the disk floor
+      // withheld.
+      if (gate === null && input.newWorkPaused !== true) {
+        implementationBackups.push(implementationAction(candidate));
+      }
       continue;
     }
-    // Fresh work only: child fixes/reconciles/ci-failures reduce backlog and
-    // must still claim under backpressure (capacity remaining still applies).
-    if (
-      candidate.intent === 'fresh'
-      && candidate.isChild !== true
-      && input.openPipelineBacklog >= input.implementationBackpressureThreshold
-    ) {
-      skips.push({ phase: candidate.phase, subject: subject(candidate), reason: 'backpressure' });
+    if (gate !== null) {
+      skips.push({ phase: candidate.phase, subject: subject(candidate), reason: gate });
       continue;
     }
-    if (configuredLogins.size === 0) {
-      skips.push({ phase: candidate.phase, subject: subject(candidate), reason: 'credential-lane' });
-      continue;
-    }
-    actions.push({
-      kind: 'claim-implementation',
-      ...candidate.intent === 'fresh'
-        ? { intent: 'fresh', issueNumber: candidate.issueNumber }
-        : {
-            intent: 'stale-recovery',
-            issueNumber: candidate.issueNumber,
-            prNumber: candidate.prNumber,
-            expectedHead: candidate.expectedHead,
-            branch: candidate.branch,
-            claimAttempt: candidate.claimAttempt,
-          },
-    });
+    actions.push(implementationAction(candidate));
+    scheduledImplementation += 1;
   }
 
+  let scheduledReview = 0;
   for (const candidate of input.candidates) {
     if (candidate.phase !== 'review') continue;
-    if (actions.filter((action) => action.kind === 'claim-review').length >= input.remaining.review) {
-      skips.push({
-        phase: candidate.phase,
-        subject: subject(candidate),
-        reason: capacitySkipReason(input),
-      });
-      continue;
-    }
     const reviewer = [...configuredLogins].find(
       (login) => login !== candidate.author.toLowerCase(),
     );
+    if (scheduledReview >= input.remaining.review) {
+      skips.push({
+        phase: candidate.phase,
+        subject: subject(candidate),
+        reason: capacitySkipReason(input),
+      });
+      if (reviewer !== undefined && input.newWorkPaused !== true) {
+        reviewBackups.push({
+          kind: 'claim-review',
+          issueNumber: candidate.issueNumber,
+          prNumber: candidate.prNumber,
+          head: candidate.head,
+        });
+      }
+      continue;
+    }
     if (reviewer === undefined) {
       skips.push({
         phase: candidate.phase,
@@ -206,6 +265,7 @@ export function scheduleActiveActions(
       prNumber: candidate.prNumber,
       head: candidate.head,
     });
+    scheduledReview += 1;
   }
 
   for (const candidate of input.candidates) {
@@ -254,5 +314,9 @@ export function scheduleActiveActions(
     });
   }
 
-  return { actions, skips };
+  return {
+    actions,
+    skips,
+    backups: { implementation: implementationBackups, review: reviewBackups },
+  };
 }

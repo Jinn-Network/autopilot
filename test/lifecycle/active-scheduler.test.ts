@@ -273,6 +273,110 @@ describe('active local scheduler', () => {
     ]);
   });
 
+  describe('ineligible-claim fall-through backups', () => {
+    it('emits the capacity surplus as ordered implementation backups', () => {
+      const plan = scheduleActiveActions(input({
+        candidates: [
+          { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
+          { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
+          { phase: 'implementation', intent: 'fresh', issueNumber: 3 },
+        ],
+        remaining: { implementation: 1, review: 0 },
+      }));
+
+      expect(plan.actions).toEqual([
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 },
+      ]);
+      // Same order the plan itself used: a backup is only ever the next
+      // candidate the cap displaced, never a re-ranking of the queue.
+      expect(plan.backups.implementation).toEqual([
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2 },
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 3 },
+      ]);
+      expect(plan.skips).toContainEqual({
+        phase: 'implementation',
+        subject: 'issue:2',
+        reason: 'capacity',
+      });
+      expect(plan.skips).toContainEqual({
+        phase: 'implementation',
+        subject: 'issue:3',
+        reason: 'capacity',
+      });
+    });
+
+    it('keeps a backpressure-suppressed surplus out of the implementation backups', () => {
+      const plan = scheduleActiveActions(input({
+        candidates: [
+          { phase: 'implementation', intent: 'fresh', issueNumber: 99, isChild: true },
+          { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
+          { phase: 'implementation', intent: 'fresh', issueNumber: 2, isChild: true },
+        ],
+        openPipelineBacklog: 10,
+        remaining: { implementation: 1, review: 0 },
+      }));
+
+      expect(plan.actions).toEqual([
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 99 },
+      ]);
+      // Issue 1 is a fresh claim under backpressure: it was never eligible to
+      // run this cycle, so promoting it would defeat the threshold.
+      expect(plan.backups.implementation).toEqual([
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2 },
+      ]);
+    });
+
+    it('keeps the credential-less surplus out of the implementation backups', () => {
+      const plan = scheduleActiveActions(input({
+        candidates: [
+          { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
+          { phase: 'implementation', intent: 'fresh', issueNumber: 2 },
+        ],
+        availableLogins: [],
+        remaining: { implementation: 1, review: 0 },
+      }));
+
+      expect(plan.actions).toEqual([]);
+      expect(plan.backups.implementation).toEqual([]);
+    });
+
+    it('emits the review surplus as ordered review backups', () => {
+      const plan = scheduleActiveActions(input({
+        candidates: [
+          { phase: 'review', issueNumber: 3, prNumber: 30, head: HEAD, author: 'other' },
+          {
+            phase: 'review',
+            issueNumber: 4,
+            prNumber: 40,
+            head: HEAD,
+            author: 'implementation-bot',
+          },
+          { phase: 'review', issueNumber: 5, prNumber: 50, head: HEAD, author: 'other' },
+        ],
+        availableLogins: ['implementation-bot'],
+        remaining: { implementation: 0, review: 1 },
+      }));
+
+      expect(plan.actions).toEqual([
+        { kind: 'claim-review', issueNumber: 3, prNumber: 30, head: HEAD },
+      ]);
+      // PR 40 is authored by the only login: no reviewer exists for it at any
+      // capacity, so it is not a promotable backup either.
+      expect(plan.backups.review).toEqual([
+        { kind: 'claim-review', issueNumber: 5, prNumber: 50, head: HEAD },
+      ]);
+    });
+
+    it('emits no backups at all while new work is paused', () => {
+      const plan = scheduleActiveActions(input({
+        remaining: { implementation: 0, review: 0 },
+        newWorkPaused: true,
+      }));
+
+      expect(plan.backups).toEqual({ implementation: [], review: [] });
+    });
+  });
+
   it('reports disk-floor skips when new work is paused', () => {
     const plan = scheduleActiveActions(input({
       remaining: { implementation: 0, review: 0 },
