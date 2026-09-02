@@ -104,6 +104,17 @@ describe('review-follow-up marker', () => {
     expect(marker).not.toMatch(/\bkind=(review-finding|reconcile)\b/);
   });
 
+  // Canon §5.1 is what agents are told to treat as authoritative, and it used
+  // to print the defect as the contract ("idempotent on pr+head+index").
+  it('is described by canon as parent-scoped, not head-scoped', () => {
+    const canon = readFileSync(
+      new URL('../../assets/canon/single-surface-lifecycle.md', import.meta.url),
+      'utf8',
+    );
+    expect(canon).not.toContain('idempotent on `pr+head+index`');
+    expect(canon).toMatch(/dedups on the \*\*parent-scoped marker prefix/);
+  });
+
   // The dedup identity, mirroring `formatChildMarkerKey`: everything through
   // `pr=<N>`, with neither of the two components that move between passes.
   it('exposes a parent-scoped key that is a prefix of every head/index marker', () => {
