@@ -5,12 +5,17 @@ import {
   closeSync,
   mkdirSync,
   openSync,
+  rmSync,
   writeSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { argv, env, pid } from 'node:process';
 import { INTERNAL_DAEMON_ACTIVE_ONCE_ENV } from '../src/service.js';
+import {
+  configureCycleHeartbeat,
+  cycleHeartbeatPath,
+} from '../src/cycle-heartbeat.js';
 import {
   AUTOPILOT_RUNTIME_ENV,
   parseAutopilotRuntime,
@@ -137,6 +142,25 @@ export async function loadDaemonCadenceSeed(
     if (error instanceof LifecycleDiscoveryCacheCorruptError) return null;
     throw error;
   }
+}
+
+/**
+ * A cycle heartbeat is armed for exactly one caller: the child the daemon
+ * spawns for one active cycle (#132). Every other run — a manual observe, a
+ * one-shot `status` read, a persistent cadence started by hand — leaves it
+ * disarmed, so nothing can publish a step the daemon would then report as its
+ * cycle's current work. Same evidence as the cadence seed above.
+ */
+export function shouldRecordCycleHeartbeat(
+  context: {
+    readonly mode: 'observe' | 'recover' | 'active';
+    readonly once: boolean;
+  },
+  environment: Readonly<Record<string, string | undefined>>,
+): boolean {
+  return context.mode === 'active'
+    && context.once
+    && environment[INTERNAL_DAEMON_ACTIVE_ONCE_ENV] === '1';
 }
 
 function authorAllowlist(raw: string | undefined): ReadonlySet<string> {
@@ -481,6 +505,13 @@ export async function runAutopilotV2(
   const executionBackend = executionBackendForEnvironment(runtimeEnvironment);
   const snapshotRuntime = parseSnapshotRuntimeConfig(runtimeEnvironment);
   const stateDirectory = parseAutopilotStateDirectory(runtimeEnvironment);
+  const heartbeatArmed = shouldRecordCycleHeartbeat(options, runtimeEnvironment);
+  if (heartbeatArmed) {
+    configureCycleHeartbeat({
+      path: cycleHeartbeatPath(loaded.paths.service),
+      pid,
+    });
+  }
   const cadenceSeed = await loadDaemonCadenceSeed(
     options,
     runtimeEnvironment,
@@ -956,13 +987,23 @@ export async function runAutopilotV2(
     if (exitCode !== undefined) process.exitCode = exitCode;
   };
 
-  await runLifecycleCadence({
-    once: options.once,
-    intervalMs: loaded.config.scheduler.pollSeconds * 1_000,
-    runCycle: runOnce,
-    shouldContinue: () => process.exitCode !== 2,
-    wait: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-  });
+  try {
+    await runLifecycleCadence({
+      once: options.once,
+      intervalMs: loaded.config.scheduler.pollSeconds * 1_000,
+      runCycle: runOnce,
+      shouldContinue: () => process.exitCode !== 2,
+      wait: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    });
+  } finally {
+    // An engine that has finished is not "inside" a step, so its last one must
+    // not linger. Only the child that armed the heartbeat clears it: an ad-hoc
+    // run in the same repository must never delete the live daemon child's.
+    if (heartbeatArmed) {
+      configureCycleHeartbeat(null);
+      rmSync(cycleHeartbeatPath(loaded.paths.service), { force: true });
+    }
+  }
 }
 
 export function isDirectLifecycleEntrypoint(

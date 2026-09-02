@@ -3,7 +3,31 @@ import {
   LifecycleDiscoveryCacheCorruptError,
   LifecycleDiscoveryCacheUnsafePathError,
 } from '../src/lifecycle/lifecycle-cache.js';
-import { loadDaemonCadenceSeed } from '../scripts/run-autopilot-v2.js';
+import {
+  loadDaemonCadenceSeed,
+  shouldRecordCycleHeartbeat,
+} from '../scripts/run-autopilot-v2.js';
+
+describe('cycle heartbeat arming', () => {
+  it('arms only for the daemon-spawned active one-shot cycle child', () => {
+    const marked = { JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE: '1' };
+
+    expect(shouldRecordCycleHeartbeat({ mode: 'active', once: true }, marked))
+      .toBe(true);
+    for (const [context, environment] of [
+      [{ mode: 'active', once: true }, {}],
+      [
+        { mode: 'active', once: true },
+        { JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE: 'yes' },
+      ],
+      [{ mode: 'active', once: false }, marked],
+      [{ mode: 'recover', once: true }, marked],
+      [{ mode: 'observe', once: true }, marked],
+    ] as const) {
+      expect(shouldRecordCycleHeartbeat(context, environment)).toBe(false);
+    }
+  });
+});
 
 describe('daemon child reconciliation cadence', () => {
   it('does not resume cadence for generic active, recover, or observe startup', async () => {

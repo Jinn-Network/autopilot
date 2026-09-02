@@ -1,4 +1,5 @@
 import { isAbsolute } from 'node:path';
+import { withCycleStep } from '../cycle-heartbeat.js';
 import type { GitHubUsage } from './github-usage.js';
 import { EMPTY_GITHUB_USAGE } from './github-usage.js';
 import {
@@ -504,11 +505,14 @@ export class LifecycleSnapshotCoordinator {
     this.fullRetryDue = true;
     try {
       const fullRequestedAtMs = exactNow(this.now).getTime();
-      const full = await this.source.read({
-        mode: 'full',
-        rateLimitFloor,
-        resetUsage: false,
-      });
+      const full = await withCycleStep(
+        'full reconciliation read (retry)',
+        () => this.source.read({
+          mode: 'full',
+          rateLimitFloor,
+          resetUsage: false,
+        }),
+      );
       assertFullSnapshotAuthority(
         full,
         fullRequestedAtMs,
@@ -539,11 +543,16 @@ export class LifecycleSnapshotCoordinator {
     this.scopedCadenceFence = null;
     this.started = true;
     try {
-      const snapshot = await this.source.read({
-        mode,
-        rateLimitFloor,
-        ...(preserveUsage ? { resetUsage: false } : {}),
-      });
+      // The cycle's single largest GitHub read (#132): named for the daemon so
+      // an operator can tell a slow reconciliation from a stuck one.
+      const snapshot = await withCycleStep(
+        mode === 'full' ? 'full reconciliation read' : 'incremental snapshot read',
+        () => this.source.read({
+          mode,
+          rateLimitFloor,
+          ...(preserveUsage ? { resetUsage: false } : {}),
+        }),
+      );
       if (mode === 'full') {
         assertFullSnapshotAuthority(snapshot, now.getTime(), exactNow(this.now).getTime());
       } else if (snapshot.snapshotComplete !== true) {

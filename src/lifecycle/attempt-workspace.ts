@@ -27,6 +27,7 @@ import {
   type TaskSubmitResultV1,
 } from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
+import { beginCycleStep, withCycleStep } from '../cycle-heartbeat.js';
 import { CHILD_KINDS, type ChildKind } from './child-issues.js';
 import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
@@ -3401,6 +3402,9 @@ function retained(
 }
 
 function removeAttemptMetadata(manifest: AttemptManifest): AttemptCleanupResult {
+  // Recursive removal of an attempt directory is the second unbounded
+  // synchronous disk wait in this file (#132); both are named for the daemon.
+  const endStep = beginCycleStep(`attempt directory remove ${manifest.subject}`);
   try {
     rmSync(manifest.paths.attemptDir, { recursive: true });
     return { status: 'removed', attemptId: manifest.attemptId };
@@ -3413,6 +3417,8 @@ function removeAttemptMetadata(manifest: AttemptManifest): AttemptCleanupResult 
       'Exact attempt metadata removal failed.',
       manifest.attemptId,
     );
+  } finally {
+    endStep();
   }
 }
 
@@ -3569,13 +3575,19 @@ async function removeAttemptWorktree(
 ): Promise<AttemptCleanupResult | null> {
   if (!existsSync(manifest.paths.worktree)) return null;
   try {
-    await runner('git', [
-      `--git-dir=${manifest.repository.gitCommonDir}`,
-      'worktree',
-      'remove',
-      ...(force ? ['--force'] : []),
-      manifest.paths.worktree,
-    ]);
+    // The incident in #132: a multi-GB `git worktree remove` sat in
+    // uninterruptible disk wait for 21+ minutes with nothing reporting it.
+    // Naming the step is what lets the daemon say "slow" instead of "hung".
+    await withCycleStep(
+      `worktree remove ${manifest.subject}`,
+      () => runner('git', [
+        `--git-dir=${manifest.repository.gitCommonDir}`,
+        'worktree',
+        'remove',
+        ...(force ? ['--force'] : []),
+        manifest.paths.worktree,
+      ]),
+    );
     return null;
   } catch {
     return retained(
@@ -3801,6 +3813,9 @@ function sweepOrphanAttemptDirs(
         } catch {
           // Orphan candidate.
         }
+        const endStep = beginCycleStep(
+          `orphan directory remove ${basename(attemptDir)}`,
+        );
         try {
           if (statSync(attemptDir).mtimeMs >= cutoff) {
             results.push(retained(
@@ -3819,6 +3834,8 @@ function sweepOrphanAttemptDirs(
             'malformed',
             'Malformed attempt directory could not be removed.',
           ));
+        } finally {
+          endStep();
         }
       }
     }
