@@ -198,6 +198,71 @@ export function classifyTransportFault(error: unknown): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Served gateway status (one caller: the full-reconciliation page ladder)
+// ---------------------------------------------------------------------------
+
+/** A gateway status GitHub serves when it gave up before answering. */
+export type GatewayStatus = 502 | 503 | 504;
+
+const GATEWAY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
+
+/**
+ * The same three shapes the `SERVED_RESPONSE` veto recognises, with the status
+ * captured. Deliberately a copy rather than a rewrite of that list: the veto
+ * governs every command and must not acquire a capture group, an extra pattern
+ * or a new caller because of this one.
+ */
+const SERVED_STATUS: ReadonlyArray<RegExp> = [
+  /\bHTTP\/[0-9.]+\s+([1-5][0-9]{2})\b/g,
+  /\bHTTP\s+([1-5][0-9]{2})\b/gi,
+  /\(HTTP\s+([1-5][0-9]{2})\)/gi,
+];
+
+/**
+ * The gateway status a failed subprocess proves GitHub served, or `null`.
+ *
+ * WHY THIS IS NOT A WIDENING OF {@link classifyTransportFault}. That classifier
+ * and its served-response veto govern every command this engine runs, mutations
+ * included, where a served 5xx may name a request that was applied and must
+ * never be re-sent. This function proves something narrower and is consulted by
+ * exactly one caller: the paged full-reconciliation read in
+ * `github-reader.ts`, which is idempotent, and for which a 502/503/504 is the
+ * canonical "this page exceeded the server's execution budget" signal — the
+ * same fault as the HTTP/2 stream cancel of #130, reported by a proxy that got
+ * to answer before the connection died (issue #134, live on Jinn-Network/mono).
+ * Nothing here makes any command retryable; the reader re-reads a *smaller*
+ * page, which is a different request.
+ *
+ * The evidence discipline is the veto's, unchanged. `stdout` is never read as
+ * evidence — it carries the response payload, so a pull-request body quoting a
+ * gateway timeout proves nothing — and a served HTTP response retained there by
+ * `gh api --include` refuses the classification outright. The message is
+ * consulted only when stderr is empty, and only past the echoed argv, so a
+ * GraphQL document of this engine's own making cannot classify itself.
+ *
+ * Fails closed everywhere else: no status found, a status outside the gateway
+ * set (a 4xx, a 429, a 500, a GraphQL `errors` payload carrying no status at
+ * all), or more than one distinct status in the same evidence — which does not
+ * establish what this command got — all return `null`.
+ */
+export function gatewayStatusFromFailure(error: unknown): GatewayStatus | null {
+  if (typeof error !== 'object' || error === null) return null;
+  const fields = error as Record<string, unknown>;
+  if (/^\s*HTTP\/[0-9.]+\s+[1-5][0-9]{2}\b/m.test(text(fields.stdout))) return null;
+  const stderr = text(fields.stderr);
+  const evidence = stderr.trim().length > 0
+    ? stderr
+    : messageEvidence(text(fields.message), text(fields.cmd));
+  const statuses = new Set<number>();
+  for (const pattern of SERVED_STATUS) {
+    for (const match of evidence.matchAll(pattern)) statuses.add(Number(match[1]));
+  }
+  if (statuses.size !== 1) return null;
+  const [status] = statuses;
+  return GATEWAY_STATUSES.has(status!) ? (status as GatewayStatus) : null;
+}
+
+// ---------------------------------------------------------------------------
 // Positive read allowlist
 // ---------------------------------------------------------------------------
 

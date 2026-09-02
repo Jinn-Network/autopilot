@@ -35,7 +35,7 @@ import {
 } from './codecs.js';
 import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import { readExactCompareEvidence } from './github-changed-files.js';
-import { classifyTransportFault } from './transient-retry.js';
+import { classifyTransportFault, gatewayStatusFromFailure } from './transient-retry.js';
 import { gitOid, gitRefName, type GitOid, type GitRefName } from './types.js';
 import {
   ENQUEUE_HOLD_REF_GLOB,
@@ -57,7 +57,8 @@ const PR_PAGE_SIZE = 50;
  * page read (#130). One page carries `PR_FIELDS` per node — reviews(100),
  * labels(100), closingIssuesReferences(20) and a 100-context check rollup — so
  * its server-side execution cost grows with the repository, and past some size
- * GitHub stops executing and resets the HTTP/2 stream instead of answering.
+ * GitHub stops executing and either resets the HTTP/2 stream instead of
+ * answering (#130) or serves a gateway status in its place (#134).
  * Re-sending that same page at that same size is the one retry that cannot
  * work, and it is exactly what the transport retry beneath this
  * (`withTransientReadRetry`) does; halving the page is the retry that can.
@@ -1898,18 +1899,32 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
 
   /**
    * One full-reconciliation page, retried at a halved page size when the
-   * transport fault beneath it is the shape of a page GitHub would not execute
-   * (#130). The retry that already sits under this one re-sends the identical
+   * failure beneath it is the shape of a page GitHub would not execute (#130,
+   * #134). The retry that already sits under this one re-sends the identical
    * request, which is the right move for a dropped packet and the wrong one for
    * a page too heavy to answer; only once that has been spent does the size
    * come down.
    *
-   * Only a *classified* transport fault downshifts. A served response — any
-   * HTTP status, auth failure or throttle — is rethrown on the first attempt
-   * exactly as before, because a smaller page answers none of those, and a
-   * decode failure is not a transport fault at all: `JSON.parse` is deliberately
-   * outside the loop, so a malformed body fails the read rather than spending
-   * the ladder on it.
+   * Two presentations of the one fault drive the ladder, because GitHub reports
+   * an over-budget page either way: a *classified* transport fault — the stream
+   * torn down before an answer exists (#130) — and a served **502/503/504**, a
+   * proxy that got to answer first (#134, the shape the live mono stall took
+   * fifteen minutes after #130 shipped). The gateway reading is a separate,
+   * single-caller classifier ({@link gatewayStatusFromFailure}); the
+   * served-response veto that governs every other command, mutations included,
+   * is untouched, and the retry beneath this still refuses to re-send a served
+   * response at all. Halving is not a re-send: it is a different, smaller
+   * request, and this read is idempotent.
+   *
+   * Every other failure is rethrown on the first attempt exactly as before — a
+   * 4xx, a throttle, any other 5xx and a GraphQL `errors` payload, none of which
+   * a smaller page answers. A decode failure is not a page-weight signal at all:
+   * `JSON.parse` is deliberately outside the loop, so a malformed body fails the
+   * read rather than spending the ladder on it.
+   *
+   * When the ladder is exhausted the failure names the rung it died on, so the
+   * operator reads "page size 10 at cursor X still failed" rather than the
+   * generic warning; the original error is both quoted and kept as the `cause`.
    */
   private async readPullRequestPage(cursor: string | null): Promise<GraphQlPage> {
     for (let downshift = 0; ; downshift += 1) {
@@ -1923,21 +1938,24 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
       try {
         raw = await this.run('gh', args);
       } catch (error: unknown) {
-        const fault = classifyTransportFault(error);
+        const gateway = gatewayStatusFromFailure(error);
+        const reason = classifyTransportFault(error)
+          ?? (gateway === null ? null : `HTTP ${gateway}`);
+        // Not a page-weight signal: the original error, never a synthetic one,
+        // and the reconciliation fails exactly as it did before.
+        if (reason === null) throw error;
         const halved = Math.max(MIN_PR_PAGE_SIZE, Math.floor(pageSize / 2));
-        if (
-          fault === null
-          || downshift >= MAX_PR_PAGE_DOWNSHIFTS
-          || halved >= pageSize
-        ) {
-          // The original error, never a synthetic one: the reconciliation fails
-          // exactly as it did before, and the operator sees what happened.
-          throw error;
+        if (downshift >= MAX_PR_PAGE_DOWNSHIFTS || halved >= pageSize) {
+          throw new Error(
+            `full reconciliation: page size ${pageSize} at cursor ${cursor ?? 'null'} `
+              + `still failed: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
         }
         this.prPageSize = halved;
         console.warn(
           `[github-reader] full reconciliation: page size ${pageSize} → ${halved} `
-            + `after ${fault}`,
+            + `after ${reason}`,
         );
         continue;
       }
