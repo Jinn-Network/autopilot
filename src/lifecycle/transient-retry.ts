@@ -34,7 +34,8 @@
  *      check into the REST branch.
  *   3. TRANSPORT FAULTS ONLY. {@link classifyTransportFault} admits only faults
  *      that prove the request never completed a round trip — connection reset,
- *      TLS handshake failure, DNS failure, connection/read timeout. Anything the
+ *      TLS handshake failure, DNS failure, connection/read timeout, and an
+ *      HTTP/2 stream the peer reset before answering. Anything the
  *      server actually returned (any HTTP status, auth failure, primary or
  *      secondary rate limiting) is refused first, as a veto: a returned response
  *      means the request was received, so re-sending it risks a duplicate side
@@ -93,6 +94,18 @@ const SERVED_RESPONSE = [
 /**
  * Transport faults: the request never completed a round trip. Deliberately
  * narrow — each entry names one concrete failure of connect, TLS, DNS or I/O.
+ *
+ * The HTTP/2 entries are I/O failures of exactly that class, one layer up from
+ * the socket: Go's http2 client reports a peer-initiated stream reset as
+ * `stream error: stream ID N; CODE; received from peer`, and a connection the
+ * server retires as `http2: server sent GOAWAY`. In both the stream is torn
+ * down before any response exists — no status line, no body, nothing for the
+ * `SERVED_RESPONSE` veto to find — so the request provably did not complete,
+ * which is the whole test this table applies. Each code is spelled out
+ * separately rather than alternated in one pattern, so no code is admitted
+ * without a test naming it. Live evidence: a full reconciliation on
+ * Jinn-Network/mono stalled for ~10 cycles on an unclassified stream cancel
+ * (issue #130).
  */
 const TRANSPORT_FAULT: ReadonlyArray<readonly [string, RegExp]> = [
   ['connection reset', /\bconnection reset by peer\b/i],
@@ -108,6 +121,11 @@ const TRANSPORT_FAULT: ReadonlyArray<readonly [string, RegExp]> = [
   ['connection timeout', /\boperation timed out\b/i],
   ['connection timeout', /\bETIMEDOUT\b/],
   ['read timeout', /\bClient\.Timeout exceeded\b/i],
+  ['stream cancelled', /\bstream error: stream ID \d+; CANCEL; received from peer\b/i],
+  ['stream internal error', /\bstream error: stream ID \d+; INTERNAL_ERROR; received from peer\b/i],
+  ['stream protocol error', /\bstream error: stream ID \d+; PROTOCOL_ERROR; received from peer\b/i],
+  ['stream flow-control reset', /\bstream error: stream ID \d+; ENHANCE_YOUR_CALM; received from peer\b/i],
+  ['server GOAWAY', /\bhttp2: server sent GOAWAY\b/i],
 ];
 
 function text(value: unknown): string {
