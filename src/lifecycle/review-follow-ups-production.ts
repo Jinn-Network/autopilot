@@ -39,6 +39,12 @@ mutation($issueId: ID!, $typeId: ID!) {
 }
 `;
 
+interface OpenIssueRow {
+  readonly number: number;
+  readonly title: string;
+  readonly body: string;
+}
+
 export interface ProductionReviewFollowUpPortOptions {
   readonly runner?: CommandRunner;
   readonly repo?: string;
@@ -47,6 +53,7 @@ export interface ProductionReviewFollowUpPortOptions {
 
 function parseIssueList(raw: string): readonly {
   readonly number: number;
+  readonly title: string;
   readonly body: string;
 }[] {
   let parsed: unknown;
@@ -63,11 +70,16 @@ function parseIssueList(raw: string): readonly {
       throw new Error('Malformed review-follow-up list entry');
     }
     const record = entry as Record<string, unknown>;
-    if (typeof record.number !== 'number' || typeof record.body !== 'string') {
+    if (
+      typeof record.number !== 'number'
+      || typeof record.body !== 'string'
+      || typeof record.title !== 'string'
+    ) {
       throw new Error('Malformed review-follow-up list entry fields');
     }
     return {
       number: record.number,
+      title: record.title,
       body: record.body,
     };
   });
@@ -95,11 +107,9 @@ export function makeProductionReviewFollowUpPort(
     ...options.issueTypeIds,
   };
   const triageApplier = createProjectTriageApplier(runner, { repo });
-  let openIssuesCache: readonly { readonly number: number; readonly body: string }[] | undefined;
+  let openIssuesCache: readonly OpenIssueRow[] | undefined;
 
-  const loadOpenIssues = async (): Promise<
-    readonly { readonly number: number; readonly body: string }[]
-  > => {
+  const loadOpenIssues = async (): Promise<readonly OpenIssueRow[]> => {
     if (openIssuesCache !== undefined) return openIssuesCache;
     const raw = await runner('gh', [
       'issue',
@@ -111,7 +121,7 @@ export function makeProductionReviewFollowUpPort(
       '--limit',
       String(FOLLOW_UP_LIST_LIMIT),
       '--json',
-      'number,body',
+      'number,title,body',
     ]);
     const rows = parseIssueList(raw);
     // Backs follow-up dedup: a truncated read files a duplicate follow-up.
@@ -130,7 +140,7 @@ export function makeProductionReviewFollowUpPort(
       const open = await loadOpenIssues();
       return open
         .filter((issue) => issue.body.includes(marker))
-        .map((issue) => ({ number: issue.number }));
+        .map((issue) => ({ number: issue.number, title: issue.title }));
     },
 
     async createIssue(input) {

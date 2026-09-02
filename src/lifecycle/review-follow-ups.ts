@@ -28,8 +28,13 @@ export interface FiledReviewFollowUp {
   readonly index: number;
 }
 
+export interface OpenReviewFollowUp {
+  readonly number: number;
+  readonly title: string;
+}
+
 export interface ReviewFollowUpPort {
-  searchOpenByMarker(marker: string): Promise<readonly { readonly number: number }[]>;
+  searchOpenByMarker(marker: string): Promise<readonly OpenReviewFollowUp[]>;
   createIssue(input: {
     readonly title: string;
     readonly body: string;
@@ -61,6 +66,54 @@ export function formatReviewFollowUpMarker(
     throw new Error(`Invalid follow-up index: ${index}`);
   }
   return `<!-- ${REVIEW_FOLLOW_UP_MARKER_TAG} pr=${parentPr} head=${normalizedHead} index=${index} -->`;
+}
+
+/**
+ * The parent-scoped prefix, which is what follow-up dedup keys on.
+ *
+ * Deliberately head-less and index-less, for the same reason
+ * `formatChildMarkerKey` is base-less (#114): the full marker is the
+ * *record*, this is the *identity*. `head` moves on exactly the event that
+ * causes a re-review and `index` is list position within one pass, so keying
+ * dedup on the full marker could only ever catch a retry of the same pass —
+ * never the cross-pass duplicate it exists to prevent. mono #3285 accumulated
+ * seventeen open follow-ups over five passes proving it (#124).
+ *
+ * The trailing space is load-bearing, not cosmetic. The key is consumed by a
+ * *substring* search over open issue bodies, so without the field boundary
+ * after the digits, PR #84's key matches PR #845's markers and one parent
+ * dedups against another's follow-ups.
+ */
+export function formatReviewFollowUpMarkerKey(parentPr: number): string {
+  const marker = formatReviewFollowUpMarker(parentPr, '0'.repeat(40), 0);
+  return marker.slice(0, marker.indexOf('head='));
+}
+
+/**
+ * Identity of a follow-up *finding*, as opposed to the review coordinate it
+ * was found at. Titles are model-authored prose, so byte equality across
+ * passes is not a realistic bar; this folds only the differences that carry no
+ * meaning — surrounding and internal whitespace, letter case, and terminal
+ * punctuation, none of which can be the difference between two findings.
+ *
+ * Internal punctuation is *not* folded: `@colophon-claims/check` is the whole
+ * identity of the finding that names it, and normalizing it away would merge
+ * genuinely distinct entries.
+ *
+ * This is the deterministic backstop only. The observed duplicates are
+ * semantic rather than lexical — "Publish @colophon-claims/check, then
+ * republish the verify alias" and "Publish the renamed Colophon reader and its
+ * retired-name alias" are the same task with no title overlap — so the primary
+ * defense is giving the review session the open follow-ups it must not
+ * re-derive (see `ExactHeadReviewSessionExecutionRequest.openFollowUps`).
+ */
+function normalizeFollowUpTitle(title: string): string {
+  return title
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .replace(/[.,;:!?]+$/, '')
+    .trim();
 }
 
 /**
@@ -201,21 +254,39 @@ export async function fileReviewFollowUps(
       `Follow-ups exceed cap of ${MAX_REVIEW_FOLLOW_UPS_PER_PASS}`,
     );
   }
+  // Dedup on the finding, never on the review coordinate: a parent whose head
+  // moved between two passes is the same parent, and the moved head is the
+  // very event that triggered the second pass. One parent-scoped lookup per
+  // pass, not one per entry — the production port's search is a substring
+  // match over open issue bodies, so the prefix returns every open follow-up
+  // for this parent regardless of the head and index recorded on it.
+  const openForParent = await port.searchOpenByMarker(
+    formatReviewFollowUpMarkerKey(input.parentPr),
+  );
+  const openByTitle = new Map<string, number>();
+  for (const existing of openForParent) {
+    const key = normalizeFollowUpTitle(existing.title);
+    // Oldest wins: two open duplicates already exist on some parents, and
+    // collapsing onto the first keeps the survivor stable across passes.
+    if (!openByTitle.has(key)) openByTitle.set(key, existing.number);
+  }
+
   const filed: FiledReviewFollowUp[] = [];
   for (let index = 0; index < input.entries.length; index += 1) {
     const entry = input.entries[index]!;
     assertNoChildMarkerInFollowUp(entry.title, entry.body, index);
     const marker = formatReviewFollowUpMarker(input.parentPr, input.head, index);
-    const existing = await port.searchOpenByMarker(marker);
-    if (existing.length > 0) {
+    const titleKey = normalizeFollowUpTitle(entry.title);
+    const existingNumber = openByTitle.get(titleKey);
+    if (existingNumber !== undefined) {
       // Create is skipped; triage still runs so a partial prior failure heals.
       await port.ensureTriageComplete({
-        issueNumber: existing[0]!.number,
+        issueNumber: existingNumber,
         type: entry.type,
         effort: entry.effort,
         priority: entry.priority,
       });
-      filed.push({ number: existing[0]!.number, created: false, index });
+      filed.push({ number: existingNumber, created: false, index });
       continue;
     }
     const prose =
@@ -232,6 +303,9 @@ export async function fileReviewFollowUps(
       effort: entry.effort,
       priority: entry.priority,
     });
+    // Visible to the rest of this pass too: one pass restating a finding twice
+    // is the same duplicate as two passes doing it.
+    openByTitle.set(titleKey, created.number);
     filed.push({ number: created.number, created: true, index });
   }
   return filed;

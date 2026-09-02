@@ -105,10 +105,11 @@ describe('makeProductionReviewFollowUpPort', () => {
     expect(filed).toEqual([{ number: 501, created: true, index: 0 }]);
 
     const listCall = calls.find((args) => args[0] === 'issue' && args[1] === 'list');
+    // `title` joined the read in #124: dedup now keys on the finding, and the
+    // title is the only field on a follow-up that names one.
     expect(listCall).toEqual(expect.arrayContaining([
-      '--json', 'number,body',
+      '--json', 'number,title,body',
     ]));
-    expect(listCall!.join(' ')).not.toContain('title');
     expect(listCall!.join(' ')).not.toContain('labels');
 
     const createCall = calls.find((args) => args[0] === 'issue' && args[1] === 'create');
@@ -144,9 +145,12 @@ describe('makeProductionReviewFollowUpPort', () => {
     )).toBe(true);
   });
 
+  // Filed at a *different* head from the pass now running, which is the whole
+  // point: the prior marker is unreachable by the head-keyed lookup #124
+  // replaced, and the substring search over the parent prefix still finds it.
   it('reuses an open follow-up matched by marker without recreating but still triages', async () => {
     const marker =
-      `<!-- jinn-autopilot:review-follow-up pr=84 head=${HEAD} index=0 -->`;
+      `<!-- jinn-autopilot:review-follow-up pr=84 head=${'b'.repeat(40)} index=3 -->`;
     const calls: string[][] = [];
     let createCount = 0;
     let listCount = 0;
@@ -157,6 +161,7 @@ describe('makeProductionReviewFollowUpPort', () => {
           listCount += 1;
           return JSON.stringify([{
             number: 400,
+            title: 'Existing',
             body: `${marker}\n\nold`,
           }]);
         }
