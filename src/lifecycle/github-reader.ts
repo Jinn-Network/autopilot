@@ -35,6 +35,7 @@ import {
 } from './codecs.js';
 import { CANONICAL_GITHUB_HTTPS_REMOTE } from './implementation-executor.js';
 import { readExactCompareEvidence } from './github-changed-files.js';
+import { classifyTransportFault } from './transient-retry.js';
 import { gitOid, gitRefName, type GitOid, type GitRefName } from './types.js';
 import {
   ENQUEUE_HOLD_REF_GLOB,
@@ -51,6 +52,24 @@ export { extractImplementationCompletionSummary } from './codecs.js';
 
 export const REVIEW_CLAIM_PAYLOAD_FILE = 'jinn-autopilot-review.json';
 const PR_PAGE_SIZE = 50;
+/**
+ * The adaptive downshift's floor and attempt cap for the full-reconciliation
+ * page read (#130). One page carries `PR_FIELDS` per node — reviews(100),
+ * labels(100), closingIssuesReferences(20) and a 100-context check rollup — so
+ * its server-side execution cost grows with the repository, and past some size
+ * GitHub stops executing and resets the HTTP/2 stream instead of answering.
+ * Re-sending that same page at that same size is the one retry that cannot
+ * work, and it is exactly what the transport retry beneath this
+ * (`withTransientReadRetry`) does; halving the page is the retry that can.
+ *
+ * From the default the ladder is 50 → 25 → 12 → 10, where the two bounds agree:
+ * the third downshift is also the point at which halving stops making progress
+ * against the floor. Below ~10 a page buys too little per round trip to be
+ * worth another attempt, and a repository whose 10-node page cannot execute has
+ * a fault this read cannot route around — so it fails, as before.
+ */
+const MIN_PR_PAGE_SIZE = 10;
+const MAX_PR_PAGE_DOWNSHIFTS = 3;
 const MERGED_ISSUE_BATCH_SIZE = 20;
 const COMMIT_HISTORY_PAGE_SIZE = 100;
 const MAX_COMMIT_HISTORY_PAGES = 100;
@@ -151,10 +170,17 @@ const MERGED_PR_FIELDS = `
           nodes { commit { oid committedDate } }
         }`;
 
-const PR_QUERY = `query($owner: String!, $name: String!, $cursor: String) {
+/**
+ * The full-reconciliation page read, at a given page size. The size is the only
+ * thing the adaptive downshift varies: the field set is identical at every rung,
+ * so a downshifted page yields the same evidence per node as a full one and no
+ * decode path sees a different shape.
+ */
+function pullRequestPageQuery(pageSize: number): string {
+  return `query($owner: String!, $name: String!, $cursor: String) {
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
-    pullRequests(first: ${PR_PAGE_SIZE}, after: $cursor, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) {
+    pullRequests(first: ${pageSize}, after: $cursor, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         ${PR_FIELDS}
@@ -162,6 +188,7 @@ const PR_QUERY = `query($owner: String!, $name: String!, $cursor: String) {
     }
   }
 }`;
+}
 
 const PR_BY_NUMBER_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   rateLimit { cost remaining resetAt }
@@ -915,6 +942,13 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
   // the life of the reader (jinn-mono#1883-follow-up).
   private readonly reviewClaimPayloadByOid = new Map<GitOid, string>();
   private reviewClaimFetchTail: Promise<void> = Promise.resolve();
+  /**
+   * The page size the current full reconciliation is reading at. Process-local
+   * and nothing else: a downshift lives only until the next reconciliation
+   * starts, which `readPullRequests` detects by its null cursor and resets. A
+   * page that was momentarily too heavy must not permanently shrink pages.
+   */
+  private prPageSize = PR_PAGE_SIZE;
   private readonly ancestryByCandidate = new Map<string, Promise<{
     readonly headCommittedAt: string;
     readonly claimTrailers: string | null;
@@ -1862,17 +1896,64 @@ export class GhLifecycleReader implements GitHubLifecycleReader {
     };
   }
 
+  /**
+   * One full-reconciliation page, retried at a halved page size when the
+   * transport fault beneath it is the shape of a page GitHub would not execute
+   * (#130). The retry that already sits under this one re-sends the identical
+   * request, which is the right move for a dropped packet and the wrong one for
+   * a page too heavy to answer; only once that has been spent does the size
+   * come down.
+   *
+   * Only a *classified* transport fault downshifts. A served response — any
+   * HTTP status, auth failure or throttle — is rethrown on the first attempt
+   * exactly as before, because a smaller page answers none of those, and a
+   * decode failure is not a transport fault at all: `JSON.parse` is deliberately
+   * outside the loop, so a malformed body fails the read rather than spending
+   * the ladder on it.
+   */
+  private async readPullRequestPage(cursor: string | null): Promise<GraphQlPage> {
+    for (let downshift = 0; ; downshift += 1) {
+      const pageSize = this.prPageSize;
+      const args = [
+        'api', 'graphql', '-f', `query=${pullRequestPageQuery(pageSize)}`,
+        ...this.repositoryVariables(),
+      ];
+      if (cursor !== null) args.push('-F', `cursor=${cursor}`);
+      let raw: string;
+      try {
+        raw = await this.run('gh', args);
+      } catch (error: unknown) {
+        const fault = classifyTransportFault(error);
+        const halved = Math.max(MIN_PR_PAGE_SIZE, Math.floor(pageSize / 2));
+        if (
+          fault === null
+          || downshift >= MAX_PR_PAGE_DOWNSHIFTS
+          || halved >= pageSize
+        ) {
+          // The original error, never a synthetic one: the reconciliation fails
+          // exactly as it did before, and the operator sees what happened.
+          throw error;
+        }
+        this.prPageSize = halved;
+        console.warn(
+          `[github-reader] full reconciliation: page size ${pageSize} → ${halved} `
+            + `after ${fault}`,
+        );
+        continue;
+      }
+      return JSON.parse(raw) as GraphQlPage;
+    }
+  }
+
   async readPullRequests(
     cursor: string | null,
     nonDoneIssueNumbers: readonly number[] = [],
   ): Promise<PullRequestPage> {
-    const args = [
-      'api', 'graphql', '-f', `query=${PR_QUERY}`,
-      ...this.repositoryVariables(),
-    ];
-    if (cursor !== null) args.push('-F', `cursor=${cursor}`);
-    const raw = await this.run('gh', args);
-    const response = JSON.parse(raw) as GraphQlPage;
+    // A null cursor is the first page of a fresh full reconciliation, and the
+    // only place the downshift is released. Nothing is persisted; a process
+    // restart starts at the default too.
+    if (cursor === null) this.prPageSize = PR_PAGE_SIZE;
+    const response = await this.readPullRequestPage(cursor);
     const connection = response.data.repository.pullRequests;
     // One git-transport listing serves every open + merged-outcome PR's
     // review-claim lookup below (jinn-mono#1883-follow-up) instead of one
