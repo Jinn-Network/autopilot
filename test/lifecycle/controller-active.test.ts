@@ -768,6 +768,113 @@ describe('active lifecycle controller', () => {
     });
   });
 
+  /**
+   * A run of cycles whose every candidate is refused by the freshness gate is a
+   * total claim stop, and #130 saw ~10 of them pass unremarked because the only
+   * evidence was one `skipped (full-reconciliation-stale)` line per candidate —
+   * 546 of them per cycle, indistinguishable at a glance from a busy engine.
+   * Surfaced the way #113 surfaces a starved lane: one derived line per cycle.
+   */
+  describe('full-reconciliation stall surfacing (#130)', () => {
+    const STALE_AT = '2026-07-20T09:00:00.000Z'; // three hours before NOW.
+
+    function staleDeps() {
+      return deps({
+        readSnapshot: async () => ({
+          ...mixedPrioritySnapshot(),
+          lastFullReconciliationAt: STALE_AT,
+        }),
+      });
+    }
+
+    const stall = (report: Awaited<ReturnType<typeof runLifecycleCycle>>) => (
+      report.events.filter((event) => event.subject === 'reconciliation')
+    );
+
+    it('says nothing on the first stale cycle', async () => {
+      // One stale cycle is a slow reconciliation, not a stall.
+      expect(stall(await runLifecycleCycle('active', staleDeps()))).toEqual([]);
+    });
+
+    it('logs the stall from the second consecutive stale cycle', async () => {
+      const controller = staleDeps();
+
+      await runLifecycleCycle('active', controller);
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(stall(report)).toEqual([expect.objectContaining({
+        mode: 'active',
+        phase: 'eligible',
+        action: 'schedule',
+        subject: 'reconciliation',
+        outcome: 'stale',
+        reason: 'for 2 cycle(s), 3 candidate(s) withheld',
+      })]);
+    });
+
+    it('counts every consecutive stale cycle, one line each', async () => {
+      const controller = staleDeps();
+      const reasons: (string | undefined)[] = [];
+
+      for (let cycle = 0; cycle < 4; cycle += 1) {
+        reasons.push(stall(await runLifecycleCycle('active', controller))[0]?.reason);
+      }
+
+      expect(reasons).toEqual([
+        undefined,
+        'for 2 cycle(s), 3 candidate(s) withheld',
+        'for 3 cycle(s), 3 candidate(s) withheld',
+        'for 4 cycle(s), 3 candidate(s) withheld',
+      ]);
+    });
+
+    it('clears the count on a fresh full reconciliation', async () => {
+      // The machine exit: nothing to reset by hand, nothing persisted to clear.
+      let fresh = false;
+      const controller = deps({
+        readSnapshot: async () => ({
+          ...mixedPrioritySnapshot(),
+          lastFullReconciliationAt: fresh ? NOW.toISOString() : STALE_AT,
+        }),
+      });
+
+      await runLifecycleCycle('active', controller);
+      expect(stall(await runLifecycleCycle('active', controller))).toHaveLength(1);
+      fresh = true;
+      expect(stall(await runLifecycleCycle('active', controller))).toEqual([]);
+      fresh = false;
+      expect(stall(await runLifecycleCycle('active', controller))).toEqual([]);
+    });
+
+    it('still withholds every claim while the reconciliation is stale', async () => {
+      const claimed: number[] = [];
+      const controller = staleDeps();
+      controller.active!.executeAction = async (action) => {
+        claimed.push(action.issueNumber);
+        return { outcome: 'spawned' };
+      };
+
+      await runLifecycleCycle('active', controller);
+      const report = await runLifecycleCycle('active', controller);
+
+      // Surfacing the stall must not release the gate.
+      expect(claimed).toEqual([]);
+      expect(report.events.filter((event) => event.reason === 'full-reconciliation-stale'))
+        .toHaveLength(3);
+    });
+
+    it('tracks the stall per controller, never across engines in one process', async () => {
+      const first = staleDeps();
+      const second = staleDeps();
+
+      await runLifecycleCycle('active', first);
+      await runLifecycleCycle('active', first);
+
+      // A second engine's first stale cycle is its own first, not this one's third.
+      expect(stall(await runLifecycleCycle('active', second))).toEqual([]);
+    });
+  });
+
   describe('the machine-child lane', () => {
     // `review-finding` carries no default triage expectation, so these children
     // are never candidates for machine-child repair and reach the claim lane
