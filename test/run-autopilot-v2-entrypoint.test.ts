@@ -12,6 +12,8 @@ const {
   makeMarketplaceRecoveryCallback,
   makeMarketplaceRecoveryCredentialResolver,
   makeMarketplaceReviewAnchorRelease,
+  renderCleanupWarnings,
+  runCycleThenBookkeeping,
 } = lifecycleEntrypoint;
 
 describe('lifecycle script entrypoint', () => {
@@ -242,5 +244,60 @@ describe('lifecycle script entrypoint', () => {
       ...base,
       report: { status: 'ok', snapshotComplete: false },
     })).toBe(false);
+  });
+
+  it('keeps bookkeeping strictly behind the cycle that scheduled and dispatched', async () => {
+    const order: string[] = [];
+    let cycleFinished = false;
+
+    const report = await runCycleThenBookkeeping({
+      runCycle: async () => {
+        order.push('schedule');
+        await Promise.resolve();
+        order.push('dispatch');
+        cycleFinished = true;
+        return { status: 'ok' } as const;
+      },
+      bookkeeping: [
+        async (finished) => {
+          order.push(`cleanup:${finished.status}`);
+          expect(cycleFinished).toBe(true);
+        },
+        async () => { order.push('paint'); },
+      ],
+    });
+
+    expect(report).toEqual({ status: 'ok' });
+    expect(order).toEqual(['schedule', 'dispatch', 'cleanup:ok', 'paint']);
+  });
+
+  it('names every deferral once and summarizes it apart from a real retention', () => {
+    expect(renderCleanupWarnings([
+      { status: 'removed', attemptId: 'a' },
+      {
+        status: 'retained',
+        attemptId: 'b',
+        reason: { code: 'live', detail: 'Attempt child PID is still live.' },
+      },
+      {
+        status: 'retained',
+        attemptId: 'c',
+        reason: { code: 'dirty', detail: 'Worktree contains uncommitted changes.' },
+      },
+      {
+        status: 'retained',
+        attemptId: 'd',
+        reason: { code: 'deferred', detail: 'deferred one' },
+      },
+      {
+        status: 'retained',
+        reason: { code: 'deferred', detail: 'deferred two' },
+      },
+    ])).toEqual([
+      '[autopilot:v2] cleanup retained attempt=c reason=dirty: '
+      + 'Worktree contains uncommitted changes.',
+      '[autopilot:v2] cleanup deferred 2 attempt(s) to the next cycle; '
+      + 'the 60s sweep budget was spent',
+    ]);
   });
 });

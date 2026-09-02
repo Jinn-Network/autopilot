@@ -3326,7 +3326,9 @@ export type CleanupReasonCode =
   | 'authentication-failed'
   | 'malformed'
   | 'escaped-path'
-  | 'ambiguous';
+  | 'ambiguous'
+  /** Not a refusal: this cycle ran out of cleanup budget and next cycle retries. */
+  | 'deferred';
 
 export type AttemptCleanupResult =
   | { readonly status: 'removed'; readonly attemptId: string }
@@ -3763,11 +3765,38 @@ export async function cleanupAttempt(
   return removeAttemptMetadata(manifest);
 }
 
+/**
+ * Wall-clock budget for one cycle's attempt sweep (#132).
+ *
+ * Cleanup is bookkeeping and must never hold the scheduler hostage, but a
+ * removal already in flight cannot be interrupted: `git worktree remove` of a
+ * multi-GB checkout is a synchronous, uninterruptible disk wait. So this bounds
+ * how many removals a cycle STARTS, not how long the last one takes — worst
+ * case is one removal running past the budget, and the incident this came from
+ * was exactly one such removal. Everything still pending defers to the next
+ * cycle, where the budget applies again; nothing is detached into an unmanaged
+ * background process, so a deferred delete is still occupied disk and the
+ * disk-floor read that gates new work sees it as occupied.
+ *
+ * Sixty seconds is a cycle's worth of tolerance, not a measurement: it is short
+ * enough that a stuck delete cannot swallow a poll interval and long enough
+ * that an ordinary backlog of small attempts clears in a single cycle.
+ */
+export const DEFAULT_ATTEMPT_SWEEP_BUDGET_MS = 60_000;
+
+const DEFERRED_CLEANUP_DETAIL =
+  'Attempt cleanup deferred to the next cycle: '
+  + 'the sweep wall-clock budget was spent.';
+
 export interface SweepDeadAttemptsOptions extends CleanupAttemptOptions {
   readonly host?: string;
   readonly diskFloorBytes?: number;
   readonly diskPath?: string;
   readonly readFreeDiskBytes?: (path: string) => number;
+  /** Defaults to DEFAULT_ATTEMPT_SWEEP_BUDGET_MS. */
+  readonly budgetMs?: number;
+  /** Monotonic milliseconds; a test seam, and immune to wall-clock jumps. */
+  readonly monotonicNow?: () => number;
 }
 
 interface CollectedAttempt {
@@ -3798,6 +3827,7 @@ function sweepOrphanAttemptDirs(
   v2Base: string,
   graceMs: number | undefined,
   now: () => Date,
+  budgetSpent: () => boolean,
 ): AttemptCleanupResult[] {
   if (graceMs === undefined) return [];
   const results: AttemptCleanupResult[] = [];
@@ -3812,6 +3842,14 @@ function sweepOrphanAttemptDirs(
           continue;
         } catch {
           // Orphan candidate.
+        }
+        if (budgetSpent()) {
+          results.push(retained(
+            'deferred',
+            DEFERRED_CLEANUP_DETAIL,
+            basename(attemptDir),
+          ));
+          continue;
         }
         const endStep = beginCycleStep(
           `orphan directory remove ${basename(attemptDir)}`,
@@ -3852,6 +3890,12 @@ export async function sweepDeadAttempts(
   const diskPath = options.diskPath ?? options.v2Base;
   const diskFloorBytes = options.diskFloorBytes;
   const readFreeDiskBytes = options.readFreeDiskBytes ?? freeDiskBytes;
+  const budgetMs = options.budgetMs ?? DEFAULT_ATTEMPT_SWEEP_BUDGET_MS;
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  const sweepStartedAt = monotonicNow();
+  // Checked BEFORE starting each removal, never during one: there is no way to
+  // interrupt a `git worktree remove` or a recursive rmSync once it has begun.
+  const budgetSpent = (): boolean => monotonicNow() - sweepStartedAt >= budgetMs;
 
   if (
     diskFloorBytes !== undefined
@@ -3863,7 +3907,12 @@ export async function sweepDeadAttempts(
       .sort((left, right) =>
         attemptEndedAtMs(left.manifest) - attemptEndedAtMs(right.manifest));
     for (const attempt of deadAttempts) {
+      // Free space is re-read from the filesystem every iteration, so an
+      // eviction only counts once its bytes are actually gone. A deferred one
+      // never counts at all — which is why the floor stays unmet, and new work
+      // stays paused, until the next cycle finishes the job.
       if (readFreeDiskBytes(diskPath) >= diskFloorBytes) break;
+      if (budgetSpent()) break;
       try {
         results.push(await cleanupAttempt(attempt.manifestPath, runner, {
           ...options,
@@ -3891,6 +3940,14 @@ export async function sweepDeadAttempts(
           results.push(retained('malformed', 'Attempt manifest could not be strictly decoded.'));
           continue;
         }
+        if (budgetSpent()) {
+          results.push(retained(
+            'deferred',
+            DEFERRED_CLEANUP_DETAIL,
+            manifest.attemptId,
+          ));
+          continue;
+        }
         try {
           results.push(await cleanupAttempt(manifestPath, runner, options));
         } catch {
@@ -3907,6 +3964,7 @@ export async function sweepDeadAttempts(
     options.v2Base,
     options.graceMs,
     options.now ?? (() => new Date()),
+    budgetSpent,
   ));
   return results;
 }

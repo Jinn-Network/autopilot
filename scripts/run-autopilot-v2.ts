@@ -68,6 +68,7 @@ import { shouldRouteToSession } from '../src/cli/routing.js';
 import {
   ConditionalPullRequestEvidenceProbe,
   ConditionalRestClient,
+  DEFAULT_ATTEMPT_SWEEP_BUDGET_MS,
   defaultRunnerId,
   activeCleanupEnabled,
   attemptGraceMs,
@@ -107,6 +108,7 @@ import {
   selectCredential,
   sweepDeadAttempts,
   freeDiskBytes,
+  type AttemptCleanupResult,
   type LifecycleCycleReport,
   type CredentialPool,
   type SelectedCredential,
@@ -353,6 +355,59 @@ export function shouldSweepAttempts(input: {
     && input.hasMaintenanceCredential
     && input.report.status === 'ok'
     && input.report.snapshotComplete === true;
+}
+
+/**
+ * The cycle first, then its bookkeeping, in order — never the other way round.
+ *
+ * Attempt cleanup is the one bookkeeping task that can block for minutes on a
+ * single uninterruptible disk wait (#132). Running it behind scheduling and
+ * dispatch means a slow delete costs the tail of a cycle instead of the whole
+ * cycle's scheduling, and the bound inside `sweepDeadAttempts` costs it only
+ * once. This shape exists so that ordering is a tested contract rather than an
+ * accident of statement order.
+ */
+export async function runCycleThenBookkeeping<Report>(input: {
+  readonly runCycle: () => Promise<Report>;
+  readonly bookkeeping: readonly ((report: Report) => Promise<void>)[];
+}): Promise<Report> {
+  const report = await input.runCycle();
+  for (const task of input.bookkeeping) await task(report);
+  return report;
+}
+
+/**
+ * A deferred attempt is not a refusal — the next cycle retries it — so it is
+ * summarized once rather than reported per attempt alongside the retentions an
+ * operator actually has to act on. `live` stays silent as before.
+ */
+export function renderCleanupWarnings(
+  results: readonly AttemptCleanupResult[],
+): string[] {
+  const lines: string[] = [];
+  let deferred = 0;
+  for (const result of results) {
+    if (result.status !== 'retained') continue;
+    if (result.reason.code === 'live') continue;
+    if (result.reason.code === 'deferred') {
+      deferred += 1;
+      continue;
+    }
+    lines.push(
+      `[autopilot:v2] cleanup retained attempt=${
+        result.attemptId ?? 'unknown'
+      } reason=${result.reason.code}: ${result.reason.detail}`,
+    );
+  }
+  if (deferred > 0) {
+    lines.push(
+      `[autopilot:v2] cleanup deferred ${deferred} attempt(s) to the next `
+      + `cycle; the ${
+        Math.round(DEFAULT_ATTEMPT_SWEEP_BUDGET_MS / 1_000)
+      }s sweep budget was spent`,
+    );
+  }
+  return lines;
 }
 
 function dispatcherConfig(
@@ -886,10 +941,11 @@ export async function runAutopilotV2(
           : { marketplaceExecutionBackend }),
       });
 
-  const runOnce = async (): Promise<void> => {
-    let report: Awaited<ReturnType<typeof runLifecycleCycle>>;
+  const runCycle = async (): Promise<
+  Awaited<ReturnType<typeof runLifecycleCycle>> | null
+  > => {
     try {
-      report = await runLifecycleCycle(options.mode, {
+      return await runLifecycleCycle(options.mode, {
         readSnapshot: readCycleSnapshot,
         readScopedSnapshot: (issueNumbers, rateLimitFloor) =>
           snapshotCoordinator.readScoped(
@@ -922,58 +978,80 @@ export async function runAutopilotV2(
       // one-shot still fails loud while a persistent loop survives to next cycle.
       if (error instanceof GitHubUsageIncompleteError && !options.once) {
         console.warn(`[autopilot:v2] ${error.message}; continuing to next cycle`);
-        return;
+        return null;
       }
       throw error;
     }
+  };
+
+  // Bookkeeping, in the order runCycleThenBookkeeping runs it. Cleanup can sit
+  // for minutes on one synchronous disk wait (#132), so it must never precede
+  // the scheduling and dispatch it is cleaning up after.
+  const sweepAttempts = async (
+    report: Awaited<ReturnType<typeof runLifecycleCycle>>,
+  ): Promise<void> => {
     // A snapshot-failed cycle must remain mutation-free. Local attempt
     // cleanup therefore follows the same complete-snapshot boundary as all
     // GitHub reconciliation/archive/action mutations.
-    if (shouldSweepAttempts({
+    if (!shouldSweepAttempts({
       mode: options.mode,
       executionBackend,
       cleanupEnabled,
       hasMaintenanceCredential: maintenanceCredential !== undefined,
       report,
     })) {
-      const cleanup = await sweepDeadAttempts(runner, {
-        v2Base: v2AttemptsBase,
-        isPidAlive: childIsAlive,
-        env: { GH_TOKEN: maintenanceCredential!.secret() },
-        graceMs: attemptGracePeriodMs,
-        now: () => new Date(),
-        diskFloorBytes,
-        diskPath: v2AttemptsBase,
-      });
-      for (const result of cleanup) {
-        if (result.status === 'retained' && result.reason.code !== 'live') {
-          console.warn(
-            `[autopilot:v2] cleanup retained attempt=${
-              result.attemptId ?? 'unknown'
-            } reason=${result.reason.code}: ${result.reason.detail}`,
-          );
-        }
-      }
+      return;
     }
+    const cleanup = await sweepDeadAttempts(runner, {
+      v2Base: v2AttemptsBase,
+      isPidAlive: childIsAlive,
+      env: { GH_TOKEN: maintenanceCredential!.secret() },
+      graceMs: attemptGracePeriodMs,
+      now: () => new Date(),
+      diskFloorBytes,
+      diskPath: v2AttemptsBase,
+    });
+    for (const line of renderCleanupWarnings(cleanup)) console.warn(line);
+  };
+
+  const paintBoard = async (
+    report: Awaited<ReturnType<typeof runLifecycleCycle>>,
+  ): Promise<void> => {
     if (
-      options.mode === 'active'
-      && report.status === 'ok'
-      && report.snapshotComplete
+      options.mode !== 'active'
+      || report.status !== 'ok'
+      || !report.snapshotComplete
     ) {
-      try {
-        await runPaintBoard(
-          runner,
-          new Date(),
-          paintBoardOptionsFromConfig(loaded.config),
-        );
-      } catch (error) {
-        console.warn(
-          `[autopilot:v2] status painter degraded: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
+      return;
     }
+    try {
+      await runPaintBoard(
+        runner,
+        new Date(),
+        paintBoardOptionsFromConfig(loaded.config),
+      );
+    } catch (error) {
+      console.warn(
+        `[autopilot:v2] status painter degraded: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
+
+  const runOnce = async (): Promise<void> => {
+    const report = await runCycleThenBookkeeping({
+      runCycle,
+      bookkeeping: [
+        async (finished) => {
+          if (finished !== null) await sweepAttempts(finished);
+        },
+        async (finished) => {
+          if (finished !== null) await paintBoard(finished);
+        },
+      ],
+    });
+    if (report === null) return;
     if (options.json) {
       process.stdout.write(`${renderLifecycleJson(report)}\n`);
     } else if (options.command.kind === 'explain-issue') {

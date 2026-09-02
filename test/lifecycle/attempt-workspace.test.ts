@@ -31,6 +31,7 @@ import {
   countRunnerLiveAttempts,
   createAttemptWorkspace,
   decodeAttemptManifest,
+  DEFAULT_ATTEMPT_SWEEP_BUDGET_MS,
   defaultRunnerId,
   freeDiskBytes,
   listRunnerLiveAttempts,
@@ -4331,5 +4332,111 @@ describe('safe attempt cleanup', () => {
     expect(freeDiskBytes(fixture.repo)).toBeGreaterThan(0);
     expect(freeDiskBytes(join(fixture.repo, 'not-created-yet', 'v2')))
       .toBeGreaterThan(0);
+  });
+});
+
+describe('bounded attempt cleanup', () => {
+  async function twoDeadAttempts(
+    fixture: ReturnType<typeof repositoryFixture>,
+  ): Promise<readonly AttemptManifest[]> {
+    const first = terminalAttempt(await createAttemptWorkspace(options(fixture, {
+      attemptId: UUID_A,
+      host: 'same-host',
+    }), defaultRunner));
+    const second = terminalAttempt(await createAttemptWorkspace(options(fixture, {
+      runnerId: 'same-host-200-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      attemptId: UUID_B,
+      host: 'same-host',
+    }), defaultRunner));
+    return [first, second];
+  }
+
+  // Advances half a budget per reading: the sweep start and the first
+  // candidate fall inside a 60s budget, the second candidate does not.
+  function halfBudgetPerReading(): () => number {
+    let elapsed = 0;
+    return () => {
+      const reading = elapsed;
+      elapsed += 30_000;
+      return reading;
+    };
+  }
+
+  it('bounds one cycle of cleanup to a sixty-second wall clock by default', () => {
+    expect(DEFAULT_ATTEMPT_SWEEP_BUDGET_MS).toBe(60_000);
+  });
+
+  it('starts at most a budget of removals and defers the rest to the next cycle', async () => {
+    const fixture = repositoryFixture();
+    const attempts = await twoDeadAttempts(fixture);
+
+    const first = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      budgetMs: 60_000,
+      monotonicNow: halfBudgetPerReading(),
+    });
+
+    expect(first.filter((result) => result.status === 'removed')).toHaveLength(1);
+    expect(first).toContainEqual({
+      status: 'retained',
+      attemptId: expect.any(String),
+      reason: {
+        code: 'deferred',
+        detail: 'Attempt cleanup deferred to the next cycle: '
+          + 'the sweep wall-clock budget was spent.',
+      },
+    });
+
+    const survivor = attempts.find(
+      (attempt) => existsSync(attempt.paths.manifest),
+    );
+    expect(survivor).toBeDefined();
+
+    const second = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+
+    expect(second).toContainEqual({
+      status: 'removed',
+      attemptId: survivor.attemptId,
+    });
+    expect(existsSync(survivor.paths.manifest)).toBe(false);
+  });
+
+  it('leaves a deferred removal occupying disk rather than counting it as reclaimed', async () => {
+    const fixture = repositoryFixture();
+    const attempts = await twoDeadAttempts(fixture);
+    const floor = 20 * 1024 * 1024 * 1024;
+    let freeReads = 0;
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      diskFloorBytes: floor,
+      diskPath: join(fixture.base, 'v2'),
+      // A pending delete is not free space: the floor stays unmet for exactly
+      // as long as the bytes are still on disk.
+      readFreeDiskBytes: () => {
+        freeReads += 1;
+        return floor - 1;
+      },
+      budgetMs: 60_000,
+      monotonicNow: halfBudgetPerReading(),
+    });
+
+    expect(freeReads).toBeGreaterThan(0);
+    expect(results.filter((result) => result.status === 'removed'))
+      .toHaveLength(1);
+    expect(results.some((result) =>
+      result.status === 'retained' && result.reason.code === 'deferred')).toBe(true);
+    expect(attempts.filter((attempt) => existsSync(attempt.paths.attemptDir)))
+      .toHaveLength(1);
   });
 });
