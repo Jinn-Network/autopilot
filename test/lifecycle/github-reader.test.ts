@@ -2680,3 +2680,166 @@ describe('merge-queue snapshot evidence', () => {
     warnSpy.mockRestore();
   });
 });
+
+/**
+ * Adaptive page size on the full-reconciliation read (#130). A `PR_PAGE_SIZE`
+ * page carries nested reviews(100)/labels(100)/closingIssuesReferences(20) and
+ * a 100-context check rollup per node; as a repository grows, the server-side
+ * execution cost of one page rises until GitHub tears the stream down. That
+ * arrives as an HTTP/2 stream cancel, and retrying the same page at the same
+ * size can fail the same way — so the retry halves the page instead.
+ */
+describe('full-reconciliation page-size adaptation (#130)', () => {
+  const STREAM_CANCEL = 'stream error: stream ID 1; CANCEL; received from peer';
+
+  function streamCancel(): Error {
+    return Object.assign(
+      new Error(`Command failed: gh api graphql\n${STREAM_CANCEL}`),
+      { stderr: STREAM_CANCEL, code: 1 },
+    );
+  }
+
+  function pageQuery(args: readonly string[]): string {
+    const query = args.find((arg) => arg.startsWith('query='));
+    if (query === undefined || !query.includes('pullRequests(first:')) return '';
+    return query;
+  }
+
+  function pageSizeOf(query: string): number {
+    const match = /pullRequests\(first: (\d+)/.exec(query);
+    if (match?.[1] === undefined) throw new Error('page query carried no page size');
+    return Number(match[1]);
+  }
+
+  function prPage(hasNextPage = false): string {
+    return JSON.stringify({
+      data: {
+        rateLimit: rateLimit(),
+        repository: {
+          pullRequests: {
+            pageInfo: { hasNextPage, endCursor: hasNextPage ? 'CURSOR-2' : null },
+            nodes: [graphQlPr({ number: 101, state: 'OPEN', head: OPEN_HEAD })],
+          },
+        },
+      },
+    });
+  }
+
+  /**
+   * Records the page size of every full-reconciliation page read, failing the
+   * attempts `fails` names by 1-based attempt number.
+   */
+  function pageReader(fails: (attempt: number) => Error | null, hasNextPage = false) {
+    const sizes: number[] = [];
+    const queries: string[] = [];
+    const run: CommandRunner = async (command, args) => {
+      if (command === 'git') return '';
+      const query = pageQuery(args);
+      if (query === '') return prPage();
+      queries.push(query);
+      sizes.push(pageSizeOf(query));
+      const failure = fails(sizes.length);
+      if (failure !== null) throw failure;
+      return prPage(hasNextPage);
+    };
+    return { run, sizes, queries };
+  }
+
+  /**
+   * The ladder is asserted against an already-metered runner so the transport
+   * retry beneath it (three attempts with a real 250ms/1s backoff, exercised in
+   * transient-retry.test.ts) does not multiply every rung. The composition of
+   * the two is asserted separately, at the bottom.
+   */
+  function ladderReader(run: CommandRunner): GhLifecycleReader {
+    return new GhLifecycleReader(run, { runnerIsMetered: true });
+  }
+
+  it('retries a cancelled page at half the page size and completes the read', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, sizes } = pageReader((attempt) => (attempt === 1 ? streamCancel() : null));
+
+    const page = await ladderReader(run).readPullRequests(null);
+
+    expect(sizes).toEqual([50, 25]);
+    expect(page.nodes).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(
+      'full reconciliation: page size 50 \u2192 25 after stream cancelled',
+    ));
+    warn.mockRestore();
+  });
+
+  it('downshifts only the page size, never the query\'s field set', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, queries } = pageReader((attempt) => (attempt === 1 ? streamCancel() : null));
+
+    await ladderReader(run).readPullRequests(null);
+
+    expect(queries).toHaveLength(2);
+    expect(queries[1]).toBe(queries[0]!.replace('pullRequests(first: 50', 'pullRequests(first: 25'));
+    warn.mockRestore();
+  });
+
+  it('keeps the downshifted size for the remaining pages of the same reconciliation', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, sizes } = pageReader((attempt) => (attempt === 1 ? streamCancel() : null), true);
+    const reader = ladderReader(run);
+
+    await reader.readPullRequests(null);
+    await reader.readPullRequests('CURSOR-2');
+
+    expect(sizes).toEqual([50, 25, 25]);
+    warn.mockRestore();
+  });
+
+  it('restores the default page size on the next full reconciliation', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, sizes } = pageReader((attempt) => (attempt === 1 ? streamCancel() : null));
+    const reader = ladderReader(run);
+
+    await reader.readPullRequests(null);
+    await reader.readPullRequests(null);
+
+    // A page that was momentarily too heavy must not permanently shrink pages.
+    expect(sizes).toEqual([50, 25, 50]);
+    warn.mockRestore();
+  });
+
+  it('fails closed when every page size is cancelled', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, sizes } = pageReader(() => streamCancel());
+
+    // The original error, never a synthetic one: the operator sees what happened.
+    await expect(ladderReader(run).readPullRequests(null))
+      .rejects.toThrow(STREAM_CANCEL);
+    // Bounded by both the halving floor and the downshift cap.
+    expect(sizes).toEqual([50, 25, 12, 10]);
+    warn.mockRestore();
+  });
+
+  it('does not downshift for a failure the server actually answered', async () => {
+    const { run, sizes } = pageReader(() => Object.assign(
+      new Error('Command failed: gh api graphql\ngh: Not Found (HTTP 404)'),
+      { stderr: 'gh: Not Found (HTTP 404)', code: 1 },
+    ));
+
+    await expect(ladderReader(run).readPullRequests(null))
+      .rejects.toThrow('HTTP 404');
+    expect(sizes).toEqual([50]);
+  });
+
+  it('leaves the page size alone when the transport retry beneath absorbs the cancel', async () => {
+    // The metered runner installs `withTransientReadRetry`, so one blip is
+    // re-sent at the same size and never reaches the ladder. The downshift is
+    // for the page GitHub cancels every time, not for network noise.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { run, sizes } = pageReader((attempt) => (attempt === 1 ? streamCancel() : null));
+
+    const page = await new GhLifecycleReader(run).readPullRequests(null);
+
+    expect(sizes).toEqual([50, 50]);
+    expect(page.nodes).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('page size'));
+    warn.mockRestore();
+  });
+});

@@ -1392,6 +1392,27 @@ export function fullReconciliationAllowsNewClaims(
   return age >= 0 && age <= MAX_FULL_RECONCILIATION_AGE_MS;
 }
 
+/**
+ * Consecutive cycles in which the freshness gate withheld every candidate,
+ * counted per active runtime (#130).
+ *
+ * A stale reconciliation is a TOTAL claim stop, and the only evidence of one
+ * today is a `skipped (full-reconciliation-stale)` line per candidate — 546 of
+ * them per cycle on the live mono stall, which reads exactly like a busy engine
+ * to anyone not already grepping for the reason. #113's starved-lane line is the
+ * shape this borrows, with the one difference that a run of cycles cannot be
+ * derived from a single cycle and so must be counted.
+ *
+ * Counted in a `WeakMap` on the runtime rather than a module-level variable, and
+ * NOT persisted: the count lives exactly as long as the engine that accrued it,
+ * a restart starts at zero, and two runtimes in one process never pool their
+ * cycles. The reset is the machine exit itself — one fresh full reconciliation
+ * makes the gate pass, and the entry goes with it. Nothing else clears it, and
+ * nothing about it can hold a claim back: it is read after the gate has already
+ * decided, and only to describe what the gate did.
+ */
+const staleReconciliationCycles = new WeakMap<object, number>();
+
 interface ActivePassResult {
   readonly items: readonly LifecycleStatusItem[];
   readonly orphanBranchClaims: readonly LifecycleOrphanBranchClaimStatus[];
@@ -1484,6 +1505,27 @@ async function executeActivePass(
       outcome: 'skipped',
       reason: 'full-reconciliation-stale',
     })));
+  }
+  // Counted after the gate, never before it: this line describes the stop, it
+  // does not participate in it.
+  const staleCycles = reconciliationFresh
+    ? 0
+    : (staleReconciliationCycles.get(deps.active!) ?? 0) + 1;
+  if (reconciliationFresh) staleReconciliationCycles.delete(deps.active!);
+  else staleReconciliationCycles.set(deps.active!, staleCycles);
+  // One stale cycle is a slow reconciliation; a run of them is a stall, and the
+  // second is the earliest cycle at which the difference is observable.
+  if (staleCycles >= 2) {
+    actionEvents.push({
+      cycleId,
+      runnerId: deps.runnerId,
+      mode: 'active',
+      phase: 'eligible',
+      subject: 'reconciliation',
+      action: 'schedule',
+      outcome: 'stale',
+      reason: `for ${staleCycles} cycle(s), ${candidates.length} candidate(s) withheld`,
+    });
   }
   const scheduling = scheduleActiveActions({
     candidates: reconciliationFresh ? candidates : [],

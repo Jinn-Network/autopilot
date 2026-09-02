@@ -74,6 +74,49 @@ describe('classifyTransportFault', () => {
     expect(classifyTransportFault(subprocessFault(stderr))).not.toBeNull();
   });
 
+  // HTTP/2 stream-level faults (issue #130). Go's http2 client reports a
+  // peer-initiated stream reset in exactly this shape, and a live full
+  // reconciliation on Jinn-Network/mono stalled for ~10 cycles because none of
+  // them classified. No HTTP status is served for any of these: the stream is
+  // torn down before a response exists, so the request never completed a round
+  // trip and the read is exactly as safe to re-send as a connection reset.
+  it.each([
+    [
+      'a peer stream cancel',
+      'stream error: stream ID 1; CANCEL; received from peer',
+      'stream cancelled',
+    ],
+    [
+      'a peer stream internal error',
+      'stream error: stream ID 7; INTERNAL_ERROR; received from peer',
+      'stream internal error',
+    ],
+    [
+      'a peer stream protocol error',
+      'stream error: stream ID 13; PROTOCOL_ERROR; received from peer',
+      'stream protocol error',
+    ],
+    [
+      'a peer stream flow-control reset',
+      'stream error: stream ID 21; ENHANCE_YOUR_CALM; received from peer',
+      'stream flow-control reset',
+    ],
+    [
+      'a server GOAWAY',
+      'http2: server sent GOAWAY and closed the connection; LastStreamID=1, ErrCode=NO_ERROR, debug=""',
+      'server GOAWAY',
+    ],
+  ])('classifies %s as a transport fault', (_label, stderr, fault) => {
+    expect(classifyTransportFault(subprocessFault(stderr))).toBe(fault);
+  });
+
+  it('classifies the exact stderr the live mono stall produced', () => {
+    // Verbatim from the WARNING in issue #130: the full-reconciliation page
+    // read whose failure was left unclassified for ~10 cycles.
+    const observed = 'stream error: stream ID 1; CANCEL; received from peer';
+    expect(classifyTransportFault(subprocessFault(observed))).toBe('stream cancelled');
+  });
+
   it.each([
     ['a returned 404', 'gh: Not Found (HTTP 404)'],
     ['a returned 500', 'gh: Internal Server Error (HTTP 500)'],
@@ -103,7 +146,43 @@ describe('classifyTransportFault', () => {
       'a 502 whose text also names a TLS handshake timeout',
       'gh: Bad Gateway (HTTP 502) - net/http: TLS handshake timeout',
     ],
+    [
+      'a 502 whose text also names a peer stream cancel',
+      'gh: Bad Gateway (HTTP 502): stream error: stream ID 1; CANCEL; received from peer',
+    ],
+    [
+      'a 403 rate limit whose text also names a GOAWAY',
+      'gh: API rate limit exceeded (HTTP 403); http2: server sent GOAWAY and closed the connection',
+    ],
   ])('vetoes %s even though a transport marker is present', (_label, stderr) => {
+    expect(classifyTransportFault(subprocessFault(stderr))).toBeNull();
+  });
+
+  it('never reads stdout as evidence of an HTTP/2 stream fault', () => {
+    // The same discipline as every other entry: a pull-request body quoting the
+    // stream-cancel text is attacker-influenced payload, not fault evidence.
+    const served = Object.assign(new Error('Command failed: gh api repos/o/r/pulls/1'), {
+      stderr: '',
+      stdout: '{"body":"CI log said stream error: stream ID 1; CANCEL; received from peer"}',
+    });
+    expect(classifyTransportFault(served)).toBeNull();
+  });
+
+  it('never reads an echoed GraphQL document as evidence of an HTTP/2 stream fault', () => {
+    const commandLine = 'gh api graphql -f query=query{\n  stream error: stream ID 1; CANCEL; received from peer\n}';
+    const unrelated = Object.assign(
+      new Error(`Command failed: ${commandLine}\n`),
+      { cmd: commandLine, stderr: '' },
+    );
+    expect(classifyTransportFault(unrelated)).toBeNull();
+  });
+
+  it.each([
+    ['a stream ID that is not a number', 'stream error: stream ID x; CANCEL; received from peer'],
+    ['an unknown stream error code', 'stream error: stream ID 1; REFUSED_STREAM; received from peer'],
+    ['a stream error the peer did not send', 'stream error: stream ID 1; CANCEL; sent by client'],
+    ['a bare GOAWAY mention', 'http2: received GOAWAY'],
+  ])('does not classify %s', (_label, stderr) => {
     expect(classifyTransportFault(subprocessFault(stderr))).toBeNull();
   });
 
