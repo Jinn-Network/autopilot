@@ -28,6 +28,7 @@ import {
   type MarketplaceReviewAnchorOrigin,
   type MarketplaceReviewAnchorPort,
 } from './marketplace-review-anchor.js';
+import { makeProductionOpenReviewFollowUpReader } from './review-follow-ups-production.js';
 import { makeProductionReviewSessionPort } from './review-session-production.js';
 import type { ReviewSessionPort } from './review-session.js';
 import type { CredentialPool } from './credentials.js';
@@ -96,6 +97,7 @@ ReviewExecutorDeps,
 | 'publishReviewClaim'
 | 'createAttempt'
 | 'repairProjection'
+| 'readOpenFollowUps'
 >;
 
 export function makeProductionReviewActionPort(
@@ -399,6 +401,11 @@ export function makeProductionReviewActionPort(
       const snapshot = targetedAuthoritySnapshot(await options.readSnapshot(prNumber));
       return snapshot === null ? null : candidateFromSnapshot(snapshot, prNumber);
     },
+
+    readOpenFollowUps: makeProductionOpenReviewFollowUpReader({
+      runner,
+      repo: repositorySlug,
+    }),
 
     confirmAcquisition: async ({ prNumber }) => {
       const snapshot = targetedAuthoritySnapshot(await options.readSnapshot(prNumber));

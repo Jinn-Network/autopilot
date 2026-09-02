@@ -162,8 +162,16 @@ follow-ups in the same session command:
   `<!-- jinn-autopilot:review-follow-up pr=<N> head=<sha> index=<i> -->`,
   Issue Type `feat|chore|fix|refactor`, and machine triage on the Project
   (Blocked on / Effort / Priority; default Blocked on: Nothing). Cap ≤5 per
-  exact head. Filing is
-  idempotent on `pr+head+index` and runs before terminal publish. These
+  exact head. Filing dedups on the **parent-scoped marker prefix through
+  `pr=<N>`** and the normalized entry title, never on `head` or `index` — a
+  re-review happens *because* the head moved, so a head-keyed lookup could only
+  catch a retry of the same pass (#124, the same defect class as #114).
+  `head`/`index` stay on the written marker as filing-time forensics. Dedup
+  reads **open** issues only, so a closed follow-up is re-fileable when the
+  finding recurs, and a matched entry is re-triaged rather than recreated. The
+  session prompt is also given the parent's already-open follow-ups so the
+  reviewer cites them instead of re-deriving them. Filing runs before terminal
+  publish. These
   issues never carry `review-finding`/`reconcile` labels or the child
   marker, never appear in `openChildKinds`, and **do not** move the parent
   into BLOCKED-BY-CHILD. They are non-blocking *for the parent*; the

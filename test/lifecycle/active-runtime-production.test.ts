@@ -715,6 +715,131 @@ describe('production active runtime preflight', () => {
     expect(events.indexOf('pid')).toBeLessThan(events.indexOf('track'));
   });
 
+  /**
+   * Issue #124 layer 2. The duplicates that motivated this are *semantic* —
+   * mono #3292 "Publish @colophon-claims/check, then republish the verify
+   * alias" and #3621 "Publish the renamed Colophon reader and its
+   * retired-name alias" are one task with no title overlap — so the
+   * mechanical title match in `review-follow-ups.ts` could not have caught
+   * them. The reviewer has to be shown what is already open.
+   */
+  async function dispatchReviewPrompt(
+    readOpenFollowUps?: (parentPr: number) => Promise<readonly {
+      readonly number: number;
+      readonly title: string;
+    }[]>,
+  ): Promise<string> {
+    const head = gitOid('3'.repeat(40));
+    const recordOid = gitOid('4'.repeat(40));
+    const candidate = {
+      issueNumber: 42,
+      number: 84,
+      open: true,
+      head,
+      headChangedAt: '2026-07-20T08:00:00.000Z',
+      headRefName: gitRefName('autopilot/42'),
+      baseRefName: gitRefName('next'),
+      draft: false,
+      author: 'implementation-bot',
+      labels: ['engine:review'],
+      body: 'Closes #42\n\n<!-- jinn-autopilot:v2 issue=42 branch=autopilot/42 -->',
+      humanHold: false,
+      approvalPolicy: 'approve-eligible',
+      nativeReviews: [],
+    };
+    let reviewRecord: unknown;
+    let prompt = '';
+    const spawn = vi.fn((_command, args) => {
+      prompt = args.join('\n');
+      return { pid: 4343, once: vi.fn() };
+    });
+    const makeReviewActionPort = vi.fn(() => ({
+      readCandidate: async () => candidate,
+      confirmAcquisition: async () => ({
+        ...candidate,
+        reviewRef: { oid: recordOid, record: reviewRecord },
+      }),
+      createReviewRecord: async ({ record }) => {
+        reviewRecord = record;
+        return recordOid;
+      },
+      publishReviewClaim: async ({ expectedRemoteRecordOid, recordOid: published }) => ({
+        status: 'won',
+        expected: expectedRemoteRecordOid,
+        published,
+        observed: published,
+      }),
+      createAttempt: async (input) => ({
+        attemptId: input.attemptId,
+        paths: {
+          worktree: '/attempt/review-worktree',
+          manifest: '/attempt/review-manifest.json',
+          log: '/attempt/review.log',
+          ghConfigDir: '/attempt/review-gh',
+          askpass: '/attempt/review-askpass',
+        },
+      }),
+      repairProjection: async () => {},
+      escalateHuman: async () => {},
+      ...(readOpenFollowUps === undefined ? {} : { readOpenFollowUps }),
+    }));
+    const active = marketplaceRuntime({
+      executionBackend: 'local',
+      environment: {},
+      credentials: new CredentialPool([{
+        login: 'implementation-bot',
+        normalizedLogin: 'implementation-bot',
+        implementationToken: 'implementation-secret',
+      }, {
+        login: 'review-bot',
+        normalizedLogin: 'review-bot',
+        reviewToken: 'review-secret',
+      }]),
+      makeReviewActionPort,
+      spawn,
+      trackAttemptChild: vi.fn(),
+      nextId: vi.fn()
+        .mockReturnValueOnce('22222222-2222-4222-8222-222222222222')
+        .mockReturnValueOnce('33333333-3333-4333-8333-333333333333'),
+    });
+
+    await expect(active.executeAction({
+      kind: 'claim-review',
+      issueNumber: 42,
+      prNumber: 84,
+      head,
+    }, {} as never)).resolves.toEqual({ outcome: 'spawned' });
+    return prompt;
+  }
+
+  it('prints the parent PR open follow-ups into the review coordinator prompt', async () => {
+    const seen: number[] = [];
+    const prompt = await dispatchReviewPrompt(async (parentPr) => {
+      seen.push(parentPr);
+      return [
+        {
+          number: 3292,
+          title: 'Publish @colophon-claims/check, then republish the verify alias',
+        },
+        { number: 3317, title: 'Prove the alias actually forwards, in CI' },
+      ];
+    });
+
+    expect(seen).toEqual([84]);
+    expect(prompt).toContain('Open Autopilot review follow-ups already filed for this PR');
+    expect(prompt).toContain(
+      '#3292 — Publish @colophon-claims/check, then republish the verify alias',
+    );
+    expect(prompt).toContain('#3317 — Prove the alias actually forwards, in CI');
+    expect(prompt).toContain('cite the existing issue number');
+  });
+
+  it('leaves the review prompt free of a follow-up section when none are open', async () => {
+    const prompt = await dispatchReviewPrompt(async () => []);
+    expect(prompt).toContain('Use the review-pr skill on PR #84');
+    expect(prompt).not.toContain('Open Autopilot review follow-ups');
+  });
+
   it('uses only the fresh canonical diagnostic to publish a mapping reread', async () => {
     const head = gitOid('3'.repeat(40));
     const acquisitionOids = [

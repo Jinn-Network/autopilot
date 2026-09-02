@@ -22,6 +22,8 @@ import type {
   LocalExactHeadReviewSessionExecutionRequest,
   SessionExecutionResult,
 } from './session-execution-backend.js';
+import type { OpenReviewFollowUp } from './review-follow-ups.js';
+import { MAX_REVIEW_FOLLOW_UP_CONTEXT } from './review-follow-ups.js';
 
 export interface ReviewNativeReview {
   readonly reviewer: string;
@@ -68,6 +70,13 @@ export interface SpawnExactHeadReviewInput {
   readonly environment: NodeJS.ProcessEnv;
   readonly worktreePath: string;
   readonly logPath: string;
+  /**
+   * Mirrors `ExactHeadReviewSessionExecutionRequest.openFollowUps` (#124). The
+   * local backend hands the spawner only `local.spawnInput` and the prompt is
+   * composed there, so the context has to ride on both.
+   */
+  readonly openFollowUps?: readonly OpenReviewFollowUp[];
+  readonly openFollowUpTotal?: number;
 }
 
 export interface ReviewExecutorDeps {
@@ -109,6 +118,20 @@ export interface ReviewExecutorDeps {
     readonly expectedReviewRefOid: GitOid;
     readonly credential: SelectedCredential;
   }): Promise<void>;
+  /**
+   * Non-blocking follow-ups already open against the parent PR (#124).
+   *
+   * The mechanical dedup in `review-follow-ups.ts` matches normalized titles,
+   * which catches a restatement but not a rewrite: mono #3292 "Publish
+   * @colophon-claims/check, then republish the verify alias" and #3621
+   * "Publish the renamed Colophon reader and its retired-name alias" are one
+   * task with no shared words. Only the reviewer can see that, and only if it
+   * is shown what is already filed.
+   *
+   * Optional because a build without it must stay distinguishable from a
+   * parent with nothing open — see the request field's note.
+   */
+  readOpenFollowUps?(parentPr: number): Promise<readonly OpenReviewFollowUp[]>;
   startSession(
     request: LocalExactHeadReviewSessionExecutionRequest<SpawnExactHeadReviewInput>,
   ): Promise<SessionExecutionResult>;
@@ -545,6 +568,32 @@ export async function acquireExactHeadReviewClaim(
   };
 }
 
+/**
+ * The already-open follow-up context for one parent, or an empty object when
+ * this build has no reader (#124).
+ *
+ * Empty object, not `{ openFollowUps: [] }`: a build that did not look must
+ * not be able to tell the reviewer that a PR carrying seventeen open
+ * follow-ups has none.
+ */
+async function readOpenFollowUpContext(
+  deps: Pick<ReviewExecutorDeps, 'readOpenFollowUps'>,
+  parentPr: number,
+): Promise<{
+  readonly openFollowUps?: readonly OpenReviewFollowUp[];
+  readonly openFollowUpTotal?: number;
+}> {
+  const read = deps.readOpenFollowUps;
+  if (read === undefined) return {};
+  const open = await read(parentPr);
+  return {
+    openFollowUps: open
+      .slice(0, MAX_REVIEW_FOLLOW_UP_CONTEXT)
+      .map((followUp) => ({ number: followUp.number, title: followUp.title })),
+    openFollowUpTotal: open.length,
+  };
+}
+
 export async function executeReviewAction(
   action: {
     readonly prNumber: number;
@@ -584,6 +633,10 @@ export async function executeReviewAction(
       manifestPath: manifestPaths.manifest,
     },
   );
+  // Read after the claim is confirmed and before the session starts: the point
+  // is to tell *this* reviewer what is already filed, and that is only worth
+  // knowing once we know we are the ones reviewing.
+  const followUpContext = await readOpenFollowUpContext(deps, claim.prNumber);
   const started = await deps.startSession({
     kind: 'exact-head-review',
     backend: 'local',
@@ -597,6 +650,7 @@ export async function executeReviewAction(
     logPath: manifestPaths.log,
     reviewedHead: claim.head,
     reviewerLogin: claim.reviewer,
+    ...followUpContext,
     local: {
       spawnInput: {
         attemptId: claim.attemptId,
@@ -604,6 +658,7 @@ export async function executeReviewAction(
         environment,
         worktreePath: manifestPaths.worktree,
         logPath: manifestPaths.log,
+        ...followUpContext,
       },
     },
   });

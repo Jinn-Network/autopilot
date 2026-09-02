@@ -5,12 +5,14 @@ import {
   fileReviewFollowUps,
   hasReviewFollowUpMarkerTag,
   formatReviewFollowUpMarker,
+  formatReviewFollowUpMarkerKey,
   parseReviewFollowUpMarker,
   parseReviewFollowUpsPayload,
   type ReviewFollowUpPort,
 } from '../../src/lifecycle/review-follow-ups.js';
 
 const HEAD = 'a'.repeat(40);
+const NEXT_HEAD = 'b'.repeat(40);
 
 /**
  * The marker template as canon §5.1 literally prints it. Read from the canon
@@ -28,6 +30,65 @@ const CANON_MARKER_TEMPLATE = (() => {
   return match[1]!;
 })();
 
+/**
+ * In-memory issue store shaped like the production port: `searchOpenByMarker`
+ * is a substring match over **open** issue bodies, exactly as
+ * `review-follow-ups-production.ts` implements it.
+ */
+function followUpHarness(seed: readonly {
+  readonly number: number;
+  readonly title: string;
+  readonly body: string;
+  readonly state: 'open' | 'closed';
+}[] = []) {
+  const issues = seed.map((issue) => ({ ...issue }));
+  const created: Array<{ title: string; body: string; type: string }> = [];
+  const triageCalls: Array<{
+    issueNumber: number;
+    type: string;
+    effort: string;
+    priority: string;
+  }> = [];
+  const searches: string[] = [];
+  let next = 100;
+  const port: ReviewFollowUpPort = {
+    async searchOpenByMarker(marker) {
+      searches.push(marker);
+      return issues
+        .filter((issue) => issue.state === 'open' && issue.body.includes(marker))
+        .map((issue) => ({ number: issue.number, title: issue.title }));
+    },
+    async createIssue(input) {
+      created.push({ title: input.title, body: input.body, type: input.type });
+      const number = next;
+      next += 1;
+      issues.push({ number, title: input.title, body: input.body, state: 'open' });
+      return { number };
+    },
+    async ensureTriageComplete(input) {
+      triageCalls.push({ ...input });
+    },
+  };
+  return { port, issues, created, triageCalls, searches };
+}
+
+function entry(overrides: Partial<{
+  type: 'feat' | 'chore' | 'fix' | 'refactor';
+  title: string;
+  body: string;
+  effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+}> = {}) {
+  return {
+    type: 'feat' as const,
+    title: 'Follow-up A',
+    body: 'Debt note',
+    effort: 'medium' as const,
+    priority: 'p2' as const,
+    ...overrides,
+  };
+}
+
 describe('review-follow-up marker', () => {
   it('round-trips pr+head+index and never looks like a child marker', () => {
     const marker = formatReviewFollowUpMarker(84, HEAD, 0);
@@ -41,6 +102,35 @@ describe('review-follow-up marker', () => {
     });
     expect(marker).not.toContain('jinn-autopilot:child');
     expect(marker).not.toMatch(/\bkind=(review-finding|reconcile)\b/);
+  });
+
+  // Canon §5.1 is what agents are told to treat as authoritative, and it used
+  // to print the defect as the contract ("idempotent on pr+head+index").
+  it('is described by canon as parent-scoped, not head-scoped', () => {
+    const canon = readFileSync(
+      new URL('../../assets/canon/single-surface-lifecycle.md', import.meta.url),
+      'utf8',
+    );
+    expect(canon).not.toContain('idempotent on `pr+head+index`');
+    expect(canon).toMatch(/dedups on the \*\*parent-scoped marker prefix/);
+  });
+
+  // The dedup identity, mirroring `formatChildMarkerKey`: everything through
+  // `pr=<N>`, with neither of the two components that move between passes.
+  it('exposes a parent-scoped key that is a prefix of every head/index marker', () => {
+    const key = formatReviewFollowUpMarkerKey(84);
+    expect(key).toBe('<!-- jinn-autopilot:review-follow-up pr=84 ');
+    expect(formatReviewFollowUpMarker(84, HEAD, 0)).toContain(key);
+    expect(formatReviewFollowUpMarker(84, NEXT_HEAD, 4)).toContain(key);
+    expect(() => formatReviewFollowUpMarkerKey(0)).toThrow(/parent PR/i);
+  });
+
+  // The key is consumed by a *substring* search, so the field boundary after
+  // the digits is load-bearing: without it PR #84's key matches PR #845's
+  // markers and dedup silently borrows another parent's follow-ups.
+  it('does not match a longer parent number', () => {
+    expect(formatReviewFollowUpMarker(845, HEAD, 0))
+      .not.toContain(formatReviewFollowUpMarkerKey(84));
   });
 });
 
@@ -112,55 +202,187 @@ describe('parseReviewFollowUpsPayload', () => {
 });
 
 describe('fileReviewFollowUps', () => {
-  it('is idempotent per pr+head+index and applies Project triage without child labels', async () => {
-    const created: Array<{ title: string; body: string; type: string }> = [];
-    const triageCalls: Array<{ issueNumber: number; type: string; effort: string; priority: string }> = [];
-    const issues: Array<{ number: number; body: string; state: 'open' | 'closed' }> = [];
-    let next = 100;
-    const port: ReviewFollowUpPort = {
-      async searchOpenByMarker(marker) {
-        return issues
-          .filter((i) => i.state === 'open' && i.body.includes(marker))
-          .map((i) => ({ number: i.number }));
-      },
-      async createIssue(input) {
-        created.push({ title: input.title, body: input.body, type: input.type });
-        const number = next++;
-        issues.push({ number, body: input.body, state: 'open' });
-        return { number };
-      },
-      async ensureTriageComplete(input) {
-        triageCalls.push({ ...input });
-      },
-    };
-
-    const entries = [{
-      type: 'feat' as const,
-      title: 'Follow-up A',
-      body: 'Debt note',
-      effort: 'medium' as const,
-      priority: 'p2' as const,
-    }];
-    const first = await fileReviewFollowUps(port, {
+  it('is idempotent on a same-pass retry and applies Project triage without child labels', async () => {
+    const h = followUpHarness();
+    const entries = [entry()];
+    const first = await fileReviewFollowUps(h.port, {
       parentPr: 84,
       head: HEAD,
       entries,
     });
-    const second = await fileReviewFollowUps(port, {
+    const second = await fileReviewFollowUps(h.port, {
       parentPr: 84,
       head: HEAD,
       entries,
     });
     expect(first).toEqual([{ number: 100, created: true, index: 0 }]);
     expect(second).toEqual([{ number: 100, created: false, index: 0 }]);
-    expect(created).toHaveLength(1);
-    expect(triageCalls).toEqual([
+    expect(h.created).toHaveLength(1);
+    expect(h.triageCalls).toEqual([
       { issueNumber: 100, type: 'feat', effort: 'medium', priority: 'p2' },
       { issueNumber: 100, type: 'feat', effort: 'medium', priority: 'p2' },
     ]);
-    expect(created[0]!.body).toContain(formatReviewFollowUpMarker(84, HEAD, 0));
-    expect(created[0]!.body).not.toContain('jinn-autopilot:child');
-    expect(created[0]!.type).toBe('feat');
+    expect(h.created[0]!.body).toContain(formatReviewFollowUpMarker(84, HEAD, 0));
+    expect(h.created[0]!.body).not.toContain('jinn-autopilot:child');
+    expect(h.created[0]!.type).toBe('feat');
+  });
+
+  // The #124 regression. `head` moves on exactly the event that causes a
+  // re-review, so a head-keyed lookup can only ever catch a retry of the same
+  // pass. mono #3285 paid this tax on five consecutive laps.
+  it('does not re-file an open follow-up when the head moved between passes', async () => {
+    const h = followUpHarness();
+    await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: HEAD,
+      entries: [entry({ title: 'Publish the renamed reader alias' })],
+    });
+    const second = await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: NEXT_HEAD,
+      entries: [entry({ title: 'Publish the renamed reader alias' })],
+    });
+
+    expect(second).toEqual([{ number: 100, created: false, index: 0 }]);
+    expect(h.created).toHaveLength(1);
+    // One parent-scoped lookup per pass, not one per entry.
+    expect(h.searches).toEqual([
+      formatReviewFollowUpMarkerKey(84),
+      formatReviewFollowUpMarkerKey(84),
+    ]);
+  });
+
+  it('still triages the existing issue on a cross-pass dedup hit', async () => {
+    const h = followUpHarness();
+    await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: HEAD,
+      entries: [entry({ effort: 'low', priority: 'p4' })],
+    });
+    h.triageCalls.length = 0;
+    await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: NEXT_HEAD,
+      entries: [entry({ effort: 'high', priority: 'p1' })],
+    });
+    expect(h.triageCalls).toEqual([
+      { issueNumber: 100, type: 'feat', effort: 'high', priority: 'p1' },
+    ]);
+  });
+
+  it('matches titles up to whitespace, case, and trailing punctuation only', async () => {
+    const h = followUpHarness();
+    await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: HEAD,
+      entries: [entry({ title: 'Publish the renamed reader alias' })],
+    });
+    const second = await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: NEXT_HEAD,
+      entries: [
+        entry({ title: '  publish   THE renamed reader  alias.  ' }),
+        // Internal punctuation is identity, not noise: a package path is the
+        // whole point of the finding, so it must not be normalized away.
+        entry({ title: 'Publish @colophon-claims/check' }),
+      ],
+    });
+    expect(second).toEqual([
+      { number: 100, created: false, index: 0 },
+      { number: 101, created: true, index: 1 },
+    ]);
+    expect(h.created).toHaveLength(2);
+  });
+
+  it('files a genuinely new entry at a different head', async () => {
+    const h = followUpHarness();
+    await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: HEAD,
+      entries: [entry({ title: 'Publish the renamed reader alias' })],
+    });
+    const second = await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: NEXT_HEAD,
+      entries: [entry({ title: 'Prove the alias forwards, in CI' })],
+    });
+    expect(second).toEqual([{ number: 101, created: true, index: 0 }]);
+    expect(h.created.map((issue) => issue.title)).toEqual([
+      'Publish the renamed reader alias',
+      'Prove the alias forwards, in CI',
+    ]);
+  });
+
+  // The machine exit: dedup reads open issues only, so a finding that recurs
+  // after its follow-up was closed must be fileable again.
+  it('re-files when the prior follow-up is closed', async () => {
+    const h = followUpHarness([{
+      number: 100,
+      title: 'Publish the renamed reader alias',
+      body: `${formatReviewFollowUpMarker(84, HEAD, 0)}\n\nold`,
+      state: 'closed',
+    }]);
+    const filed = await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: NEXT_HEAD,
+      entries: [entry({ title: 'Publish the renamed reader alias' })],
+    });
+    expect(filed).toEqual([{ number: 100, created: true, index: 0 }]);
+    expect(h.created).toHaveLength(1);
+  });
+
+  it('never dedups against another parent whose number shares the prefix', async () => {
+    const h = followUpHarness([{
+      number: 900,
+      title: 'Publish the renamed reader alias',
+      body: `${formatReviewFollowUpMarker(845, HEAD, 0)}\n\nother parent`,
+      state: 'open',
+    }]);
+    const filed = await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: HEAD,
+      entries: [entry({ title: 'Publish the renamed reader alias' })],
+    });
+    expect(filed).toEqual([{ number: 100, created: true, index: 0 }]);
+  });
+
+  // head/index stay on the written marker: they say which pass filed what.
+  // They just stop being the dedup key.
+  it('keeps head and index on the written marker', async () => {
+    const h = followUpHarness();
+    await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: NEXT_HEAD,
+      entries: [entry({ title: 'A' }), entry({ title: 'B' })],
+    });
+    expect(h.created[0]!.body)
+      .toContain(formatReviewFollowUpMarker(84, NEXT_HEAD, 0));
+    expect(h.created[1]!.body)
+      .toContain(formatReviewFollowUpMarker(84, NEXT_HEAD, 1));
+    expect(parseReviewFollowUpMarker(h.created[1]!.body)).toEqual({
+      parentPr: 84,
+      head: NEXT_HEAD,
+      index: 1,
+    });
+  });
+
+  it('keeps the per-pass cap exactly where it was', async () => {
+    const h = followUpHarness();
+    const entries = Array.from(
+      { length: MAX_REVIEW_FOLLOW_UPS_PER_PASS },
+      (_unused, index) => entry({ title: `Item ${index}` }),
+    );
+    const filed = await fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: HEAD,
+      entries,
+    });
+    expect(filed).toHaveLength(MAX_REVIEW_FOLLOW_UPS_PER_PASS);
+    await expect(fileReviewFollowUps(h.port, {
+      parentPr: 84,
+      head: HEAD,
+      entries: [...entries, entry({ title: 'Item 5' })],
+    })).rejects.toThrow(/cap of 5/i);
   });
 
   it('rejects entries whose title/body embed a child marker and creates no issue', async () => {

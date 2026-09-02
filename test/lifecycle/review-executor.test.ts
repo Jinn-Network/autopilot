@@ -7,6 +7,7 @@ import {
   type ReviewActionCandidate,
   type ReviewExecutorDeps,
 } from '../../src/lifecycle/review-executor.js';
+import { MAX_REVIEW_FOLLOW_UP_CONTEXT } from '../../src/lifecycle/review-follow-ups.js';
 import {
   gitOid,
   gitRefName,
@@ -750,5 +751,91 @@ describe('review action executor', () => {
     await expect(executeReviewAction({ prNumber: 84 }, older.deps))
       .resolves.toMatchObject({ status: 'spawned' });
     expect(older.records[0]?.head).toBe(HEAD);
+  });
+});
+
+/**
+ * Issue #124 layer 2. The duplicates that motivated this are *semantic*, not
+ * lexical — mono #3292 "Publish @colophon-claims/check, then republish the
+ * verify alias" and #3621 "Publish the renamed Colophon reader and its
+ * retired-name alias" are one task with no title overlap — so the mechanical
+ * dedup in `review-follow-ups.ts` could never have caught them. The reviewer
+ * has to see what is already open and decline to re-derive it.
+ */
+describe('review session open follow-up context', () => {
+  function captureRequest(overrides = {}) {
+    let request;
+    const h = harness({
+      startSession: async (started) => {
+        request = started;
+        return { status: 'started', backend: 'local', pid: 4242 };
+      },
+      ...overrides,
+    });
+    return { h, read: () => request };
+  }
+
+  it('carries the parent PR open follow-ups into the request and the spawn input', async () => {
+    const parents = [];
+    const { h, read } = captureRequest({
+      readOpenFollowUps: async (parentPr) => {
+        parents.push(parentPr);
+        return [
+          { number: 3292, title: 'Publish the renamed reader alias' },
+          { number: 3317, title: 'Prove the alias forwards, in CI' },
+        ];
+      },
+    });
+
+    await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned' });
+
+    expect(parents).toEqual([84]);
+    const request = read();
+    expect(request.openFollowUps).toEqual([
+      { number: 3292, title: 'Publish the renamed reader alias' },
+      { number: 3317, title: 'Prove the alias forwards, in CI' },
+    ]);
+    expect(request.openFollowUpTotal).toBe(2);
+    expect(request.local.spawnInput.openFollowUps)
+      .toEqual(request.openFollowUps);
+    expect(request.local.spawnInput.openFollowUpTotal).toBe(2);
+  });
+
+  // "We looked and there are none" is a different fact from "we did not
+  // look", and only the second may leave the field absent.
+  it('carries an empty list, not an absent one, when the parent has none open', async () => {
+    const { h, read } = captureRequest({ readOpenFollowUps: async () => [] });
+    await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned' });
+    expect(read().openFollowUps).toEqual([]);
+    expect(read().openFollowUpTotal).toBe(0);
+  });
+
+  it('omits the context entirely when no reader is wired', async () => {
+    const { h, read } = captureRequest();
+    await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned' });
+    expect(read().openFollowUps).toBeUndefined();
+    expect(read().openFollowUpTotal).toBeUndefined();
+  });
+
+  // Titles only, numbers only, and a hard bound: this rides in a prompt, and
+  // a parent with a long tail of debt must not push the diff out of it.
+  it('caps what it passes and still reports the true total', async () => {
+    const many = Array.from({ length: MAX_REVIEW_FOLLOW_UP_CONTEXT + 7 }, (_u, i) => ({
+      number: 3000 + i,
+      title: `Follow-up ${i}`,
+    }));
+    const { h, read } = captureRequest({ readOpenFollowUps: async () => many });
+    await expect(executeReviewAction({ prNumber: 84 }, h.deps))
+      .resolves.toMatchObject({ status: 'spawned' });
+    expect(read().openFollowUps).toHaveLength(MAX_REVIEW_FOLLOW_UP_CONTEXT);
+    expect(read().openFollowUps[0]).toEqual({ number: 3000, title: 'Follow-up 0' });
+    expect(read().openFollowUpTotal).toBe(MAX_REVIEW_FOLLOW_UP_CONTEXT + 7);
+    // No bodies: the payload is an index of what exists, not its content.
+    for (const entry of read().openFollowUps) {
+      expect(Object.keys(entry).sort()).toEqual(['number', 'title']);
+    }
   });
 });

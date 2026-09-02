@@ -296,16 +296,54 @@ function requireTrackable(child: SpawnResult): TrackableAttemptChild {
   return child as TrackableAttemptChild;
 }
 
+/**
+ * The follow-ups already open against this PR, rendered for the coordinator
+ * prompt (#124).
+ *
+ * Titles only, no bodies. The section is omitted entirely when nothing is
+ * open: a reviewer told "there are none" learns nothing it did not already
+ * assume, and every line here competes with the diff it is there to read. When
+ * the list is capped, the true count is printed alongside it, because a
+ * reviewer that reads a capped list as complete will re-file exactly the
+ * findings this exists to stop.
+ */
+function openFollowUpSection(
+  followUps: readonly { readonly number: number; readonly title: string }[],
+  total: number,
+): readonly string[] {
+  if (followUps.length === 0) return [];
+  const shown = followUps.length < total
+    ? ` (showing ${followUps.length} of ${total})`
+    : '';
+  return [
+    '',
+    `Open Autopilot review follow-ups already filed for this PR${shown}:`,
+    ...followUps.map((followUp) =>
+      `- #${followUp.number} — ${followUp.title.replace(/\s+/g, ' ').trim()}`),
+    'Do not file another follow-up for anything already covered above; '
+    + 'cite the existing issue number in the verdict body instead.',
+  ];
+}
+
 function reviewScenario(input: {
   readonly prNumber: number;
   readonly issueNumber: number;
   readonly head: string;
   readonly worktreePath: string;
+  readonly openFollowUps?: readonly {
+    readonly number: number;
+    readonly title: string;
+  }[];
+  readonly openFollowUpTotal?: number;
 }): string {
   return [
     `Use the review-pr skill on PR #${input.prNumber} for issue #${input.issueNumber}.`,
     `The v2 lifecycle already claimed exact head \`${input.head}\` and created the detached worktree at \`${input.worktreePath}\`.`,
     'Finish with `autopilot session review-verdict --state <APPROVE|REQUEST_CHANGES> --body-file <path>` or park with `autopilot session human --reason-file <path>`.',
+    ...openFollowUpSection(
+      input.openFollowUps ?? [],
+      input.openFollowUpTotal ?? 0,
+    ),
   ].join('\n');
 }
 
@@ -553,6 +591,12 @@ export function makeProductionActiveRuntime(
       issueNumber: input.candidate.issueNumber,
       head: input.candidate.head,
       worktreePath: input.worktreePath,
+      ...(input.openFollowUps === undefined
+        ? {}
+        : {
+            openFollowUps: input.openFollowUps,
+            openFollowUpTotal: input.openFollowUpTotal ?? input.openFollowUps.length,
+          }),
     }),
     worktreePath: input.worktreePath,
     effort: null,
