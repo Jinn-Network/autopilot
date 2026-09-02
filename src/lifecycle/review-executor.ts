@@ -568,6 +568,32 @@ export async function acquireExactHeadReviewClaim(
   };
 }
 
+/**
+ * The already-open follow-up context for one parent, or an empty object when
+ * this build has no reader (#124).
+ *
+ * Empty object, not `{ openFollowUps: [] }`: a build that did not look must
+ * not be able to tell the reviewer that a PR carrying seventeen open
+ * follow-ups has none.
+ */
+async function readOpenFollowUpContext(
+  deps: Pick<ReviewExecutorDeps, 'readOpenFollowUps'>,
+  parentPr: number,
+): Promise<{
+  readonly openFollowUps?: readonly OpenReviewFollowUp[];
+  readonly openFollowUpTotal?: number;
+}> {
+  const read = deps.readOpenFollowUps;
+  if (read === undefined) return {};
+  const open = await read(parentPr);
+  return {
+    openFollowUps: open
+      .slice(0, MAX_REVIEW_FOLLOW_UP_CONTEXT)
+      .map((followUp) => ({ number: followUp.number, title: followUp.title })),
+    openFollowUpTotal: open.length,
+  };
+}
+
 export async function executeReviewAction(
   action: {
     readonly prNumber: number;
@@ -608,21 +634,9 @@ export async function executeReviewAction(
     },
   );
   // Read after the claim is confirmed and before the session starts: the point
-  // is to tell *this* reviewer what is already filed, and the answer is only
-  // meaningful once we know we are the ones reviewing.
-  const followUpContext = deps.readOpenFollowUps === undefined
-    ? {}
-    : await (async () => {
-      const open = await deps.readOpenFollowUps!(claim.prNumber);
-      return {
-        openFollowUps: open.slice(0, MAX_REVIEW_FOLLOW_UP_CONTEXT)
-          .map((followUp) => ({
-            number: followUp.number,
-            title: followUp.title,
-          })),
-        openFollowUpTotal: open.length,
-      };
-    })();
+  // is to tell *this* reviewer what is already filed, and that is only worth
+  // knowing once we know we are the ones reviewing.
+  const followUpContext = await readOpenFollowUpContext(deps, claim.prNumber);
   const started = await deps.startSession({
     kind: 'exact-head-review',
     backend: 'local',
