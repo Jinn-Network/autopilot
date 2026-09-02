@@ -84,6 +84,30 @@ non-blocking notes.
 Collect blocking findings into one list. Split into multiple finding children
 only when findings are genuinely independent workstreams.
 
+### Follow-ups that already exist
+
+When this PR already carries non-blocking follow-ups, the prompt lists them
+under `Open Autopilot review follow-ups already filed for this PR`, as issue
+number and title.
+
+A PR is re-reviewed because its head moved, so on every pass after the first
+you are reading code that already produced those issues. Check that list before
+writing a follow-up entry. If an open follow-up already covers the note — the
+same task, however differently the two of you phrase it — **do not file another
+follow-up for it**. Cite the existing issue number in the approval body instead
+("already tracked in #3292") and drop the entry.
+
+Judge by the task, not the wording. Titles are prose and two passes will not
+choose the same ones: "Publish `@scope/check`, then republish the verify alias"
+and "Publish the renamed reader and its retired-name alias" are one piece of
+work.
+
+Two properties of that list, both meaning absence is not proof of absence:
+
+- it is **capped**, and says `showing N of M` when it was truncated;
+- it names **open** issues only. A finding whose follow-up was closed without
+  the work landing is fileable again — file it.
+
 ## Terminal outcomes (exactly two)
 
 ### Approve

@@ -1697,6 +1697,9 @@ describe('buildGitHubLifecycleSnapshot', () => {
           isDraft: false,
         });
       }
+      // Since #124 the review session is told which follow-ups are already
+      // open against the parent before it spawns.
+      if (args[0] === 'issue' && args[1] === 'list') return '[]';
       if (args[0] === 'api' && args[1] === 'graphql') return projectGraphQl();
       throw new Error(`unexpected production review command: ${args.join(' ')}`);
     };

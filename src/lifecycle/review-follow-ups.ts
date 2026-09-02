@@ -10,6 +10,17 @@ const CHILD_MARKER_SUBSTRING = 'jinn-autopilot:child';
 
 export const MAX_REVIEW_FOLLOW_UPS_PER_PASS = 5;
 
+/**
+ * How many already-open follow-ups the review session is told about (#124).
+ *
+ * Not a cap on filing — deliberately, per #124, there is no per-PR cap — only
+ * on what rides in the coordinator prompt. Titles and numbers are small, but a
+ * parent with a long tail of debt must not crowd out the diff the reviewer is
+ * there to read. When the true count exceeds this, the prompt says so, so a
+ * short list is never mistaken for a complete one.
+ */
+export const MAX_REVIEW_FOLLOW_UP_CONTEXT = 20;
+
 export type ReviewFollowUpType = 'feat' | 'chore' | 'fix' | 'refactor';
 export type ReviewFollowUpEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type ReviewFollowUpPriority = 'p0' | 'p1' | 'p2' | 'p3' | 'p4';

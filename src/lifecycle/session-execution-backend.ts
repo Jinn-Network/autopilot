@@ -80,6 +80,27 @@ export interface ExactHeadReviewSessionExecutionRequest
   readonly reviewedHead: string;
   /** Non-secret selected reviewer identity; never a credential or token. */
   readonly reviewerLogin: string;
+  /**
+   * Non-blocking follow-ups already open against this PR, so the session does
+   * not re-derive a finding that is already filed (#124).
+   *
+   * Numbers and titles only, never bodies: an index of what exists, not its
+   * content. Capped at `MAX_REVIEW_FOLLOW_UP_CONTEXT`, with
+   * {@link ExactHeadReviewSessionExecutionRequest.openFollowUpTotal} carrying
+   * the true count so a capped list is never read as a complete one.
+   *
+   * Absent and empty mean different things, which is why this is optional
+   * rather than defaulted: `[]` is "we looked and there are none", absence is
+   * "this build did not look". A build with no follow-up reader must not be
+   * able to tell the reviewer that a PR carrying seventeen open follow-ups has
+   * none.
+   */
+  readonly openFollowUps?: readonly {
+    readonly number: number;
+    readonly title: string;
+  }[];
+  /** Open follow-ups observed, which may exceed what `openFollowUps` carries. */
+  readonly openFollowUpTotal?: number;
 }
 
 /**

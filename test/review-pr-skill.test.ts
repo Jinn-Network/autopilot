@@ -70,6 +70,18 @@ describe('review-pr method contract', () => {
     expect(skill).not.toContain('review → fix → re-review');
   });
 
+  // Issue #124: five passes over mono #3285 re-derived the same three
+  // non-blocking findings and filed them three times over. The prompt now
+  // supplies the open follow-ups; the skill has to tell the reviewer what to
+  // do with them.
+  it('tells the reviewer not to re-file a note an open follow-up already covers', () => {
+    expect(skill).toContain('Open Autopilot review follow-ups already filed for this PR');
+    expect(skill).toMatch(/do not file another\s+\**follow-up/i);
+    expect(skill).toMatch(/cite the existing issue number/i);
+    // The prompt is capped, so absence of a section is never proof of absence.
+    expect(skill).toMatch(/capped|truncat/i);
+  });
+
   it('does not approve a human-codeowner surface', () => {
     expect(skill).toMatch(/CODEOWNER/);
     expect(skill).toContain('autopilot session human --reason-file');
