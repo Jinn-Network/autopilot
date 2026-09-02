@@ -164,3 +164,31 @@ describe('implement-issue relevance gate', () => {
     expect(doc).toMatch(/Do not design, implement, or open a fix for a problem that no\s+longer\s+exists/);
   });
 });
+
+describe('implement-issue debt sweep contract', () => {
+  it('detects a sweep issue by the shared marker tag', () => {
+    expect(doc).toMatch(/##\s*Debt sweep issues/);
+    // The literal tag is a contract shared with the engine's filing path and
+    // with backlog classification; it may not drift in either direction.
+    expect(doc).toContain('jinn-autopilot:debt-sweep');
+    expect(doc).toContain('members=');
+  });
+
+  it('keeps the sweep PR closing exactly one issue', () => {
+    expect(doc).toContain('`Closes #<member>`');
+    expect(doc).toMatch(/never[\s\S]{0,200}`Closes #<member>`/i);
+    expect(doc).toContain('branch-mapping-ambiguous');
+    expect(doc).toMatch(/closes only the sweep issue/i);
+  });
+
+  it('closes addressed members as a side effect and leaves the rest open', () => {
+    expect(doc).toContain('gh issue close');
+    expect(doc).toContain('Addressed in sweep PR #');
+    expect(doc).toMatch(/deferred[\s\S]{0,400}open/i);
+  });
+
+  it('keeps the sweep a single coherent change set on the same verification bar', () => {
+    expect(doc).toMatch(/single coherent change set/i);
+    expect(doc).toMatch(/fix it in this PR or record it as deferred/i);
+  });
+});

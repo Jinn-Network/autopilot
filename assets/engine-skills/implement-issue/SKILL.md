@@ -231,6 +231,52 @@ Escalation authority is the PR label `review:needs-human` plus the structured
 marker comment — not Project Status. The early draft PR remains the recovery
 surface. Do not close it, ready it, or clean the worktree yourself.
 
+## Debt sweep issues
+
+An issue whose body carries
+
+```
+<!-- jinn-autopilot:debt-sweep pr=<N> members=<a>,<b>,… -->
+```
+
+is a **debt sweep**: the engine batched several open review follow-ups from one
+merged or closed parent PR so they can be worked in one session. It is ordinary
+implementation work — every stage above still applies, at the effort the board
+records — with four extra rules.
+
+**Work the members, and be honest about which.** Read each member issue. For
+each one, either fix it in this PR or record it as deferred with the reason.
+Deferring is a legitimate outcome: a member that turns out to be obsolete,
+already fixed, or too large to belong in this change set should be deferred, not
+forced in.
+
+**Keep the PR to a single coherent change set.** The members are findings about
+the same code, which is why they were batched. If the fixes stop cohering, fix
+the subset that does and defer the rest.
+
+**The PR body closes only the sweep issue.** Never write `Closes #<member>` — or
+`Fixes`/`Resolves` — for a member. A PR carrying several closing references
+makes the branch-to-issue mapping ambiguous (`branch-mapping-ambiguous`) and
+parks the whole item under Human. Plain `#<member>` mentions carry no closing
+semantics and are exactly how a deferred member gets a visible cross-reference,
+so use those. Under a `Deferred` heading in the PR body, name every member you
+did not address and why. A deferred member stays open — ordinary debt again,
+eligible for the next sweep once this one closes.
+
+**Close the addressed members yourself, last.** After Stage 8 verification and
+*before* `implementation-complete`, close each member you actually addressed:
+
+```bash
+gh issue close <member> -c "Addressed in sweep PR #<pr>"
+```
+
+That is the one GitHub mutation this section adds, and it is deliberately not a
+session command: a member is another issue, not this attempt's lifecycle
+surface, and the engine files no sweep-side closure of its own. The authority
+boundary in **Input contract** and **Authority** is unchanged for everything
+that *is* this attempt's surface — its own issue, its PR, its board fields,
+labels and comments. Leave every unaddressed member open and untouched.
+
 ## Shape variants
 
 - `feat`, `fix`, `chore`, `docs`, `test`, `refactor`: run all eight stages.
