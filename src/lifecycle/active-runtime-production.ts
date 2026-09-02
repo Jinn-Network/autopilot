@@ -64,6 +64,7 @@ import {
   executeProductionRerunFailedChecks,
 } from './ci-rerun-production.js';
 import { repairProductionMachineChild } from './child-issues-production.js';
+import { executeProductionFileDebtSweep } from './debt-sweep-production.js';
 import { withSelectedCredential } from './production-auth.js';
 import {
   makeProductionReconciliationWriter,
@@ -1190,6 +1191,35 @@ export function makeProductionActiveRuntime(
             projectMapping: options.projectMapping,
           },
           selection.credential,
+        );
+      },
+
+      // Ordinary issue filing on the repository, not a mutation of any pull
+      // request: no head to pin, no snapshot to re-read. Dedup and the live
+      // member set both come from the one open-issue listing the port makes,
+      // which refuses a truncated page rather than risk a second sweep.
+      fileDebtSweep: async (action, credentials) => {
+        const selection = selectCredential(credentials, { phase: 'implement' });
+        if (selection.status !== 'selected') {
+          return { status: 'skipped', reason: 'credential-unavailable' };
+        }
+        return withSelectedCredential(
+          selection.credential,
+          ambient,
+          ({ run }) => executeProductionFileDebtSweep(action, {
+            runner: run,
+            ...(options.repositorySlug === undefined
+              ? {}
+              : { repo: options.repositorySlug }),
+            ...(options.projectMapping === undefined
+              ? {}
+              : {
+                  projectOwner: options.projectMapping.owner,
+                  projectNumber: options.projectMapping.number,
+                  projectMapping: options.projectMapping,
+                }),
+          }),
+          runner,
         );
       },
 

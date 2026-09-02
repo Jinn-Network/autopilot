@@ -5,6 +5,7 @@
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { defaultRunner } from '../dispatcher/issue-source.js';
 import { REPO } from '../dispatcher/constants.js';
+import type { ProjectMapping } from '../config/config.js';
 import { FIX_ISSUE_TYPE_ID } from './child-issues-production.js';
 import { createProjectTriageApplier } from './project-triage.js';
 import {
@@ -51,6 +52,15 @@ export interface ProductionReviewFollowUpPortOptions {
   readonly runner?: CommandRunner;
   readonly repo?: string;
   readonly issueTypeIds?: Partial<Record<ReviewFollowUpType, string>>;
+  /**
+   * Project coordinates for the triage applier. A review session omits them and
+   * gets the ORG/PROJECT_NUMBER defaults plus a `field-list` read, exactly as
+   * before. The engine, which files debt sweeps through this same port (#126),
+   * already holds a resolved mapping and passes it, so no field read is made.
+   */
+  readonly projectOwner?: string;
+  readonly projectNumber?: number;
+  readonly projectMapping?: ProjectMapping;
 }
 
 function parseIssueList(raw: string): readonly {
@@ -153,7 +163,18 @@ export function makeProductionReviewFollowUpPort(
     ...ISSUE_TYPE_IDS,
     ...options.issueTypeIds,
   };
-  const triageApplier = createProjectTriageApplier(runner, { repo });
+  const triageApplier = createProjectTriageApplier(runner, {
+    repo,
+    ...(options.projectOwner === undefined
+      ? {}
+      : { projectOwner: options.projectOwner }),
+    ...(options.projectNumber === undefined
+      ? {}
+      : { projectNumber: options.projectNumber }),
+    ...(options.projectMapping === undefined
+      ? {}
+      : { projectMapping: options.projectMapping }),
+  });
   let openIssuesCache: readonly OpenIssueRow[] | undefined;
 
   const loadOpenIssues = async (): Promise<readonly OpenIssueRow[]> => {

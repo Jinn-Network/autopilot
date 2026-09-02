@@ -474,6 +474,27 @@ export type NewWorkAction =
     }
   | {
       /**
+       * File one debt sweep batching a merged/closed parent's open review
+       * follow-ups (#126). Not head-pinned and not bound to a lifecycle item:
+       * the subject is the parent pull request, whose lifecycle is already
+       * over, and the members are ordinary open issues. Dedup lives at
+       * execution time, on the parent-scoped sweep marker.
+       */
+      readonly kind: 'file-debt-sweep';
+      readonly parentPr: number;
+      /**
+       * Structurally `DebtSweepMember` (`debt-sweep.ts`), spelled out here so
+       * this module stays the leaf it is. Each member's Project Priority rides
+       * along because the sweep's own priority is derived from the members that
+       * are still open at filing time, not from the ones the snapshot saw.
+       */
+      readonly members: readonly {
+        readonly number: number;
+        readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+      }[];
+    }
+  | {
+      /**
        * Hand the exact head to GitHub's merge queue. The queue, not this
        * engine, constructs and lands the merge commit, so nothing downstream of
        * a successful enqueue may claim the change is merged.
@@ -489,8 +510,9 @@ export type NewWorkAction =
 export type NewWorkLane = 'implementation' | 'child' | 'review';
 
 /**
- * Which lane an action spends a slot from, or `null` for the uncapped
- * actions (machine-child repair, child filing, rerun, enqueue).
+ * Which lane an action spends a slot from, or `null` for the actions that
+ * spend none (machine-child repair, child filing, debt sweeps, rerun,
+ * enqueue). Those are bounded where they are derived, not by a lane.
  *
  * One definition for the two places that must agree — the runtime's
  * per-action capacity guard and the controller's fall-through bookkeeping.
