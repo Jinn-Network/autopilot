@@ -1502,4 +1502,41 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
   it('does not fail closed on an undeterminable issue number when the allowlist is unset', () => {
     expect(matchesOnlyIssuesAllowlist(undefined, undefined)).toBe(true);
   });
+
+  // #127: active mode is one of three report-assembly sites; the backlog
+  // summary must be derived there too, not only in observe/recover.
+  it('carries the backlog composition on an active-mode report', async () => {
+    const controller = deps({
+      readSnapshot: async () => ({
+        ...snapshot(),
+        issues: [{
+          number: 90,
+          title: 'feat: something',
+          labels: [],
+          body: '',
+          shape: 'feat',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Low',
+          priority: 'P2',
+          status: 'Todo',
+          onBoard: true,
+          author: 'trusted',
+          projectItemId: 'PVTI_90',
+          inCurrentSprint: true,
+        }],
+      }),
+    });
+    const report = await runLifecycleCycle('active', controller);
+    expect(report.status).toBe('ok');
+    if (report.status !== 'ok') throw new Error(`expected ok, got ${report.status}`);
+    expect(report.backlog).toMatchObject({
+      ordinary: 1,
+      followUps: 0,
+      children: 0,
+      sweeps: 0,
+      actionable: 1,
+    });
+    expect(report.backlog.ordinaryByPriority.p2).toBe(1);
+  });
 });

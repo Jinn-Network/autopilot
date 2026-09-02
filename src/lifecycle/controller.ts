@@ -38,6 +38,7 @@ import {
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
 import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
+import { hasReviewFollowUpMarkerTag } from './review-follow-ups.js';
 import type {
   AutopilotMode,
   GitOid,
@@ -234,6 +235,36 @@ export interface LifecycleStatusDiagnostic extends LifecycleMappingDiagnostic {
   readonly desiredActions: readonly ProjectionAction[];
 }
 
+/**
+ * Project Priority key, lowercased, plus `unset` for a Priority-less issue —
+ * unset-priority issues are triage gaps, not exclusions, so they get their own
+ * bucket rather than being dropped (#127).
+ */
+type LifecycleBacklogPriorityKey = 'p0' | 'p1' | 'p2' | 'p3' | 'p4' | 'unset';
+
+/**
+ * Composition of this cycle's OPEN issues (#127), classified by body marker
+ * in precedence order: debt-sweep -> machine child -> review follow-up ->
+ * ordinary. Derived fresh every cycle from the snapshot the controller
+ * already holds; nothing here is persisted and nothing here changes
+ * scheduling — it exists so an operator (or tooling) can read the shape of
+ * the backlog instead of one misleading open-issue count.
+ *
+ * `actionable` is `ordinary + sweeps` — the work the implementation lane will
+ * actually reach. Follow-ups and children are real open issues but neither
+ * competes for an ordinary claim the way a sweep does, so they are reported
+ * separately rather than folded into `actionable`.
+ */
+export interface LifecycleBacklogSummary {
+  readonly ordinary: number;
+  readonly followUps: number;
+  readonly children: number;
+  readonly sweeps: number;
+  readonly actionable: number;
+  /** Per-priority counts for the ORDINARY set only — follow-ups, children, and sweeps are excluded. */
+  readonly ordinaryByPriority: Readonly<Record<LifecycleBacklogPriorityKey, number>>;
+}
+
 export interface LifecycleLogEvent {
   readonly cycleId: string;
   readonly runnerId: string;
@@ -311,6 +342,8 @@ export type LifecycleCycleReport =
       readonly orphanBranchClaims: readonly LifecycleOrphanBranchClaimStatus[];
       readonly diagnostics: readonly LifecycleStatusDiagnostic[];
       readonly events: readonly LifecycleLogEvent[];
+      /** Open-issue composition derived from this cycle's snapshot (#127). */
+      readonly backlog: LifecycleBacklogSummary;
       readonly reconciliation?: ReconciliationReport;
       /** Stage 4: GraphQL points spent this cycle (start remaining − end). */
       readonly budget?: {
@@ -713,6 +746,88 @@ function orphanStatusItems(
       )),
     };
   });
+}
+
+/**
+ * The debt-sweep marker's literal tag prefix. CONTRACT with #126 (debt-sweep
+ * issue filing): matched here as a plain substring rather than imported from
+ * #126's module — that module is owned by a concurrent agent and may not
+ * exist on this branch. The full marker is
+ * `<!-- jinn-autopilot:debt-sweep pr=<N> members=<a>,<b>,… -->`; only the
+ * fixed prefix is checked, so a body carrying it in any form counts.
+ */
+const DEBT_SWEEP_MARKER_TAG = '<!-- jinn-autopilot:debt-sweep';
+
+function hasDebtSweepMarkerTag(body: string): boolean {
+  return body.includes(DEBT_SWEEP_MARKER_TAG);
+}
+
+type LifecycleBacklogClass = 'sweep' | 'child' | 'follow-up' | 'ordinary';
+
+/**
+ * Classification precedence for #127: debt-sweep -> machine child -> review
+ * follow-up -> ordinary. An issue can carry more than one marker (a stale
+ * follow-up marker left on an issue later folded into a sweep, say); the
+ * first one recognized in this order wins.
+ */
+function classifyBacklogIssue(issue: { readonly body?: string }): LifecycleBacklogClass {
+  const body = issue.body ?? '';
+  if (hasDebtSweepMarkerTag(body)) return 'sweep';
+  if (isMachineChildIssue({ body })) return 'child';
+  if (hasReviewFollowUpMarkerTag(body)) return 'follow-up';
+  return 'ordinary';
+}
+
+const BACKLOG_PRIORITY_KEYS = ['p0', 'p1', 'p2', 'p3', 'p4'] as const;
+
+/**
+ * Unset or unrecognized Priority buckets under `unset` — unset-priority
+ * issues are triage gaps, not exclusions, and still count as ordinary (#127).
+ */
+function backlogPriorityKey(priority: string | null | undefined): LifecycleBacklogPriorityKey {
+  if (priority === null || priority === undefined) return 'unset';
+  const lower = priority.toLowerCase();
+  return (BACKLOG_PRIORITY_KEYS as readonly string[]).includes(lower)
+    ? (lower as LifecycleBacklogPriorityKey)
+    : 'unset';
+}
+
+/**
+ * Derives the open-issue composition (#127) from `snapshot.issues` alone —
+ * already open-only (the poller reads `state=open`), so no separate closed
+ * filter is needed here. Pure and total: never throws, and never reads any
+ * other part of the snapshot, so a closed issue that still lingers on the
+ * Project board pre-archive can never be counted.
+ */
+function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBacklogSummary {
+  const ordinaryByPriority: Record<LifecycleBacklogPriorityKey, number> = {
+    p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unset: 0,
+  };
+  let ordinary = 0;
+  let followUps = 0;
+  let children = 0;
+  let sweeps = 0;
+  for (const issue of issues) {
+    const backlogClass = classifyBacklogIssue(issue);
+    if (backlogClass === 'sweep') {
+      sweeps += 1;
+    } else if (backlogClass === 'child') {
+      children += 1;
+    } else if (backlogClass === 'follow-up') {
+      followUps += 1;
+    } else {
+      ordinary += 1;
+      ordinaryByPriority[backlogPriorityKey(issue.priority)] += 1;
+    }
+  }
+  return {
+    ordinary,
+    followUps,
+    children,
+    sweeps,
+    actionable: ordinary + sweeps,
+    ordinaryByPriority,
+  };
 }
 
 function eventFor(
@@ -1761,6 +1876,7 @@ export async function runLifecycleCycle(
       orphanBranchClaims: [],
       diagnostics: [],
       events: [],
+      backlog: backlogSummary(snapshot.issues),
     };
   }
   const graphqlRemaining = snapshot.githubUsage?.graphqlRemaining ?? null;
@@ -1839,6 +1955,7 @@ export async function runLifecycleCycle(
         ...(scopedPass?.events ?? []),
         ...activePass.events,
       ],
+      backlog: backlogSummary(snapshot.issues),
       reconciliation: combinedReconciliation,
     });
   }
@@ -1881,6 +1998,7 @@ export async function runLifecycleCycle(
       orphanBranchClaims,
       diagnostics,
       events: [],
+      backlog: backlogSummary(snapshot.issues),
     });
   }
   const writer = deps.writerForSnapshot?.(snapshot) ?? deps.writer!;
@@ -1908,6 +2026,7 @@ export async function runLifecycleCycle(
     orphanBranchClaims,
     diagnostics,
     events: reconciliationEvents,
+    backlog: backlogSummary(snapshot.issues),
     reconciliation,
   });
 }
@@ -2121,6 +2240,28 @@ function paritySummary(
 }
 
 /**
+ * Renders the open-issue composition (#127) as two lines: the exact
+ * `backlog: ordinary=N follow-ups=M children=K sweeps=S (actionable=A)`
+ * summary, and a per-priority breakdown of the ordinary set only. Both flow
+ * through the one renderer, so both the per-cycle log (the continuous
+ * cadence's own stdout) and `autopilot status` (the same renderer run
+ * on-demand) show the composition — never derived, persisted, or scheduled
+ * on; purely a read of the summary the controller already computed.
+ */
+function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[] {
+  return [
+    `backlog: ordinary=${backlog.ordinary} follow-ups=${backlog.followUps} `
+      + `children=${backlog.children} sweeps=${backlog.sweeps} `
+      + `(actionable=${backlog.actionable})`,
+    `backlog ordinary priority: ${
+      [...BACKLOG_PRIORITY_KEYS, 'unset' as const]
+        .map((key) => `${key}=${backlog.ordinaryByPriority[key]}`)
+        .join(' ')
+    }`,
+  ];
+}
+
+/**
  * Elision budget for `LifecycleLogEvent.reason`.
  *
  * Failure detail originates as `message(error)`, and the production writer
@@ -2226,6 +2367,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     report.snapshotComplete,
     report.parityUnavailableReason,
   );
+  const backlogLines = backlogSummaryLines(report.backlog);
   if (
     report.items.length === 0
     && report.orphanBranchClaims.length === 0
@@ -2239,6 +2381,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
       ...warningLines,
       usageLine,
       ...accountingLines,
+      ...backlogLines,
       ...parityLines,
       'No lifecycle items.',
     ].join('\n');
@@ -2249,6 +2392,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     ...warningLines,
     usageLine,
     ...accountingLines,
+    ...backlogLines,
     ...parityLines,
     ...report.items.map(explanation),
     ...report.orphanBranchClaims.map(orphanExplanation),
