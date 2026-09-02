@@ -9,6 +9,7 @@ import type { ReconciliationWriter } from '../../src/lifecycle/reconciler.js';
 import type { GitHubLifecycleSnapshot } from '../../src/lifecycle/snapshot.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
 import { formatChildMarker } from '../../src/lifecycle/child-issues.js';
+import { formatReviewFollowUpMarker } from '../../src/lifecycle/review-follow-ups.js';
 
 const NOW = new Date('2026-07-20T12:00:00.000Z');
 
@@ -1484,6 +1485,95 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       head: gitOid('6'.repeat(40)),
       recoverFixes: false,
     }]);
+  });
+
+  function debtSweepSnapshot(): GitHubLifecycleSnapshot {
+    const head = 'a'.repeat(40);
+    const followUp = (number: number, parentPr: number, priority: string) => ({
+      number,
+      title: `Follow-up ${number}`,
+      body: `${formatReviewFollowUpMarker(parentPr, head, number)}\n\nbody`,
+      labels: [],
+      shape: 'chore',
+      blockedOn: 'Nothing',
+      blockedByIssues: [],
+      effort: 'Low',
+      priority,
+      status: 'Todo',
+      onBoard: true,
+      author: 'implementation-bot',
+      projectItemId: `PVTI_${number}`,
+      inCurrentSprint: false,
+    });
+    return {
+      ...snapshot(),
+      issues: [
+        followUp(101, 84, 'P4'),
+        followUp(102, 84, 'P3'),
+        followUp(103, 84, 'P4'),
+        followUp(201, 90, 'P4'),
+        followUp(202, 90, 'P4'),
+        followUp(203, 90, 'P4'),
+      ],
+      pullRequests: [{
+        number: 90,
+        title: 'Open parent',
+        body: '',
+        author: 'implementation-bot',
+        baseRefName: 'next',
+        headRefName: 'autopilot/90',
+        headOid: gitOid('9'.repeat(40)),
+        headCommittedAt: NOW.toISOString(),
+        isDraft: false,
+        state: 'OPEN',
+        labels: [],
+        closingIssueNumbers: [],
+        mergeability: 'MERGEABLE',
+        mergeStateStatus: 'CLEAN',
+        checks: [],
+        reviews: [],
+      }],
+      lifecycle: { items: [] },
+    };
+  }
+
+  it('emits one debt-sweep filing action per qualifying cluster, skipping an open parent', async () => {
+    const actions: unknown[] = [];
+    const controller = deps({ readSnapshot: async () => debtSweepSnapshot() });
+    controller.active!.executeAction = async (action) => {
+      actions.push(action);
+      return { outcome: 'filed' };
+    };
+
+    await runLifecycleCycle('active', controller);
+
+    expect(actions).toEqual([{
+      kind: 'file-debt-sweep',
+      parentPr: 84,
+      members: [
+        { number: 101, priority: 'p4' },
+        { number: 102, priority: 'p3' },
+        { number: 103, priority: 'p4' },
+      ],
+    }]);
+  });
+
+  it('files no debt sweep from a scoped or incomplete snapshot', async () => {
+    for (const partial of [
+      { snapshotAuthority: 'scoped', globalOpenPipelineBacklog: 0 },
+      { snapshotComplete: false },
+    ] as const) {
+      const actions: unknown[] = [];
+      const controller = deps({
+        readSnapshot: async () => ({ ...debtSweepSnapshot(), ...partial }),
+      });
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'filed' };
+      };
+      await runLifecycleCycle('active', controller);
+      expect(actions).toEqual([]);
+    }
   });
 
   // Every `ActiveCandidate` variant carries a required `issueNumber` sourced

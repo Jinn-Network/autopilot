@@ -51,6 +51,12 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
+  /** File one debt sweep for a merged/closed parent's follow-ups (#126). */
+  fileDebtSweep?(
+    action: Extract<NewWorkAction, { kind: 'file-debt-sweep' }>,
+    credentials: CredentialPool,
+    snapshot: GitHubLifecycleSnapshot,
+  ): Promise<ActiveRuntimeResult>;
   /**
    * Hand the exact head to GitHub's merge queue. Nothing this handler returns
    * may claim the change landed: the queue merges on its own schedule, and Done
@@ -105,6 +111,54 @@ function reason(result: ActiveRuntimeResult): string | undefined {
     return result.reasons.join(', ');
   }
   return undefined;
+}
+
+/**
+ * One action to one handler. The optional handlers report `skipped` rather
+ * than throwing when a build does not wire them, so a partially-wired runtime
+ * degrades to "did not run" instead of failing the cycle.
+ */
+async function dispatchAction(
+  handlers: ActiveRuntimeHandlers,
+  action: NewWorkAction,
+  credentials: CredentialPool,
+  snapshot: GitHubLifecycleSnapshot,
+): Promise<ActiveRuntimeResult> {
+  const unwired = (kind: string): ActiveRuntimeResult => ({
+    status: 'skipped',
+    detail: `${kind} handler unavailable`,
+  });
+  switch (action.kind) {
+    case 'claim-implementation':
+      return handlers.implementation(action, credentials, snapshot);
+    case 'claim-review':
+      return handlers.review(action, credentials, snapshot);
+    case 'enqueue':
+      return handlers.enqueue(action, credentials, snapshot);
+    case 'repair-machine-child':
+      return handlers.repairMachineChild?.(action, credentials, snapshot)
+        ?? unwired('repair-machine-child');
+    case 'file-reconcile-child':
+      return handlers.fileReconcileChild?.(action, credentials, snapshot)
+        ?? unwired('file-reconcile-child');
+    case 'rerun-failed-checks':
+      return handlers.rerunFailedChecks?.(action, credentials, snapshot)
+        ?? unwired('rerun-failed-checks');
+    case 'file-ci-failure-child':
+      return handlers.fileCiFailureChild?.(action, credentials, snapshot)
+        ?? unwired('file-ci-failure-child');
+    case 'file-debt-sweep':
+      return handlers.fileDebtSweep?.(action, credentials, snapshot)
+        ?? unwired('file-debt-sweep');
+    default:
+      // Unreachable for the declared union; reached only by a retired or
+      // not-yet-declared kind arriving from a stale plan. Skipping names it
+      // rather than throwing the cycle away.
+      return {
+        status: 'skipped',
+        detail: `action ${(action as { kind: string }).kind} is not wired`,
+      };
+  }
 }
 
 export function makeActiveRuntime(
@@ -194,32 +248,12 @@ export function makeActiveRuntime(
         return { outcome: 'skipped', reason: 'local phase capacity is full' };
       }
       const credentials = options.credentials;
-      const result = action.kind === 'claim-implementation'
-        ? await options.handlers.implementation(action, credentials, snapshot)
-        : action.kind === 'repair-machine-child'
-          ? options.handlers.repairMachineChild === undefined
-            ? { status: 'skipped', detail: 'repair-machine-child handler unavailable' }
-            : await options.handlers.repairMachineChild(action, credentials, snapshot)
-          : action.kind === 'claim-review'
-            ? await options.handlers.review(action, credentials, snapshot)
-            : action.kind === 'file-reconcile-child'
-              ? options.handlers.fileReconcileChild === undefined
-                ? { status: 'skipped', detail: 'file-reconcile-child handler unavailable' }
-                : await options.handlers.fileReconcileChild(action, credentials, snapshot)
-              : action.kind === 'rerun-failed-checks'
-                ? options.handlers.rerunFailedChecks === undefined
-                  ? { status: 'skipped', detail: 'rerun-failed-checks handler unavailable' }
-                  : await options.handlers.rerunFailedChecks(action, credentials, snapshot)
-                : action.kind === 'file-ci-failure-child'
-                  ? options.handlers.fileCiFailureChild === undefined
-                    ? { status: 'skipped', detail: 'file-ci-failure-child handler unavailable' }
-                    : await options.handlers.fileCiFailureChild(action, credentials, snapshot)
-                  : action.kind === 'enqueue'
-                    ? await options.handlers.enqueue(action, credentials, snapshot)
-                    : {
-                        status: 'skipped',
-                        detail: `action ${(action as { kind: string }).kind} is not wired`,
-                      };
+      const result = await dispatchAction(
+        options.handlers,
+        action,
+        credentials,
+        snapshot,
+      );
       const detail = reason(result);
       return {
         outcome: result.status,

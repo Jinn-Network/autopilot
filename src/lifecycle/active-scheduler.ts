@@ -61,6 +61,24 @@ export type ActiveCandidate =
     }
   | {
       /**
+       * Batch a merged/closed parent's open review follow-ups into one
+       * elevated sweep issue (#126). Spends no concurrency lane, like the
+       * other filing rungs — it spawns no session — and is instead bounded at
+       * derivation by `DEBT_SWEEP_MAX_PER_CYCLE`; its dedup is the
+       * parent-scoped sweep marker, re-checked live at execution.
+       *
+       * The only candidate that names no single issue: its subject is the
+       * parent PR and its members are the issues it batches.
+       */
+      readonly phase: 'file-debt-sweep';
+      readonly parentPr: number;
+      readonly members: readonly {
+        readonly number: number;
+        readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+      }[];
+    }
+  | {
+      /**
        * Hand the exact head to GitHub's merge queue. The queue builds and lands
        * the merge commit; this engine only puts the PR in line.
        */
@@ -140,7 +158,23 @@ function subject(candidate: ActiveCandidate): string {
     ? `issue:${candidate.issueNumber}`
     : candidate.phase === 'repair-machine-child'
       ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
+      : candidate.phase === 'file-debt-sweep'
+        ? `pr:${candidate.parentPr}`
     : `pr:${candidate.prNumber}`;
+}
+
+/**
+ * The issue numbers a candidate is gated on — blocked-by-projection and the
+ * `JINN_AUTOPILOT_ONLY_ISSUES` allowlist. One for every candidate that names a
+ * single issue; for a debt sweep, every member it would batch, so a sweep is
+ * admitted only when all of them are.
+ */
+export function gatingIssueNumbers(
+  candidate: ActiveCandidate,
+): readonly number[] {
+  return candidate.phase === 'file-debt-sweep'
+    ? candidate.members.map((member) => member.number)
+    : [candidate.issueNumber];
 }
 
 function capacitySkipReason(input: ActiveSchedulingInput): ActiveSchedulingSkip['reason'] {
@@ -339,6 +373,14 @@ export function scheduleActiveActions(
         issueNumber: candidate.issueNumber,
         prNumber: candidate.prNumber,
         head: candidate.head,
+      });
+      continue;
+    }
+    if (candidate.phase === 'file-debt-sweep') {
+      actions.push({
+        kind: 'file-debt-sweep',
+        parentPr: candidate.parentPr,
+        members: candidate.members,
       });
     }
   }

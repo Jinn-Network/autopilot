@@ -24,6 +24,7 @@ import {
 import { implementationClaimFingerprint } from './terminal-claim.js';
 import {
   applyMergePolicy,
+  gatingIssueNumbers,
   scheduleActiveActions,
   type ActiveCandidate,
   type ActiveSchedulingSkip,
@@ -36,6 +37,7 @@ import {
   resolveChildTriageExpectation,
 } from './child-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
+import { planDebtSweeps, rankDebtSweeps } from './debt-sweep.js';
 import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import type {
@@ -1068,7 +1070,47 @@ function activeCandidates(
     ...orderImplementationClaims(childImplementation),
     ...orderImplementationClaims(freshImplementation),
     ...other,
+    ...debtSweepCandidates(snapshot),
   ];
+}
+
+/**
+ * Debt sweeps (#126), derived from the snapshot's issue bodies rather than from
+ * the lifecycle view: a sweep's subject is a parent pull request whose
+ * lifecycle is already over, and its members are ordinary open issues that the
+ * view carries no bodies for. The `repair-machine-child` pass above reads
+ * `snapshot.issues` for the same reason.
+ *
+ * Refused on anything short of a proven-global, proven-complete view. The
+ * qualifying test is "this parent is not OPEN", and absence is only evidence of
+ * that when the pull-request set is known to be the whole set — a scoped
+ * pre-dispatch pass reads a handful of pull requests and would read every other
+ * parent as closed. Every other consumer of absence in this engine gets to fail
+ * safe by releasing; this one would fail by creating issues, so it fails
+ * closed instead. Nothing is lost: the very next global cycle re-derives it.
+ */
+function debtSweepCandidates(
+  snapshot: GitHubLifecycleSnapshot,
+): ActiveCandidate[] {
+  if (snapshot.snapshotComplete !== true) return [];
+  if (snapshot.snapshotAuthority === 'scoped') return [];
+  return rankDebtSweeps(planDebtSweeps({
+    issues: snapshot.issues.map((issue) => ({
+      number: issue.number,
+      body: issue.body,
+      priority: issue.priority,
+    })),
+    openPullRequestNumbers: new Set(
+      snapshot.pullRequests
+        .filter((pr) => pr.state === 'OPEN')
+        .map((pr) => pr.number),
+    ),
+    closedUnmergedParentPrs: new Set(snapshot.closedUnmergedParentPrs ?? []),
+  })).map((cluster) => ({
+    phase: 'file-debt-sweep',
+    parentPr: cluster.parentPr,
+    members: cluster.members,
+  }));
 }
 
 /**
@@ -1129,6 +1171,9 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
   if (action.kind === 'rerun-failed-checks' || action.kind === 'file-ci-failure-child') {
     return 'ci-blocked';
   }
+  // A debt sweep's subject is a parent whose pull request is merged or closed;
+  // `merged` is the phase that names where that parent actually is.
+  if (action.kind === 'file-debt-sweep') return 'merged';
   return 'merge-ready';
 }
 
@@ -1137,6 +1182,8 @@ function subjectForAction(action: NewWorkAction): string {
     ? `issue:${action.issueNumber}`
     : action.kind === 'repair-machine-child'
       ? `issue:${action.issueNumber}/pr:${action.parentPr}`
+      : action.kind === 'file-debt-sweep'
+        ? `pr:${action.parentPr}`
     : `issue:${action.issueNumber}/pr:${action.prNumber}`;
 }
 
@@ -1155,6 +1202,7 @@ function phaseForSchedulingSkip(
   ) {
     return 'ci-blocked';
   }
+  if (skip.phase === 'file-debt-sweep') return 'merged';
   return 'merge-ready';
 }
 
@@ -1296,10 +1344,10 @@ async function executeActivePass(
   const candidates = applyMergePolicy(
     activeCandidates(snapshot, view),
     deps.mergePolicy ?? 'manual',
-  ).filter((candidate) => (
-    !blockedIssues.has(candidate.issueNumber)
-    && matchesOnlyIssuesAllowlist(candidate.issueNumber, deps.active!.onlyIssues)
-  ));
+  ).filter((candidate) => gatingIssueNumbers(candidate).every((issueNumber) => (
+    !blockedIssues.has(issueNumber)
+    && matchesOnlyIssuesAllowlist(issueNumber, deps.active!.onlyIssues)
+  )));
   const reconciliationFresh = fullReconciliationAllowsNewClaims(
     snapshot.lastFullReconciliationAt,
     now,
@@ -1314,6 +1362,8 @@ async function executeActivePass(
         ? `issue:${candidate.issueNumber}`
         : candidate.phase === 'repair-machine-child'
           ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
+          : candidate.phase === 'file-debt-sweep'
+            ? `pr:${candidate.parentPr}`
         : `issue:${candidate.issueNumber}/pr:${candidate.prNumber}`,
       action: 'schedule',
       outcome: 'skipped',
