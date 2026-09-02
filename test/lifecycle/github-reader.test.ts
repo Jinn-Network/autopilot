@@ -2809,7 +2809,8 @@ describe('full-reconciliation page-size adaptation (#130)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { run, sizes } = pageReader(() => streamCancel());
 
-    // The original error, never a synthetic one: the operator sees what happened.
+    // The original failure is still what the operator reads (#134 adds the rung
+    // it died on in front of it, and keeps the original as the `cause`).
     await expect(ladderReader(run).readPullRequests(null))
       .rejects.toThrow(STREAM_CANCEL);
     // Bounded by both the halving floor and the downshift cap.
@@ -2841,5 +2842,156 @@ describe('full-reconciliation page-size adaptation (#130)', () => {
     expect(page.nodes).toHaveLength(1);
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('page size'));
     warn.mockRestore();
+  });
+
+  /**
+   * The same fault, served instead of dropped (#134). The next occurrence of the
+   * stall #130 fixed arrived as an `HTTP 504` — a proxy that got to answer
+   * before the connection died — which the `SERVED_RESPONSE` veto refuses to
+   * call a transport fault, correctly, because that veto also governs mutations.
+   * The paged full-reconciliation read is idempotent, so it drives the same
+   * ladder from a served gateway status on its own.
+   */
+  describe('served gateway statuses (#134)', () => {
+    /** Verbatim from the WARNING in issue #134. */
+    const LIVE_504 = 'gh: We couldn\'t respond to your request in time. Sorry about that. '
+      + 'Please try resubmitting your request and contact us if the problem persists. (HTTP 504)';
+
+    function served(stderr: string, stdout = ''): Error {
+      return Object.assign(
+        new Error(`Command failed: gh api graphql\n${stderr}`),
+        { stderr, stdout, code: 1 },
+      );
+    }
+
+    function gateway(status: number): Error {
+      return served(status === 504 ? LIVE_504 : `gh: Bad Gateway (HTTP ${status})`);
+    }
+
+    it('retries a served HTTP 504 page at half the page size and completes the read', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { run, sizes } = pageReader((attempt) => (attempt === 1 ? gateway(504) : null));
+
+      const page = await ladderReader(run).readPullRequests(null);
+
+      expect(sizes).toEqual([50, 25]);
+      expect(page.nodes).toHaveLength(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(
+        'full reconciliation: page size 50 → 25 after HTTP 504',
+      ));
+      warn.mockRestore();
+    });
+
+    it.each([502, 503])('retries a served HTTP %i page at half the page size', async (status) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { run, sizes } = pageReader((attempt) => (attempt === 1 ? gateway(status) : null));
+
+      const page = await ladderReader(run).readPullRequests(null);
+
+      expect(sizes).toEqual([50, 25]);
+      expect(page.nodes).toHaveLength(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(
+        `full reconciliation: page size 50 → 25 after HTTP ${status}`,
+      ));
+      warn.mockRestore();
+    });
+
+    it('restores the default page size on the next reconciliation after a gateway downshift', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { run, sizes } = pageReader((attempt) => (attempt === 1 ? gateway(504) : null));
+      const reader = ladderReader(run);
+
+      await reader.readPullRequests(null);
+      await reader.readPullRequests(null);
+
+      expect(sizes).toEqual([50, 25, 50]);
+      warn.mockRestore();
+    });
+
+    it('does not downshift a served HTTP 500', async () => {
+      // Only the gateway statuses say "this page exceeded an execution budget".
+      const { run, sizes } = pageReader(() => served('gh: Internal Server Error (HTTP 500)'));
+
+      await expect(ladderReader(run).readPullRequests(null)).rejects.toThrow('HTTP 500');
+      expect(sizes).toEqual([50]);
+    });
+
+    it.each([
+      ['a secondary rate limit', 'gh: You have exceeded a secondary rate limit (HTTP 429)'],
+      ['a primary rate limit', 'gh: API rate limit exceeded (HTTP 403)'],
+      ['an auth failure', 'gh: Bad credentials (HTTP 401)'],
+    ])('does not downshift %s', async (_label, stderr) => {
+      const { run, sizes } = pageReader(() => served(stderr));
+
+      await expect(ladderReader(run).readPullRequests(null)).rejects.toThrow(stderr);
+      expect(sizes).toEqual([50]);
+    });
+
+    it('does not downshift a GraphQL errors payload', async () => {
+      const { run, sizes } = pageReader(() => served(
+        'gh: Something went wrong while executing your query.',
+        JSON.stringify({ errors: [{ message: 'Something went wrong (HTTP 504)' }] }),
+      ));
+
+      await expect(ladderReader(run).readPullRequests(null))
+        .rejects.toThrow('Something went wrong while executing your query.');
+      expect(sizes).toEqual([50]);
+    });
+
+    it('never reads a response body quoting a gateway status as evidence', async () => {
+      // stdout is the response payload, and a pull-request title quoting
+      // "(HTTP 504)" is attacker-influenced text, not a fault.
+      const { run, sizes } = pageReader(() => served(
+        '',
+        JSON.stringify({ data: { repository: { pullRequests: { nodes: [{ title: '(HTTP 504)' }] } } } }),
+      ));
+
+      await expect(ladderReader(run).readPullRequests(null)).rejects.toThrow('Command failed');
+      expect(sizes).toEqual([50]);
+    });
+
+    it('vetoes the downshift when stdout carries the served HTTP response', async () => {
+      // The veto's stdout discipline, unchanged: a response `gh api --include`
+      // retained on a non-zero exit refuses the classification outright.
+      const { run, sizes } = pageReader(() => served(
+        LIVE_504,
+        'HTTP/2.0 504 \r\nx-github-request-id: abc\r\n\r\n{"message":"Gateway Timeout"}',
+      ));
+
+      await expect(ladderReader(run).readPullRequests(null)).rejects.toThrow('(HTTP 504)');
+      expect(sizes).toEqual([50]);
+    });
+
+    it('names the exhausted page size and cursor when every rung times out', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { run, sizes } = pageReader(() => gateway(504));
+
+      const error = await ladderReader(run).readPullRequests(null)
+        .then(() => null, (thrown: unknown) => thrown as Error);
+
+      expect(error?.message).toContain('full reconciliation: page size 10 at cursor null still failed:');
+      // The original failure is still in the message the operator reads, and the
+      // original error itself is still reachable.
+      expect(error?.message).toContain('(HTTP 504)');
+      expect((error?.cause as { stderr?: string } | undefined)?.stderr).toContain('(HTTP 504)');
+      expect(sizes).toEqual([50, 25, 12, 10]);
+      warn.mockRestore();
+    });
+
+    it('names the cursor of the page that died mid-reconciliation', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { run, sizes } = pageReader(
+        (attempt) => (attempt === 1 ? null : gateway(504)),
+        true,
+      );
+      const reader = ladderReader(run);
+
+      await reader.readPullRequests(null);
+      await expect(reader.readPullRequests('CURSOR-2')).rejects.toThrow(
+        'full reconciliation: page size 10 at cursor CURSOR-2 still failed:',
+      );
+      expect(sizes).toEqual([50, 50, 25, 12, 10]);
+      warn.mockRestore();
+    });
   });
 });

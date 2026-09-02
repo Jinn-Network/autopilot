@@ -3,6 +3,7 @@ import {
   BACKOFF_MS,
   MAX_READ_ATTEMPTS,
   classifyTransportFault,
+  gatewayStatusFromFailure,
   isRetryableReadCommand,
   withTransientReadRetry,
 } from '../../src/lifecycle/transient-retry.js';
@@ -272,6 +273,100 @@ describe('classifyTransportFault', () => {
       { stderr: 'dial tcp: lookup api.github.com: no such host' },
     );
     expect(classifyTransportFault(fault)).toBe('DNS failure');
+  });
+});
+
+/**
+ * The served gateway status the full-reconciliation page ladder reads (#134).
+ * A separate classifier on purpose: `classifyTransportFault` governs every
+ * command including mutations, and a served 5xx on a mutation may have been
+ * applied. This one is consulted by exactly one idempotent paged read.
+ */
+describe('gatewayStatusFromFailure', () => {
+  /** Verbatim from the WARNING in issue #134. */
+  const LIVE_504 = 'gh: We couldn\'t respond to your request in time. Sorry about that. '
+    + 'Please try resubmitting your request and contact us if the problem persists. (HTTP 504)';
+
+  it.each([
+    ['the live mono gateway timeout', LIVE_504, 504],
+    ['a parenthesised 502', 'gh: Bad Gateway (HTTP 502)', 502],
+    ['a parenthesised 503', 'gh: Service Unavailable (HTTP 503)', 503],
+    ['a bare HTTP 504', 'gh: request failed: HTTP 504', 504],
+    ['a status line', 'HTTP/2.0 503 Service Unavailable', 503],
+  ])('reads %s as a gateway status', (_label, stderr, status) => {
+    expect(gatewayStatusFromFailure(subprocessFault(stderr))).toBe(status);
+  });
+
+  it('leaves the served-response veto exactly as it was', () => {
+    // The same failure the ladder acts on is still not a transport fault: the
+    // retry beneath, which also covers mutations, must not re-send it.
+    expect(classifyTransportFault(subprocessFault(LIVE_504))).toBeNull();
+  });
+
+  it.each([
+    ['a 500', 'gh: Internal Server Error (HTTP 500)'],
+    ['a 501', 'gh: Not Implemented (HTTP 501)'],
+    ['a 404', 'gh: Not Found (HTTP 404)'],
+    ['a 429', 'gh: You have exceeded a secondary rate limit (HTTP 429)'],
+    ['a 403 rate limit', 'gh: API rate limit exceeded (HTTP 403)'],
+    ['a 401', 'gh: Bad credentials (HTTP 401)'],
+    ['a 200', 'HTTP/2.0 200 OK'],
+    ['a transport fault that served nothing', 'stream error: stream ID 1; CANCEL; received from peer'],
+    ['a GraphQL errors payload', 'gh: Something went wrong while executing your query.'],
+    ['a missing binary', 'spawn gh ENOENT'],
+  ])('does not read %s as a gateway status', (_label, stderr) => {
+    expect(gatewayStatusFromFailure(subprocessFault(stderr))).toBeNull();
+  });
+
+  it('refuses a failure that names a gateway status alongside another status', () => {
+    // Two statuses in one message means the evidence does not establish which
+    // one this command got. Fail closed.
+    expect(gatewayStatusFromFailure(
+      subprocessFault('gh: Bad credentials (HTTP 401); upstream returned (HTTP 504)'),
+    )).toBeNull();
+  });
+
+  it('never reads stdout as evidence of a gateway status', () => {
+    // stdout is the response payload: a pull-request body quoting a gateway
+    // timeout must not shrink the page, let alone drive a retry.
+    expect(gatewayStatusFromFailure(Object.assign(
+      new Error('Command failed: gh api graphql'),
+      { stderr: '', stdout: '{"body":"the job died with (HTTP 504)"}' },
+    ))).toBeNull();
+  });
+
+  it('vetoes a gateway status when stdout carries the HTTP response gh --include retained', () => {
+    expect(gatewayStatusFromFailure(Object.assign(
+      new Error('Command failed: gh'),
+      {
+        stdout: 'HTTP/2.0 504 \r\nx-github-request-id: abc\r\n\r\n{"message":"Gateway Timeout"}',
+        stderr: LIVE_504,
+      },
+    ))).toBeNull();
+  });
+
+  it('never reads a MULTI-LINE echoed command line as gateway evidence', () => {
+    const commandLine = 'gh api graphql -f query=query{\n  search(query: "(HTTP 504)")\n}';
+    expect(gatewayStatusFromFailure(Object.assign(
+      new Error(`Command failed: ${commandLine}\n`),
+      { cmd: commandLine, stderr: '' },
+    ))).toBeNull();
+  });
+
+  it('reads the stderr that follows a multi-line echoed command line', () => {
+    const commandLine = 'gh api graphql -f query=query{\n  repository { id }\n}';
+    expect(gatewayStatusFromFailure(Object.assign(
+      new Error(`Command failed: ${commandLine}\n${LIVE_504}`),
+      { cmd: commandLine },
+    ))).toBe(504);
+  });
+
+  it.each([
+    ['a string', 'gh: Gateway Timeout (HTTP 504)'],
+    ['null', null],
+    ['undefined', undefined],
+  ])('refuses %s outright', (_label, error) => {
+    expect(gatewayStatusFromFailure(error)).toBeNull();
   });
 });
 
