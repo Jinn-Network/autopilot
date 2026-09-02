@@ -28,6 +28,7 @@ import { updateMaintainerSkills } from '../src/maintainer-skills.js';
 import { packageRoot } from '../src/package-paths.js';
 import {
   redactLog,
+  renderDaemonStatus,
   runDaemon,
   serviceStatus,
   startService,
@@ -380,7 +381,7 @@ async function main(): Promise<void> {
         lifecycle: parseTrailingJson(lifecycle.text),
       }, null, 2)}\n`);
     } else {
-      process.stdout.write(`Daemon: ${daemon.status}\n${lifecycle.text}`);
+      process.stdout.write(`Daemon: ${renderDaemonStatus(daemon)}\n${lifecycle.text}`);
     }
     return;
   }

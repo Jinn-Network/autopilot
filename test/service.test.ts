@@ -1,16 +1,25 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { LoadedAutopilotConfig } from '../src/config/config.js';
+import { cycleHeartbeatPath } from '../src/cycle-heartbeat.js';
 import {
   classifyDaemonRecord,
   completeDaemonCycle,
+  cycleWatchdogLine,
+  cycleWatchdogThresholdMs,
   daemonActiveOnceEnvironment,
+  daemonCycleStatus,
+  formatCycleDuration,
   INTERNAL_DAEMON_ACTIVE_ONCE_ENV,
+  MIN_CYCLE_WATCHDOG_MS,
+  renderDaemonStatus,
   serviceSocketPath,
+  serviceStatus,
+  startCycleWatchdog,
   startService,
   stopService,
   type DaemonMetadata,
@@ -145,12 +154,190 @@ describe('repository-scoped daemon safety', () => {
   });
 });
 
+const MINUTE = 60_000;
+
+describe('cycle-duration watchdog', () => {
+  it('takes the longer of two poll intervals and a twenty-minute floor', () => {
+    expect(MIN_CYCLE_WATCHDOG_MS).toBe(20 * MINUTE);
+    expect(cycleWatchdogThresholdMs(60)).toBe(20 * MINUTE);
+    expect(cycleWatchdogThresholdMs(600)).toBe(20 * MINUTE);
+    expect(cycleWatchdogThresholdMs(900)).toBe(30 * MINUTE);
+  });
+
+  it('renders durations the way an operator reads a stalled cycle', () => {
+    expect(formatCycleDuration(0)).toBe('0s');
+    expect(formatCycleDuration(45_000)).toBe('45s');
+    expect(formatCycleDuration(20 * MINUTE)).toBe('20m');
+    expect(formatCycleDuration(35 * MINUTE)).toBe('35m');
+    expect(formatCycleDuration(128 * MINUTE)).toBe('2h08m');
+  });
+
+  it('stays silent while a cycle is still inside the threshold', () => {
+    expect(cycleWatchdogLine({
+      cycleStartedAtMs: 0,
+      nowMs: 19 * MINUTE,
+      thresholdMs: 20 * MINUTE,
+      step: { step: 'worktree remove pr-3683', startedAtMs: 5 * MINUTE },
+    })).toBeNull();
+  });
+
+  it('carries the cycle age and the last recorded step once the threshold is passed', () => {
+    expect(cycleWatchdogLine({
+      cycleStartedAtMs: 0,
+      nowMs: 35 * MINUTE,
+      thresholdMs: 20 * MINUTE,
+      step: { step: 'worktree remove pr-3683', startedAtMs: 14 * MINUTE },
+    })).toBe(
+      '[autopilot:daemon] cycle running for 35m (threshold 20m); '
+      + 'last step: worktree remove pr-3683 (21m ago)',
+    );
+    expect(cycleWatchdogLine({
+      cycleStartedAtMs: 0,
+      nowMs: 35 * MINUTE,
+      thresholdMs: 20 * MINUTE,
+      step: null,
+    })).toBe(
+      '[autopilot:daemon] cycle running for 35m (threshold 20m); '
+      + 'last step: none recorded',
+    );
+  });
+
+  it('logs nothing below the threshold and exactly one line per interval above it', () => {
+    const scheduled: { tick?: () => void; intervalMs?: number } = {};
+    let stopped = false;
+    const lines: string[] = [];
+    let nowMs = 0;
+    let step: { step: string; startedAtMs: number } | null = null;
+
+    const stop = startCycleWatchdog({
+      cycleStartedAtMs: 0,
+      thresholdMs: 20 * MINUTE,
+      now: () => nowMs,
+      readStep: () => step,
+      log: (line) => lines.push(line),
+      schedule: (tick, intervalMs) => {
+        scheduled.tick = tick;
+        scheduled.intervalMs = intervalMs;
+        return () => { stopped = true; };
+      },
+    });
+
+    expect(scheduled.intervalMs).toBe(20 * MINUTE);
+    nowMs = 19 * MINUTE;
+    scheduled.tick!();
+    expect(lines).toEqual([]);
+
+    step = { step: 'worktree remove pr-3683', startedAtMs: 14 * MINUTE };
+    nowMs = 20 * MINUTE;
+    scheduled.tick!();
+    nowMs = 40 * MINUTE;
+    scheduled.tick!();
+
+    expect(lines).toEqual([
+      '[autopilot:daemon] cycle running for 20m (threshold 20m); '
+      + 'last step: worktree remove pr-3683 (6m ago)',
+      '[autopilot:daemon] cycle running for 40m (threshold 20m); '
+      + 'last step: worktree remove pr-3683 (26m ago)',
+    ]);
+
+    stop();
+    expect(stopped).toBe(true);
+  });
+});
+
+describe('operator-visible cycle age and current step', () => {
+  const started = '2026-09-02T18:09:45.000Z';
+
+  it('reports no in-flight cycle once the last one has finished', () => {
+    expect(daemonCycleStatus({
+      metadata: {
+        lastCycleStartedAt: started,
+        lastCycleFinishedAt: '2026-09-02T18:12:45.000Z',
+      },
+      heartbeat: null,
+      thresholdMs: 20 * MINUTE,
+      nowMs: Date.parse('2026-09-02T18:20:00.000Z'),
+    })).toBeNull();
+    expect(daemonCycleStatus({
+      metadata: {},
+      heartbeat: null,
+      thresholdMs: 20 * MINUTE,
+      nowMs: Date.parse('2026-09-02T18:20:00.000Z'),
+    })).toBeNull();
+  });
+
+  it('surfaces cycle age and current step instead of a bare running', () => {
+    const cycle = daemonCycleStatus({
+      metadata: { lastCycleStartedAt: started },
+      heartbeat: {
+        schemaVersion: 1,
+        pid: 4242,
+        step: 'worktree remove pr-3683',
+        startedAt: '2026-09-02T18:23:45.000Z',
+      },
+      thresholdMs: 20 * MINUTE,
+      nowMs: Date.parse('2026-09-02T18:44:45.000Z'),
+    });
+
+    expect(cycle).toEqual({
+      startedAt: started,
+      ageMs: 35 * MINUTE,
+      thresholdMs: 20 * MINUTE,
+      overdue: true,
+      step: {
+        step: 'worktree remove pr-3683',
+        startedAt: '2026-09-02T18:23:45.000Z',
+        ageMs: 21 * MINUTE,
+      },
+    });
+    expect(renderDaemonStatus({ status: 'running', cycle })).toBe(
+      'running (cycle 35m, over the 20m watchdog threshold; '
+      + 'step: worktree remove pr-3683 21m ago)',
+    );
+  });
+
+  it('renders a healthy in-flight cycle, a stepless one, and an idle daemon', () => {
+    const healthy = daemonCycleStatus({
+      metadata: { lastCycleStartedAt: started },
+      heartbeat: {
+        schemaVersion: 1,
+        pid: 4242,
+        step: 'full reconciliation read',
+        startedAt: '2026-09-02T18:10:45.000Z',
+      },
+      thresholdMs: 20 * MINUTE,
+      nowMs: Date.parse('2026-09-02T18:13:45.000Z'),
+    });
+
+    expect(renderDaemonStatus({ status: 'running', cycle: healthy })).toBe(
+      'running (cycle 4m; step: full reconciliation read 3m ago)',
+    );
+    expect(renderDaemonStatus({
+      status: 'running',
+      cycle: daemonCycleStatus({
+        metadata: { lastCycleStartedAt: started },
+        heartbeat: null,
+        thresholdMs: 20 * MINUTE,
+        nowMs: Date.parse('2026-09-02T18:13:45.000Z'),
+      }),
+    })).toBe('running (cycle 4m; step: none recorded)');
+    expect(renderDaemonStatus({ status: 'running', cycle: null }))
+      .toBe('running (idle)');
+    expect(renderDaemonStatus({ status: 'not-running' })).toBe('not-running');
+    expect(renderDaemonStatus({ status: 'stale-binary', cycle: null }))
+      .toBe('stale-binary');
+  });
+});
+
 function loadedFixture(serviceDir: string, logsDir: string): LoadedAutopilotConfig {
   return {
-    config: { repository: { slug: metadata.repository } },
     configPath: join(serviceDir, 'config.json'),
     repositoryRoot: serviceDir,
     stateKey: 'octo-labs-widget-test',
+    config: {
+      repository: { slug: metadata.repository },
+      scheduler: { pollSeconds: 600 },
+    },
     paths: {
       root: serviceDir,
       credentials: join(serviceDir, 'credentials.json'),
@@ -250,6 +437,35 @@ describe('operator exit when the live daemon is only a binary drift', () => {
       loaded, entryPath: '/dev/null', force: true, inspect,
     })).rejects.toThrow(
       'Refusing to signal a live PID whose daemon identity does not match',
+    );
+  });
+
+  it('never reports a dead engine child\'s recorded step as the current one', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-status-heartbeat-'));
+    const dead = spawn(process.execPath, ['-e', '']);
+    await new Promise<void>((resolve) => { dead.once('exit', () => resolve()); });
+    const startedAt = new Date(Date.now() - 90_000).toISOString();
+    writeFileSync(cycleHeartbeatPath(dir), `${JSON.stringify({
+      schemaVersion: 1,
+      pid: dead.pid!,
+      step: 'worktree remove pr-3683',
+      startedAt,
+    })}\n`, { mode: 0o600 });
+
+    const status = await serviceStatus({
+      loaded: loadedFixture(dir, dir),
+      entryPath: '/dev/null',
+      inspect: async () => ({
+        classification: 'already-running',
+        metadata: { ...metadata, lastCycleStartedAt: startedAt },
+      }),
+    });
+
+    expect(status.status).toBe('running');
+    expect(status.cycle?.step).toBeNull();
+    expect(status.cycle?.ageMs).toBeGreaterThanOrEqual(90_000);
+    expect(renderDaemonStatus(status)).toMatch(
+      /^running \(cycle \d+[ms]; step: none recorded\)$/,
     );
   });
 

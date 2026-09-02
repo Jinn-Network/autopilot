@@ -1,3 +1,4 @@
+import { withCycleStep } from '../cycle-heartbeat.js';
 import type { AttemptManifest } from './attempt-workspace.js';
 import type { LifecycleControllerDeps } from './controller.js';
 import type { CredentialPool } from './credentials.js';
@@ -114,11 +115,40 @@ function reason(result: ActiveRuntimeResult): string | undefined {
 }
 
 /**
+ * Names one dispatch for the cycle heartbeat (#132). A dispatch is where the
+ * cycle prepares an attempt workspace — a `git worktree add` of the whole
+ * repository — so it is the other place a cycle can sit for minutes with
+ * nothing to show for it.
+ */
+export function dispatchStepLabel(action: NewWorkAction): string {
+  const subject = 'prNumber' in action
+    ? `pr-${action.prNumber}`
+    : 'parentPr' in action
+      ? `pr-${action.parentPr}`
+      : 'issueNumber' in action
+        ? `issue-${action.issueNumber}`
+        : null;
+  return `dispatch ${action.kind}${subject === null ? '' : ` ${subject}`}`;
+}
+
+/**
  * One action to one handler. The optional handlers report `skipped` rather
  * than throwing when a build does not wire them, so a partially-wired runtime
  * degrades to "did not run" instead of failing the cycle.
  */
-async function dispatchAction(
+function dispatchAction(
+  handlers: ActiveRuntimeHandlers,
+  action: NewWorkAction,
+  credentials: CredentialPool,
+  snapshot: GitHubLifecycleSnapshot,
+): Promise<ActiveRuntimeResult> {
+  return withCycleStep(
+    dispatchStepLabel(action),
+    () => routeAction(handlers, action, credentials, snapshot),
+  );
+}
+
+async function routeAction(
   handlers: ActiveRuntimeHandlers,
   action: NewWorkAction,
   credentials: CredentialPool,
@@ -222,11 +252,14 @@ export function makeActiveRuntime(
       await options.reserveReviewCohort?.(actions.length);
       return Promise.all(actions.map(async (action) => {
         try {
-          const result = await options.handlers.review(
-            action,
-            options.credentials,
-            snapshot,
-            { cohortQuotaReserved: true },
+          const result = await withCycleStep(
+            dispatchStepLabel(action),
+            () => options.handlers.review(
+              action,
+              options.credentials,
+              snapshot,
+              { cohortQuotaReserved: true },
+            ),
           );
           const detail = reason(result);
           return {

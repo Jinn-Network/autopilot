@@ -18,6 +18,12 @@ import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { LoadedAutopilotConfig } from './config/config.js';
+import {
+  clearCycleHeartbeat,
+  cycleHeartbeatPath,
+  readCycleHeartbeat,
+  type CycleHeartbeat,
+} from './cycle-heartbeat.js';
 import type { DoctorReport } from './doctor.js';
 
 export const INTERNAL_DAEMON_ACTIVE_ONCE_ENV =
@@ -63,6 +69,170 @@ export async function completeDaemonCycle(options: {
   if (options.shouldStop()) return { exitCode, waited: false };
   await options.wait(options.intervalMs);
   return { exitCode, waited: true };
+}
+
+/**
+ * Floor for the cycle-duration watchdog (jinn-autopilot#132).
+ *
+ * Deliberately a constant and NOT config. A cycle that outlives this is not a
+ * tuning question, it is the one failure class no other signal covers: the
+ * per-lane starvation lines (#113), the reconciliation-stale counter (#130) and
+ * the `Snapshot:` line all fire at cycle *end*, so a cycle that never ends is
+ * silent everywhere else. An operator who could raise this knob could silence
+ * the only evidence that a cycle is stuck; a threshold that needed raising per
+ * repository would mean the signal itself is wrong.
+ *
+ * Twenty minutes is chosen against the shape of a healthy cycle rather than a
+ * quantile: a full reconciliation plus a dispatch fan-out is minutes, not tens
+ * of minutes, and the incident this came from sat at 2h08m on one synchronous
+ * `git worktree remove`. Under a long poll interval two intervals is already
+ * anomalous and wins instead, so the effective threshold is
+ * `max(2 x pollSeconds, 20 min)`.
+ */
+export const MIN_CYCLE_WATCHDOG_MS = 20 * 60 * 1_000;
+
+export function cycleWatchdogThresholdMs(pollSeconds: number): number {
+  return Math.max(2 * pollSeconds * 1_000, MIN_CYCLE_WATCHDOG_MS);
+}
+
+/** Compact human durations: `45s`, `35m`, `2h08m`. */
+export function formatCycleDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1_000));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${String(minutes % 60).padStart(2, '0')}m`;
+}
+
+export interface CycleStepReading {
+  readonly step: string;
+  readonly startedAtMs: number;
+}
+
+/**
+ * The watchdog line, or null while the cycle is still inside its threshold.
+ * Pure so the wording and the silence below the threshold are both pinned.
+ */
+export function cycleWatchdogLine(input: {
+  readonly cycleStartedAtMs: number;
+  readonly nowMs: number;
+  readonly thresholdMs: number;
+  readonly step: CycleStepReading | null;
+}): string | null {
+  const ageMs = input.nowMs - input.cycleStartedAtMs;
+  if (ageMs < input.thresholdMs) return null;
+  const step = input.step === null
+    ? 'none recorded'
+    : `${input.step.step} (${
+      formatCycleDuration(input.nowMs - input.step.startedAtMs)
+    } ago)`;
+  return `[autopilot:daemon] cycle running for ${formatCycleDuration(ageMs)} `
+    + `(threshold ${formatCycleDuration(input.thresholdMs)}); last step: ${step}`;
+}
+
+function scheduleWatchdogInterval(
+  tick: () => void,
+  intervalMs: number,
+): () => void {
+  const timer = setInterval(tick, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+/**
+ * Emits one line per threshold-length interval for as long as the cycle keeps
+ * running, starting at the first interval past the threshold. `schedule` is a
+ * test seam; production always uses a plain unref'd interval.
+ */
+export function startCycleWatchdog(input: {
+  readonly cycleStartedAtMs: number;
+  readonly thresholdMs: number;
+  readonly now: () => number;
+  readonly readStep: () => CycleStepReading | null;
+  readonly log: (line: string) => void;
+  readonly schedule?: (tick: () => void, intervalMs: number) => () => void;
+}): () => void {
+  const schedule = input.schedule ?? scheduleWatchdogInterval;
+  return schedule(() => {
+    const line = cycleWatchdogLine({
+      cycleStartedAtMs: input.cycleStartedAtMs,
+      nowMs: input.now(),
+      thresholdMs: input.thresholdMs,
+      step: input.readStep(),
+    });
+    if (line !== null) input.log(line);
+  }, input.thresholdMs);
+}
+
+export interface DaemonCycleStatus {
+  readonly startedAt: string;
+  readonly ageMs: number;
+  readonly thresholdMs: number;
+  readonly overdue: boolean;
+  readonly step: {
+    readonly step: string;
+    readonly startedAt: string;
+    readonly ageMs: number;
+  } | null;
+}
+
+/**
+ * The in-flight cycle, or null when none is running. A cycle is in flight
+ * exactly while `lastCycleStartedAt` is the later of the two markers — the
+ * same evidence the watchdog runs on, so `status` and the log agree.
+ */
+export function daemonCycleStatus(input: {
+  readonly metadata: Pick<DaemonMetadata, 'lastCycleStartedAt' | 'lastCycleFinishedAt'>;
+  readonly heartbeat: CycleHeartbeat | null;
+  readonly thresholdMs: number;
+  readonly nowMs: number;
+}): DaemonCycleStatus | null {
+  const startedAt = input.metadata.lastCycleStartedAt;
+  if (startedAt === undefined) return null;
+  const startedAtMs = Date.parse(startedAt);
+  if (!Number.isFinite(startedAtMs)) return null;
+  const finishedAt = input.metadata.lastCycleFinishedAt;
+  if (finishedAt !== undefined && Date.parse(finishedAt) >= startedAtMs) return null;
+  const ageMs = Math.max(0, input.nowMs - startedAtMs);
+  const stepStartedAtMs = input.heartbeat === null
+    ? null
+    : Date.parse(input.heartbeat.startedAt);
+  return {
+    startedAt,
+    ageMs,
+    thresholdMs: input.thresholdMs,
+    overdue: ageMs >= input.thresholdMs,
+    step: input.heartbeat === null || stepStartedAtMs === null
+      || !Number.isFinite(stepStartedAtMs)
+      ? null
+      : {
+          step: input.heartbeat.step,
+          startedAt: input.heartbeat.startedAt,
+          ageMs: Math.max(0, input.nowMs - stepStartedAtMs),
+        },
+  };
+}
+
+/**
+ * `autopilot status`'s daemon line. A live daemon reports the cycle it is in
+ * and what that cycle is doing, so "slow" is distinguishable from "hung"
+ * without reading logs.
+ */
+export function renderDaemonStatus(input: {
+  readonly status: string;
+  readonly cycle?: DaemonCycleStatus | null;
+}): string {
+  if (input.status !== 'running') return input.status;
+  const cycle = input.cycle ?? null;
+  if (cycle === null) return 'running (idle)';
+  const overdue = cycle.overdue
+    ? `, over the ${formatCycleDuration(cycle.thresholdMs)} watchdog threshold`
+    : '';
+  const step = cycle.step === null
+    ? 'none recorded'
+    : `${cycle.step.step} ${formatCycleDuration(cycle.step.ageMs)} ago`;
+  return `running (cycle ${formatCycleDuration(cycle.ageMs)}${overdue}; step: ${step})`;
 }
 
 export interface DaemonMetadata {
@@ -245,6 +415,12 @@ function processAlive(pid: number): boolean {
   }
 }
 
+function readCurrentCycleStep(path: string): CycleStepReading | null {
+  const heartbeat = readCycleHeartbeat(path, processAlive);
+  if (heartbeat === null) return null;
+  return { step: heartbeat.step, startedAtMs: Date.parse(heartbeat.startedAt) };
+}
+
 async function processStartedAt(pid: number): Promise<string | null> {
   if (!processAlive(pid)) return null;
   const child = spawn('ps', ['-p', String(pid), '-o', 'lstart='], {
@@ -422,6 +598,10 @@ export async function runDaemon(input: {
   ensureSocketDirectory(controlPath);
   rmSync(controlPath, { force: true });
   const startupConfigHash = configurationHash(input.loaded.configPath);
+  const heartbeatPath = cycleHeartbeatPath(input.loaded.paths.service);
+  const watchdogThresholdMs = cycleWatchdogThresholdMs(
+    input.loaded.config.scheduler.pollSeconds,
+  );
   let stopping = false;
   let wake: (() => void) | undefined;
   let metadata: DaemonMetadata = {
@@ -492,36 +672,55 @@ export async function runDaemon(input: {
         break;
       }
 
+      // Nothing from the previous cycle's child may survive into this one:
+      // the heartbeat is process-local, so the last step of an engine that has
+      // already exited must never be reported as this cycle's current step.
+      clearCycleHeartbeat(heartbeatPath);
+      const cycleStartedAtMs = Date.now();
       metadata = updateMetadata(input.loaded, metadata, {
-        lastCycleStartedAt: new Date().toISOString(),
+        lastCycleStartedAt: new Date(cycleStartedAtMs).toISOString(),
       });
       const controller = spawnDaemonActiveOnce({
         entryPath: input.entryPath,
         cwd: input.loaded.repositoryRoot,
         environment: input.environment ?? process.env,
       });
-      const completed = await completeDaemonCycle({
-        exit: new Promise<number | null>((resolvePromise) => {
-          controller.once('error', () => resolvePromise(null));
-          controller.once('exit', resolvePromise);
-        }),
-        recordCompletion: (exitCode) => {
-          metadata = updateMetadata(input.loaded, metadata, {
-            lastCycleFinishedAt: new Date().toISOString(),
-            lastCycleExitCode: exitCode,
-            state: stopping ? 'stopping' : 'running',
-          });
-        },
-        shouldStop: () => stopping,
-        intervalMs: input.loaded.config.scheduler.pollSeconds * 1_000,
-        wait: (ms) => new Promise<void>((resolvePromise) => {
-          const timer = setTimeout(resolvePromise, ms);
-          wake = () => {
-            clearTimeout(timer);
-            resolvePromise();
-          };
-        }),
+      const stopWatchdog = startCycleWatchdog({
+        cycleStartedAtMs,
+        thresholdMs: watchdogThresholdMs,
+        now: () => Date.now(),
+        readStep: () => readCurrentCycleStep(heartbeatPath),
+        log: (line) => console.warn(line),
       });
+      let completed: Awaited<ReturnType<typeof completeDaemonCycle>>;
+      try {
+        completed = await completeDaemonCycle({
+          exit: new Promise<number | null>((resolvePromise) => {
+            controller.once('error', () => resolvePromise(null));
+            controller.once('exit', resolvePromise);
+          }),
+          recordCompletion: (exitCode) => {
+            stopWatchdog();
+            clearCycleHeartbeat(heartbeatPath);
+            metadata = updateMetadata(input.loaded, metadata, {
+              lastCycleFinishedAt: new Date().toISOString(),
+              lastCycleExitCode: exitCode,
+              state: stopping ? 'stopping' : 'running',
+            });
+          },
+          shouldStop: () => stopping,
+          intervalMs: input.loaded.config.scheduler.pollSeconds * 1_000,
+          wait: (ms) => new Promise<void>((resolvePromise) => {
+            const timer = setTimeout(resolvePromise, ms);
+            wake = () => {
+              clearTimeout(timer);
+              resolvePromise();
+            };
+          }),
+        });
+      } finally {
+        stopWatchdog();
+      }
       if (!completed.waited) break;
       wake = undefined;
     }
@@ -534,6 +733,7 @@ export async function runDaemon(input: {
       await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
     }
     rmSync(controlPath, { force: true });
+    clearCycleHeartbeat(heartbeatPath);
     const currentMetadata = readDaemonMetadata(input.loaded);
     if (currentMetadata?.pid === process.pid) {
       rmSync(metadataPath(input.loaded), { force: true });
@@ -589,11 +789,16 @@ export async function stopService(input: {
 export async function serviceStatus(input: {
   readonly loaded: LoadedAutopilotConfig;
   readonly entryPath: string;
+  // Test-only seam: production callers never pass this, so inspectDaemon
+  // (with its real ps/fingerprint reads) is always used outside tests.
+  readonly inspect?: typeof inspectDaemon;
 }): Promise<{
   readonly status: 'not-running' | 'running' | 'stale' | 'stale-binary' | 'unsafe';
   readonly daemon?: DaemonMetadata;
+  /** Additive (#132): the in-flight cycle's age and current step, if any. */
+  readonly cycle?: DaemonCycleStatus | null;
 }> {
-  const inspected = await inspectDaemon(input);
+  const inspected = await (input.inspect ?? inspectDaemon)(input);
   switch (inspected.classification) {
     case 'not-running':
       return { status: 'not-running' };
@@ -607,7 +812,21 @@ export async function serviceStatus(input: {
     case 'unsafe-live-mismatch':
       return { status: 'unsafe', daemon: inspected.metadata! };
     case 'already-running':
-      return { status: 'running', daemon: inspected.metadata! };
+      return {
+        status: 'running',
+        daemon: inspected.metadata!,
+        cycle: daemonCycleStatus({
+          metadata: inspected.metadata!,
+          heartbeat: readCycleHeartbeat(
+            cycleHeartbeatPath(input.loaded.paths.service),
+            processAlive,
+          ),
+          thresholdMs: cycleWatchdogThresholdMs(
+            input.loaded.config.scheduler.pollSeconds,
+          ),
+          nowMs: Date.now(),
+        }),
+      };
   }
 }
 
