@@ -3149,6 +3149,10 @@ describe('operator usage summary', () => {
       orphanBranchClaims: [],
       diagnostics: [],
       events: [],
+      backlog: {
+        ordinary: 0, followUps: 0, children: 0, sweeps: 0, actionable: 0,
+        ordinaryByPriority: { p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unset: 0 },
+      },
     };
     const retried = new GitHubUsageMeter();
     retried.recordTransientReadRetry('gh', 'TLS handshake failure');
@@ -3574,5 +3578,171 @@ describe('enqueue stage scheduling', () => {
       if (previous === undefined) delete process.env.JINN_AUTOPILOT_ENQUEUE;
       else process.env.JINN_AUTOPILOT_ENQUEUE = previous;
     }
+  });
+});
+
+// #127: open-issue composition, derived every cycle from `snapshot.issues`
+// (already open-only — the poller reads `state=open`). No scheduling
+// behavior depends on any of this; it is measurement only.
+describe('backlog composition (#127)', () => {
+  const DEBT_SWEEP_BODY = '<!-- jinn-autopilot:debt-sweep pr=101 members=1,2,3 -->';
+  const CHILD_BODY = '<!-- jinn-autopilot:child pr=101 kind=review-finding -->';
+  const FOLLOW_UP_BODY =
+    '<!-- jinn-autopilot:review-follow-up pr=101 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa index=0 -->';
+
+  function issue(
+    number: number,
+    overrides: Partial<PolledIssue> = {},
+  ): PolledIssue {
+    return { ...openIssue(number), body: '', priority: 'P1', ...overrides };
+  }
+
+  async function backlogFor(issues: readonly PolledIssue[]) {
+    const calls: string[] = [];
+    const report = await runLifecycleCycle('observe', {
+      ...deps(implementation(), calls),
+      readSnapshot: async () => ({
+        ...snapshot(implementation()),
+        issues,
+      }),
+    });
+    if (report.status !== 'ok') throw new Error(`expected ok, got ${report.status}`);
+    return report;
+  }
+
+  it('classifies an issue carrying both a sweep tag and a follow-up marker as a sweep', async () => {
+    const report = await backlogFor([
+      issue(50, { body: `${DEBT_SWEEP_BODY}\n${FOLLOW_UP_BODY}` }),
+    ]);
+    expect(report.backlog).toMatchObject({
+      ordinary: 0,
+      followUps: 0,
+      children: 0,
+      sweeps: 1,
+      actionable: 1,
+    });
+  });
+
+  it('classifies an issue carrying both a child marker and a follow-up marker as a child', async () => {
+    const report = await backlogFor([
+      issue(51, { body: `${CHILD_BODY}\n${FOLLOW_UP_BODY}` }),
+    ]);
+    expect(report.backlog).toMatchObject({
+      ordinary: 0,
+      followUps: 0,
+      children: 1,
+      sweeps: 0,
+      actionable: 0,
+    });
+  });
+
+  it('counts an unset-priority issue as ordinary, bucketed under "unset"', async () => {
+    const report = await backlogFor([
+      issue(52, { priority: null }),
+    ]);
+    expect(report.backlog.ordinary).toBe(1);
+    expect(report.backlog.ordinaryByPriority).toEqual({
+      p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unset: 1,
+    });
+  });
+
+  it('covers only the ordinary set in the per-priority breakdown', async () => {
+    const report = await backlogFor([
+      issue(53, { priority: 'P0' }),
+      issue(54, { priority: 'P0', body: FOLLOW_UP_BODY }),
+      issue(55, { priority: 'P0', body: CHILD_BODY }),
+      issue(56, { priority: 'P0', body: DEBT_SWEEP_BODY }),
+    ]);
+    expect(report.backlog).toMatchObject({
+      ordinary: 1,
+      followUps: 1,
+      children: 1,
+      sweeps: 1,
+    });
+    // Only the one ordinary P0 issue counts; the follow-up/child/sweep P0
+    // issues must not inflate this bucket.
+    expect(report.backlog.ordinaryByPriority.p0).toBe(1);
+  });
+
+  it('computes actionable as ordinary + sweeps, excluding follow-ups and children', async () => {
+    const report = await backlogFor([
+      issue(60),
+      issue(61, { body: FOLLOW_UP_BODY }),
+      issue(62, { body: CHILD_BODY }),
+      issue(63, { body: DEBT_SWEEP_BODY }),
+    ]);
+    expect(report.backlog).toEqual({
+      ordinary: 1,
+      followUps: 1,
+      children: 1,
+      sweeps: 1,
+      actionable: 2,
+      ordinaryByPriority: { p0: 0, p1: 1, p2: 0, p3: 0, p4: 0, unset: 0 },
+    });
+  });
+
+  it('renders the per-cycle backlog log line in the exact specified format', async () => {
+    const report = await backlogFor([
+      issue(70),
+      issue(71, { body: FOLLOW_UP_BODY }),
+      issue(72, { body: CHILD_BODY }),
+      issue(73, { body: DEBT_SWEEP_BODY }),
+    ]);
+    const human = renderLifecycleHuman(report);
+    expect(human.split('\n')).toContain(
+      'backlog: ordinary=1 follow-ups=1 children=1 sweeps=1 (actionable=2)',
+    );
+  });
+
+  it('renders the ordinary per-priority breakdown in status text', async () => {
+    const report = await backlogFor([
+      issue(80, { priority: 'P0' }),
+      issue(81, { priority: 'P2' }),
+      issue(82, { priority: null }),
+    ]);
+    const human = renderLifecycleHuman(report);
+    expect(human.split('\n')).toContain(
+      'backlog ordinary priority: p0=1 p1=0 p2=1 p3=0 p4=0 unset=1',
+    );
+  });
+
+  it('excludes closed issues: composition is derived only from snapshot.issues', async () => {
+    // snapshot.issues is already open-only (the poller reads state=open); a
+    // stray project-board item for an issue not present in `issues` (as a
+    // closed issue can still linger on the board pre-archive) must not be
+    // counted.
+    const calls: string[] = [];
+    const report = await runLifecycleCycle('observe', {
+      ...deps(implementation(), calls),
+      readSnapshot: async () => ({
+        ...snapshot(implementation()),
+        issues: [issue(90)],
+        project: {
+          ...snapshot(implementation()).project,
+          items: [{
+            id: 'PVTI_91',
+            number: 91,
+            contentType: 'Issue',
+            status: 'Done',
+            priority: 'P0',
+            effort: 'Medium',
+            blockedOn: 'Nothing',
+            issueType: 'feat',
+            blockedByIssues: [],
+            sprintIterationId: null,
+          }],
+        },
+      }),
+    });
+    if (report.status !== 'ok') throw new Error(`expected ok, got ${report.status}`);
+    expect(report.backlog).toMatchObject({
+      ordinary: 1,
+      followUps: 0,
+      children: 0,
+      sweeps: 0,
+      actionable: 1,
+    });
+    expect(report.backlog.ordinaryByPriority.p1).toBe(1); // issue(90) defaults to P1
+    expect(report.backlog.ordinaryByPriority.p0).toBe(0); // the stray board item is not counted
   });
 });
