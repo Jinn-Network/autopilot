@@ -9,6 +9,10 @@ import { cycleHeartbeatPath } from '../src/cycle-heartbeat.js';
 import {
   classifyDaemonRecord,
   completeDaemonCycle,
+  consecutiveFailureLine,
+  CYCLE_FAILURE_EXCERPT_CHARS,
+  cycleFailureExcerpt,
+  cycleFailureSignal,
   cycleWatchdogLine,
   cycleWatchdogThresholdMs,
   daemonActiveOnceEnvironment,
@@ -16,6 +20,9 @@ import {
   formatCycleDuration,
   INTERNAL_DAEMON_ACTIVE_ONCE_ENV,
   MIN_CYCLE_WATCHDOG_MS,
+  nextConsecutiveFailedCycles,
+  readCycleFailureExcerpt,
+  readDaemonMetadata,
   renderDaemonStatus,
   serviceSocketPath,
   serviceStatus,
@@ -242,6 +249,219 @@ describe('cycle-duration watchdog', () => {
 
     stop();
     expect(stopped).toBe(true);
+  });
+});
+
+describe('consecutive failed-cycle streak', () => {
+  it('counts every consecutive non-zero exit and resets on the first clean cycle', () => {
+    expect(nextConsecutiveFailedCycles(0, 1)).toBe(1);
+    expect(nextConsecutiveFailedCycles(1, 1)).toBe(2);
+    expect(nextConsecutiveFailedCycles(2, 137)).toBe(3);
+    // A child that never reported an exit code (spawn error, signal kill) is a
+    // failed cycle, not an unknown one.
+    expect(nextConsecutiveFailedCycles(3, null)).toBe(4);
+    expect(nextConsecutiveFailedCycles(4, 0)).toBe(0);
+    expect(nextConsecutiveFailedCycles(0, 0)).toBe(0);
+  });
+
+  it('stays silent after one failed cycle and speaks once per cycle from the second', () => {
+    expect(consecutiveFailureLine({ failures: 0, exitCode: 0, excerpt: null })).toBeNull();
+    expect(consecutiveFailureLine({ failures: 1, exitCode: 1, excerpt: 'boom' })).toBeNull();
+    expect(consecutiveFailureLine({ failures: 2, exitCode: 1, excerpt: 'boom' })).toBe(
+      '[autopilot:daemon] cycle failed 2 time(s) in a row (exit 1); last: boom',
+    );
+    expect(consecutiveFailureLine({ failures: 3, exitCode: 137, excerpt: 'boom' })).toBe(
+      '[autopilot:daemon] cycle failed 3 time(s) in a row (exit 137); last: boom',
+    );
+    expect(consecutiveFailureLine({ failures: 2, exitCode: null, excerpt: null })).toBe(
+      '[autopilot:daemon] cycle failed 2 time(s) in a row (exit unknown); '
+      + 'last: none recorded',
+    );
+  });
+
+  it('drives one line per cycle across a failing run that a success ends', () => {
+    const lines: string[] = [];
+    let failures = 0;
+
+    for (const exitCode of [1, 1, 1, 0, 1]) {
+      failures = nextConsecutiveFailedCycles(failures, exitCode);
+      const line = consecutiveFailureLine({ failures, exitCode, excerpt: 'ECONNRESET' });
+      if (line !== null) lines.push(line);
+    }
+
+    expect(lines).toEqual([
+      '[autopilot:daemon] cycle failed 2 time(s) in a row (exit 1); last: ECONNRESET',
+      '[autopilot:daemon] cycle failed 3 time(s) in a row (exit 1); last: ECONNRESET',
+    ]);
+    expect(failures).toBe(1);
+  });
+
+  it('takes the last meaningful engine line, redacted and cut at 120 characters', () => {
+    expect(CYCLE_FAILURE_EXCERPT_CHARS).toBe(120);
+    expect(cycleFailureExcerpt('')).toBeNull();
+    expect(cycleFailureExcerpt('\n  \n\n')).toBeNull();
+    expect(cycleFailureExcerpt([
+      'cycle 41 start',
+      'Error: HTTP 504 from api.github.com',
+      '',
+      '   ',
+    ].join('\n'))).toBe('Error: HTTP 504 from api.github.com');
+    // The daemon's own lines must never become the next cycle's excerpt, or the
+    // signal quotes itself instead of the child.
+    expect(cycleFailureExcerpt([
+      'Error: HTTP 504 from api.github.com',
+      '[autopilot:daemon] cycle failed 2 time(s) in a row (exit 1); last: x',
+      '[autopilot:daemon] cycle running for 20m (threshold 20m); last step: none recorded',
+    ].join('\n'))).toBe('Error: HTTP 504 from api.github.com');
+    expect(cycleFailureExcerpt(`Error: ${'x'.repeat(200)}\n`))
+      .toBe(`Error: ${'x'.repeat(113)}`);
+    expect(cycleFailureExcerpt('fatal: bad credentials ghp_abcdefghijklmnopqrstuvwxyz012345\n'))
+      .toBe('fatal: bad credentials [REDACTED_GITHUB_TOKEN]');
+  });
+
+  it('reads the tail of the engine log the child inherits, and never throws', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-failure-excerpt-'));
+    const logPath = join(dir, 'engine.log');
+
+    expect(readCycleFailureExcerpt(logPath)).toBeNull();
+    writeFileSync(logPath, '');
+    expect(readCycleFailureExcerpt(logPath)).toBeNull();
+    writeFileSync(logPath, `${'filler line\n'.repeat(20_000)}Error: worktree is locked\n`);
+    expect(readCycleFailureExcerpt(logPath)).toBe('Error: worktree is locked');
+    expect(readCycleFailureExcerpt(dir)).toBeNull();
+  });
+
+  it('never lets the excerpt source throw into the daemon loop', () => {
+    expect(cycleFailureSignal({
+      failures: 2,
+      exitCode: 1,
+      readExcerpt: () => { throw new Error('log read exploded'); },
+    })).toEqual({
+      excerpt: null,
+      line: '[autopilot:daemon] cycle failed 2 time(s) in a row (exit 1); '
+        + 'last: none recorded',
+    });
+    // A clean cycle reads no log at all.
+    let reads = 0;
+    expect(cycleFailureSignal({
+      failures: 0,
+      exitCode: 0,
+      readExcerpt: () => { reads += 1; return 'never'; },
+    })).toEqual({ excerpt: null, line: null });
+    expect(reads).toBe(0);
+    expect(cycleFailureSignal({
+      failures: 1,
+      exitCode: 1,
+      readExcerpt: () => 'Error: HTTP 504',
+    })).toEqual({ excerpt: 'Error: HTTP 504', line: null });
+  });
+
+  it('renders the streak in status and leaves a clean daemon byte-identical', () => {
+    const cycle = daemonCycleStatus({
+      metadata: { lastCycleStartedAt: '2026-09-02T18:09:45.000Z' },
+      heartbeat: {
+        schemaVersion: 1,
+        pid: 4242,
+        step: 'full reconciliation read',
+        startedAt: '2026-09-02T18:10:45.000Z',
+      },
+      thresholdMs: 20 * MINUTE,
+      nowMs: Date.parse('2026-09-02T18:13:45.000Z'),
+    });
+
+    expect(renderDaemonStatus({
+      status: 'running',
+      cycle: null,
+      daemon: { ...metadata, consecutiveFailedCycles: 3, lastCycleFailureExcerpt: 'HTTP 504' },
+    })).toBe('running (idle; last 3 cycles failed; last: HTTP 504)');
+    expect(renderDaemonStatus({
+      status: 'running',
+      cycle,
+      daemon: { ...metadata, consecutiveFailedCycles: 3, lastCycleFailureExcerpt: 'HTTP 504' },
+    })).toBe(
+      'running (cycle 4m; step: full reconciliation read 3m ago; '
+      + 'last 3 cycles failed; last: HTTP 504)',
+    );
+    expect(renderDaemonStatus({
+      status: 'running',
+      cycle: null,
+      daemon: { ...metadata, consecutiveFailedCycles: 1 },
+    })).toBe('running (idle; last 1 cycle failed; last: none recorded)');
+
+    // Streak zero, absent, or on a record written before #139: unchanged.
+    expect(renderDaemonStatus({
+      status: 'running',
+      cycle: null,
+      daemon: { ...metadata, consecutiveFailedCycles: 0 },
+    })).toBe('running (idle)');
+    expect(renderDaemonStatus({ status: 'running', cycle: null, daemon: metadata }))
+      .toBe('running (idle)');
+    expect(renderDaemonStatus({ status: 'running', cycle })).toBe(
+      'running (cycle 4m; step: full reconciliation read 3m ago)',
+    );
+    // A hand-edited or truncated record renders as no streak, never as one.
+    for (const corrupt of [-1, Number.NaN, 1.5, 'three' as unknown as number]) {
+      expect(renderDaemonStatus({
+        status: 'running',
+        cycle: null,
+        daemon: { ...metadata, consecutiveFailedCycles: corrupt },
+      })).toBe('running (idle)');
+    }
+    for (const status of ['not-running', 'stale', 'stale-binary', 'unsafe']) {
+      expect(renderDaemonStatus({
+        status,
+        cycle: null,
+        daemon: { ...metadata, consecutiveFailedCycles: 5, lastCycleFailureExcerpt: 'HTTP 504' },
+      })).toBe(status);
+    }
+  });
+
+  it('carries the streak all the way to the line the CLI prints', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-streak-status-'));
+    // Exactly what bin/autopilot.ts does: serviceStatus's result, rendered.
+    const status = await serviceStatus({
+      loaded: loadedFixture(dir, dir),
+      entryPath: '/dev/null',
+      inspect: async () => ({
+        classification: 'already-running',
+        metadata: {
+          ...metadata,
+          lastCycleExitCode: 1,
+          consecutiveFailedCycles: 4,
+          lastCycleFailureExcerpt: 'Error: HTTP 504 from api.github.com',
+        },
+      }),
+    });
+
+    expect(status.daemon?.consecutiveFailedCycles).toBe(4);
+    expect(`Daemon: ${renderDaemonStatus(status)}`).toBe(
+      'Daemon: running (idle; last 4 cycles failed; '
+      + 'last: Error: HTTP 504 from api.github.com)',
+    );
+  });
+
+  it('still parses and classifies a daemon record written before the streak field', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-old-record-'));
+    writeFileSync(join(dir, 'daemon.json'), `${JSON.stringify({
+      ...metadata,
+      lastCycleStartedAt: '2026-09-02T18:09:45.000Z',
+      lastCycleFinishedAt: '2026-09-02T18:12:45.000Z',
+      lastCycleExitCode: 1,
+    })}\n`, { mode: 0o600 });
+
+    const record = readDaemonMetadata(loadedFixture(dir, dir))!;
+
+    expect(record.lastCycleExitCode).toBe(1);
+    expect(record.consecutiveFailedCycles).toBeUndefined();
+    expect(record.lastCycleFailureExcerpt).toBeUndefined();
+    expect(classifyDaemonRecord(record, {
+      processAlive: true,
+      processStartedAt: metadata.processStartedAt,
+      repository: metadata.repository,
+      executableFingerprint: metadata.executableFingerprint,
+    })).toBe('already-running');
+    expect(renderDaemonStatus({ status: 'running', cycle: null, daemon: record }))
+      .toBe('running (idle)');
   });
 });
 

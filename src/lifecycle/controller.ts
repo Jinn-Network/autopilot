@@ -1410,6 +1410,17 @@ export function fullReconciliationAllowsNewClaims(
  * makes the gate pass, and the entry goes with it. Nothing else clears it, and
  * nothing about it can hold a claim back: it is read after the gate has already
  * decided, and only to describe what the gate did.
+ *
+ * SCOPE (#139): "consecutive cycles" here means consecutive cycles OF THIS
+ * ENGINE PROCESS, so this counter only ever exceeds 1 under continuous cadence.
+ * The daemon runs one `internal engine --mode active --once` child per cycle
+ * (`spawnDaemonActiveOnce`), and each such child gets a fresh runtime: on that
+ * topology every stale cycle is this counter's first, and a run of them reads
+ * as a series of unrelated single cycles. Keep it — it is the right instrument
+ * for continuous mode, and it still names the reason on any single cycle — but
+ * the live stall instrument is the daemon-side consecutive-failure counter in
+ * `src/service.ts` (`nextConsecutiveFailedCycles`), which lives in the only
+ * process that spans cycles.
  */
 const staleReconciliationCycles = new WeakMap<object, number>();
 
@@ -1956,6 +1967,16 @@ export async function runLifecycleCycle(
         events: [],
       };
     }
+    // SCOPE (#139): this branch — and therefore every counter that rides on the
+    // report it returns, including #136's `read snapshot: unavailable (for N
+    // consecutive cycle(s))` — is unreachable under `--once`, which sets
+    // `snapshotFailureMode: 'throw'` (scripts/run-autopilot-v2.ts). The live
+    // daemon runs exactly one `--once` child per cycle, so a snapshot failure
+    // there throws and there is no report for a per-cycle counter to ride on.
+    // Those counters are right for continuous cadence; the live instrument for
+    // a run of failing cycles is the daemon-side counter in src/service.ts
+    // (`nextConsecutiveFailedCycles`), which counts non-zero child exits in the
+    // only process that spans cycles.
     if (deps.snapshotFailureMode === 'report') {
       const failed = {
         status: 'failed' as const,
