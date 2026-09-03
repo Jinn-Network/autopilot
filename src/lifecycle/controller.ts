@@ -1413,6 +1413,55 @@ export function fullReconciliationAllowsNewClaims(
  */
 const staleReconciliationCycles = new WeakMap<object, number>();
 
+/**
+ * Consecutive cycles that produced no snapshot at all, counted per active
+ * runtime (#136).
+ *
+ * Every stall instrument this engine has — the stale-reconciliation line, the
+ * starved-lane line, the watchdog — sits behind a snapshot, so a cycle that
+ * never builds one trips none of them. It finishes, in about a minute, having
+ * done nothing, and `status` still reads `running`. #136 ran 46 of those
+ * overnight on one skewed timestamp, and the only evidence was a WARNING line
+ * shaped like every other WARNING line.
+ *
+ * Keyed on `deps.readSnapshot` rather than on `deps`, because the daemon builds
+ * a fresh deps object per cycle around one long-lived snapshot reader: the
+ * reader IS the runtime here, the way `deps.active` is for #130. Not persisted
+ * and not shared: a restart starts at zero, and two engines in one process
+ * never pool their cycles. The reset is the machine exit — one snapshot, and
+ * the entry goes with it. It is read only to describe a cycle that has already
+ * failed, and can hold nothing back.
+ */
+const noSnapshotCycles = new WeakMap<object, number>();
+
+/**
+ * The stall line for a run of snapshot-less cycles, or nothing.
+ *
+ * One failed read is a failed read; a run of them is a stall, and the second is
+ * the earliest cycle at which the difference is observable — the same threshold
+ * and the same event shape as #130's stale-reconciliation line, so the two read
+ * alike in the log.
+ */
+function noSnapshotStallEvents(
+  mode: AutopilotMode,
+  deps: LifecycleControllerDeps,
+  cycles: number,
+  error: unknown,
+): readonly LifecycleLogEvent[] {
+  if (cycles < 2) return [];
+  const detail = logSafeReason(error instanceof Error ? error.message : String(error));
+  return [{
+    cycleId: deps.cycleId(),
+    runnerId: deps.runnerId,
+    mode,
+    phase: 'eligible',
+    subject: 'snapshot',
+    action: 'read',
+    outcome: 'unavailable',
+    reason: `for ${cycles} consecutive cycle(s): ${detail.slice(0, LOG_REASON_HEAD_LENGTH)}`,
+  }];
+}
+
 interface ActivePassResult {
   readonly items: readonly LifecycleStatusItem[];
   readonly orphanBranchClaims: readonly LifecycleOrphanBranchClaimStatus[];
@@ -1881,7 +1930,10 @@ export async function runLifecycleCycle(
   try {
     emitPhase('read-snapshot');
     snapshot = await deps.readSnapshot(rateLimitFloor);
+    noSnapshotCycles.delete(deps.readSnapshot);
   } catch (error) {
+    const unavailableCycles = (noSnapshotCycles.get(deps.readSnapshot) ?? 0) + 1;
+    noSnapshotCycles.set(deps.readSnapshot, unavailableCycles);
     if (scopedPass !== undefined) {
       return failedAfterScopedPreDispatch(
         mode,
@@ -1915,7 +1967,7 @@ export async function runLifecycleCycle(
         items: [],
         orphanBranchClaims: [],
         diagnostics: [],
-        events: [],
+        events: noSnapshotStallEvents(mode, deps, unavailableCycles, error),
       };
       try {
         return {
