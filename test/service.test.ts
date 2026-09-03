@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -18,14 +18,18 @@ import {
   daemonActiveOnceEnvironment,
   daemonCycleStatus,
   formatCycleDuration,
+  healStartTimeFallback,
   INTERNAL_DAEMON_ACTIVE_ONCE_ENV,
+  isStartTimeFallback,
   MIN_CYCLE_WATCHDOG_MS,
   nextConsecutiveFailedCycles,
   readCycleFailureExcerpt,
   readDaemonMetadata,
   renderDaemonStatus,
+  runDaemon,
   serviceSocketPath,
   serviceStatus,
+  START_TIME_FALLBACK_HEAL_ATTEMPTS,
   startCycleWatchdog,
   startService,
   stopService,
@@ -704,4 +708,198 @@ describe('operator exit when the live daemon is only a binary drift', () => {
       'Live daemon predates the current build; run autopilot stop (or stop --force) first',
     );
   });
+});
+
+const HEALED_START_TIME = 'Wed Sep  2 23:14:53 2026';
+
+/** Mirrors `requestControl`: one connection, one message, read the answer. */
+async function sendControl(socketPath: string, message: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const connection = createConnection(socketPath);
+    let output = '';
+    connection.setEncoding('utf8');
+    connection.once('error', reject);
+    connection.on('data', (chunk: string) => { output += chunk; });
+    connection.on('end', () => resolve(output));
+    connection.end(message);
+  });
+}
+
+async function waitForRecord(
+  loaded: LoadedAutopilotConfig,
+  matches: (record: DaemonMetadata) => boolean,
+  timeoutMs = 15_000,
+): Promise<DaemonMetadata> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let record: DaemonMetadata | null = null;
+    try {
+      record = readDaemonMetadata(loaded);
+    } catch {
+      record = null;
+    }
+    if (record !== null && matches(record)) return record;
+    await new Promise<void>((resolve) => { setTimeout(resolve, 25); });
+  }
+  throw new Error('daemon record never reached the expected shape');
+}
+
+/**
+ * A daemon whose `ps` fails its first two calls (the startup read that writes
+ * the fallback, then the first cycle boundary's heal attempt) and succeeds
+ * afterwards — the exact shape of a transiently unreadable `ps`.
+ */
+function fallbackDaemonFixture(dir: string, failingCalls: number): {
+  readonly loaded: LoadedAutopilotConfig;
+  readonly entryPath: string;
+  readonly binDirectory: string;
+} {
+  const binDirectory = join(dir, 'bin');
+  mkdirSync(binDirectory, { mode: 0o700 });
+  const counter = join(dir, 'ps-calls');
+  // Shell builtins only: the daemon under test runs with a PATH holding
+  // nothing but this shim, so `cat` and friends are not on it.
+  writeFileSync(join(binDirectory, 'ps'), [
+    '#!/bin/sh',
+    'count=0',
+    `[ -f '${counter}' ] && read count < '${counter}'`,
+    'count=$((count + 1))',
+    `printf '%s\\n' "$count" > '${counter}'`,
+    `[ "$count" -le ${failingCalls} ] && exit 1`,
+    `printf '%s\\n' '${HEALED_START_TIME}'`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const entryPath = join(dir, 'engine-child.mjs');
+  writeFileSync(entryPath, 'process.exit(0);\n', { mode: 0o700 });
+  writeFileSync(join(dir, 'config.json'), '{"schemaVersion":1}\n', { mode: 0o600 });
+  return {
+    loaded: {
+      ...loadedFixture(dir, dir),
+      config: {
+        repository: { slug: metadata.repository },
+        scheduler: { pollSeconds: 1 },
+      },
+    } as unknown as LoadedAutopilotConfig,
+    entryPath,
+    binDirectory,
+  };
+}
+
+describe('the start-time fallback is transient, not permanent', () => {
+  it('treats only the record\'s own pid-<pid> string as the fallback form', () => {
+    expect(isStartTimeFallback({ pid: 36859, processStartedAt: 'pid-36859' }))
+      .toBe(true);
+    expect(isStartTimeFallback(metadata)).toBe(false);
+    // A record naming some other pid is not this record's fallback: it is
+    // malformed, and the guard must keep refusing it.
+    expect(isStartTimeFallback({ pid: 36859, processStartedAt: 'pid-999' }))
+      .toBe(false);
+    expect(isStartTimeFallback({ pid: 36859, processStartedAt: 'pid-' }))
+      .toBe(false);
+  });
+
+  it('heals the fallback at the first boundary whose ps read succeeds', async () => {
+    const readings: readonly (string | null)[] = [null, HEALED_START_TIME, null];
+    let calls = 0;
+    let record: DaemonMetadata = {
+      ...metadata,
+      pid: 36859,
+      processStartedAt: 'pid-36859',
+    };
+    let attemptsSpent = 0;
+
+    for (let boundary = 0; boundary < START_TIME_FALLBACK_HEAL_ATTEMPTS; boundary += 1) {
+      const heal = await healStartTimeFallback({
+        record,
+        attemptsSpent,
+        read: async () => {
+          const reading = readings[calls] ?? null;
+          calls += 1;
+          return reading;
+        },
+      });
+      attemptsSpent = heal.attemptsSpent;
+      if (heal.processStartedAt !== null) {
+        record = { ...record, processStartedAt: heal.processStartedAt };
+      }
+    }
+
+    expect(record.processStartedAt).toBe(HEALED_START_TIME);
+    expect(isStartTimeFallback(record)).toBe(false);
+    // Once healed the daemon stops paying for `ps` at every boundary.
+    expect(calls).toBe(2);
+    expect(record.startedAt).toBe(metadata.startedAt);
+  });
+
+  it('never touches a record that already carries a real start time', async () => {
+    let calls = 0;
+    const heal = await healStartTimeFallback({
+      record: metadata,
+      attemptsSpent: 0,
+      read: async () => { calls += 1; return HEALED_START_TIME; },
+    });
+
+    expect(heal).toEqual({ attemptsSpent: 0, processStartedAt: null });
+    expect(calls).toBe(0);
+  });
+
+  it('gives up silently after three boundaries when ps never becomes readable', async () => {
+    let calls = 0;
+    const record = { ...metadata, pid: 36859, processStartedAt: 'pid-36859' };
+    let attemptsSpent = 0;
+
+    for (let boundary = 0; boundary < 6; boundary += 1) {
+      const heal = await healStartTimeFallback({
+        record,
+        attemptsSpent,
+        read: async () => {
+          calls += 1;
+          throw new Error('spawn ps ENOENT');
+        },
+      });
+      attemptsSpent = heal.attemptsSpent;
+      expect(heal.processStartedAt).toBeNull();
+    }
+
+    expect(START_TIME_FALLBACK_HEAL_ATTEMPTS).toBe(3);
+    expect(calls).toBe(START_TIME_FALLBACK_HEAL_ATTEMPTS);
+    expect(attemptsSpent).toBe(START_TIME_FALLBACK_HEAL_ATTEMPTS);
+    expect(record.processStartedAt).toBe('pid-36859');
+  });
+
+  it('upgrades a live daemon\'s own record once ps becomes readable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-heal-daemon-'));
+    const fixture = fallbackDaemonFixture(dir, 2);
+    const previousPath = process.env.PATH;
+    process.env.PATH = fixture.binDirectory;
+    let daemon: Promise<void> | null = null;
+
+    try {
+      daemon = runDaemon({
+        loaded: fixture.loaded,
+        entryPath: fixture.entryPath,
+        environment: { PATH: fixture.binDirectory },
+      });
+      const started = await waitForRecord(fixture.loaded, () => true);
+      expect(started.processStartedAt).toBe(`pid-${process.pid}`);
+      expect(isStartTimeFallback(started)).toBe(true);
+
+      const healed = await waitForRecord(
+        fixture.loaded,
+        (record) => !isStartTimeFallback(record),
+      );
+
+      expect(healed.processStartedAt).toBe(HEALED_START_TIME);
+      expect(healed.pid).toBe(process.pid);
+      expect(healed.startedAt).toBe(started.startedAt);
+      expect(healed.socketPath).toBe(started.socketPath);
+    } finally {
+      process.env.PATH = previousPath;
+      if (daemon !== null) {
+        const record = readDaemonMetadata(fixture.loaded);
+        if (record !== null) await sendControl(record.socketPath, 'stop');
+        await daemon;
+      }
+    }
+  }, 30_000);
 });

@@ -420,6 +420,71 @@ export interface DaemonMetadata {
   readonly lastCycleFailureExcerpt?: string;
 }
 
+/**
+ * The start time a daemon records when `ps lstart` cannot be read at start
+ * (jinn-autopilot#140). It is deliberately a form no real `ps` reading can
+ * equal, so a record still carrying it is unproven — but it must be *transient*
+ * (`healStartTimeFallback`) rather than the permanent dead end #95 documented.
+ */
+export function startTimeFallback(pid: number): string {
+  return `pid-${pid}`;
+}
+
+export function isStartTimeFallback(
+  record: Pick<DaemonMetadata, 'pid' | 'processStartedAt'>,
+): boolean {
+  return record.processStartedAt === startTimeFallback(record.pid);
+}
+
+/**
+ * How many cycle boundaries a daemon spends trying to replace its own fallback
+ * with a real `ps` reading. Bounded because a host where `ps` is unreadable at
+ * start is usually a host where it stays unreadable, and an unbounded retry
+ * would pay for a process spawn on every cycle forever; three boundaries is
+ * enough for the transient causes (a fork that hit a momentary resource limit,
+ * a PATH a login shell had not finished exporting).
+ */
+export const START_TIME_FALLBACK_HEAL_ATTEMPTS = 3;
+
+/**
+ * One cycle boundary's attempt to upgrade the fallback in `record`. Returns the
+ * real start time to persist, or null when there is nothing to write — the
+ * record already carries a real reading, the attempts are spent, or this read
+ * failed. Failure is silent by construction: an unhealed record is exactly as
+ * safe as it was before, and #140's second remedy (control-socket identity)
+ * gives the operator an exit either way.
+ */
+export async function healStartTimeFallback(input: {
+  readonly record: Pick<DaemonMetadata, 'pid' | 'processStartedAt'>;
+  readonly attemptsSpent: number;
+  readonly read: (pid: number) => Promise<string | null>;
+}): Promise<{
+  readonly attemptsSpent: number;
+  readonly processStartedAt: string | null;
+}> {
+  if (
+    !isStartTimeFallback(input.record)
+    || input.attemptsSpent >= START_TIME_FALLBACK_HEAL_ATTEMPTS
+  ) {
+    return { attemptsSpent: input.attemptsSpent, processStartedAt: null };
+  }
+  let reading: string | null = null;
+  try {
+    reading = await input.read(input.record.pid);
+  } catch {
+    reading = null;
+  }
+  return {
+    attemptsSpent: input.attemptsSpent + 1,
+    processStartedAt: reading === null || isStartTimeFallback({
+      pid: input.record.pid,
+      processStartedAt: reading,
+    })
+      ? null
+      : reading,
+  };
+}
+
 export type DaemonClassification =
   | 'already-running'
   | 'stale'
@@ -777,17 +842,21 @@ export async function runDaemon(input: {
   // start (#139): a daemon that has just started has failed no cycles, so a
   // restart is the operator-visible reset.
   let consecutiveFailedCycles = 0;
+  // Daemon-process-local (#140): boundaries spent trying to replace a
+  // start-time fallback with a real `ps` reading.
+  let startTimeHealAttempts = 0;
   let stopping = false;
   let wake: (() => void) | undefined;
   let metadata: DaemonMetadata = {
     schemaVersion: 1,
     pid: process.pid,
-    // Deliberately not "fixed": when `ps` is unavailable this fallback can
-    // never match a later real `ps` reading, so such a record legitimately
-    // classifies as unsafe rather than drift or already-running — that is
-    // the correct, conservative outcome for an unverifiable start time.
+    // A start time that could not be read is recorded in a form no real `ps`
+    // reading can equal, so the record stays conservative — unsafe rather than
+    // drift or already-running. It is no longer permanent (#140): the first
+    // cycle boundaries re-read `ps` and upgrade it, and until one succeeds the
+    // control socket is the second identity channel `stopService` asks.
     processStartedAt: (await processStartedAt(process.pid))
-      ?? `pid-${process.pid}`,
+      ?? startTimeFallback(process.pid),
     startedAt: new Date().toISOString(),
     repository: input.loaded.config.repository.slug,
     executableFingerprint: executableFingerprint(input.entryPath),
@@ -845,6 +914,21 @@ export async function runDaemon(input: {
           continue;
         }
         break;
+      }
+
+      // #140: a record written with the start-time fallback is unprovable by
+      // `ps`, so the first boundaries re-read it and rewrite the field the
+      // moment `ps` answers. Bounded and silent — see `healStartTimeFallback`.
+      const heal = await healStartTimeFallback({
+        record: metadata,
+        attemptsSpent: startTimeHealAttempts,
+        read: processStartedAt,
+      });
+      startTimeHealAttempts = heal.attemptsSpent;
+      if (heal.processStartedAt !== null) {
+        metadata = updateMetadata(input.loaded, metadata, {
+          processStartedAt: heal.processStartedAt,
+        });
       }
 
       // Nothing from the previous cycle's child may survive into this one:
