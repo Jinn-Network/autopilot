@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +19,7 @@ import {
   daemonCycleStatus,
   formatCycleDuration,
   healStartTimeFallback,
+  inspectDaemon,
   INTERNAL_DAEMON_ACTIVE_ONCE_ENV,
   isStartTimeFallback,
   MIN_CYCLE_WATCHDOG_MS,
@@ -753,6 +754,7 @@ function fallbackDaemonFixture(dir: string, failingCalls: number): {
   readonly loaded: LoadedAutopilotConfig;
   readonly entryPath: string;
   readonly binDirectory: string;
+  readonly psCallsPath: string;
 } {
   const binDirectory = join(dir, 'bin');
   mkdirSync(binDirectory, { mode: 0o700 });
@@ -782,6 +784,7 @@ function fallbackDaemonFixture(dir: string, failingCalls: number): {
     } as unknown as LoadedAutopilotConfig,
     entryPath,
     binDirectory,
+    psCallsPath: counter,
   };
 }
 
@@ -893,6 +896,441 @@ describe('the start-time fallback is transient, not permanent', () => {
       expect(healed.pid).toBe(process.pid);
       expect(healed.startedAt).toBe(started.startedAt);
       expect(healed.socketPath).toBe(started.socketPath);
+    } finally {
+      process.env.PATH = previousPath;
+      if (daemon !== null) {
+        const record = readDaemonMetadata(fixture.loaded);
+        if (record !== null) await sendControl(record.socketPath, 'stop');
+        await daemon;
+      }
+    }
+  }, 30_000);
+});
+
+const fallbackRecord: DaemonMetadata = {
+  ...metadata,
+  processStartedAt: `pid-${metadata.pid}`,
+};
+
+/** The answer a live daemon gives an `identity` control request. */
+function identityAnswer(
+  overrides: Record<string, unknown> = {},
+  record: DaemonMetadata = fallbackRecord,
+): string {
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    pid: record.pid,
+    startedAt: record.startedAt,
+    repository: record.repository,
+    executableFingerprint: record.executableFingerprint,
+    ...overrides,
+  })}\n`;
+}
+
+async function controlSocketStub(
+  socketPath: string,
+  answers: Record<string, string | null>,
+): Promise<{
+  readonly received: string[];
+  readonly close: () => void;
+}> {
+  const received: string[] = [];
+  const server = createServer((connection) => {
+    let message = '';
+    connection.setEncoding('utf8');
+    connection.on('data', (chunk: string) => { message += chunk; });
+    connection.on('end', () => {
+      const request = message.trim();
+      received.push(request);
+      // A null answer is the silent daemon: the socket closes saying nothing.
+      const answer = answers[request];
+      if (answer == null) connection.end();
+      else connection.end(answer);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, () => resolve());
+  });
+  return { received, close: () => server.close() };
+}
+
+function spawnLiveProcess(): {
+  readonly child: ReturnType<typeof spawn>;
+  readonly exited: Promise<boolean>;
+} {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  return {
+    child,
+    exited: new Promise<boolean>((resolve) => {
+      child.once('exit', () => resolve(true));
+    }),
+  };
+}
+
+async function exitedWithin(exited: Promise<boolean>, ms: number): Promise<boolean> {
+  return Promise.race([
+    exited,
+    new Promise<boolean>((resolve) => { setTimeout(() => resolve(false), ms); }),
+  ]);
+}
+
+describe('control-socket identity is the fallback record\'s second channel', () => {
+  it('lets a plain stop proceed when the socket answers the record\'s identity', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-stop-'));
+    const socketPath = join(dir, 'control.sock');
+    const stub = await controlSocketStub(socketPath, {
+      identity: identityAnswer(),
+      stop: 'stopping\n',
+    });
+
+    try {
+      const result = await stopService({
+        loaded: loadedFixture(dir, dir),
+        entryPath: '/dev/null',
+        force: false,
+        inspect: async () => ({
+          classification: 'unsafe-live-mismatch',
+          metadata: { ...fallbackRecord, socketPath },
+          startTimeFallback: true,
+        }),
+      });
+
+      expect(result).toEqual({ status: 'stopping' });
+      expect(stub.received).toEqual(['identity', 'stop']);
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('lets --force signal a fallback-record daemon the socket confirms', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-force-'));
+    const socketPath = join(dir, 'control.sock');
+    const live = spawnLiveProcess();
+    const record: DaemonMetadata = {
+      ...fallbackRecord,
+      pid: live.child.pid!,
+      processStartedAt: `pid-${live.child.pid!}`,
+      socketPath,
+    };
+    const stub = await controlSocketStub(socketPath, {
+      identity: identityAnswer({ pid: record.pid }, record),
+    });
+
+    try {
+      const result = await stopService({
+        loaded: loadedFixture(dir, dir),
+        entryPath: '/dev/null',
+        force: true,
+        inspect: async () => ({
+          classification: 'unsafe-live-mismatch',
+          metadata: record,
+          startTimeFallback: true,
+        }),
+      });
+
+      expect(result).toEqual({ status: 'forced' });
+      expect(stub.received).toEqual(['identity']);
+      await expect(exitedWithin(live.exited, 2_000)).resolves.toBe(true);
+    } finally {
+      stub.close();
+      live.child.kill('SIGKILL');
+    }
+  });
+
+  it('still refuses a pid whose socket answers a different start time', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-reuse-'));
+    const socketPath = join(dir, 'control.sock');
+    const live = spawnLiveProcess();
+    const record: DaemonMetadata = {
+      ...fallbackRecord,
+      pid: live.child.pid!,
+      processStartedAt: `pid-${live.child.pid!}`,
+      socketPath,
+    };
+    // The pid-reuse shape: the recorded pid is alive and something is
+    // listening, but it started at a different time — a different process.
+    const stub = await controlSocketStub(socketPath, {
+      identity: identityAnswer(
+        { pid: record.pid, startedAt: '2026-09-03T06:00:00.000Z' },
+        record,
+      ),
+    });
+    const inspect = async () => ({
+      classification: 'unsafe-live-mismatch' as const,
+      metadata: record,
+      startTimeFallback: true,
+    });
+
+    try {
+      const loaded = loadedFixture(dir, dir);
+      await expect(stopService({
+        loaded, entryPath: '/dev/null', force: false, inspect,
+      })).rejects.toThrow(
+        'Refusing to signal a live PID whose daemon identity does not match',
+      );
+      await expect(stopService({
+        loaded, entryPath: '/dev/null', force: true, inspect,
+      })).rejects.toThrow(
+        'Refusing to signal a live PID whose daemon identity does not match',
+      );
+
+      expect(await exitedWithin(live.exited, 250)).toBe(false);
+    } finally {
+      stub.close();
+      live.child.kill('SIGKILL');
+    }
+  });
+
+  it('still refuses when the socket answers for a different repository', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-repository-'));
+    const socketPath = join(dir, 'control.sock');
+    const stub = await controlSocketStub(socketPath, {
+      identity: identityAnswer({ repository: 'Octo-Labs/other' }),
+    });
+
+    try {
+      await expect(stopService({
+        loaded: loadedFixture(dir, dir),
+        entryPath: '/dev/null',
+        force: false,
+        inspect: async () => ({
+          classification: 'unsafe-live-mismatch',
+          metadata: { ...fallbackRecord, socketPath },
+          startTimeFallback: true,
+        }),
+      })).rejects.toThrow(
+        'Refusing to signal a live PID whose daemon identity does not match',
+      );
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('fails closed on a silent, malformed or missing control socket', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-closed-'));
+    const answers: readonly (string | null)[] = [
+      null,
+      'unknown command\n',
+      '{"schemaVersion":1,"pid":4242}\n',
+      'not json at all\n',
+      identityAnswer({ schemaVersion: 2 }),
+    ];
+
+    for (const [index, answer] of answers.entries()) {
+      const socketPath = join(dir, `control-${index}.sock`);
+      const stub = await controlSocketStub(socketPath, { identity: answer });
+      try {
+        await expect(stopService({
+          loaded: loadedFixture(dir, dir),
+          entryPath: '/dev/null',
+          force: true,
+          inspect: async () => ({
+            classification: 'unsafe-live-mismatch',
+            metadata: { ...fallbackRecord, socketPath },
+            startTimeFallback: true,
+          }),
+        })).rejects.toThrow(
+          'Refusing to signal a live PID whose daemon identity does not match',
+        );
+      } finally {
+        stub.close();
+      }
+    }
+
+    // No socket at all — the daemon died, or never listened.
+    await expect(stopService({
+      loaded: loadedFixture(dir, dir),
+      entryPath: '/dev/null',
+      force: true,
+      inspect: async () => ({
+        classification: 'unsafe-live-mismatch',
+        metadata: { ...fallbackRecord, socketPath: join(dir, 'absent.sock') },
+        startTimeFallback: true,
+      }),
+    })).rejects.toThrow(
+      'Refusing to signal a live PID whose daemon identity does not match',
+    );
+  });
+
+  it('never asks the socket about a genuine identity mismatch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-genuine-'));
+    const socketPath = join(dir, 'control.sock');
+    // A socket that would confirm anything: the record still carries a real
+    // `ps` reading that did not match, so the guard must not even ask.
+    const stub = await controlSocketStub(socketPath, {
+      identity: identityAnswer({}, metadata),
+      stop: 'stopping\n',
+    });
+
+    try {
+      await expect(stopService({
+        loaded: loadedFixture(dir, dir),
+        entryPath: '/dev/null',
+        force: false,
+        inspect: async () => ({
+          classification: 'unsafe-live-mismatch',
+          metadata: { ...metadata, socketPath },
+        }),
+      })).rejects.toThrow(
+        'Refusing to signal a live PID whose daemon identity does not match',
+      );
+
+      expect(stub.received).toEqual([]);
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('refuses to replace a live daemon the control socket verifies', async () => {
+    const serviceDir = mkdtempSync(join(tmpdir(), 'autopilot-identity-start-'));
+    const logsDir = mkdtempSync(join(tmpdir(), 'autopilot-identity-start-logs-'));
+    const socketPath = join(serviceDir, 'control.sock');
+    const stub = await controlSocketStub(socketPath, {
+      identity: identityAnswer(),
+    });
+    const start = (startTimeFallback: boolean) => startService({
+      loaded: loadedFixture(serviceDir, logsDir),
+      entryPath: '/dev/null',
+      foreground: false,
+      doctor: async () => ({ schemaVersion: 1, blocking: false, checks: [] }),
+      inspect: async () => ({
+        classification: 'unsafe-live-mismatch',
+        metadata: { ...fallbackRecord, socketPath },
+        startTimeFallback,
+      }),
+    });
+
+    try {
+      await expect(start(true)).rejects.toThrow(
+        'Live daemon verified through its control socket; '
+        + 'run autopilot stop (or stop --force) first',
+      );
+      await expect(start(false)).rejects.toThrow(
+        'Recorded daemon PID is live but its identity does not match; '
+        + 'refusing replacement',
+      );
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('marks only a solely-fallback record as socket-verifiable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-inspect-'));
+    const entryPath = join(dir, 'entry.mjs');
+    writeFileSync(entryPath, 'export default 1;\n', { mode: 0o600 });
+    const live = spawnLiveProcess();
+    const loaded = loadedFixture(dir, dir);
+    const inspectWith = async (record: Partial<DaemonMetadata>) => {
+      writeFileSync(join(dir, 'daemon.json'), `${JSON.stringify({
+        ...fallbackRecord,
+        pid: live.child.pid!,
+        processStartedAt: `pid-${live.child.pid!}`,
+        ...record,
+      })}\n`, { mode: 0o600 });
+      return inspectDaemon({ loaded, entryPath });
+    };
+
+    try {
+      const fallback = await inspectWith({});
+      expect(fallback.classification).toBe('unsafe-live-mismatch');
+      expect(fallback.startTimeFallback).toBe(true);
+
+      // A record carrying a real (but wrong) reading is the pid-reuse case the
+      // guard exists for, and a fallback for a different repository is not
+      // "solely" the fallback either.
+      const genuine = await inspectWith({
+        processStartedAt: 'Thu Jul 23 23:00:00 2026',
+      });
+      expect(genuine.classification).toBe('unsafe-live-mismatch');
+      expect(genuine.startTimeFallback).toBe(false);
+
+      const foreign = await inspectWith({ repository: 'Octo-Labs/other' });
+      expect(foreign.classification).toBe('unsafe-live-mismatch');
+      expect(foreign.startTimeFallback).toBe(false);
+    } finally {
+      live.child.kill('SIGKILL');
+    }
+  });
+
+  it('tells the operator the record is unverifiable instead of just "unsafe"', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-status-'));
+    const loaded = loadedFixture(dir, dir);
+
+    const unverifiable = await serviceStatus({
+      loaded,
+      entryPath: '/dev/null',
+      inspect: async () => ({
+        classification: 'unsafe-live-mismatch',
+        metadata: fallbackRecord,
+        startTimeFallback: true,
+      }),
+    });
+
+    expect(unverifiable.status).toBe('unverifiable-fallback');
+    expect(unverifiable.daemon).toEqual(fallbackRecord);
+    expect(`Daemon: ${renderDaemonStatus(unverifiable)}`).toBe(
+      'Daemon: running but unverifiable (start-time fallback in record; '
+      + 'stop will verify via the control socket)',
+    );
+
+    // Every other verdict keeps the byte it printed before.
+    const unsafe = await serviceStatus({
+      loaded,
+      entryPath: '/dev/null',
+      inspect: async () => ({
+        classification: 'unsafe-live-mismatch',
+        metadata,
+      }),
+    });
+
+    expect(unsafe.status).toBe('unsafe');
+    expect(renderDaemonStatus(unsafe)).toBe('unsafe');
+  });
+
+  it('answers identity from a live daemon that never healed its record', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-identity-daemon-'));
+    const fixture = fallbackDaemonFixture(dir, 99);
+    const previousPath = process.env.PATH;
+    process.env.PATH = fixture.binDirectory;
+    let daemon: Promise<void> | null = null;
+
+    try {
+      daemon = runDaemon({
+        loaded: fixture.loaded,
+        entryPath: fixture.entryPath,
+        environment: { PATH: fixture.binDirectory },
+      });
+      const record = await waitForRecord(fixture.loaded, () => true);
+      expect(isStartTimeFallback(record)).toBe(true);
+
+      const answer = await sendControl(record.socketPath, 'identity');
+
+      expect(JSON.parse(answer)).toEqual({
+        schemaVersion: 1,
+        pid: record.pid,
+        startedAt: record.startedAt,
+        repository: record.repository,
+        executableFingerprint: record.executableFingerprint,
+      });
+      expect(await sendControl(record.socketPath, 'wat')).toBe('unknown command\n');
+
+      // Past the third boundary the daemon stops re-reading `ps` and keeps
+      // running with the fallback: bounded, silent, still answering identity.
+      await waitForRecord(
+        fixture.loaded,
+        (current) => Date.parse(current.lastCycleStartedAt ?? '')
+          > Date.parse(record.startedAt) + 3_000,
+      );
+      const unhealed = readDaemonMetadata(fixture.loaded)!;
+
+      expect(isStartTimeFallback(unhealed)).toBe(true);
+      expect(readFileSync(fixture.psCallsPath, 'utf8').trim())
+        .toBe(String(1 + START_TIME_FALLBACK_HEAL_ATTEMPTS));
+      expect(JSON.parse(await sendControl(record.socketPath, 'identity')))
+        .toMatchObject({ pid: record.pid, startedAt: record.startedAt });
     } finally {
       process.env.PATH = previousPath;
       if (daemon !== null) {

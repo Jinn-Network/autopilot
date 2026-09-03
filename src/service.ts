@@ -382,6 +382,13 @@ export function renderDaemonStatus(input: {
   /** The daemon record, read only for its additive failure-streak fields. */
   readonly daemon?: Partial<DaemonMetadata> | null;
 }): string {
+  // #140: the one verdict whose bare name would mislead — the daemon IS
+  // running; only the record's start time is unprovable, and `stop` knows how
+  // to prove it.
+  if (input.status === 'unverifiable-fallback') {
+    return 'running but unverifiable (start-time fallback in record; '
+      + 'stop will verify via the control socket)';
+  }
   if (input.status !== 'running') return input.status;
   const streak = failureStreakClause(input.daemon ?? null);
   const cycle = input.cycle ?? null;
@@ -677,17 +684,30 @@ export async function inspectDaemon(input: {
 }): Promise<{
   readonly classification: DaemonClassification | 'not-running';
   readonly metadata: DaemonMetadata | null;
+  /**
+   * Additive (#140): true when the verdict is `unsafe-live-mismatch` and the
+   * ONLY reason is that the record carries the start-time fallback — the
+   * repository still matches, so the sole missing proof is the one `ps` could
+   * not give. Optional so an old caller (and every test seam that predates
+   * #140) reads as false, which refuses exactly as before.
+   */
+  readonly startTimeFallback?: boolean;
 }> {
   const metadata = readDaemonMetadata(input.loaded);
   if (metadata == null) return { classification: 'not-running', metadata: null };
+  const repository = input.loaded.config.repository.slug;
+  const classification = classifyDaemonRecord(metadata, {
+    processAlive: processAlive(metadata.pid),
+    processStartedAt: await processStartedAt(metadata.pid),
+    repository,
+    executableFingerprint: executableFingerprint(input.entryPath),
+  });
   return {
-    classification: classifyDaemonRecord(metadata, {
-      processAlive: processAlive(metadata.pid),
-      processStartedAt: await processStartedAt(metadata.pid),
-      repository: input.loaded.config.repository.slug,
-      executableFingerprint: executableFingerprint(input.entryPath),
-    }),
+    classification,
     metadata,
+    startTimeFallback: classification === 'unsafe-live-mismatch'
+      && isStartTimeFallback(metadata)
+      && metadata.repository === repository,
   };
 }
 
@@ -752,6 +772,18 @@ export async function startService(input: {
     );
   }
   if (inspected.classification === 'unsafe-live-mismatch') {
+    // #140: a live daemon whose record only lacks a `ps`-provable start time
+    // is still a live daemon — proving it through the control socket must
+    // refuse the double start, not authorise it.
+    if (
+      inspected.startTimeFallback === true
+      && await identityVerifiedThroughControlSocket(inspected.metadata!)
+    ) {
+      throw new Error(
+        'Live daemon verified through its control socket; '
+        + 'run autopilot stop (or stop --force) first',
+      );
+    }
     throw new Error(
       'Recorded daemon PID is live but its identity does not match; refusing replacement',
     );
@@ -798,6 +830,17 @@ export async function startService(input: {
           return { status: 'started', pid: child.pid };
         }
         if (inspectedAfterStart.classification === 'unsafe-live-mismatch') {
+          // #140: on a host where `ps` is unreadable the daemon we just
+          // spawned writes the start-time fallback. It is still the process we
+          // spawned — the record names our child's pid and its own socket
+          // answers for it — so this is readiness, not a foreign pid.
+          if (
+            inspectedAfterStart.startTimeFallback === true
+            && inspectedAfterStart.metadata!.pid === child.pid
+            && await identityVerifiedThroughControlSocket(inspectedAfterStart.metadata!)
+          ) {
+            return { status: 'started', pid: child.pid };
+          }
           throw new Error('new daemon wrote unverifiable process metadata');
         }
       }
@@ -867,18 +910,31 @@ export async function runDaemon(input: {
 
   const server = createServer((connection) => {
     let message = '';
+    let answered = false;
     connection.setEncoding('utf8');
-    connection.on('data', (chunk: string) => {
-      message += chunk;
-      if (message.trim() === 'stop') {
+    const answer = (request: string): boolean => {
+      if (request === 'stop') {
         stopping = true;
         metadata = updateMetadata(input.loaded, metadata, { state: 'stopping' });
         wake?.();
         connection.end('stopping\n');
+        return true;
       }
+      // #140: answered from this process's own memory, so it is proof of who
+      // is listening — the identity `ps` could not give when the record was
+      // written with the start-time fallback.
+      if (request === IDENTITY_CONTROL_REQUEST) {
+        connection.end(`${JSON.stringify(daemonIdentity(metadata))}\n`);
+        return true;
+      }
+      return false;
+    };
+    connection.on('data', (chunk: string) => {
+      message += chunk;
+      if (!answered) answered = answer(message.trim());
     });
     connection.on('end', () => {
-      if (message.trim() !== 'stop') connection.end('unknown command\n');
+      if (!answered) connection.end('unknown command\n');
     });
   });
   const requestStop = (): void => {
@@ -1015,6 +1071,96 @@ export async function runDaemon(input: {
   }
 }
 
+/**
+ * The `identity` control request (#140): the second identity channel, used
+ * when the record's start time is the unprovable fallback. A live daemon
+ * answers from its own memory, so an answer carrying the record's pid, start
+ * time and repository proves the listener IS the process the record describes
+ * — a reused pid cannot forge it, because it would have to be listening on
+ * this repository's socket AND know a start time it never had.
+ */
+const IDENTITY_CONTROL_REQUEST = 'identity';
+
+export interface DaemonIdentity {
+  readonly schemaVersion: 1;
+  readonly pid: number;
+  readonly startedAt: string;
+  readonly repository: string;
+  readonly executableFingerprint: string;
+}
+
+function daemonIdentity(metadata: DaemonMetadata): DaemonIdentity {
+  return {
+    schemaVersion: 1,
+    pid: metadata.pid,
+    startedAt: metadata.startedAt,
+    repository: metadata.repository,
+    executableFingerprint: metadata.executableFingerprint,
+  };
+}
+
+/** Fail-closed: anything but a complete, well-typed answer reads as null. */
+function parseDaemonIdentity(answer: string): DaemonIdentity | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(answer);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const identity = parsed as Partial<DaemonIdentity>;
+  if (
+    identity.schemaVersion !== 1
+    || typeof identity.pid !== 'number'
+    || !Number.isSafeInteger(identity.pid)
+    || typeof identity.startedAt !== 'string'
+    || typeof identity.repository !== 'string'
+    || typeof identity.executableFingerprint !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    pid: identity.pid,
+    startedAt: identity.startedAt,
+    repository: identity.repository,
+    executableFingerprint: identity.executableFingerprint,
+  };
+}
+
+/**
+ * Deliberately silent about `executableFingerprint`: a rebuilt dist under a
+ * still-running daemon is `binary-drift`, an operator case this path must keep
+ * serving (#95). Identity is pid + start time + repository, exactly as it is
+ * for a record `ps` could prove.
+ */
+function daemonIdentityMatches(
+  record: DaemonMetadata,
+  identity: DaemonIdentity | null,
+): boolean {
+  return identity !== null
+    && identity.pid === record.pid
+    && identity.startedAt === record.startedAt
+    && identity.repository === record.repository;
+}
+
+/**
+ * Ask the recorded socket who is listening. Every failure — no socket, no
+ * answer, a malformed answer, a different daemon — is false, so the guard
+ * refuses exactly as it did before #140.
+ */
+async function identityVerifiedThroughControlSocket(
+  record: DaemonMetadata,
+): Promise<boolean> {
+  let answer: string;
+  try {
+    answer = await requestControl(record.socketPath, IDENTITY_CONTROL_REQUEST);
+  } catch {
+    return false;
+  }
+  return daemonIdentityMatches(record, parseDaemonIdentity(answer));
+}
+
 async function requestControl(socket: string, message: string): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
     const connection = createConnection(socket);
@@ -1045,12 +1191,23 @@ export async function stopService(input: {
     return { status: 'not-running' };
   }
   if (inspected.classification === 'unsafe-live-mismatch') {
-    throw new Error('Refusing to signal a live PID whose daemon identity does not match');
+    // #140: `ps` is not the only way to prove identity. When the record's
+    // start time is the fallback — and nothing else about the record differs —
+    // ask the recorded socket who is listening. A daemon answering with this
+    // record's own pid, start time and repository is proven, and stopping it
+    // is exactly as safe as the 'binary-drift' path below. Every other
+    // mismatch, and every silent or malformed socket, still refuses.
+    const verified = inspected.startTimeFallback === true
+      && await identityVerifiedThroughControlSocket(inspected.metadata!);
+    if (!verified) {
+      throw new Error('Refusing to signal a live PID whose daemon identity does not match');
+    }
   }
   // 'already-running' and 'binary-drift' both carry a proven process
-  // identity (processStartedAt + repository matched); only the on-disk
+  // identity (processStartedAt + repository matched), and a fallback record
+  // that reaches here was proven by the socket instead; only the on-disk
   // binary may have drifted, and the recorded socket/pid are independent of
-  // that binary, so a plain stop or --force kill is safe on either verdict.
+  // that binary, so a plain stop or --force kill is safe on all three.
   const metadata = inspected.metadata!;
   if (input.force) {
     process.kill(metadata.pid, 'SIGKILL');
@@ -1067,7 +1224,8 @@ export async function serviceStatus(input: {
   // (with its real ps/fingerprint reads) is always used outside tests.
   readonly inspect?: typeof inspectDaemon;
 }): Promise<{
-  readonly status: 'not-running' | 'running' | 'stale' | 'stale-binary' | 'unsafe';
+  readonly status: 'not-running' | 'running' | 'stale' | 'stale-binary'
+    | 'unsafe' | 'unverifiable-fallback';
   readonly daemon?: DaemonMetadata;
   /** Additive (#132): the in-flight cycle's age and current step, if any. */
   readonly cycle?: DaemonCycleStatus | null;
@@ -1083,8 +1241,16 @@ export async function serviceStatus(input: {
     // still live but running last build's binary — apart from "unsafe pid".
     case 'binary-drift':
       return { status: 'stale-binary', daemon: inspected.metadata! };
+    // Distinct from 'unsafe' too (#140): the daemon is running and the record
+    // simply cannot prove which process it is by start time. `stop` has a
+    // second channel for exactly this record, so the operator is not stuck.
     case 'unsafe-live-mismatch':
-      return { status: 'unsafe', daemon: inspected.metadata! };
+      return {
+        status: inspected.startTimeFallback === true
+          ? 'unverifiable-fallback'
+          : 'unsafe',
+        daemon: inspected.metadata!,
+      };
     case 'already-running':
       return {
         status: 'running',
