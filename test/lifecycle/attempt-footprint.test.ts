@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   decodeAttemptManifest,
   listHostAttemptFootprints,
+  listHostLiveAttempts,
   markAttemptExited,
   measureWorktreeBytes,
   readAttemptManifest,
@@ -203,6 +204,43 @@ describe('attempt worktree footprint', () => {
       { phase: 'implement', worktreeBytes: 1000, endedAtMs: Date.parse('2026-09-03T09:00:00.000Z') },
       { phase: 'implement', worktreeBytes: 2000, endedAtMs: Date.parse('2026-09-03T11:00:00.000Z') },
     ]);
+  });
+
+  it('lists every live attempt on this host, whichever runner owns it', () => {
+    const v2Base = join(root, 'v2');
+    const write = (
+      runnerId: string,
+      name: string,
+      overrides: Record<string, unknown>,
+    ): void => {
+      const attemptDir = join(v2Base, runnerId, 'implement', name);
+      mkdirSync(attemptDir, { recursive: true });
+      writeFileSync(
+        join(attemptDir, 'manifest.json'),
+        JSON.stringify(manifestFixture(root, { runnerId, ...overrides })),
+      );
+    };
+    write('runner-1', 'issue-7-a', { processState: 'preparing', pid: null });
+    // Another runner, same disk: its worktree costs this host exactly as much.
+    write('runner-2', 'issue-7-b', { processState: 'preparing', pid: null });
+    write('runner-1', 'issue-7-c', {
+      host: 'host-2',
+      processState: 'preparing',
+      pid: null,
+    });
+    write('runner-1', 'issue-7-d', {
+      processState: 'exited',
+      pid: 4242,
+      timestamps: {
+        createdAt: '2026-09-03T10:00:00.000Z',
+        updatedAt: '2026-09-03T10:05:00.000Z',
+        childStartedAt: '2026-09-03T10:00:00.000Z',
+        childExitedAt: '2026-09-03T10:05:00.000Z',
+      },
+    });
+    const live = listHostLiveAttempts(v2Base, 'host-1', () => false);
+    expect(live.map((manifest) => manifest.runnerId).sort())
+      .toEqual(['runner-1', 'runner-2']);
   });
 
   it('keeps a decoded manifest assignable to the interface', () => {

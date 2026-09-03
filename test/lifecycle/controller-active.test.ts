@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   matchesOnlyIssuesAllowlist,
+  renderLifecycleHuman,
   runLifecycleCycle,
   type LifecycleControllerDeps,
 } from '../../src/lifecycle/controller.js';
@@ -1735,5 +1736,58 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       actionable: 1,
     });
     expect(report.backlog.ordinaryByPriority.p2).toBe(1);
+  });
+  describe('disk headroom (#144)', () => {
+    const headroom = {
+      paused: true,
+      free: 12 * 1024 ** 3,
+      reserved: 19.5 * 1024 ** 3,
+      floor: 8 * 1024 ** 3,
+      settling: 3,
+    };
+
+    it('names the projection in the disk-floor skip it caused', async () => {
+      const controller = deps();
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 0, child: 0, review: 0 },
+        newWorkPaused: true,
+        diskHeadroom: headroom,
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.events).toContainEqual(expect.objectContaining({
+        subject: 'issue:42',
+        outcome: 'skipped',
+        reason: 'disk-floor (free 12.0G \u2212 reserved 19.5G for 3 settling '
+          + 'attempts < floor 8G)',
+      }));
+    });
+
+    it('reports one disk line per cycle even when the governor is not biting', async () => {
+      const controller = deps();
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 1, child: 1, review: 1 },
+        newWorkPaused: false,
+        diskHeadroom: { ...headroom, paused: false, reserved: 0, settling: 0 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.disk).toEqual({ ...headroom, paused: false, reserved: 0, settling: 0 });
+      expect(renderLifecycleHuman(report))
+        .toContain('disk: free=12.0G reserved=0.0G floor=8G settling=0');
+    });
+
+    it('omits the disk line entirely when no projection was computed', async () => {
+      const report = await runLifecycleCycle('active', deps());
+
+      expect(report.disk).toBeUndefined();
+      expect(renderLifecycleHuman(report)).not.toContain('disk: free=');
+    });
   });
 });

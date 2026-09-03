@@ -5,9 +5,12 @@ import {
   makeActiveRuntime,
 } from '../../src/lifecycle/active-runtime.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
+import { projectDiskHeadroom } from '../../src/lifecycle/disk-headroom.js';
 import { gitOid } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
+const GB = 1024 ** 3;
+const NOW = Date.parse('2026-09-03T10:00:00.000Z');
 
 function pool(): CredentialPool {
   return new CredentialPool([
@@ -427,5 +430,175 @@ describe('active runtime boundary', () => {
       outcome: 'skipped',
       reason: 'action update-branch is not wired',
     });
+  });
+  it('reserves each spawn against the same cycle\u2019s later spawns', async () => {
+    const seen: (readonly string[])[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => {
+        seen.push([...pendingSpawns]);
+        return projectDiskHeadroom({
+          free: 12 * GB,
+          floor: 8 * GB,
+          liveAttempts: [],
+          pendingSpawns,
+          history: [],
+          defaults: { implement: 8 * GB, review: 1 * GB },
+          nowMs: NOW,
+        });
+      },
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const claim = (issueNumber: number) => ({
+      kind: 'claim-implementation' as const,
+      intent: 'fresh' as const,
+      issueNumber,
+    });
+
+    await expect(runtime.executeAction(claim(1), {} as never))
+      .resolves.toEqual({ outcome: 'spawned' });
+    // Twelve gigabytes free, an eight-gigabyte floor, and eight already spoken
+    // for: the second slot is open but the disk it would need is not.
+    await expect(runtime.executeAction(claim(2), {} as never)).resolves.toEqual({
+      outcome: 'skipped',
+      reason: 'disk-floor (free 12.0G \u2212 reserved 8.0G for 1 settling attempt '
+        + '< floor 8G)',
+    });
+    // One projection per dispatch, and the second one sees the first's charge.
+    expect(seen).toEqual([[], ['implement']]);
+  });
+
+  it('reserves a review spawn its own smaller footprint', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 10 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const claim = (prNumber: number) => ({
+      kind: 'claim-review' as const,
+      issueNumber: prNumber - 40,
+      prNumber,
+      head: HEAD,
+    });
+
+    await expect(runtime.executeAction(claim(84), {} as never))
+      .resolves.toEqual({ outcome: 'spawned' });
+    // One gigabyte reserved, not eight, so a second review still fits.
+    await expect(runtime.executeAction(claim(85), {} as never))
+      .resolves.toEqual({ outcome: 'spawned' });
+    expect(runtime.readLocalState().diskHeadroom).toMatchObject({
+      paused: false,
+      reserved: 2 * GB,
+      settling: 2,
+    });
+  });
+
+  it('forgets the previous cycle\u2019s spawns when the next one preflights', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 12 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const claim = { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 };
+
+    await runtime.executeAction(claim as never, {} as never);
+    expect(runtime.readLocalState().newWorkPaused).toBe(true);
+    await runtime.preflight();
+    expect(runtime.readLocalState().newWorkPaused).toBe(false);
+  });
+
+  it('charges nothing for a spawn that never happened', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 12 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'ineligible' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    await runtime.executeAction(
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 } as never,
+      {} as never,
+    );
+    expect(runtime.readLocalState().diskHeadroom).toMatchObject({ reserved: 0 });
+  });
+
+  it('keeps the boolean pause seam working with no projection wired', () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      newWorkPaused: () => true,
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    const local = runtime.readLocalState();
+    expect(local.newWorkPaused).toBe(true);
+    expect(local.diskHeadroom).toBeUndefined();
   });
 });

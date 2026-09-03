@@ -8,6 +8,7 @@ import {
   rmSync,
   writeSync,
 } from 'node:fs';
+import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { argv, env, pid } from 'node:process';
@@ -108,6 +109,12 @@ import {
   selectCredential,
   sweepDeadAttempts,
   freeDiskBytes,
+  attemptFootprintDefaultsFromGb,
+  listHostAttemptFootprints,
+  listHostLiveAttempts,
+  projectDiskHeadroom,
+  type AttemptPhase,
+  type DiskHeadroom,
   type AttemptCleanupResult,
   type LifecycleCycleReport,
   type CredentialPool,
@@ -893,6 +900,50 @@ export async function runAutopilotV2(
   );
   const diskBelowFloor = (): boolean =>
     diskFloorBytes > 0 && freeDiskBytes(v2AttemptsBase) < diskFloorBytes;
+  const attemptFootprintDefaults = attemptFootprintDefaultsFromGb(
+    loaded.config.safety.attemptFootprintGb,
+  );
+  const diskHost = hostname();
+  /**
+   * Free space projected forward over this cycle's own dispatches (#144).
+   *
+   * `diskBelowFloor` above only ever held against work already on disk: a
+   * spawn's footprint lands minutes later, so every spawn in a cycle read the
+   * same free bytes. This charges each still-settling attempt and each spawn
+   * this cycle already made, so the floor bounds pending footprint too.
+   *
+   * Returns null — the fail-safe the issue asks for — when the projection
+   * cannot be computed at all. The caller then falls back to `diskBelowFloor`,
+   * which is exactly the pre-#144 behavior; a projection that cannot answer
+   * must never be the thing that stops the engine.
+   */
+  const readDiskHeadroom = (
+    pendingSpawns: readonly AttemptPhase[],
+  ): DiskHeadroom | null => {
+    if (diskFloorBytes <= 0) return null;
+    try {
+      return projectDiskHeadroom({
+        free: freeDiskBytes(v2AttemptsBase),
+        floor: diskFloorBytes,
+        liveAttempts: listHostLiveAttempts(v2AttemptsBase, diskHost, childIsAlive)
+          .map((manifest) => ({
+            phase: manifest.phase,
+            // Creation, not child start: the clone that writes most of the
+            // footprint happens before the child ever runs.
+            startedAtMs: Date.parse(manifest.timestamps.createdAt),
+            ...(manifest.worktreeBytes === undefined
+              ? {}
+              : { worktreeBytes: manifest.worktreeBytes }),
+          })),
+        pendingSpawns,
+        history: listHostAttemptFootprints(v2AttemptsBase, diskHost),
+        defaults: attemptFootprintDefaults,
+        nowMs: Date.now(),
+      });
+    } catch {
+      return null;
+    }
+  };
 
   const writerForSnapshot = credentials === undefined
     ? undefined
@@ -990,6 +1041,7 @@ export async function runAutopilotV2(
         codeOwnerLogins: new Set(loaded.config.repository.codeOwnerLogins),
         projectMapping: loaded.config.project,
         newWorkPaused: diskBelowFloor,
+        readDiskHeadroom,
         ...(marketplaceTaskAdapter === undefined
           ? {}
           : { marketplaceTaskAdapter }),

@@ -157,7 +157,9 @@ describe('Autopilot product configuration', () => {
   });
 
   it('round-trips configured attempt footprints', () => {
-    const input = validConfig();
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      safety: { attemptFootprintGb: unknown };
+    };
     input.safety.attemptFootprintGb = { implement: 12, review: 2 };
 
     expect(decodeAutopilotConfig(input).safety.attemptFootprintGb)

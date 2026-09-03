@@ -19,6 +19,7 @@ export * from './reconciliation-writer-production.js';
 export * from './controller.js';
 export * from './active-scheduler.js';
 export * from './active-config.js';
+export * from './disk-headroom.js';
 export * from './active-runtime.js';
 export * from './active-runtime-production.js';
 export * from './credentials.js';

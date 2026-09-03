@@ -3476,6 +3476,24 @@ export function measureWorktreeBytes(
   return bytes;
 }
 
+/**
+ * Every attempt still holding a worktree on this host (#144).
+ *
+ * Host-scoped, unlike `listRunnerLiveAttempts`, and deliberately so: lane
+ * capacity belongs to a runner, but disk does not. A second runner's live
+ * worktree occupies exactly the same volume this one is projecting against,
+ * and a projection that could not see it would hand out headroom twice.
+ */
+export function listHostLiveAttempts(
+  v2Base: string,
+  host: string,
+  isPidAlive: (pid: number) => boolean,
+): readonly AttemptManifest[] {
+  return collectHostedAttempts(v2Base, filesystemSafeHostname(host))
+    .filter(({ manifest }) => isRunnerLiveAttempt(manifest, isPidAlive))
+    .map(({ manifest }) => manifest);
+}
+
 /** One recorded attempt footprint, as the headroom projection consumes it. */
 export interface AttemptFootprintRecord {
   readonly phase: AttemptPhase;

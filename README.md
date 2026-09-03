@@ -113,6 +113,17 @@ Optional one-off overrides:
 If `doctor` blocks on disk space, free space or deliberately lower
 `safety.diskFloorGb` in that target config (default remains `10`).
 
+The floor is evaluated against *projected* free space, not only current free
+space: a spawn's worktree lands minutes after the spawn, so the scheduler
+charges every attempt still settling — and every spawn this cycle already made
+— its expected footprint before admitting the next one. Expected footprint
+comes from what attempts have actually cost on this host, falling back to
+`safety.attemptFootprintGb` (default `{ "implement": 8, "review": 1 }`, in GB)
+until there is history. That key is optional: a config written before it
+existed keeps loading and gets those defaults. Every active cycle logs one
+`disk: free=… reserved=… floor=… settling=…` line, and a candidate the floor
+holds back reports `disk-floor` with the arithmetic that produced it.
+
 ## Read-only smoke
 
 ```text
