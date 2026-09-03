@@ -988,6 +988,54 @@ describe('GitHubRestDiscoveryReader issue and PR indexes', () => {
       expect(warnings).toEqual([]);
     });
 
+    it('refuses only the record whose skew exceeds the tolerance, never its page', async () => {
+      const { index, warnings } = await readClosed([
+        closedPr({
+          number: 3697,
+          updatedAt: '2026-09-02T21:52:00Z',
+          closedAt: '2026-09-02T21:52:00Z',
+          mergedAt: '2026-09-02T21:52:00Z',
+        }),
+        closedPr({
+          number: 3698,
+          updatedAt: '2026-09-02T21:51:00Z',
+          closedAt: '2026-09-02T21:45:00Z',
+          mergedAt: '2026-09-02T21:51:00Z',
+        }),
+        closedPr({
+          number: 3699,
+          updatedAt: '2026-09-02T21:50:00Z',
+          closedAt: '2026-09-02T21:50:00Z',
+          mergedAt: null,
+        }),
+      ]);
+
+      expect(index.map((pr) => pr.number)).toEqual([3697, 3699]);
+      expect(warnings).toEqual([
+        '[autopilot] pull request 3698 merged 360s after it closed, beyond the'
+        + ' 300s tolerance; refusing the record for this cycle',
+      ]);
+    });
+
+    it('still aborts the page on a schema violation that is not skew', async () => {
+      await expect(readClosed([
+        closedPr({
+          number: 3700,
+          updatedAt: '2026-09-02T21:52:00Z',
+          closedAt: '2026-09-02T21:52:00Z',
+          mergedAt: null,
+        }),
+        {
+          ...closedPr({
+            number: 3701,
+            updatedAt: '2026-09-02T21:51:00Z',
+            closedAt: '2026-09-02T21:51:00Z',
+            mergedAt: null,
+          }),
+          head: { sha: 'not-an-oid', ref: 'autopilot/3701' },
+        },
+      ])).rejects.toThrow(/40-character OID/);
+    });
   });
 
   it('follows the live numeric-repository closed-PR Link in strict page-only mode', async () => {
@@ -1080,10 +1128,10 @@ describe('GitHubRestDiscoveryReader issue and PR indexes', () => {
       updated_at: '2026-07-22T10:00:00Z', closed_at: null, merged_at: null,
       head: { sha: 'b'.repeat(40), ref: 'feature/100' }, base: { ref: 'next' },
     }],
-    ['closed PR merged long after close', {
+    ['closed PR with a non-OID head sha', {
       number: 100, title: 'PR 100', state: 'closed', draft: false,
-      updated_at: '2026-07-22T10:00:00Z', closed_at: '2026-07-22T09:00:00Z', merged_at: '2026-07-22T09:06:00Z',
-      head: { sha: 'b'.repeat(40), ref: 'feature/100' }, base: { ref: 'next' },
+      updated_at: '2026-07-22T10:00:00Z', closed_at: '2026-07-22T09:00:00Z', merged_at: null,
+      head: { sha: 'b'.repeat(39), ref: 'feature/100' }, base: { ref: 'next' },
     }],
   ])('fails closed on %s', async (_label, row) => {
     const reader = new GitHubRestDiscoveryReader(new ConditionalRestClient(mapRunner(new Map([
