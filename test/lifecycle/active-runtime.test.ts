@@ -646,19 +646,83 @@ describe('active runtime boundary', () => {
       head: HEAD,
     }));
 
+    // The arithmetic names what admitting one more review WOULD cost: the
+    // eight gigabytes the implement claim already spoke for, plus the one this
+    // review needs.
     await expect(runtime.executeReviewActions!(cohort, {} as never)).resolves.toEqual([
       {
         outcome: 'skipped',
-        reason: 'disk-floor (free 12.0G \u2212 reserved 8.0G for 1 settling attempt '
+        reason: 'disk-floor (free 12.0G \u2212 reserved 9.0G for 2 settling attempts '
           + '< floor 8G)',
       },
       {
         outcome: 'skipped',
-        reason: 'disk-floor (free 12.0G \u2212 reserved 8.0G for 1 settling attempt '
+        reason: 'disk-floor (free 12.0G \u2212 reserved 9.0G for 2 settling attempts '
           + '< floor 8G)',
       },
     ]);
     // Nothing reserved GitHub quota and no reviewer session started.
     expect(spawned).toBe(0);
+  });
+  it('admits only the prefix of a review cohort the projection affords', async () => {
+    // Reviews dispatch concurrently, so the projection cannot gate them one at
+    // a time the way `executeAction` does. Admitting a whole cohort against one
+    // reading is the same overcommit #144 is about, in miniature.
+    const started: number[] = [];
+    const reservations: number[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 4 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 10 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      reserveReviewCohort: async (size) => { reservations.push(size); },
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async (action) => {
+          started.push(action.prNumber);
+          return { status: 'spawned' };
+        },
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const cohort = [84, 85, 86, 87].map((prNumber, index) => ({
+      kind: 'claim-review' as const,
+      issueNumber: 42 + index,
+      prNumber,
+      head: HEAD,
+    }));
+
+    // Ten gigabytes free against an eight-gigabyte floor leaves room for two
+    // one-gigabyte reviews; the third would put the projection under.
+    const results = await runtime.executeReviewActions!(cohort, {} as never);
+
+    expect(results).toEqual([
+      { outcome: 'spawned' },
+      { outcome: 'spawned' },
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 10.0G \u2212 reserved 3.0G for 3 settling attempts '
+          + '< floor 8G)',
+      },
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 10.0G \u2212 reserved 3.0G for 3 settling attempts '
+          + '< floor 8G)',
+      },
+    ]);
+    expect(started).toEqual([84, 85]);
+    // Quota is reserved for what actually runs, not for what was scheduled.
+    expect(reservations).toEqual([2]);
   });
 });

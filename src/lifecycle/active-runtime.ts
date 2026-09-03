@@ -279,6 +279,31 @@ export function makeActiveRuntime(
   );
 
   /**
+   * How many of a review cohort the projected headroom can take, and the
+   * refusal to report for the rest. With no projection wired, every member is
+   * affordable — the pre-#144 behavior.
+   */
+  const affordableReviewCohort = (size: number): {
+    readonly admitted: number;
+    readonly refusal?: string;
+  } => {
+    const project = options.readDiskHeadroom;
+    if (project === undefined) return { admitted: size };
+    for (let admitted = 1; admitted <= size; admitted += 1) {
+      const projected = project([
+        ...spawnedThisCycle,
+        ...Array.from({ length: admitted }, () => 'review' as const),
+      ]);
+      if (projected?.paused !== true) continue;
+      return {
+        admitted: admitted - 1,
+        refusal: `disk-floor (${diskHeadroomSkipDetail(projected)})`,
+      };
+    }
+    return { admitted: size };
+  };
+
+  /**
    * Charges a spawn's expected footprint against the rest of this cycle. Only
    * `spawned` counts: a refused claim opened no worktree and must not consume
    * the headroom the next candidate needs.
@@ -308,24 +333,34 @@ export function makeActiveRuntime(
     async executeReviewActions(actions, snapshot) {
       if (actions.length === 0) return [];
       const local = readLocalState();
-      // The disk can drop below the floor partway through a cycle (#144):
-      // implementation claims dispatch before the review cohort and charge
-      // their footprint against the same volume. That is the governor
-      // working, not a scheduling error, so the cohort reports skipped rather
-      // than throwing a capacity violation the controller would log as
-      // `failed` — and nothing spends GitHub quota on the way past.
-      if (local.diskHeadroom?.paused === true) {
-        const reason = laneFullReason(local);
-        return actions.map(() => ({ outcome: 'skipped', reason }));
-      }
-      if (actions.length > local.remaining.review) {
+      // A review cohort dispatches concurrently, so the projection cannot gate
+      // it one member at a time the way `executeAction` does — and admitting a
+      // whole cohort against one reading of free space is exactly the
+      // overcommit #144 is about, in miniature. So the cohort is trimmed to
+      // the prefix the projection affords.
+      //
+      // The tail is reported as a `disk-floor` skip rather than thrown at the
+      // controller as a capacity violation: the disk can fall below the floor
+      // partway through a cycle — implementation claims dispatch first and
+      // charge their footprint against the same volume — and that is the
+      // governor working, not a scheduling error. A throw here reached the
+      // controller's catch and logged every member as `failed`, which is a lie
+      // about work that was deliberately held back.
+      const admission = affordableReviewCohort(actions.length);
+      const refused = actions.slice(admission.admitted).map(() => ({
+        outcome: 'skipped',
+        reason: admission.refusal!,
+      }));
+      if (admission.admitted === 0) return refused;
+      const batch = actions.slice(0, admission.admitted);
+      if (batch.length > local.remaining.review) {
         throw new Error(
-          `Review cohort of ${actions.length} exceeds remaining review capacity `
+          `Review cohort of ${batch.length} exceeds remaining review capacity `
             + `${local.remaining.review}`,
         );
       }
-      await options.reserveReviewCohort?.(actions.length);
-      return Promise.all(actions.map(async (action) => {
+      await options.reserveReviewCohort?.(batch.length);
+      const results = await Promise.all(batch.map(async (action) => {
         try {
           const result = await withCycleStep(
             dispatchStepLabel(action),
@@ -349,6 +384,7 @@ export function makeActiveRuntime(
           };
         }
       }));
+      return [...results, ...refused];
     },
     async executeAction(action, snapshot) {
       const local = readLocalState();
