@@ -339,41 +339,98 @@ export function makeMarketplaceReviewAnchorRelease(input: {
   };
 }
 
+/**
+ * Whether this engine may sweep its own dead attempts — a question about the
+ * engine, deliberately not about the cycle.
+ *
+ * The cycle's report is not an input. Local attempt cleanup removes worktrees
+ * of attempts whose child PID is already dead, using local manifests and
+ * process liveness alone; nothing it decides is read from a snapshot, so a
+ * cycle that never produced one cannot make a dead attempt any less dead. See
+ * the call site for why this sits outside the complete-snapshot boundary that
+ * still governs every GitHub mutation (#137).
+ */
 export function shouldSweepAttempts(input: {
   readonly mode: 'observe' | 'recover' | 'active';
   readonly executionBackend: 'local' | 'marketplace';
   readonly cleanupEnabled: boolean;
   readonly hasMaintenanceCredential: boolean;
-  readonly report: {
-    readonly status: LifecycleCycleReport['status'];
-    readonly snapshotComplete?: boolean;
-  };
 }): boolean {
   return input.mode === 'active'
     && input.executionBackend === 'local'
     && input.cleanupEnabled
-    && input.hasMaintenanceCredential
+    && input.hasMaintenanceCredential;
+}
+
+/**
+ * Whether the status board may be repainted — a question about the cycle, and
+ * the mutation-free boundary in its bookkeeping half.
+ *
+ * Painting publishes lifecycle state to GitHub, so it demands a cycle that
+ * finished with a snapshot complete enough to justify what it publishes. A
+ * cycle that threw has no report at all, which is the same refusal.
+ */
+export function shouldPaintBoard(input: {
+  readonly mode: 'observe' | 'recover' | 'active';
+  readonly report?: {
+    readonly status: LifecycleCycleReport['status'];
+    readonly snapshotComplete?: boolean;
+  } | null;
+}): boolean {
+  return input.mode === 'active'
+    && input.report != null
     && input.report.status === 'ok'
     && input.report.snapshotComplete === true;
 }
 
 /**
- * The cycle first, then its bookkeeping, in order — never the other way round.
+ * The cycle first, then its bookkeeping, in order — never the other way round,
+ * and never skipped because the cycle failed.
  *
  * Attempt cleanup is the one bookkeeping task that can block for minutes on a
  * single uninterruptible disk wait (#132). Running it behind scheduling and
  * dispatch means a slow delete costs the tail of a cycle instead of the whole
  * cycle's scheduling, and the bound inside `sweepDeadAttempts` costs it only
  * once. This shape exists so that ordering is a tested contract rather than an
- * accident of statement order.
+ * accident of statement order. A cycle that threw scheduled and dispatched
+ * nothing, so that ordering holds trivially for it — and its bookkeeping is
+ * exactly the bookkeeping that matters most, because a failure that persists
+ * for hours is a failure that accumulates dead attempts for hours (#137).
+ *
+ * Bookkeeping therefore receives `undefined` when the cycle produced no report,
+ * and each task decides for itself what it can do without one. A plain
+ * `finally` would not be enough: it cannot see the cycle's error, and anything
+ * thrown from inside one silently replaces it. Catching the outcome instead
+ * keeps the cycle's error the one that propagates, while a bookkeeping failure
+ * on top of it is logged distinctly rather than swallowed or promoted. When the
+ * cycle succeeded, its bookkeeping error is the only error there is, so it
+ * propagates unchanged — the pre-existing contract.
  */
 export async function runCycleThenBookkeeping<Report>(input: {
   readonly runCycle: () => Promise<Report>;
-  readonly bookkeeping: readonly ((report: Report) => Promise<void>)[];
+  readonly bookkeeping: readonly ((report: Report | undefined) => Promise<void>)[];
 }): Promise<Report> {
-  const report = await input.runCycle();
-  for (const task of input.bookkeeping) await task(report);
-  return report;
+  let outcome: { readonly ok: true; readonly report: Report }
+  | { readonly ok: false; readonly error: unknown };
+  try {
+    outcome = { ok: true, report: await input.runCycle() };
+  } catch (error) {
+    outcome = { ok: false, error };
+  }
+  for (const task of input.bookkeeping) {
+    try {
+      await task(outcome.ok ? outcome.report : undefined);
+    } catch (error) {
+      if (outcome.ok) throw error;
+      console.error(
+        `[autopilot:v2] bookkeeping failed after a failed cycle: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  if (!outcome.ok) throw outcome.error;
+  return outcome.report;
 }
 
 /**
@@ -984,21 +1041,31 @@ export async function runAutopilotV2(
     }
   };
 
-  // Bookkeeping, in the order runCycleThenBookkeeping runs it. Cleanup can sit
-  // for minutes on one synchronous disk wait (#132), so it must never precede
-  // the scheduling and dispatch it is cleaning up after.
-  const sweepAttempts = async (
-    report: Awaited<ReturnType<typeof runLifecycleCycle>>,
-  ): Promise<void> => {
-    // A snapshot-failed cycle must remain mutation-free. Local attempt
-    // cleanup therefore follows the same complete-snapshot boundary as all
-    // GitHub reconciliation/archive/action mutations.
+  // Bookkeeping, in the order runCycleThenBookkeeping runs it, after every
+  // cycle including a failed one. Cleanup can sit for minutes on one
+  // synchronous disk wait (#132), so it must never precede the scheduling and
+  // dispatch it is cleaning up after.
+  const sweepAttempts = async (): Promise<void> => {
+    // A snapshot-failed cycle must remain mutation-free, and it does: every
+    // GitHub reconciliation, archive and action mutation stays behind the
+    // complete-snapshot boundary, as does the board paint below. The local
+    // attempt sweep is exempt from that boundary, because it is not that kind
+    // of work. It removes worktrees belonging to attempts whose child PID is
+    // already dead, deciding from local manifests and process liveness alone:
+    // no GitHub mutation, no lifecycle state, no dependence on snapshot
+    // contents. Its only network I/O is a `git fetch` of the attempt's own
+    // branch to prove the work was published before the worktree goes — a
+    // read. A cycle that failed before it read anything therefore tells us
+    // nothing about these attempts that would argue for keeping them, while
+    // the failure that made it fail is precisely the failure that repeats:
+    // gating the sweep on a complete snapshot cost 46 consecutive cycles their
+    // cleanup and left 16 dead attempts holding 44 GB with zero workers
+    // running (#137). Cleanup is local hygiene; the boundary guards GitHub.
     if (!shouldSweepAttempts({
       mode: options.mode,
       executionBackend,
       cleanupEnabled,
       hasMaintenanceCredential: maintenanceCredential !== undefined,
-      report,
     })) {
       return;
     }
@@ -1015,15 +1082,9 @@ export async function runAutopilotV2(
   };
 
   const paintBoard = async (
-    report: Awaited<ReturnType<typeof runLifecycleCycle>>,
+    report: Awaited<ReturnType<typeof runLifecycleCycle>> | null | undefined,
   ): Promise<void> => {
-    if (
-      options.mode !== 'active'
-      || report.status !== 'ok'
-      || !report.snapshotComplete
-    ) {
-      return;
-    }
+    if (!shouldPaintBoard({ mode: options.mode, report })) return;
     try {
       await runPaintBoard(
         runner,
@@ -1043,12 +1104,10 @@ export async function runAutopilotV2(
     const report = await runCycleThenBookkeeping({
       runCycle,
       bookkeeping: [
-        async (finished) => {
-          if (finished !== null) await sweepAttempts(finished);
-        },
-        async (finished) => {
-          if (finished !== null) await paintBoard(finished);
-        },
+        // The sweep asks the cycle for nothing, so a thrown or reportless
+        // cycle reaches it exactly as a successful one does.
+        async () => { await sweepAttempts(); },
+        async (finished) => { await paintBoard(finished); },
       ],
     });
     if (report === null) return;
