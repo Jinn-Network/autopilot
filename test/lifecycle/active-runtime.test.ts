@@ -477,6 +477,59 @@ describe('active runtime boundary', () => {
     expect(seen).toEqual([[], ['implement']]);
   });
 
+  // #146: the executor writes the manifest before the dispatch returns, so
+  // each spawn is a live attempt *and* a pending spawn by the time the next
+  // dispatch reads the projection. Charged twice, 38G free admitted two
+  // implement claims where it has room for three.
+  it('charges a spawn once when its manifest lands mid-cycle', async () => {
+    const CYCLE_START = NOW - 60_000;
+    const landed: { phase: string; startedAtMs: number }[] = [];
+    // Stands in for the executor: the manifest exists before `spawned` returns.
+    const spawnLanding = (phase: 'implement' | 'review') => async () => {
+      landed.push({ phase, startedAtMs: CYCLE_START + 1_000 });
+      return { status: 'spawned' } as const;
+    };
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 3, child: 3, review: 3 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 38 * GB,
+        floor: 8 * GB,
+        liveAttempts: landed,
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+        cycleStartedAtMs: CYCLE_START,
+      }),
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: spawnLanding('implement'),
+        review: spawnLanding('review'),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const claim = (issueNumber: number) => ({
+      kind: 'claim-implementation' as const,
+      intent: 'fresh' as const,
+      issueNumber,
+    });
+
+    for (const issueNumber of [1, 2, 3]) {
+      await expect(runtime.executeAction(claim(issueNumber), {} as never))
+        .resolves.toEqual({ outcome: 'spawned' });
+    }
+    // Twenty-four gigabytes for three spawns, not forty-eight for six.
+    expect(runtime.readLocalState().diskHeadroom).toMatchObject({
+      paused: false,
+      reserved: 24 * GB,
+      settling: 3,
+    });
+  });
+
   it('reserves a review spawn its own smaller footprint', async () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),

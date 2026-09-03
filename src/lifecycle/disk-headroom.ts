@@ -74,6 +74,21 @@ export interface DiskHeadroomInput {
   readonly defaults: AttemptFootprintDefaults;
   readonly nowMs: number;
   readonly settleMs?: number;
+  /**
+   * When this cycle began, so a spawn it already made is charged once (#146).
+   *
+   * The executor writes an attempt's manifest before the dispatch returns, so
+   * by the time the next dispatch reads this projection the spawn is already a
+   * live attempt *and* still listed in `pendingSpawns` — and was charged twice,
+   * which paused cycles that had room for three more claims. A live attempt
+   * created at or after this instant is one of those spawns, and cancels one
+   * `pendingSpawns` entry of its own phase; it stays reserved through the
+   * live-attempt path, so nothing goes uncounted. Pending entries with no
+   * manifest yet — the review cohort's pre-dispatch trim — are untouched.
+   *
+   * Omitted, every pending spawn is charged in full: the pre-#146 behavior.
+   */
+  readonly cycleStartedAtMs?: number;
 }
 
 export function attemptFootprintDefaultsFromGb(
@@ -113,7 +128,8 @@ export function expectedAttemptFootprintBytes(
  *
  * `reserved` is the footprint that has been committed to but has not landed:
  * what each still-settling attempt has yet to write, plus the whole expected
- * footprint of every spawn this cycle already made. Subtracting it from free
+ * footprint of every spawn this cycle made that has no workspace on disk yet.
+ * A spawn counted on both sides is charged once. Subtracting it from free
  * space is what makes the floor hold against work in flight rather than only
  * against work already on disk.
  *
@@ -133,11 +149,22 @@ export function projectDiskHeadroom(input: DiskHeadroomInput): DiskHeadroom {
     reserved += bytes;
     settling += 1;
   };
+  const cycleStartedAtMs = input.cycleStartedAtMs ?? Number.POSITIVE_INFINITY;
+  const landedThisCycle: Record<AttemptPhase, number> = { implement: 0, review: 0 };
   for (const attempt of input.liveAttempts) {
+    if (attempt.startedAtMs >= cycleStartedAtMs) landedThisCycle[attempt.phase] += 1;
     if (input.nowMs - attempt.startedAtMs >= settleMs) continue;
     reserve(expected(attempt.phase) - (attempt.worktreeBytes ?? 0));
   }
-  for (const phase of input.pendingSpawns) reserve(expected(phase));
+  for (const phase of input.pendingSpawns) {
+    // Already on disk as a live attempt, and reserved as one: charging the
+    // pending entry too would reserve the same spawn twice.
+    if (landedThisCycle[phase] > 0) {
+      landedThisCycle[phase] -= 1;
+      continue;
+    }
+    reserve(expected(phase));
+  }
   return {
     paused: input.floor > 0 && input.free - reserved < input.floor,
     free: input.free,
