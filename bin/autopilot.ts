@@ -373,6 +373,15 @@ async function main(): Promise<void> {
   }
   if (command.kind === 'status') {
     const daemon = await serviceStatus({ loaded, entryPath });
+    // #140: when the record cannot prove which process it names, that verdict
+    // IS the answer. Running an observe cycle here only buries it under that
+    // cycle's own (unrelated) output, which is what happened in production.
+    if (daemon.status === 'unverifiable-fallback') {
+      process.stdout.write(command.json
+        ? `${JSON.stringify({ schemaVersion: 1, daemon, lifecycle: null }, null, 2)}\n`
+        : `Daemon: ${renderDaemonStatus(daemon)}\n`);
+      return;
+    }
     const lifecycle = await captureEngine(['--mode', 'observe', '--once', '--json']);
     if (command.json) {
       process.stdout.write(`${JSON.stringify({
