@@ -905,6 +905,17 @@ export async function runAutopilotV2(
   );
   const diskHost = hostname();
   /**
+   * When the cycle now running began (#146).
+   *
+   * The projection needs it to tell this cycle's own spawns — whose manifests
+   * appear the instant the dispatch returns — from the settling attempts of
+   * earlier cycles, so it charges each spawn once rather than twice. Reset per
+   * cycle rather than captured at process start: the daemon runs one cycle per
+   * child, but a hand-started persistent cadence runs many in one process, and
+   * a stale mark there would cancel reservations it had no business cancelling.
+   */
+  let cycleStartedAtMs = Date.now();
+  /**
    * Free space projected forward over this cycle's own dispatches (#144).
    *
    * `diskBelowFloor` above only ever held against work already on disk: a
@@ -939,6 +950,7 @@ export async function runAutopilotV2(
         history: listHostAttemptFootprints(v2AttemptsBase, diskHost),
         defaults: attemptFootprintDefaults,
         nowMs: Date.now(),
+        cycleStartedAtMs,
       });
     } catch {
       return null;
@@ -1053,6 +1065,9 @@ export async function runAutopilotV2(
   const runCycle = async (): Promise<
   Awaited<ReturnType<typeof runLifecycleCycle>> | null
   > => {
+    // Before anything this cycle can dispatch, so every manifest it writes
+    // reads as this cycle's own (#146).
+    cycleStartedAtMs = Date.now();
     try {
       return await runLifecycleCycle(options.mode, {
         readSnapshot: readCycleSnapshot,
