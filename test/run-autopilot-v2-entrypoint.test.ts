@@ -211,7 +211,7 @@ describe('lifecycle script entrypoint', () => {
     );
   });
 
-  it('allows attempt cleanup only for successful complete local active cycles', () => {
+  it('allows local attempt cleanup without asking the cycle for a snapshot', () => {
     const shouldSweepAttempts = Reflect.get(
       lifecycleEntrypoint,
       'shouldSweepAttempts',
@@ -220,14 +220,14 @@ describe('lifecycle script entrypoint', () => {
       readonly executionBackend: string;
       readonly cleanupEnabled: boolean;
       readonly hasMaintenanceCredential: boolean;
-      readonly report: { readonly status: string; readonly snapshotComplete?: boolean };
     }) => boolean) | undefined;
+    // No report of any shape is an input here: a cycle that threw before its
+    // snapshot has none to offer, and its dead attempts are no less dead.
     const base = {
       mode: 'active',
       executionBackend: 'local',
       cleanupEnabled: true,
       hasMaintenanceCredential: true,
-      report: { status: 'ok', snapshotComplete: true },
     };
 
     expect(shouldSweepAttempts).toBeTypeOf('function');
@@ -236,14 +236,42 @@ describe('lifecycle script entrypoint', () => {
       ...base,
       executionBackend: 'marketplace',
     })).toBe(false);
+    expect(shouldSweepAttempts!({ ...base, mode: 'observe' })).toBe(false);
+    expect(shouldSweepAttempts!({ ...base, cleanupEnabled: false })).toBe(false);
     expect(shouldSweepAttempts!({
       ...base,
-      report: { status: 'rejected', snapshotComplete: false },
+      hasMaintenanceCredential: false,
     })).toBe(false);
-    expect(shouldSweepAttempts!({
-      ...base,
+  });
+
+  it('keeps board painting behind the snapshot boundary the sweep is exempt from', () => {
+    const shouldPaintBoard = Reflect.get(
+      lifecycleEntrypoint,
+      'shouldPaintBoard',
+    ) as ((input: {
+      readonly mode: string;
+      readonly report?: {
+        readonly status: string;
+        readonly snapshotComplete?: boolean;
+      } | null;
+    }) => boolean) | undefined;
+    const complete = { status: 'ok', snapshotComplete: true };
+
+    expect(shouldPaintBoard).toBeTypeOf('function');
+    expect(shouldPaintBoard!({ mode: 'active', report: complete })).toBe(true);
+    // The exemption is exactly one bookkeeping step wide: painting the board is
+    // a GitHub mutation and still refuses a cycle without a complete snapshot.
+    expect(shouldPaintBoard!({ mode: 'active' })).toBe(false);
+    expect(shouldPaintBoard!({ mode: 'active', report: null })).toBe(false);
+    expect(shouldPaintBoard!({
+      mode: 'active',
       report: { status: 'ok', snapshotComplete: false },
     })).toBe(false);
+    expect(shouldPaintBoard!({
+      mode: 'active',
+      report: { status: 'failed', snapshotComplete: true },
+    })).toBe(false);
+    expect(shouldPaintBoard!({ mode: 'observe', report: complete })).toBe(false);
   });
 
   it('keeps bookkeeping strictly behind the cycle that scheduled and dispatched', async () => {
@@ -260,7 +288,7 @@ describe('lifecycle script entrypoint', () => {
       },
       bookkeeping: [
         async (finished) => {
-          order.push(`cleanup:${finished.status}`);
+          order.push(`cleanup:${finished?.status}`);
           expect(cycleFinished).toBe(true);
         },
         async () => { order.push('paint'); },
@@ -269,6 +297,77 @@ describe('lifecycle script entrypoint', () => {
 
     expect(report).toEqual({ status: 'ok' });
     expect(order).toEqual(['schedule', 'dispatch', 'cleanup:ok', 'paint']);
+  });
+
+  it('still books a cycle that threw before it produced any snapshot', async () => {
+    const cycleError = new Error('snapshot read failed');
+    const order: string[] = [];
+    const seen: Array<{ readonly status: string } | undefined> = [];
+
+    await expect(runCycleThenBookkeeping({
+      runCycle: async (): Promise<{ readonly status: string }> => {
+        order.push('cycle');
+        throw cycleError;
+      },
+      bookkeeping: [
+        async (finished) => {
+          order.push('cleanup');
+          seen.push(finished);
+        },
+        async () => { order.push('paint'); },
+      ],
+    })).rejects.toBe(cycleError);
+
+    expect(order).toEqual(['cycle', 'cleanup', 'paint']);
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('reports a bookkeeping failure of a failed cycle without masking either', async () => {
+    const cycleError = new Error('snapshot read failed');
+    const cleanupError = new Error('worktree remove failed');
+    const order: string[] = [];
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await expect(runCycleThenBookkeeping({
+        runCycle: async (): Promise<{ readonly status: string }> => {
+          throw cycleError;
+        },
+        bookkeeping: [
+          async () => {
+            order.push('cleanup');
+            throw cleanupError;
+          },
+          async () => { order.push('paint'); },
+        ],
+      })).rejects.toBe(cycleError);
+
+      expect(order).toEqual(['cleanup', 'paint']);
+      expect(logged.mock.calls.map(([line]) => String(line))).toEqual([
+        '[autopilot:v2] bookkeeping failed after a failed cycle: '
+        + 'worktree remove failed',
+      ]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('leaves a successful cycle answering for its own bookkeeping failure', async () => {
+    const cleanupError = new Error('worktree remove failed');
+    const order: string[] = [];
+
+    await expect(runCycleThenBookkeeping({
+      runCycle: async () => ({ status: 'ok' } as const),
+      bookkeeping: [
+        async () => {
+          order.push('cleanup');
+          throw cleanupError;
+        },
+        async () => { order.push('paint'); },
+      ],
+    })).rejects.toBe(cleanupError);
+
+    expect(order).toEqual(['cleanup']);
   });
 
   it('names every deferral once and summarizes it apart from a real retention', () => {
