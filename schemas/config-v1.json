@@ -155,6 +155,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["implement", "review"],
+          "default": { "implement": 8, "review": 1 },
           "properties": {
             "implement": { "type": "integer", "minimum": 0 },
             "review": { "type": "integer", "minimum": 0 }
