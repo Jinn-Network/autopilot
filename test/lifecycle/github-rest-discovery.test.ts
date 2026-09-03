@@ -885,6 +885,111 @@ describe('GitHubRestDiscoveryReader issue and PR indexes', () => {
       }]);
   });
 
+  /**
+   * GitHub writes `merged_at` and `closed_at` from different steps of the merge
+   * transaction and does not order them to the second. Across the last 100
+   * merged PRs on Jinn-Network/mono: 86 equal, 7 with `merged_at` before
+   * `closed_at`, 1 (#3694) with it one second after — which aborted every
+   * discovery page, and so every snapshot, for ~10 hours (#136).
+   */
+  describe('merged_at/closed_at skew (#136)', () => {
+    const closedPr = (input: {
+      readonly number: number;
+      readonly updatedAt: string;
+      readonly closedAt: string;
+      readonly mergedAt: string | null;
+    }) => ({
+      number: input.number,
+      title: `PR ${input.number}`,
+      state: 'closed',
+      draft: false,
+      updated_at: input.updatedAt,
+      closed_at: input.closedAt,
+      merged_at: input.mergedAt,
+      head: { sha: `${input.number}`.padStart(40, '0'), ref: `autopilot/${input.number}` },
+      base: { ref: 'next' },
+    });
+
+    const readClosed = async (rows: readonly unknown[]) => {
+      const reader = new GitHubRestDiscoveryReader(new ConditionalRestClient(mapRunner(new Map([
+        [CLOSED_PR_ENDPOINT, included(rows)],
+      ]))));
+      const warnings: string[] = [];
+      const warn = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+      try {
+        return {
+          index: await reader.readRecentlyClosedPullRequestIndex('2026-09-01T00:00:00.000Z'),
+          warnings,
+        };
+      } finally {
+        console.warn = warn;
+      }
+    };
+
+    it('normalizes the live mono #3694 record instead of aborting its page', async () => {
+      // The exact record: closed 21:45:07Z, merged 21:45:08Z, one second apart.
+      const { index, warnings } = await readClosed([{
+        number: 3694,
+        title: 'Spec conflict: ceremony mints discovery keys without the ratified scope',
+        state: 'closed',
+        draft: false,
+        updated_at: '2026-09-02T21:45:09Z',
+        closed_at: '2026-09-02T21:45:07Z',
+        merged_at: '2026-09-02T21:45:08Z',
+        head: { sha: '29dbbcb69ef9eacbbe0a0d9889b0b9c1a78fe93d', ref: 'autopilot/2527' },
+        base: { ref: 'next' },
+      }]);
+
+      expect(index).toEqual([expect.objectContaining({
+        number: 3694,
+        state: 'CLOSED',
+        closedAt: '2026-09-02T21:45:08Z',
+        mergedAt: '2026-09-02T21:45:08Z',
+      })]);
+      expect(warnings).toEqual([
+        '[autopilot] pull request 3694 reports merged_at 1s after closed_at;'
+        + ' treating the merge time as the close time',
+      ]);
+    });
+
+    it('normalizes a skew at the far edge of the tolerance', async () => {
+      const { index, warnings } = await readClosed([closedPr({
+        number: 3695,
+        updatedAt: '2026-09-02T21:50:00Z',
+        closedAt: '2026-09-02T21:45:00Z',
+        mergedAt: '2026-09-02T21:49:00Z',
+      })]);
+
+      expect(index).toEqual([expect.objectContaining({
+        number: 3695,
+        closedAt: '2026-09-02T21:49:00Z',
+        mergedAt: '2026-09-02T21:49:00Z',
+      })]);
+      expect(warnings).toEqual([
+        '[autopilot] pull request 3695 reports merged_at 240s after closed_at;'
+        + ' treating the merge time as the close time',
+      ]);
+    });
+
+    it('leaves a merge that precedes its close exactly as GitHub reported it', async () => {
+      // 7 of the last 100 merged mono PRs: GitHub routinely closes after merging.
+      const { index, warnings } = await readClosed([closedPr({
+        number: 3696,
+        updatedAt: '2026-09-02T21:50:00Z',
+        closedAt: '2026-09-02T21:45:02Z',
+        mergedAt: '2026-09-02T21:45:00Z',
+      })]);
+
+      expect(index).toEqual([expect.objectContaining({
+        closedAt: '2026-09-02T21:45:02Z',
+        mergedAt: '2026-09-02T21:45:00Z',
+      })]);
+      expect(warnings).toEqual([]);
+    });
+
+  });
+
   it('follows the live numeric-repository closed-PR Link in strict page-only mode', async () => {
     const linkedPage2 =
       'repositories/1190804373/pulls?state=closed&sort=updated&direction=desc'
@@ -975,9 +1080,9 @@ describe('GitHubRestDiscoveryReader issue and PR indexes', () => {
       updated_at: '2026-07-22T10:00:00Z', closed_at: null, merged_at: null,
       head: { sha: 'b'.repeat(40), ref: 'feature/100' }, base: { ref: 'next' },
     }],
-    ['closed PR merged after close', {
+    ['closed PR merged long after close', {
       number: 100, title: 'PR 100', state: 'closed', draft: false,
-      updated_at: '2026-07-22T10:00:00Z', closed_at: '2026-07-22T09:00:00Z', merged_at: '2026-07-22T09:01:00Z',
+      updated_at: '2026-07-22T10:00:00Z', closed_at: '2026-07-22T09:00:00Z', merged_at: '2026-07-22T09:06:00Z',
       head: { sha: 'b'.repeat(40), ref: 'feature/100' }, base: { ref: 'next' },
     }],
   ])('fails closed on %s', async (_label, row) => {

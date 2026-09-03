@@ -440,6 +440,31 @@ function parseIssueIndexRow(
   };
 }
 
+/**
+ * The widest `merged_at` > `closed_at` skew read as GitHub's own bookkeeping
+ * rather than as corruption (#136).
+ *
+ * GitHub writes the two timestamps in different steps of the merge transaction
+ * and does not order them to the second. Across the last 100 merged pull
+ * requests on Jinn-Network/mono: 86 carried the two equal, 7 carried
+ * `merged_at` BEFORE `closed_at` (accepted here and always has been), and 1 —
+ * #3694, closed 21:45:07Z and merged 21:45:08Z — carried it one second after.
+ * That single record threw, the throw aborted the whole recently-closed page,
+ * and the engine produced no snapshot at all for ~10 hours.
+ *
+ * Five minutes is orders of magnitude wider than any skew that transaction can
+ * produce, and still far narrower than any interval in which a genuinely
+ * incoherent record could hide: a merged pull request IS closed at its merge,
+ * so normalizing `closedAt` to `mergedAt` restores `closed >= merged` by
+ * construction rather than by assertion.
+ */
+export const MERGED_AFTER_CLOSED_TOLERANCE_MS = 5 * 60_000;
+
+/** Whole seconds of skew, for a message a human can compare to the tolerance. */
+function skewSeconds(skewMs: number): number {
+  return Math.round(skewMs / 1_000);
+}
+
 function parsePullRequestIndexRow(
   input: unknown,
   index: number,
@@ -477,11 +502,21 @@ function parsePullRequestIndexRow(
     closedAt = isoTimestamp(pr.closed_at, `pull request ${index}.closed_at`);
     mergedAt = nullableTimestamp(pr.merged_at, `pull request ${index}.merged_at`);
     const closedMs = exactUtcTimestamp(closedAt, `pull request ${index}.closed_at`).ms;
-    if (
-      mergedAt !== null
-      && exactUtcTimestamp(mergedAt, `pull request ${index}.merged_at`).ms > closedMs
-    ) {
-      throw new GitHubRestSchemaError(`pull request ${index} merged after it closed`);
+    if (mergedAt !== null) {
+      const skewMs =
+        exactUtcTimestamp(mergedAt, `pull request ${index}.merged_at`).ms - closedMs;
+      if (skewMs > MERGED_AFTER_CLOSED_TOLERANCE_MS) {
+        throw new GitHubRestSchemaError(
+          `pull request ${number} merged ${skewSeconds(skewMs)}s after it closed`,
+        );
+      }
+      if (skewMs > 0) {
+        console.warn(
+          `[autopilot] pull request ${number} reports merged_at ${skewSeconds(skewMs)}s`
+          + ' after closed_at; treating the merge time as the close time',
+        );
+        closedAt = mergedAt;
+      }
     }
   }
   return {
