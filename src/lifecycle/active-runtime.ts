@@ -308,6 +308,16 @@ export function makeActiveRuntime(
     async executeReviewActions(actions, snapshot) {
       if (actions.length === 0) return [];
       const local = readLocalState();
+      // The disk can drop below the floor partway through a cycle (#144):
+      // implementation claims dispatch before the review cohort and charge
+      // their footprint against the same volume. That is the governor
+      // working, not a scheduling error, so the cohort reports skipped rather
+      // than throwing a capacity violation the controller would log as
+      // `failed` — and nothing spends GitHub quota on the way past.
+      if (local.diskHeadroom?.paused === true) {
+        const reason = laneFullReason(local);
+        return actions.map(() => ({ outcome: 'skipped', reason }));
+      }
       if (actions.length > local.remaining.review) {
         throw new Error(
           `Review cohort of ${actions.length} exceeds remaining review capacity `

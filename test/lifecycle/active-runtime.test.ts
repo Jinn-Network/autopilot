@@ -601,4 +601,64 @@ describe('active runtime boundary', () => {
     expect(local.newWorkPaused).toBe(true);
     expect(local.diskHeadroom).toBeUndefined();
   });
+  it('skips a review cohort the disk went below the floor under', async () => {
+    // Implementation claims dispatch before the review cohort and charge their
+    // footprint against the same disk, so the floor can start biting partway
+    // through a cycle. That is the governor working, not a scheduling error:
+    // the cohort must read as skipped, never as a capacity violation thrown at
+    // the controller and logged as `failed`.
+    let spawned = 0;
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 12 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      reserveReviewCohort: async () => { spawned += 1; },
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => {
+          spawned += 1;
+          return { status: 'spawned' };
+        },
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    await runtime.executeAction(
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 } as never,
+      {} as never,
+    );
+    const cohort = [84, 85].map((prNumber, index) => ({
+      kind: 'claim-review' as const,
+      issueNumber: 42 + index,
+      prNumber,
+      head: HEAD,
+    }));
+
+    await expect(runtime.executeReviewActions!(cohort, {} as never)).resolves.toEqual([
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 12.0G \u2212 reserved 8.0G for 1 settling attempt '
+          + '< floor 8G)',
+      },
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 12.0G \u2212 reserved 8.0G for 1 settling attempt '
+          + '< floor 8G)',
+      },
+    ]);
+    // Nothing reserved GitHub quota and no reviewer session started.
+    expect(spawned).toBe(0);
+  });
 });
