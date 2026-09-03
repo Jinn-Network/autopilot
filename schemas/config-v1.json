@@ -151,6 +151,16 @@
       "properties": {
         "staleAfterSeconds": { "type": "integer", "minimum": 1 },
         "diskFloorGb": { "type": "integer", "minimum": 0 },
+        "attemptFootprintGb": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["implement", "review"],
+          "default": { "implement": 8, "review": 1 },
+          "properties": {
+            "implement": { "type": "integer", "minimum": 0 },
+            "review": { "type": "integer", "minimum": 0 }
+          }
+        },
         "cleanup": { "type": "boolean" },
         "children": { "type": "boolean" },
         "carryover": { "type": "boolean" }

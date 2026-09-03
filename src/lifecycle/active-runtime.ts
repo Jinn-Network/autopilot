@@ -1,5 +1,6 @@
 import { withCycleStep } from '../cycle-heartbeat.js';
-import type { AttemptManifest } from './attempt-workspace.js';
+import type { AttemptManifest, AttemptPhase } from './attempt-workspace.js';
+import { diskHeadroomSkipDetail, type DiskHeadroom } from './disk-headroom.js';
 import type { LifecycleControllerDeps } from './controller.js';
 import type { CredentialPool } from './credentials.js';
 import { laneForNewWorkAction, type NewWorkAction } from './types.js';
@@ -92,7 +93,26 @@ export interface ActiveRuntimeOptions {
     readonly ok: boolean;
     readonly detail?: string;
   }>;
+  /**
+   * The pre-#144 seam: current free bytes against the floor, with no notion of
+   * work already committed to. Still honoured — a build that wires no
+   * projection behaves exactly as it did — but `readDiskHeadroom` supersedes
+   * it wherever both are present.
+   */
   readonly newWorkPaused?: () => boolean;
+  /**
+   * Projects free space forward over this cycle's own dispatches (#144).
+   *
+   * Called with the phases this cycle has already spawned, so the projection
+   * can charge each of them its expected footprint before the next dispatch
+   * asks whether the disk can take one more. Returning `null` means the
+   * projection could not be computed — an unreadable volume, an absent
+   * `statvfs` — and the runtime falls back to `newWorkPaused`; it never
+   * blocks work on its own inability to answer.
+   */
+  readonly readDiskHeadroom?: (
+    pendingSpawns: readonly AttemptPhase[],
+  ) => DiskHeadroom | null;
   /** Reserves aggregate GitHub capacity once before a review cohort starts. */
   readonly reserveReviewCohort?: (size: number) => Promise<void>;
   readonly handlers: ActiveRuntimeHandlers;
@@ -199,8 +219,23 @@ export function makeActiveRuntime(
     child: nonNegative(options.caps.child, 'child cap'),
     review: nonNegative(options.caps.review, 'review cap'),
   };
+  /**
+   * Phases this cycle has already spawned (#144).
+   *
+   * The footprint of a spawn lands minutes after the spawn — clone, then
+   * install — so nothing on disk records it while the cycle is still
+   * dispatching. This does, and the projection charges each entry its expected
+   * footprint, which is what stops N spawns in one cycle from all being
+   * admitted against the same free bytes.
+   *
+   * Reset at preflight rather than trusted to the process lifetime: the daemon
+   * runs many cycles in one process, and a count that survived a cycle would
+   * pause the next one for work that has long since landed.
+   */
+  let spawnedThisCycle: AttemptPhase[] = [];
   const readLocalState = () => {
-    const newWorkPaused = options.newWorkPaused?.() ?? false;
+    const diskHeadroom = options.readDiskHeadroom?.(spawnedThisCycle) ?? null;
+    const newWorkPaused = diskHeadroom?.paused ?? options.newWorkPaused?.() ?? false;
     const attempts = options.readLocalAttempts();
     // Both lanes write `implement`-phase manifests, so the split is the
     // manifest's own `childKind`. An attempt written before that field existed
@@ -226,13 +261,68 @@ export function makeActiveRuntime(
             review: Math.max(0, caps.review - activeByLane.review),
           },
       newWorkPaused,
+      ...(diskHeadroom === null ? {} : { diskHeadroom }),
       availableLogins: options.credentials.logins(),
       implementationPreferredLogin: options.implementationPreferredLogin,
     };
   };
 
+  /**
+   * The reason a lane with no remaining capacity refused this action. A paused
+   * disk and a genuinely full lane are the same zero, and only the projection
+   * can tell an operator which one they are looking at.
+   */
+  const laneFullReason = (local: ReturnType<typeof readLocalState>): string => (
+    local.diskHeadroom?.paused === true
+      ? `disk-floor (${diskHeadroomSkipDetail(local.diskHeadroom)})`
+      : 'local phase capacity is full'
+  );
+
+  /**
+   * How many of a review cohort the projected headroom can take, and the
+   * refusal to report for the rest. With no projection wired, every member is
+   * affordable — the pre-#144 behavior.
+   */
+  const affordableReviewCohort = (size: number): {
+    readonly admitted: number;
+    readonly refusal?: string;
+  } => {
+    const project = options.readDiskHeadroom;
+    if (project === undefined) return { admitted: size };
+    for (let admitted = 1; admitted <= size; admitted += 1) {
+      const projected = project([
+        ...spawnedThisCycle,
+        ...Array.from({ length: admitted }, () => 'review' as const),
+      ]);
+      if (projected?.paused !== true) continue;
+      return {
+        admitted: admitted - 1,
+        refusal: `disk-floor (${diskHeadroomSkipDetail(projected)})`,
+      };
+    }
+    return { admitted: size };
+  };
+
+  /**
+   * Charges a spawn's expected footprint against the rest of this cycle. Only
+   * `spawned` counts: a refused claim opened no worktree and must not consume
+   * the headroom the next candidate needs.
+   */
+  const chargeSpawn = (action: NewWorkAction, status: string): void => {
+    if (status !== 'spawned') return;
+    const lane = laneForNewWorkAction(action);
+    if (lane === null) return;
+    spawnedThisCycle = [
+      ...spawnedThisCycle,
+      lane === 'review' ? 'review' : 'implement',
+    ];
+  };
+
   return {
-    preflight: options.preflight,
+    async preflight() {
+      spawnedThisCycle = [];
+      return options.preflight();
+    },
     readLocalState,
     implementationBackpressureThreshold:
       nonNegative(
@@ -243,14 +333,34 @@ export function makeActiveRuntime(
     async executeReviewActions(actions, snapshot) {
       if (actions.length === 0) return [];
       const local = readLocalState();
-      if (actions.length > local.remaining.review) {
+      // A review cohort dispatches concurrently, so the projection cannot gate
+      // it one member at a time the way `executeAction` does — and admitting a
+      // whole cohort against one reading of free space is exactly the
+      // overcommit #144 is about, in miniature. So the cohort is trimmed to
+      // the prefix the projection affords.
+      //
+      // The tail is reported as a `disk-floor` skip rather than thrown at the
+      // controller as a capacity violation: the disk can fall below the floor
+      // partway through a cycle — implementation claims dispatch first and
+      // charge their footprint against the same volume — and that is the
+      // governor working, not a scheduling error. A throw here reached the
+      // controller's catch and logged every member as `failed`, which is a lie
+      // about work that was deliberately held back.
+      const admission = affordableReviewCohort(actions.length);
+      const refused = actions.slice(admission.admitted).map(() => ({
+        outcome: 'skipped',
+        reason: admission.refusal!,
+      }));
+      if (admission.admitted === 0) return refused;
+      const batch = actions.slice(0, admission.admitted);
+      if (batch.length > local.remaining.review) {
         throw new Error(
-          `Review cohort of ${actions.length} exceeds remaining review capacity `
+          `Review cohort of ${batch.length} exceeds remaining review capacity `
             + `${local.remaining.review}`,
         );
       }
-      await options.reserveReviewCohort?.(actions.length);
-      return Promise.all(actions.map(async (action) => {
+      await options.reserveReviewCohort?.(batch.length);
+      const results = await Promise.all(batch.map(async (action) => {
         try {
           const result = await withCycleStep(
             dispatchStepLabel(action),
@@ -262,6 +372,7 @@ export function makeActiveRuntime(
             ),
           );
           const detail = reason(result);
+          chargeSpawn(action, result.status);
           return {
             outcome: result.status,
             ...(detail === undefined ? {} : { reason: detail }),
@@ -273,12 +384,13 @@ export function makeActiveRuntime(
           };
         }
       }));
+      return [...results, ...refused];
     },
     async executeAction(action, snapshot) {
       const local = readLocalState();
       const lane = laneForNewWorkAction(action);
       if (lane !== null && local.remaining[lane] === 0) {
-        return { outcome: 'skipped', reason: 'local phase capacity is full' };
+        return { outcome: 'skipped', reason: laneFullReason(local) };
       }
       const credentials = options.credentials;
       const result = await dispatchAction(
@@ -288,6 +400,7 @@ export function makeActiveRuntime(
         snapshot,
       );
       const detail = reason(result);
+      chargeSpawn(action, result.status);
       return {
         outcome: result.status,
         ...(detail === undefined ? {} : { reason: detail }),

@@ -5,9 +5,12 @@ import {
   makeActiveRuntime,
 } from '../../src/lifecycle/active-runtime.js';
 import { CredentialPool } from '../../src/lifecycle/credentials.js';
+import { projectDiskHeadroom } from '../../src/lifecycle/disk-headroom.js';
 import { gitOid } from '../../src/lifecycle/types.js';
 
 const HEAD = gitOid('1'.repeat(40));
+const GB = 1024 ** 3;
+const NOW = Date.parse('2026-09-03T10:00:00.000Z');
 
 function pool(): CredentialPool {
   return new CredentialPool([
@@ -427,5 +430,299 @@ describe('active runtime boundary', () => {
       outcome: 'skipped',
       reason: 'action update-branch is not wired',
     });
+  });
+  it('reserves each spawn against the same cycle\u2019s later spawns', async () => {
+    const seen: (readonly string[])[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => {
+        seen.push([...pendingSpawns]);
+        return projectDiskHeadroom({
+          free: 12 * GB,
+          floor: 8 * GB,
+          liveAttempts: [],
+          pendingSpawns,
+          history: [],
+          defaults: { implement: 8 * GB, review: 1 * GB },
+          nowMs: NOW,
+        });
+      },
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const claim = (issueNumber: number) => ({
+      kind: 'claim-implementation' as const,
+      intent: 'fresh' as const,
+      issueNumber,
+    });
+
+    await expect(runtime.executeAction(claim(1), {} as never))
+      .resolves.toEqual({ outcome: 'spawned' });
+    // Twelve gigabytes free, an eight-gigabyte floor, and eight already spoken
+    // for: the second slot is open but the disk it would need is not.
+    await expect(runtime.executeAction(claim(2), {} as never)).resolves.toEqual({
+      outcome: 'skipped',
+      reason: 'disk-floor (free 12.0G \u2212 reserved 8.0G for 1 settling attempt '
+        + '< floor 8G)',
+    });
+    // One projection per dispatch, and the second one sees the first's charge.
+    expect(seen).toEqual([[], ['implement']]);
+  });
+
+  it('reserves a review spawn its own smaller footprint', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 10 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const claim = (prNumber: number) => ({
+      kind: 'claim-review' as const,
+      issueNumber: prNumber - 40,
+      prNumber,
+      head: HEAD,
+    });
+
+    await expect(runtime.executeAction(claim(84), {} as never))
+      .resolves.toEqual({ outcome: 'spawned' });
+    // One gigabyte reserved, not eight, so a second review still fits.
+    await expect(runtime.executeAction(claim(85), {} as never))
+      .resolves.toEqual({ outcome: 'spawned' });
+    expect(runtime.readLocalState().diskHeadroom).toMatchObject({
+      paused: false,
+      reserved: 2 * GB,
+      settling: 2,
+    });
+  });
+
+  it('forgets the previous cycle\u2019s spawns when the next one preflights', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 12 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const claim = { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 };
+
+    await runtime.executeAction(claim as never, {} as never);
+    expect(runtime.readLocalState().newWorkPaused).toBe(true);
+    await runtime.preflight();
+    expect(runtime.readLocalState().newWorkPaused).toBe(false);
+  });
+
+  it('charges nothing for a spawn that never happened', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 12 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'ineligible' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    await runtime.executeAction(
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 } as never,
+      {} as never,
+    );
+    expect(runtime.readLocalState().diskHeadroom).toMatchObject({ reserved: 0 });
+  });
+
+  it('keeps the boolean pause seam working with no projection wired', () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      newWorkPaused: () => true,
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    const local = runtime.readLocalState();
+    expect(local.newWorkPaused).toBe(true);
+    expect(local.diskHeadroom).toBeUndefined();
+  });
+  it('skips a review cohort the disk went below the floor under', async () => {
+    // Implementation claims dispatch before the review cohort and charge their
+    // footprint against the same disk, so the floor can start biting partway
+    // through a cycle. That is the governor working, not a scheduling error:
+    // the cohort must read as skipped, never as a capacity violation thrown at
+    // the controller and logged as `failed`.
+    let spawned = 0;
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 12 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      reserveReviewCohort: async () => { spawned += 1; },
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => {
+          spawned += 1;
+          return { status: 'spawned' };
+        },
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    await runtime.executeAction(
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 } as never,
+      {} as never,
+    );
+    const cohort = [84, 85].map((prNumber, index) => ({
+      kind: 'claim-review' as const,
+      issueNumber: 42 + index,
+      prNumber,
+      head: HEAD,
+    }));
+
+    // The arithmetic names what admitting one more review WOULD cost: the
+    // eight gigabytes the implement claim already spoke for, plus the one this
+    // review needs.
+    await expect(runtime.executeReviewActions!(cohort, {} as never)).resolves.toEqual([
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 12.0G \u2212 reserved 9.0G for 2 settling attempts '
+          + '< floor 8G)',
+      },
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 12.0G \u2212 reserved 9.0G for 2 settling attempts '
+          + '< floor 8G)',
+      },
+    ]);
+    // Nothing reserved GitHub quota and no reviewer session started.
+    expect(spawned).toBe(0);
+  });
+  it('admits only the prefix of a review cohort the projection affords', async () => {
+    // Reviews dispatch concurrently, so the projection cannot gate them one at
+    // a time the way `executeAction` does. Admitting a whole cohort against one
+    // reading is the same overcommit #144 is about, in miniature.
+    const started: number[] = [];
+    const reservations: number[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 2, review: 4 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+        free: 10 * GB,
+        floor: 8 * GB,
+        liveAttempts: [],
+        pendingSpawns,
+        history: [],
+        defaults: { implement: 8 * GB, review: 1 * GB },
+        nowMs: NOW,
+      }),
+      preflight: async () => ({ ok: true }),
+      reserveReviewCohort: async (size) => { reservations.push(size); },
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async (action) => {
+          started.push(action.prNumber);
+          return { status: 'spawned' };
+        },
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    const cohort = [84, 85, 86, 87].map((prNumber, index) => ({
+      kind: 'claim-review' as const,
+      issueNumber: 42 + index,
+      prNumber,
+      head: HEAD,
+    }));
+
+    // Ten gigabytes free against an eight-gigabyte floor leaves room for two
+    // one-gigabyte reviews; the third would put the projection under.
+    const results = await runtime.executeReviewActions!(cohort, {} as never);
+
+    expect(results).toEqual([
+      { outcome: 'spawned' },
+      { outcome: 'spawned' },
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 10.0G \u2212 reserved 3.0G for 3 settling attempts '
+          + '< floor 8G)',
+      },
+      {
+        outcome: 'skipped',
+        reason: 'disk-floor (free 10.0G \u2212 reserved 3.0G for 3 settling attempts '
+          + '< floor 8G)',
+      },
+    ]);
+    expect(started).toEqual([84, 85]);
+    // Quota is reserved for what actually runs, not for what was scheduled.
+    expect(reservations).toEqual([2]);
   });
 });

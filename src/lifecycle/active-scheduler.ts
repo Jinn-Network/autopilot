@@ -108,12 +108,22 @@ export interface ActiveSchedulingInput {
   readonly openPipelineBacklog: number;
   readonly implementationBackpressureThreshold: number;
   readonly newWorkPaused?: boolean;
+  /**
+   * The arithmetic behind the pause (#144), e.g. `free 12.0G − reserved 19.5G
+   * for 3 settling attempts < floor 8G`. The scheduler carries it onto every
+   * `disk-floor` skip without reading it: a full disk and a disk this cycle
+   * has already spoken for are the same refusal in a log that says only
+   * `disk-floor`.
+   */
+  readonly newWorkPausedDetail?: string;
 }
 
 export interface ActiveSchedulingSkip {
   readonly phase: ActiveCandidate['phase'];
   readonly subject: string;
   readonly reason: 'capacity' | 'credential-lane' | 'identity' | 'backpressure' | 'disk-floor';
+  /** Operator-facing arithmetic for a `disk-floor` skip; absent otherwise. */
+  readonly detail?: string;
 }
 
 export interface ActiveSchedulingPlan {
@@ -177,8 +187,17 @@ export function gatingIssueNumbers(
     : [candidate.issueNumber];
 }
 
-function capacitySkipReason(input: ActiveSchedulingInput): ActiveSchedulingSkip['reason'] {
-  return input.newWorkPaused === true ? 'disk-floor' : 'capacity';
+function capacitySkipCause(input: ActiveSchedulingInput): {
+  readonly reason: ActiveSchedulingSkip['reason'];
+  readonly detail?: string;
+} {
+  if (input.newWorkPaused !== true) return { reason: 'capacity' };
+  return {
+    reason: 'disk-floor',
+    ...(input.newWorkPausedDetail === undefined
+      ? {}
+      : { detail: input.newWorkPausedDetail }),
+  };
 }
 
 function implementationAction(
@@ -278,7 +297,7 @@ export function scheduleActiveActions(
         skips.push({
           phase: candidate.phase,
           subject: subject(candidate),
-          reason: capacitySkipReason(input),
+          ...capacitySkipCause(input),
         });
         // Paused new work is not a slot shortage, so nothing behind it is a
         // backup: promoting one would spend the very capacity the disk floor
@@ -317,7 +336,7 @@ export function scheduleActiveActions(
       skips.push({
         phase: candidate.phase,
         subject: subject(candidate),
-        reason: capacitySkipReason(input),
+        ...capacitySkipCause(input),
       });
       if (reviewer !== undefined && input.newWorkPaused !== true) {
         reviewBackups.push({

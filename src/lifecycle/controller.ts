@@ -37,6 +37,11 @@ import {
   resolveChildTriageExpectation,
 } from './child-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
+import {
+  diskHeadroomSkipDetail,
+  diskHeadroomSummaryLine,
+  type DiskHeadroom,
+} from './disk-headroom.js';
 import { planDebtSweeps, rankDebtSweeps } from './debt-sweep.js';
 import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
@@ -132,6 +137,12 @@ export interface LifecycleControllerDeps {
         readonly review: number;
       };
       readonly newWorkPaused: boolean;
+      /**
+       * The projection behind `newWorkPaused` (#144), when one was computed.
+       * Absent means the runtime fell back to reading current free bytes, and
+       * the cycle reports no disk line rather than a made-up one.
+       */
+      readonly diskHeadroom?: DiskHeadroom;
       readonly availableLogins: readonly string[];
       readonly implementationPreferredLogin: string;
     };
@@ -346,6 +357,11 @@ export type LifecycleCycleReport =
       readonly events: readonly LifecycleLogEvent[];
       /** Open-issue composition derived from this cycle's snapshot (#127). */
       readonly backlog: LifecycleBacklogSummary;
+      /**
+       * Projected disk headroom this cycle scheduled against (#144). Absent in
+       * observe/recover, and in any active build that wired no projection.
+       */
+      readonly disk?: DiskHeadroom;
       readonly reconciliation?: ReconciliationReport;
       /** Stage 4: GraphQL points spent this cycle (start remaining − end). */
       readonly budget?: {
@@ -1479,6 +1495,8 @@ interface ActivePassResult {
   readonly diagnostics: readonly LifecycleStatusDiagnostic[];
   readonly events: readonly LifecycleLogEvent[];
   readonly reconciliation: ReconciliationReport;
+  /** Projected disk headroom this pass scheduled against (#144), when computed. */
+  readonly disk?: DiskHeadroom;
 }
 
 async function executeActivePass(
@@ -1596,6 +1614,9 @@ async function executeActivePass(
     implementationBackpressureThreshold:
       deps.active!.implementationBackpressureThreshold,
     ...(local.newWorkPaused ? { newWorkPaused: true } : {}),
+    ...(local.diskHeadroom === undefined
+      ? {}
+      : { newWorkPausedDetail: diskHeadroomSkipDetail(local.diskHeadroom) }),
   });
   actionEvents.push(...scheduling.skips.map((skip): LifecycleLogEvent => ({
     cycleId,
@@ -1605,7 +1626,7 @@ async function executeActivePass(
     subject: skip.subject,
     action: 'schedule',
     outcome: 'skipped',
-    reason: skip.reason,
+    reason: skip.detail === undefined ? skip.reason : `${skip.reason} (${skip.detail})`,
   })));
   const actionEvent = (
     action: NewWorkAction,
@@ -1826,6 +1847,10 @@ async function executeActivePass(
     diagnostics,
     events: [...reconciliationEvents, ...actionEvents],
     reconciliation,
+    // Reported whether or not the floor bit this cycle: a governor that is
+    // only visible when it refuses cannot be told from one that is not
+    // running at all.
+    ...(local.diskHeadroom === undefined ? {} : { disk: local.diskHeadroom }),
   };
 }
 
@@ -2121,6 +2146,7 @@ export async function runLifecycleCycle(
         ...activePass.events,
       ],
       backlog: backlogSummary(snapshot.issues),
+      ...(activePass.disk === undefined ? {} : { disk: activePass.disk }),
       reconciliation: combinedReconciliation,
     });
   }
@@ -2533,6 +2559,9 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     report.parityUnavailableReason,
   );
   const backlogLines = backlogSummaryLines(report.backlog);
+  const diskLines = report.disk === undefined
+    ? []
+    : [diskHeadroomSummaryLine(report.disk)];
   if (
     report.items.length === 0
     && report.orphanBranchClaims.length === 0
@@ -2547,6 +2576,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
       usageLine,
       ...accountingLines,
       ...backlogLines,
+      ...diskLines,
       ...parityLines,
       'No lifecycle items.',
     ].join('\n');
@@ -2558,6 +2588,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     usageLine,
     ...accountingLines,
     ...backlogLines,
+    ...diskLines,
     ...parityLines,
     ...report.items.map(explanation),
     ...report.orphanBranchClaims.map(orphanExplanation),

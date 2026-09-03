@@ -25,9 +25,11 @@ import {
   listRunnerLiveAttempts,
   readAttemptManifest,
   trackAttemptChild,
+  type AttemptPhase,
   type TrackableAttemptChild,
 } from './attempt-workspace.js';
 import { makeActiveRuntime } from './active-runtime.js';
+import type { DiskHeadroom } from './disk-headroom.js';
 import {
   decodeReviewClaimPayload,
   formatHumanCommentMarker,
@@ -248,6 +250,10 @@ export interface ProductionActiveRuntimeOptions {
    */
   readonly sleep?: (ms: number) => Promise<void>;
   readonly newWorkPaused?: () => boolean;
+  /** Projected disk headroom for this cycle's own dispatches (#144). */
+  readonly readDiskHeadroom?: (
+    pendingSpawns: readonly AttemptPhase[],
+  ) => DiskHeadroom | null;
   readonly marketplaceTaskAdapter?: ProductionMarketplaceTaskAdapter;
   readonly marketplaceExecutionBackend?: Pick<
     MarketplaceSessionExecutionBackend,
@@ -979,6 +985,9 @@ export function makeProductionActiveRuntime(
     ...(options.newWorkPaused === undefined
       ? {}
       : { newWorkPaused: options.newWorkPaused }),
+    ...(options.readDiskHeadroom === undefined
+      ? {}
+      : { readDiskHeadroom: options.readDiskHeadroom }),
     handlers: {
       repairMachineChild: async (action, credentials) => {
         const selection = selectCredential(credentials, { phase: 'implement' });

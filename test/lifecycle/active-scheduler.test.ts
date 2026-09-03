@@ -541,4 +541,35 @@ describe('active local scheduler', () => {
       reason: 'disk-floor',
     });
   });
+  it('carries the projection arithmetic on every disk-floor skip', () => {
+    const detail = 'free 12.0G \u2212 reserved 19.5G for 3 settling attempts < floor 8G';
+    const plan = scheduleActiveActions(input({
+      remaining: { implementation: 0, child: 0, review: 0 },
+      newWorkPaused: true,
+      newWorkPausedDetail: detail,
+    }));
+
+    // A full disk and a disk this cycle has already spoken for look identical
+    // in a log that says only `disk-floor`; the arithmetic tells them apart.
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:1',
+      reason: 'disk-floor',
+      detail,
+    });
+    expect(plan.skips).toContainEqual({
+      phase: 'review',
+      subject: 'pr:30',
+      reason: 'disk-floor',
+      detail,
+    });
+  });
+
+  it('leaves an ordinary capacity skip undetailed', () => {
+    const plan = scheduleActiveActions(input({
+      remaining: { implementation: 0, child: 0, review: 0 },
+    }));
+
+    expect(plan.skips.every((skip) => !('detail' in skip))).toBe(true);
+  });
 });
