@@ -1971,8 +1971,16 @@ function recordedFootprint(
   measure: (path: string) => number | null,
 ): { readonly worktreeBytes?: number } {
   if (manifest.worktreeBytes !== undefined) return {};
-  const measured = measure(manifest.paths.worktree);
-  return measured === null ? {} : { worktreeBytes: measured };
+  // Named for the heartbeat (#132) for the same reason the removals below are:
+  // it is a synchronous walk of a whole checkout, and a cycle that sits in one
+  // must say what it is sitting in rather than look hung.
+  const endStep = beginCycleStep(`attempt worktree measure ${manifest.subject}`);
+  try {
+    const measured = measure(manifest.paths.worktree);
+    return measured === null ? {} : { worktreeBytes: measured };
+  } finally {
+    endStep();
+  }
 }
 
 export function markAttemptExited(
