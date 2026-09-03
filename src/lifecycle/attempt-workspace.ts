@@ -16,6 +16,7 @@ import {
   statSync,
   statfsSync,
   writeFileSync,
+  type Dirent,
 } from 'node:fs';
 import { hostname as systemHostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -173,6 +174,21 @@ export interface AttemptManifest {
   readonly processState: AttemptProcessState;
   readonly pid: number | null;
   readonly terminalHead?: string;
+  /**
+   * Bytes this attempt's worktree occupied when the child exited (#144).
+   *
+   * Written once, at the exit transition, because that is the moment the
+   * worktree is both at its largest and still on disk. Additive and optional
+   * on exactly the `childKind` pattern: every manifest written before this
+   * field existed decodes unchanged and simply contributes no history. The
+   * disk-headroom projection reads these to learn what a phase actually costs
+   * on this host, and falls back to the configured default until enough of
+   * them exist.
+   *
+   * Absent also means "the measurement gave up" (see `measureWorktreeBytes`),
+   * so a missing value never asserts a small footprint.
+   */
+  readonly worktreeBytes?: number;
   readonly paths: AttemptPaths;
   readonly timestamps: AttemptTimestamps;
 }
@@ -290,6 +306,13 @@ function positiveInteger(value: unknown, name: string): number {
   return value;
 }
 
+function nonNegativeInteger(value: unknown, name: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid ${name}`);
+  }
+  return value;
+}
+
 function attemptChildKind(value: unknown): ChildKind {
   if (
     typeof value !== 'string'
@@ -324,6 +347,7 @@ function exactKeys(
       'targetBaseOid',
       'terminalHead',
       'childKind',
+      'worktreeBytes',
       'childStartedAt',
       'childExitedAt',
     ].includes(key));
@@ -746,6 +770,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'processState',
     'pid',
     'terminalHead',
+    'worktreeBytes',
     'paths',
     'timestamps',
   ], 'attempt manifest', ['execution']);
@@ -833,6 +858,9 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const terminalHead = manifest.terminalHead === undefined
     ? undefined
     : gitOid(stringField(manifest.terminalHead, 'terminal head'));
+  const worktreeBytes = manifest.worktreeBytes === undefined
+    ? undefined
+    : nonNegativeInteger(manifest.worktreeBytes, 'worktree bytes');
   const timestamps = decodeTimestamps(manifest.timestamps);
   if (
     (decodedProcessState === 'preparing'
@@ -920,6 +948,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     processState: decodedProcessState,
     pid,
     ...(terminalHead === undefined ? {} : { terminalHead }),
+    ...(worktreeBytes === undefined ? {} : { worktreeBytes }),
     paths,
     timestamps,
   };
@@ -1199,6 +1228,9 @@ export function updateAttemptManifest(
     'processState',
     'pid',
     'terminalHead',
+    // Learned at the exit transition, not at creation (#144), and never
+    // rewritten once present — see `recordedFootprint`.
+    'worktreeBytes',
     'timestamps',
   ]);
   const progressiveTimestampFields = new Set([
@@ -1929,10 +1961,25 @@ export function markAttemptRunning(
   });
 }
 
+/**
+ * Records the worktree footprint at the exit transition (#144), or nothing at
+ * all when the measurement gave up. Never overwrites a footprint an earlier
+ * transition already recorded — the worktree only shrinks after exit.
+ */
+function recordedFootprint(
+  manifest: AttemptManifest,
+  measure: (path: string) => number | null,
+): { readonly worktreeBytes?: number } {
+  if (manifest.worktreeBytes !== undefined) return {};
+  const measured = measure(manifest.paths.worktree);
+  return measured === null ? {} : { worktreeBytes: measured };
+}
+
 export function markAttemptExited(
   manifestPath: string,
   now: () => Date = () => new Date(),
   terminalHead?: string,
+  measure: (path: string) => number | null = measureWorktreeBytes,
 ): AttemptManifest {
   const current = readAttemptManifest(manifestPath);
   if (
@@ -1942,7 +1989,7 @@ export function markAttemptExited(
       || current.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1'
     )
   ) {
-    return markMarketplaceAttemptExited(manifestPath, now, terminalHead);
+    return markMarketplaceAttemptExited(manifestPath, now, terminalHead, measure);
   }
   const timestamp = transitionTimestamp(now);
   const validTerminalHead = terminalHead === undefined ? undefined : gitOid(terminalHead);
@@ -1954,6 +2001,7 @@ export function markAttemptExited(
       ...manifest,
       processState: 'exited',
       ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
+      ...recordedFootprint(manifest, measure),
       timestamps: {
         ...manifest.timestamps,
         updatedAt: timestamp,
@@ -1967,6 +2015,7 @@ export function markMarketplaceAttemptExited(
   manifestPath: string,
   now: () => Date = () => new Date(),
   terminalHead?: string,
+  measure: (path: string) => number | null = measureWorktreeBytes,
 ): AttemptManifest {
   const timestamp = transitionTimestamp(now);
   const validTerminalHead = terminalHead === undefined ? undefined : gitOid(terminalHead);
@@ -1978,6 +2027,7 @@ export function markMarketplaceAttemptExited(
     ...current,
     processState: 'exited',
     ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
+    ...recordedFootprint(current, measure),
     timestamps: {
       ...current.timestamps,
       updatedAt: timestamp,
@@ -3362,6 +3412,101 @@ export function freeDiskBytes(path: string): number {
   }
   const stats = statfsSync(existingPath);
   return Number(stats.bavail) * Number(stats.bsize);
+}
+
+/**
+ * Entries `measureWorktreeBytes` will visit before it gives up.
+ *
+ * A checked-out repository plus one `node_modules` install is comfortably
+ * inside this; a runaway build output directory is not, and a walk that ran
+ * for minutes at the exit transition would delay the very cleanup that frees
+ * the disk. Generous enough that exceeding it means something is wrong.
+ */
+const WORKTREE_MEASUREMENT_ENTRY_BUDGET = 500_000;
+
+/**
+ * Allocated bytes under `path`, or `null` when the walk exceeded its entry
+ * budget (#144).
+ *
+ * `null` rather than a partial sum, deliberately: this value becomes history
+ * that the headroom projection turns into an *expected* footprint, and a
+ * truncated walk would teach the projection that attempts are smaller than
+ * they are — the exact error that let a cycle overcommit the disk. Refusing to
+ * answer keeps the configured default in play instead.
+ *
+ * Blocks, not `size`, so the number matches what `du` and the filesystem's own
+ * free-space accounting report; `size` would over-count sparse files and
+ * under-count block-rounded small ones. Symlinks are not followed and their
+ * targets are never counted twice. Entries that vanish mid-walk — the child
+ * may still be exiting — are skipped rather than thrown on: a footprint is an
+ * estimate, and no caller may fail because one file moved.
+ */
+export function measureWorktreeBytes(
+  path: string,
+  entryBudget: number = WORKTREE_MEASUREMENT_ENTRY_BUDGET,
+): number | null {
+  const pending = [path];
+  let bytes = 0;
+  let visited = 0;
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    let entries: readonly Dirent[];
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      visited += 1;
+      if (visited > entryBudget) return null;
+      const child = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(child);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      try {
+        const stats = lstatSync(child);
+        bytes += stats.blocks > 0 ? stats.blocks * 512 : stats.size;
+      } catch {
+        // Vanished between readdir and lstat; it occupies nothing now.
+      }
+    }
+  }
+  return bytes;
+}
+
+/** One recorded attempt footprint, as the headroom projection consumes it. */
+export interface AttemptFootprintRecord {
+  readonly phase: AttemptPhase;
+  readonly worktreeBytes: number;
+  readonly endedAtMs: number;
+}
+
+/**
+ * Every footprint this host has recorded, oldest first (#144).
+ *
+ * Host-scoped rather than runner-scoped: a footprint is a fact about the
+ * machine's filesystem and repository, and a runner that restarts gets a new
+ * id but the same disk. Attempts that carry no `worktreeBytes` — written
+ * before the field existed, or measured and given up on — are simply absent;
+ * they must not read as zero-byte attempts.
+ */
+export function listHostAttemptFootprints(
+  v2Base: string,
+  host: string,
+): readonly AttemptFootprintRecord[] {
+  return collectHostedAttempts(v2Base, filesystemSafeHostname(host))
+    .flatMap(({ manifest }) => (
+      manifest.worktreeBytes === undefined
+        ? []
+        : [{
+            phase: manifest.phase,
+            worktreeBytes: manifest.worktreeBytes,
+            endedAtMs: attemptEndedAtMs(manifest),
+          }]
+    ))
+    .sort((left, right) => left.endedAtMs - right.endedAtMs);
 }
 
 function attemptEndedAtMs(manifest: AttemptManifest): number {
