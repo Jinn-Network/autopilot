@@ -145,6 +145,25 @@ export const autopilotConfigSchema = z.object({
   safety: z.object({
     staleAfterSeconds: positiveSeconds,
     diskFloorGb: nonNegativeInteger,
+    /**
+     * What one attempt of each phase is expected to cost on disk, used by the
+     * headroom projection (#144) until this host has recorded enough real
+     * footprints to speak for itself.
+     *
+     * Defaulted, not required: every `.autopilot/config.json` written before
+     * the projection existed omits the key and must keep parsing. The defaults
+     * are the footprints the incident measured — an implement worktree at
+     * ~6.5 GB and a review worktree at ~0.2 GB, each rounded up — so a host
+     * with no history at all still errs toward holding work back.
+     *
+     * Zero is representable and means "reserve nothing for this phase": the
+     * pre-#144 behavior for that lane, and the escape hatch for an operator
+     * whose worktrees genuinely cost nothing.
+     */
+    attemptFootprintGb: z.object({
+      implement: nonNegativeInteger,
+      review: nonNegativeInteger,
+    }).strict().default({ implement: 8, review: 1 }),
     cleanup: z.boolean(),
     children: z.boolean(),
     // Deprecated: the approval carry-over knob lost its only caller when the

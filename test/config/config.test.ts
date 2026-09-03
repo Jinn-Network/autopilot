@@ -102,6 +102,7 @@ function validConfig(): unknown {
     safety: {
       staleAfterSeconds: 7200,
       diskFloorGb: 10,
+      attemptFootprintGb: { implement: 8, review: 1 },
       cleanup: true,
       children: true,
       carryover: true,
@@ -140,6 +141,41 @@ describe('Autopilot product configuration', () => {
     input.repository.codeOwnerLogins = ['Owner-One', 'owner-two'];
 
     expect(decodeAutopilotConfig(input)).toEqual(input);
+  });
+
+  // Same additive contract: every `.autopilot/config.json` written before the
+  // disk-headroom projection existed (#144) omits `attemptFootprintGb` and
+  // must keep parsing, landing on the footprints the incident measured.
+  it('defaults attempt footprints when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      safety: { attemptFootprintGb?: unknown };
+    };
+    delete input.safety.attemptFootprintGb;
+
+    expect(decodeAutopilotConfig(input).safety.attemptFootprintGb)
+      .toEqual({ implement: 8, review: 1 });
+  });
+
+  it('round-trips configured attempt footprints', () => {
+    const input = validConfig();
+    input.safety.attemptFootprintGb = { implement: 12, review: 2 };
+
+    expect(decodeAutopilotConfig(input).safety.attemptFootprintGb)
+      .toEqual({ implement: 12, review: 2 });
+  });
+
+  it('rejects a partial or unknown attempt-footprint block', () => {
+    const missingPhase = validConfig() as ReturnType<typeof validConfig> & {
+      safety: { attemptFootprintGb: unknown };
+    };
+    missingPhase.safety.attemptFootprintGb = { implement: 8 };
+    expect(() => decodeAutopilotConfig(missingPhase)).toThrow();
+
+    const unknownPhase = validConfig() as ReturnType<typeof validConfig> & {
+      safety: { attemptFootprintGb: unknown };
+    };
+    unknownPhase.safety.attemptFootprintGb = { implement: 8, review: 1, enqueue: 1 };
+    expect(() => decodeAutopilotConfig(unknownPhase)).toThrow();
   });
 
   // Same additive contract `codeOwnerLogins` established: every deployed
