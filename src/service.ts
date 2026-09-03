@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -165,6 +166,146 @@ export function startCycleWatchdog(input: {
   }, input.thresholdMs);
 }
 
+/**
+ * Every line the daemon writes about itself carries this prefix, so a line the
+ * daemon emitted can never be mistaken for one of its children's.
+ */
+const DAEMON_LOG_PREFIX = '[autopilot:daemon]';
+
+/**
+ * The engine log. `startService` attaches the detached daemon's stdout AND
+ * stderr to this file, and `spawnDaemonActiveOnce` hands the child those same
+ * descriptors (`stdio: ['ignore', 'inherit', 'inherit']`), so everything an
+ * engine child says lands here. It is therefore the only place a supervisor
+ * that never pipes its child can read what that child said before it died.
+ */
+function engineLogPath(logsDirectory: string): string {
+  return join(logsDirectory, 'engine.log');
+}
+
+/**
+ * How much of the child's last line an operator gets. Long enough for a
+ * `fatal:`/`Error:` head plus its cause, short enough that a runaway line — a
+ * dumped payload, a stack on one line — cannot push the count and the exit code
+ * off the end of the line that carries them.
+ */
+export const CYCLE_FAILURE_EXCERPT_CHARS = 120;
+
+/** Only the tail of the engine log is ever read; it grows without bound. */
+const CYCLE_FAILURE_LOG_TAIL_BYTES = 64 * 1_024;
+
+/**
+ * The consecutive-failure counter the live topology can actually carry
+ * (jinn-autopilot#139).
+ *
+ * The in-engine counters (#130's stale reconciliation, #136's unavailable
+ * snapshot read) count in memory owned by the engine, and the live daemon
+ * spawns one `--mode active --once` child per cycle: every such counter is born
+ * at 0 and dies with the child, so a stall lasting 46 cycles looks like 46
+ * unrelated first cycles. The daemon process is the only thing here that spans
+ * cycles, so this is where a run of failures can be seen at all.
+ *
+ * A cycle counts as failed on any non-zero exit and on a null one — a spawn
+ * error or a signal kill is a failed cycle, not an unknown one. The machine
+ * exit is the first exit-0 cycle; nothing else clears it, and a daemon restart
+ * legitimately starts at zero because a fresh daemon has failed no cycles.
+ */
+export function nextConsecutiveFailedCycles(
+  previous: number,
+  exitCode: number | null,
+): number {
+  return exitCode === 0 ? 0 : previous + 1;
+}
+
+/**
+ * The daemon-side stall line, or null while the run is too short to be a run.
+ * Pure, so both the wording and the silence after a single failed cycle are
+ * pinned. One failure is a cycle that failed; two in a row is a stall, and it is
+ * the second that earns the first line — the same shape as the #132 watchdog.
+ */
+export function consecutiveFailureLine(input: {
+  readonly failures: number;
+  readonly exitCode: number | null;
+  readonly excerpt: string | null;
+}): string | null {
+  if (input.failures < 2) return null;
+  const exit = input.exitCode === null ? 'unknown' : String(input.exitCode);
+  const last = input.excerpt === null || input.excerpt === ''
+    ? 'none recorded'
+    : input.excerpt;
+  return `${DAEMON_LOG_PREFIX} cycle failed ${input.failures} time(s) in a row `
+    + `(exit ${exit}); last: ${last}`;
+}
+
+/**
+ * The last thing the engine child said, redacted and cut to
+ * `CYCLE_FAILURE_EXCERPT_CHARS`. Blank lines and the daemon's own lines are
+ * skipped: without the second rule the signal quotes itself, since the failure
+ * line it just wrote is the newest line in the very log it reads next cycle.
+ */
+export function cycleFailureExcerpt(content: string): string | null {
+  const lines = content.split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!.trim();
+    if (line === '' || line.startsWith(DAEMON_LOG_PREFIX)) continue;
+    return redactLog(line).slice(0, CYCLE_FAILURE_EXCERPT_CHARS);
+  }
+  return null;
+}
+
+/**
+ * Reads the excerpt from the engine log's tail. Never throws: a missing,
+ * unreadable, or truncated log is a missing excerpt, not a failed cycle.
+ */
+export function readCycleFailureExcerpt(logPath: string): string | null {
+  try {
+    const stat = statSync(logPath);
+    if (!stat.isFile()) return null;
+    const length = Math.min(stat.size, CYCLE_FAILURE_LOG_TAIL_BYTES);
+    if (length <= 0) return null;
+    const buffer = Buffer.alloc(length);
+    const descriptor = openSync(logPath, 'r');
+    try {
+      readSync(descriptor, buffer, 0, length, stat.size - length);
+    } finally {
+      closeSync(descriptor);
+    }
+    // A tail cut mid-character only damages the FIRST line of the window, which
+    // is never the one returned unless the whole tail is a single line.
+    return cycleFailureExcerpt(buffer.toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The whole signal for one completed cycle, in one call the daemon loop can
+ * make unguarded: a clean cycle reads no log at all, and a log read that throws
+ * degrades to "none recorded" rather than taking the supervisor down with it.
+ */
+export function cycleFailureSignal(input: {
+  readonly failures: number;
+  readonly exitCode: number | null;
+  readonly readExcerpt: () => string | null;
+}): { readonly excerpt: string | null; readonly line: string | null } {
+  let excerpt: string | null = null;
+  if (input.failures > 0) {
+    try {
+      excerpt = input.readExcerpt();
+    } catch {
+      excerpt = null;
+    }
+  }
+  return {
+    excerpt,
+    line: consecutiveFailureLine({
+      failures: input.failures,
+      exitCode: input.exitCode,
+      excerpt,
+    }),
+  };
+}
+
 export interface DaemonCycleStatus {
   readonly startedAt: string;
   readonly ageMs: number;
@@ -215,24 +356,44 @@ export function daemonCycleStatus(input: {
 }
 
 /**
+ * The failure-streak clause, or '' when the daemon has no streak to report.
+ * Empty for a zero, absent, or pre-#139 field, which is what keeps every
+ * healthy daemon line byte-identical to what #132 rendered.
+ */
+function failureStreakClause(daemon: Partial<DaemonMetadata> | null): string {
+  const failures = daemon?.consecutiveFailedCycles ?? 0;
+  // `readDaemonMetadata` does not validate the additive fields, so a
+  // hand-edited or truncated record must render as no streak, never as one.
+  if (!Number.isSafeInteger(failures) || failures < 1) return '';
+  const excerpt = daemon?.lastCycleFailureExcerpt;
+  const last = typeof excerpt === 'string' && excerpt !== '' ? excerpt : 'none recorded';
+  return `; last ${failures} cycle${failures === 1 ? '' : 's'} failed; last: ${last}`;
+}
+
+/**
  * `autopilot status`'s daemon line. A live daemon reports the cycle it is in
  * and what that cycle is doing, so "slow" is distinguishable from "hung"
- * without reading logs.
+ * without reading logs — and, since #139, a run of failed cycles, so "cycling
+ * fine" is distinguishable from "cycling and failing every time".
  */
 export function renderDaemonStatus(input: {
   readonly status: string;
   readonly cycle?: DaemonCycleStatus | null;
+  /** The daemon record, read only for its additive failure-streak fields. */
+  readonly daemon?: Partial<DaemonMetadata> | null;
 }): string {
   if (input.status !== 'running') return input.status;
+  const streak = failureStreakClause(input.daemon ?? null);
   const cycle = input.cycle ?? null;
-  if (cycle === null) return 'running (idle)';
+  if (cycle === null) return `running (idle${streak})`;
   const overdue = cycle.overdue
     ? `, over the ${formatCycleDuration(cycle.thresholdMs)} watchdog threshold`
     : '';
   const step = cycle.step === null
     ? 'none recorded'
     : `${cycle.step.step} ${formatCycleDuration(cycle.step.ageMs)} ago`;
-  return `running (cycle ${formatCycleDuration(cycle.ageMs)}${overdue}; step: ${step})`;
+  return `running (cycle ${formatCycleDuration(cycle.ageMs)}${overdue}; `
+    + `step: ${step}${streak})`;
 }
 
 export interface DaemonMetadata {
@@ -248,6 +409,15 @@ export interface DaemonMetadata {
   readonly lastCycleStartedAt?: string;
   readonly lastCycleFinishedAt?: string;
   readonly lastCycleExitCode?: number | null;
+  /**
+   * Additive (#139): consecutive cycles that exited non-zero, 0 while healthy.
+   * Absent on every record written before #139 and on any record a reader other
+   * than `status` cares about, so it stays optional — `classifyDaemonRecord`
+   * and `readDaemonMetadata` must keep parsing a record that lacks it.
+   */
+  readonly consecutiveFailedCycles?: number;
+  /** Additive (#139): the excerpt behind the current streak; absent when 0. */
+  readonly lastCycleFailureExcerpt?: string;
 }
 
 export type DaemonClassification =
@@ -536,7 +706,7 @@ export async function startService(input: {
     });
     return { status: 'started', pid: process.pid };
   }
-  const logPath = join(input.loaded.paths.logs, 'engine.log');
+  const logPath = engineLogPath(input.loaded.paths.logs);
   const descriptor = openSync(logPath, 'a', 0o600);
   try {
     const child = spawn(process.execPath, [
@@ -602,6 +772,11 @@ export async function runDaemon(input: {
   const watchdogThresholdMs = cycleWatchdogThresholdMs(
     input.loaded.config.scheduler.pollSeconds,
   );
+  const cycleLogPath = engineLogPath(input.loaded.paths.logs);
+  // Daemon-process-local and deliberately not recovered from the record on
+  // start (#139): a daemon that has just started has failed no cycles, so a
+  // restart is the operator-visible reset.
+  let consecutiveFailedCycles = 0;
   let stopping = false;
   let wake: (() => void) | undefined;
   let metadata: DaemonMetadata = {
@@ -702,11 +877,26 @@ export async function runDaemon(input: {
           recordCompletion: (exitCode) => {
             stopWatchdog();
             clearCycleHeartbeat(heartbeatPath);
+            consecutiveFailedCycles = nextConsecutiveFailedCycles(
+              consecutiveFailedCycles,
+              exitCode,
+            );
+            const signal = cycleFailureSignal({
+              failures: consecutiveFailedCycles,
+              exitCode,
+              readExcerpt: () => readCycleFailureExcerpt(cycleLogPath),
+            });
             metadata = updateMetadata(input.loaded, metadata, {
               lastCycleFinishedAt: new Date().toISOString(),
               lastCycleExitCode: exitCode,
+              consecutiveFailedCycles,
+              // Explicit undefined clears the field on the first clean cycle:
+              // `JSON.stringify` drops it, so a healthy record carries no
+              // excerpt at all rather than a stale one.
+              lastCycleFailureExcerpt: signal.excerpt ?? undefined,
               state: stopping ? 'stopping' : 'running',
             });
+            if (signal.line !== null) console.warn(signal.line);
           },
           shouldStop: () => stopping,
           intervalMs: input.loaded.config.scheduler.pollSeconds * 1_000,
