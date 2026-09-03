@@ -121,6 +121,24 @@ export class GitHubRestSchemaError extends Error {
   }
 }
 
+/**
+ * A closed pull request whose `merged_at` follows its `closed_at` by more than
+ * the tolerance: incoherent enough to refuse, but per-record (#136).
+ *
+ * A subclass so the closed-PR page parser can drop exactly this record and
+ * complete its page, while every other `GitHubRestSchemaError` keeps aborting
+ * the page as it always has.
+ */
+export class GitHubRestMergedAfterClosedError extends GitHubRestSchemaError {
+  constructor(
+    readonly prNumber: number,
+    readonly skewMs: number,
+  ) {
+    super(`pull request ${prNumber} merged ${skewSeconds(skewMs)}s after it closed`);
+    this.name = 'GitHubRestMergedAfterClosedError';
+  }
+}
+
 export class GitHubRestPaginationError extends Error {
   constructor(detail: string) {
     super(`GitHub REST pagination is incomplete: ${detail}`);
@@ -440,6 +458,31 @@ function parseIssueIndexRow(
   };
 }
 
+/**
+ * The widest `merged_at` > `closed_at` skew read as GitHub's own bookkeeping
+ * rather than as corruption (#136).
+ *
+ * GitHub writes the two timestamps in different steps of the merge transaction
+ * and does not order them to the second. Across the last 100 merged pull
+ * requests on Jinn-Network/mono: 86 carried the two equal, 7 carried
+ * `merged_at` BEFORE `closed_at` (accepted here and always has been), and 1 —
+ * #3694, closed 21:45:07Z and merged 21:45:08Z — carried it one second after.
+ * That single record threw, the throw aborted the whole recently-closed page,
+ * and the engine produced no snapshot at all for ~10 hours.
+ *
+ * Five minutes is orders of magnitude wider than any skew that transaction can
+ * produce, and still far narrower than any interval in which a genuinely
+ * incoherent record could hide: a merged pull request IS closed at its merge,
+ * so normalizing `closedAt` to `mergedAt` restores `closed >= merged` by
+ * construction rather than by assertion.
+ */
+export const MERGED_AFTER_CLOSED_TOLERANCE_MS = 5 * 60_000;
+
+/** Whole seconds of skew, for a message a human can compare to the tolerance. */
+function skewSeconds(skewMs: number): number {
+  return Math.round(skewMs / 1_000);
+}
+
 function parsePullRequestIndexRow(
   input: unknown,
   index: number,
@@ -477,11 +520,19 @@ function parsePullRequestIndexRow(
     closedAt = isoTimestamp(pr.closed_at, `pull request ${index}.closed_at`);
     mergedAt = nullableTimestamp(pr.merged_at, `pull request ${index}.merged_at`);
     const closedMs = exactUtcTimestamp(closedAt, `pull request ${index}.closed_at`).ms;
-    if (
-      mergedAt !== null
-      && exactUtcTimestamp(mergedAt, `pull request ${index}.merged_at`).ms > closedMs
-    ) {
-      throw new GitHubRestSchemaError(`pull request ${index} merged after it closed`);
+    if (mergedAt !== null) {
+      const skewMs =
+        exactUtcTimestamp(mergedAt, `pull request ${index}.merged_at`).ms - closedMs;
+      if (skewMs > MERGED_AFTER_CLOSED_TOLERANCE_MS) {
+        throw new GitHubRestMergedAfterClosedError(number, skewMs);
+      }
+      if (skewMs > 0) {
+        console.warn(
+          `[autopilot] pull request ${number} reports merged_at ${skewSeconds(skewMs)}s`
+          + ' after closed_at; treating the merge time as the close time',
+        );
+        closedAt = mergedAt;
+      }
     }
   }
   return {
@@ -496,6 +547,39 @@ function parsePullRequestIndexRow(
     closedAt,
     mergedAt,
   };
+}
+
+/**
+ * One closed-PR index row, or `null` where its `merged_at`/`closed_at` skew is
+ * too wide to normalize (#136).
+ *
+ * The trade, deliberately: a refused merged PR is absent from the
+ * recently-closed index for this cycle, which delays its issue's terminal-claim
+ * backfill by a cycle — and the record re-enters the index the moment GitHub
+ * reads coherent, since nothing about the refusal is persisted. The alternative
+ * is what #136 was: one incoherent record on page 1 aborts the page, so the
+ * full reconciliation and its incremental fallback both fail, so there are no
+ * cycles at all. One record's evidence for one cycle is the smaller loss.
+ *
+ * Only the skew is refusable. Every other schema violation still throws through
+ * this function and aborts the page, because a malformed OID or an absent
+ * timestamp is corruption, not clock skew.
+ */
+function parseRefusableClosedPullRequestRow(
+  input: unknown,
+  index: number,
+): PullRequestIndexEntry | null {
+  try {
+    return parsePullRequestIndexRow(input, index, 'closed');
+  } catch (error) {
+    if (!(error instanceof GitHubRestMergedAfterClosedError)) throw error;
+    console.warn(
+      `[autopilot] pull request ${error.prNumber} merged ${skewSeconds(error.skewMs)}s`
+      + ` after it closed, beyond the ${skewSeconds(MERGED_AFTER_CLOSED_TOLERANCE_MS)}s`
+      + ' tolerance; refusing the record for this cycle',
+    );
+    return null;
+  }
 }
 
 type PaginationMode = 'after' | 'page' | 'page+after';
@@ -961,7 +1045,8 @@ export class GitHubRestDiscoveryReader {
       seen.add(endpoint);
       const response = await this.rest.getJson(endpoint);
       const pageRows = rows(response.body, `recently-closed PR page ${page}`)
-        .map((row, index) => parsePullRequestIndexRow(row, index, 'closed'));
+        .map((row, index) => parseRefusableClosedPullRequestRow(row, index))
+        .filter((pr): pr is PullRequestIndexEntry => pr !== null);
       let reachedCutoff = false;
       for (const pr of pageRows) {
         const updatedMs = exactUtcTimestamp(pr.updatedAt, `pull request ${pr.number}.updated_at`).ms;

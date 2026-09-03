@@ -13,7 +13,10 @@ import { dirname, join } from 'node:path';
 import { z } from 'zod';
 import type { PolledIssue } from '../dispatcher/types.js';
 import type { ProjectSnapshot } from '../dispatcher/project-snapshot.js';
-import type { PullRequestIndexEntry } from './github-rest-discovery.js';
+import {
+  MERGED_AFTER_CLOSED_TOLERANCE_MS,
+  type PullRequestIndexEntry,
+} from './github-rest-discovery.js';
 import {
   isConfinedRestEndpoint,
   type PersistedConditionalRestCacheEntry,
@@ -685,7 +688,15 @@ const stateSchema = z.object({
         `PR #${pr.number} is not a coherent CLOSED index row`,
       );
     }
-    if (pr.mergedAt !== null && Date.parse(pr.mergedAt) > closedMs) {
+    // The reader normalizes a tolerated `merged_at > closed_at` skew away
+    // (#136), so a record it emits satisfies this by construction; the same
+    // tolerance is mirrored here because the cache validates records it did not
+    // watch the reader produce, and a validator stricter than its reader turns
+    // ordinary GitHub clock skew into a corrupt cache.
+    if (
+      pr.mergedAt !== null
+      && Date.parse(pr.mergedAt) - closedMs > MERGED_AFTER_CLOSED_TOLERANCE_MS
+    ) {
       issue(['recentlyClosedPullRequests'], `PR #${pr.number} merged after it closed`);
     }
     if (openIndex.has(pr.number)) {

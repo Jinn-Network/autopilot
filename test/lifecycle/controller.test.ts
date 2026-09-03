@@ -316,6 +316,120 @@ describe('lifecycle controller', () => {
     expect(json).not.toContain('"graphqlCost": 0');
   });
 
+  /**
+   * A cycle that produces no snapshot at all finishes in about a minute having
+   * done nothing, leaves `status` reading `running`, and fires none of the
+   * stall instruments — every one of them sits behind a snapshot. #136 ran 46
+   * such cycles overnight and the only evidence was one WARNING line shaped
+   * like every other WARNING line. Counted and surfaced the way #130 surfaces a
+   * stale reconciliation: one derived line per cycle, from the second.
+   */
+  describe('no-snapshot stall surfacing (#136)', () => {
+    const unavailable = (report: Awaited<ReturnType<typeof runLifecycleCycle>>) => (
+      report.events.filter((event) => event.subject === 'snapshot')
+    );
+
+    /**
+     * A fresh deps object per cycle carrying one stable `readSnapshot`, exactly
+     * as the daemon builds it: the count must survive the per-cycle deps and
+     * still belong to this engine alone.
+     */
+    function failingRuntime(message = 'both failed') {
+      const readSnapshot = async (): Promise<never> => { throw new Error(message); };
+      return () => ({
+        ...deps(implementation(), []),
+        snapshotFailureMode: 'report' as const,
+        readSnapshot,
+      });
+    }
+
+    it('says nothing on the first cycle that produces no snapshot', async () => {
+      // One is a failed read; a run of them is a stall.
+      const runtime = failingRuntime();
+      expect(unavailable(await runLifecycleCycle('recover', runtime()))).toEqual([]);
+    });
+
+    it('logs the stall from the second consecutive no-snapshot cycle', async () => {
+      const runtime = failingRuntime(
+        'Full reconciliation and incremental fallback both failed: [full] '
+        + 'GitHubRestSchemaError: pull request 1 merged after it closed',
+      );
+
+      await runLifecycleCycle('recover', runtime());
+      const report = await runLifecycleCycle('recover', runtime());
+
+      expect(unavailable(report)).toEqual([expect.objectContaining({
+        mode: 'recover',
+        phase: 'eligible',
+        action: 'read',
+        subject: 'snapshot',
+        outcome: 'unavailable',
+        reason:
+          'for 2 consecutive cycle(s): Full reconciliation and incremental fallback both '
+          + 'failed: [full] GitHubRestSchemaError: pull request 1 merged after it c',
+      })]);
+    });
+
+    it('counts every consecutive no-snapshot cycle, one line each', async () => {
+      const runtime = failingRuntime();
+      const reasons: (string | undefined)[] = [];
+
+      for (let cycle = 0; cycle < 4; cycle += 1) {
+        reasons.push(unavailable(await runLifecycleCycle('recover', runtime()))[0]?.reason);
+      }
+
+      expect(reasons).toEqual([
+        undefined,
+        'for 2 consecutive cycle(s): both failed',
+        'for 3 consecutive cycle(s): both failed',
+        'for 4 consecutive cycle(s): both failed',
+      ]);
+    });
+
+    it('carries only the first 120 characters of the last error', async () => {
+      const runtime = failingRuntime('x'.repeat(400));
+
+      await runLifecycleCycle('recover', runtime());
+      const report = await runLifecycleCycle('recover', runtime());
+
+      expect(unavailable(report)[0]?.reason)
+        .toBe(`for 2 consecutive cycle(s): ${'x'.repeat(120)}`);
+    });
+
+    it('clears the count once a snapshot succeeds', async () => {
+      // The machine exit: one good snapshot, nothing persisted to clear.
+      let broken = true;
+      const readSnapshot = async () => {
+        if (broken) throw new Error('both failed');
+        return snapshot(implementation());
+      };
+      const runtime = () => ({
+        ...deps(implementation(), []),
+        snapshotFailureMode: 'report' as const,
+        readSnapshot,
+      });
+
+      await runLifecycleCycle('recover', runtime());
+      expect(unavailable(await runLifecycleCycle('recover', runtime()))).toHaveLength(1);
+      broken = false;
+      // Observed, so the good snapshot proves the reset without mutating.
+      await runLifecycleCycle('observe', runtime());
+      broken = true;
+      expect(unavailable(await runLifecycleCycle('recover', runtime()))).toEqual([]);
+    });
+
+    it('tracks the stall per runtime, never across engines in one process', async () => {
+      const first = failingRuntime();
+      const second = failingRuntime();
+
+      await runLifecycleCycle('recover', first());
+      await runLifecycleCycle('recover', first());
+
+      // A second engine's first no-snapshot cycle is its own first, not this one's third.
+      expect(unavailable(await runLifecycleCycle('recover', second()))).toEqual([]);
+    });
+  });
+
   it('reports eventually-consistent counter skew as an approximation, not a per-cycle warning', async () => {
     // Regression (PR #2001): GitHub used/remaining counters are eventually
     // consistent, so under concurrent reads a cycle's usage accounting can be

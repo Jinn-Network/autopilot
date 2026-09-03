@@ -643,6 +643,60 @@ describe('LifecycleDiscoveryCacheStore', () => {
     await expect(store.load()).resolves.toEqual(withDelayedClose);
   });
 
+  /**
+   * The reader normalizes a tolerated `merged_at > closed_at` skew to
+   * `closedAt === mergedAt` (#136); the cache must agree with the reader, both
+   * on the normalized record and on the tolerance itself, or a record the
+   * reader emits becomes a corrupt cache on the next save.
+   */
+  describe('merged_at/closed_at skew in the closed index (#136)', () => {
+    const closedRow = (closedAt: string, mergedAt: string) => ({
+      number: 3694,
+      title: 'cached',
+      state: 'CLOSED' as const,
+      updatedAt: '2026-09-02T21:45:09.000Z',
+      headOid: '29dbbcb69ef9eacbbe0a0d9889b0b9c1a78fe93d',
+      headRefName: 'autopilot/2527',
+      baseRefName: 'next',
+      isDraft: false,
+      closedAt,
+      mergedAt,
+    });
+
+    it.each([
+      ['the reader-normalized record', '2026-09-02T21:45:08.000Z', '2026-09-02T21:45:08.000Z'],
+      ['a tolerated one-second skew', '2026-09-02T21:45:07.000Z', '2026-09-02T21:45:08.000Z'],
+      ['a tolerated four-minute skew', '2026-09-02T21:45:00.000Z', '2026-09-02T21:49:00.000Z'],
+    ])('accepts %s', async (_label, closedAt, mergedAt) => {
+      const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+      const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+      const skewed: LifecycleDiscoveryState = {
+        ...state(),
+        recentlyClosedPullRequests: [closedRow(closedAt, mergedAt)],
+      };
+
+      await expect(store.save(skewed)).resolves.toBeUndefined();
+      await expect(store.load()).resolves.toEqual(skewed);
+    });
+
+    it('still refuses a skew beyond the tolerance', async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'jinn-lifecycle-cache-'));
+      const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+      await writeFile(
+        join(directory, 'lifecycle-cache.json'),
+        JSON.stringify({
+          ...state(),
+          recentlyClosedPullRequests: [
+            closedRow('2026-09-02T21:45:00.000Z', '2026-09-02T21:51:00.000Z'),
+          ],
+        }),
+        { mode: 0o600 },
+      );
+
+      await expect(store.load()).rejects.toBeInstanceOf(LifecycleDiscoveryCacheCorruptError);
+    });
+  });
+
   it.each([
     ['no live REST request', { restRequests: 0 }],
     ['nonzero GraphQL cost without a GraphQL request', { graphqlCost: 1 }],
