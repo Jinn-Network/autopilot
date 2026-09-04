@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync,
@@ -18,7 +19,6 @@ import {
   writeFileSync,
   type Dirent,
 } from 'node:fs';
-import { rm as rmAsync } from 'node:fs/promises';
 import { hostname as systemHostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -3757,49 +3757,150 @@ async function provePublicationReachability(
 }
 
 /**
- * Trashed directories whose bytes are still being reclaimed, keyed by trash
- * path. The daemon owns every entry: the sweep that trashed it started the
- * reclaim, the next sweep re-adopts any it finds on disk (a daemon that died
- * mid-reclaim leaves them behind), and the count is reported in every cycle's
- * cleanup summary. Nothing here is detached into an unmanaged process, and
- * nothing here is free space: the bytes stay on the volume, and the disk-floor
- * read that gates new work sees them as occupied, until the entry is gone.
+ * Reclaims this engine process started that have not finished, keyed by trash
+ * path. Cross-process truth lives in the pid sidecars: the sweep runs in a
+ * per-cycle engine process, and a reclaim outlives it on purpose (#150) — the
+ * engine exits on time, the `rm` finishes on its own, and the next cycle
+ * adopts an entry only when no live pid owns it. Nothing here is unmanaged:
+ * every reclaim is owned by a recorded pid and reported in the cycle summary,
+ * and nothing here is free space — the bytes stay on the volume, and the
+ * disk-floor read that gates new work sees them as occupied, until the entry
+ * is gone.
  */
 const reclaimsInFlight = new Map<string, Promise<void>>();
+/** Last failure per trash path, so the cycle summary can say so (#150). */
+const reclaimFailures = new Map<string, string>();
 
-/** Trashed directories still being reclaimed, for the cycle log. */
+/** A reclaim whose last attempt failed; the next sweep retries it. */
+export interface TrashReclaimFailure {
+  readonly trashed: string;
+  readonly entry: string;
+  readonly detail: string;
+}
+
+/** Reclaims this process started that have not finished. */
 export function pendingTrashReclaims(): number {
   return reclaimsInFlight.size;
 }
 
-/** Waits for every in-flight reclaim: tests, and an orderly shutdown. */
+/** Trash entries whose last reclaim failed, with the reason. */
+export function failedTrashReclaims(): readonly TrashReclaimFailure[] {
+  return [...reclaimFailures].map(([trashed, detail]) => ({
+    trashed,
+    entry: basename(trashed),
+    detail,
+  }));
+}
+
+/** Waits for every reclaim this process started: tests, orderly shutdown. */
 export async function drainTrashReclaims(): Promise<void> {
   await Promise.allSettled([...reclaimsInFlight.values()]);
 }
 
-function defaultReclaimTrashed(path: string): Promise<void> {
-  return rmAsync(path, { recursive: true, force: true });
+/** Where `<v2Base>`'s trashed worktrees wait for their bytes to be reclaimed. */
+export function trashBaseForV2(v2Base: string): string {
+  return join(dirname(v2Base), 'trash');
 }
 
 function trashBaseFor(options: CleanupAttemptOptions): string {
-  return options.trashBase ?? join(dirname(options.v2Base), 'trash');
+  return options.trashBase ?? trashBaseForV2(options.v2Base);
+}
+
+function reclaimSidecar(trashed: string): string {
+  return join(dirname(trashed), `.${basename(trashed)}.reclaim`);
+}
+
+function sidecarPid(sidecar: string): number | null {
+  try {
+    const pid = Number.parseInt(readFileSync(sidecar, 'utf8').trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Live reclaims under `trashBase`, whichever engine process started them. */
+export function countLiveTrashReclaims(
+  trashBase: string,
+  isPidAlive: (pid: number) => boolean,
+): number {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(trashBase, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let live = 0;
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.reclaim')) continue;
+    const pid = sidecarPid(join(trashBase, entry.name));
+    if (pid !== null && isPidAlive(pid)) live += 1;
+  }
+  return live;
+}
+
+interface StartedReclaim {
+  readonly pid: number;
+  readonly promise: Promise<void>;
+}
+
+/**
+ * `rm -rf` as a child: ~4× the throughput of a recursive `fs.promises.rm` on
+ * a 150k-file checkout, and none of it on this process's threadpool, where one
+ * big recursive rm starves everything queued behind it (#150). Unless the
+ * caller waits for it, the child is unref'd so the per-cycle engine exits on
+ * time and the rm finishes on its own; the pid sidecar keeps it owned.
+ */
+function spawnReclaim(path: string, keepProcessAlive: boolean): StartedReclaim {
+  const child = spawn('rm', ['-rf', path], { stdio: 'ignore' });
+  if (!keepProcessAlive) child.unref();
+  const promise = new Promise<void>((resolveReclaim, rejectReclaim) => {
+    child.once('error', rejectReclaim);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolveReclaim();
+      else rejectReclaim(new Error(`rm -rf exited with ${code ?? signal}`));
+    });
+  });
+  return { pid: child.pid ?? process.pid, promise };
 }
 
 function startTrashReclaim(
-  path: string,
-  reclaim: (path: string) => Promise<void>,
+  trashed: string,
+  options: CleanupAttemptOptions,
+  keepProcessAlive: boolean,
 ): Promise<void> {
-  const known = reclaimsInFlight.get(path);
+  const known = reclaimsInFlight.get(trashed);
   if (known !== undefined) return known;
-  const done = reclaim(path)
-    .catch(() => {
-      // Not lost: the directory is still in the trash, and the next sweep
-      // adopts it again.
+  const started: StartedReclaim = options.reclaimTrashed === undefined
+    ? spawnReclaim(trashed, keepProcessAlive)
+    : { pid: process.pid, promise: options.reclaimTrashed(trashed) };
+  const sidecar = reclaimSidecar(trashed);
+  try {
+    writeFileSync(sidecar, `${started.pid}\n`);
+  } catch {
+    // Ownership is then visible only to this process; the next sweep adopts.
+  }
+  const done = started.promise
+    .then(() => {
+      reclaimFailures.delete(trashed);
+      try {
+        rmSync(sidecar, { force: true });
+      } catch {
+        // A stale sidecar for a gone entry is dropped by the next sweep.
+      }
+    })
+    .catch((error: unknown) => {
+      // The sidecar stays: its pid is dead now, so the next sweep retries the
+      // entry, and the failure is reported until it clears.
+      reclaimFailures.set(
+        trashed,
+        error instanceof Error ? error.message : String(error),
+      );
     })
     .finally(() => {
-      reclaimsInFlight.delete(path);
+      reclaimsInFlight.delete(trashed);
     });
-  reclaimsInFlight.set(path, done);
+  reclaimsInFlight.set(trashed, done);
   return done;
 }
 
@@ -3825,13 +3926,15 @@ function trashDirectory(
   } catch {
     return null;
   }
-  startTrashReclaim(trashed, options.reclaimTrashed ?? defaultReclaimTrashed);
+  startTrashReclaim(trashed, options, options.awaitReclaim === true);
   return trashed;
 }
 
 /**
- * Re-adopts trash a previous daemon left mid-reclaim, so a restart never
- * strands occupied bytes that nothing is working to free.
+ * Re-adopts trash no live reclaim owns — an engine that died mid-reclaim, or
+ * an `rm` that failed — so a restart never strands occupied bytes that nothing
+ * is working to free. An entry a live pid owns is left to it (#150), and a
+ * sidecar whose entry is already gone is dropped.
  */
 function adoptTrashedDirectories(options: CleanupAttemptOptions): void {
   const trashBase = trashBaseFor(options);
@@ -3841,10 +3944,17 @@ function adoptTrashedDirectories(options: CleanupAttemptOptions): void {
   } catch {
     return;
   }
-  const reclaim = options.reclaimTrashed ?? defaultReclaimTrashed;
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    startTrashReclaim(join(trashBase, entry.name), reclaim);
+    const path = join(trashBase, entry.name);
+    if (entry.isFile() && entry.name.endsWith('.reclaim')) {
+      const owned = join(trashBase, entry.name.slice(1, -'.reclaim'.length));
+      if (!existsSync(owned)) rmSync(path, { force: true });
+      continue;
+    }
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    const pid = sidecarPid(reclaimSidecar(path));
+    if (pid !== null && options.isPidAlive(pid)) continue;
+    startTrashReclaim(path, options, false);
   }
 }
 
@@ -3859,8 +3969,8 @@ function adoptTrashedDirectories(options: CleanupAttemptOptions): void {
  * each cycle spawned several. A rename is a metadata write, so every eligible
  * worktree leaves its attempt within the same cycle regardless of size;
  * `git worktree prune` then drops the registration, which is cheap because it
- * only stats paths; and a recursive `fs.promises.rm` on the threadpool
- * reclaims the bytes without the cycle waiting on it.
+ * only stats paths; and an `rm -rf` child reclaims the bytes without the cycle
+ * waiting on it — or, since #150, without the engine process lingering on it.
  *
  * What the budget's design note protected is kept: the trashed bytes are still
  * on the volume and the disk-floor read still sees them as occupied; the

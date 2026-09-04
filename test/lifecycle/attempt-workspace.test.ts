@@ -34,6 +34,7 @@ import {
   DEFAULT_ATTEMPT_SWEEP_BUDGET_MS,
   defaultRunnerId,
   drainTrashReclaims,
+  failedTrashReclaims,
   freeDiskBytes,
   listRunnerLiveAttempts,
   markAttemptExited,
@@ -4479,12 +4480,17 @@ describe('bounded attempt cleanup', () => {
     // But the bytes are still on disk, owned and counted, until each reclaim
     // finishes: a trashed worktree is occupied space, never reclaimed space.
     expect(reclaims).toHaveLength(2);
-    expect(readdirSync(trashBase)).toHaveLength(2);
+    const trashed = readdirSync(trashBase, { withFileTypes: true });
+    expect(trashed.filter((entry) => entry.isDirectory())).toHaveLength(2);
+    // Each is owned by a recorded pid while it is in flight.
+    expect(trashed.filter((entry) => entry.name.endsWith('.reclaim'))).toHaveLength(2);
     expect(pendingTrashReclaims()).toBe(2);
 
     release.resolve();
     await drainTrashReclaims();
     expect(pendingTrashReclaims()).toBe(0);
+    expect(readdirSync(trashBase).filter((name) => name.endsWith('.reclaim')))
+      .toHaveLength(0);
   });
 
   it('reclaims trashed bytes for real by default', async () => {
@@ -4565,5 +4571,93 @@ describe('bounded attempt cleanup', () => {
     expect(results.filter((result) => result.status === 'removed')).toHaveLength(1);
     expect(attempts.filter((attempt) => existsSync(attempt.paths.attemptDir)))
       .toHaveLength(1);
+  });
+
+  it('adopts a trashed entry only when no live pid owns it', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    const owned = join(trashBase, 'owned-by-a-live-reclaim');
+    mkdirSync(owned, { recursive: true });
+    writeFileSync(join(trashBase, '.owned-by-a-live-reclaim.reclaim'), `${process.pid}\n`);
+    const orphaned = join(trashBase, 'left-by-a-dead-reclaim');
+    mkdirSync(orphaned, { recursive: true });
+    writeFileSync(join(trashBase, '.left-by-a-dead-reclaim.reclaim'), '999999\n');
+    const reclaims: string[] = [];
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: (pid) => pid === process.pid,
+      trashBase,
+      reclaimTrashed: async (path) => {
+        reclaims.push(path);
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+    await drainTrashReclaims();
+
+    // The live owner's entry is left to it; the dead owner's is taken over.
+    expect(reclaims).toEqual([orphaned]);
+    expect(existsSync(join(trashBase, '.owned-by-a-live-reclaim.reclaim'))).toBe(true);
+    expect(existsSync(join(trashBase, '.left-by-a-dead-reclaim.reclaim'))).toBe(false);
+  });
+
+  it('drops a sidecar whose entry is already gone', async () => {
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    mkdirSync(trashBase, { recursive: true });
+    writeFileSync(join(trashBase, '.finished-elsewhere.reclaim'), '999999\n');
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      trashBase,
+      reclaimTrashed: async () => {},
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+
+    expect(existsSync(join(trashBase, '.finished-elsewhere.reclaim'))).toBe(false);
+  });
+
+  it('keeps a failed reclaim owned, reports it, and retries it next sweep', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    const stuck = join(trashBase, 'will-not-delete');
+    mkdirSync(stuck, { recursive: true });
+    let calls = 0;
+    const sweep = () => sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      trashBase,
+      reclaimTrashed: async () => {
+        calls += 1;
+        throw new Error('EPERM: operation not permitted');
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+
+    await sweep();
+    await drainTrashReclaims();
+
+    expect(calls).toBe(1);
+    expect(failedTrashReclaims()).toContainEqual({
+      trashed: stuck,
+      entry: 'will-not-delete',
+      detail: 'EPERM: operation not permitted',
+    });
+    // Still owned, still on disk, and the next sweep tries again.
+    expect(existsSync(join(trashBase, '.will-not-delete.reclaim'))).toBe(true);
+    expect(existsSync(stuck)).toBe(true);
+
+    await sweep();
+    await drainTrashReclaims();
+    expect(calls).toBe(2);
   });
 });
