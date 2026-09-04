@@ -3,6 +3,7 @@ import {
   DEFAULT_CURSOR_BIN,
   DEFAULT_CURSOR_REVIEW_MODEL,
 } from './cursor-runtime.js';
+import { DEFAULT_CODEX_BIN } from './codex-runtime.js';
 import type { AutopilotRuntime } from '../autopilot-runtime.js';
 
 /** The nine work-shape Issue Types (DR-2026-05-20-b). */
@@ -165,6 +166,16 @@ export interface DispatcherConfig {
    */
   reviewGhToken: string;
   /**
+   * Codex overflow pool (#152): how many coordinator sessions beyond the
+   * implementation and child lanes' caps may run on Codex at once. Zero, the
+   * default, disables the pool and every Codex code path with it. The review
+   * lane never overflows — it is the quality gate and stays on `runtime`.
+   */
+  codexOverflowSlots: number;
+  codexBin: string;
+  /** Passed as `-m`; absent, Codex's own configured default model applies. */
+  codexModel?: string;
+  /**
    * Model id for `hermes` coordinator sessions, as `--model` to `hermes chat`.
    * BARE — never `<org>/<model>`: an org-prefixed id makes hermes infer the
    * `openrouter` provider and bill an API key instead of the operator's Codex
@@ -241,6 +252,8 @@ export const DEFAULT_CONFIG: DispatcherConfig = {
   reviewBotLogin: '',
   implGhToken: '',
   reviewGhToken: '',
+  codexOverflowSlots: 0,
+  codexBin: DEFAULT_CODEX_BIN,
 
   // Bare id + explicit provider: mirrors the operator's own working codex setup
   // (~/.codex/config.toml model = "gpt-5.6-sol"; ~/.hermes/config.yaml

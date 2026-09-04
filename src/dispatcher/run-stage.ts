@@ -22,6 +22,12 @@ import {
   CURSOR_MODEL_ENV,
   cursorAgentArgs,
 } from './cursor-runtime.js';
+import {
+  CODEX_BIN_ENV,
+  CODEX_MODEL_ENV,
+  codexExecArgs,
+  DEFAULT_CODEX_BIN,
+} from './codex-runtime.js';
 
 /**
  * A minimal child handle the stage runner needs: stdout/stderr streams to
@@ -79,6 +85,8 @@ export interface StageRunOpts {
   provider?: string;
   /** Cursor Agent CLI binary override. */
   cursorBin?: string;
+  /** Codex CLI binary override (#152). */
+  codexBin?: string;
   /** Wall-clock ceiling; default 10 minutes (pressure-suite starting value). */
   timeoutMs?: number;
   /** Coordinator environment to reduce to a non-authoritative stage view. */
@@ -239,6 +247,16 @@ export function runStageHeadless(
     );
     cmd = binPath;
     args = cursorAgentArgs(prompt, { model, workspace: opts.worktreePath });
+  } else if (runtime === 'codex') {
+    // A stage launched by a Codex coordinator stays on Codex (#152): the
+    // coordinator exported the binary and model it was itself launched with.
+    const model = opts.model ?? ambient[CODEX_MODEL_ENV];
+    cmd = opts.codexBin ?? ambient[CODEX_BIN_ENV] ?? DEFAULT_CODEX_BIN;
+    args = codexExecArgs(prompt, {
+      ...(model === undefined ? {} : { model }),
+      effort: null,
+      workspace: opts.worktreePath,
+    });
   } else {
     cmd = 'claude';
     args = ['-p', ...(opts.model ? ['--model', opts.model] : []), prompt];

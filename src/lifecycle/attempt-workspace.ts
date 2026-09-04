@@ -30,6 +30,7 @@ import {
 } from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { beginCycleStep, withCycleStep } from '../cycle-heartbeat.js';
+import { AUTOPILOT_RUNTIME_SET, type AutopilotRuntime } from '../autopilot-runtime.js';
 import { CHILD_KINDS, type ChildKind } from './child-issues.js';
 import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
@@ -176,6 +177,20 @@ export interface AttemptManifest {
   readonly pid: number | null;
   readonly terminalHead?: string;
   /**
+   * The coordinator runtime this attempt was dispatched on (#152). Recorded so
+   * live attempts can be counted per runtime for the Codex overflow pool.
+   * Optional on the `childKind` pattern: absent means "the process-wide
+   * runtime", which is every manifest written before the pool existed.
+   */
+  readonly runtime?: AutopilotRuntime;
+  /**
+   * The child's exit code, recorded at the exit transition (#152) so the
+   * session-limit circuit can tell an instant failure from a finished
+   * session. `null` when the child died to a signal; absent on manifests that
+   * predate the field or whose exit was never observed.
+   */
+  readonly exitCode?: number | null;
+  /**
    * Bytes this attempt's worktree occupied when the child exited (#144).
    *
    * Written once, at the exit transition, because that is the moment the
@@ -215,6 +230,8 @@ export interface CreateAttemptOptions {
   readonly reviewRefOid?: string;
   readonly reviewApprovalPolicy?: ReviewApprovalPolicy;
   readonly selectedLogin: string;
+  /** The coordinator runtime this attempt is dispatched on (#152); see the manifest field. */
+  readonly runtime?: AutopilotRuntime;
   /**
    * The winning credential for this attempt. Written into the attempt-scoped
    * `gh-config/hosts.yml` and `gh-token` file at creation time (#1883) so the
@@ -774,7 +791,9 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'worktreeBytes',
     'paths',
     'timestamps',
-  ], 'attempt manifest', ['execution']);
+    'runtime',
+    'exitCode',
+  ], 'attempt manifest', ['execution', 'runtime', 'exitCode']);
   if (manifest.version !== 2) throw new Error('Unsupported attempt manifest version');
   const phase = manifest.phase;
   if (phase !== 'implement' && phase !== 'review') {
@@ -862,6 +881,12 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const worktreeBytes = manifest.worktreeBytes === undefined
     ? undefined
     : nonNegativeInteger(manifest.worktreeBytes, 'worktree bytes');
+  const runtime = manifest.runtime === undefined
+    ? undefined
+    : decodeAttemptRuntime(manifest.runtime);
+  const exitCode = manifest.exitCode === undefined
+    ? undefined
+    : decodeAttemptExitCode(manifest.exitCode);
   const timestamps = decodeTimestamps(manifest.timestamps);
   if (
     (decodedProcessState === 'preparing'
@@ -950,9 +975,24 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     pid,
     ...(terminalHead === undefined ? {} : { terminalHead }),
     ...(worktreeBytes === undefined ? {} : { worktreeBytes }),
+    ...(runtime === undefined ? {} : { runtime }),
+    ...(exitCode === undefined ? {} : { exitCode }),
     paths,
     timestamps,
   };
+}
+
+function decodeAttemptRuntime(value: unknown): AutopilotRuntime {
+  if (typeof value === 'string' && AUTOPILOT_RUNTIME_SET.has(value as AutopilotRuntime)) {
+    return value as AutopilotRuntime;
+  }
+  throw new Error('Invalid attempt runtime');
+}
+
+function decodeAttemptExitCode(value: unknown): number | null {
+  if (value === null) return null;
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  throw new Error('Invalid attempt exit code');
 }
 
 export function readAttemptManifest(path: string): AttemptManifest {
@@ -1233,6 +1273,7 @@ export function updateAttemptManifest(
     // rewritten once present — see `recordedFootprint`.
     'worktreeBytes',
     'timestamps',
+    'exitCode',
   ]);
   const progressiveTimestampFields = new Set([
     'updatedAt',
@@ -1989,6 +2030,7 @@ export function markAttemptExited(
   now: () => Date = () => new Date(),
   terminalHead?: string,
   measure: (path: string) => number | null = measureWorktreeBytes,
+  exitCode?: number | null,
 ): AttemptManifest {
   const current = readAttemptManifest(manifestPath);
   if (
@@ -2010,6 +2052,7 @@ export function markAttemptExited(
       ...manifest,
       processState: 'exited',
       ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
+      ...(exitCode === undefined ? {} : { exitCode }),
       ...recordedFootprint(manifest, measure),
       timestamps: {
         ...manifest.timestamps,
@@ -2072,10 +2115,19 @@ export function trackAttemptChild(
   let exitObserved = child.exitCode !== undefined && child.exitCode !== null;
   let runningRecorded = false;
   let exitedRecorded = false;
-  const recordExit = (): void => {
+  // The `exit` event's first argument is the code (null on a signal). It is
+  // recorded on the manifest (#152) so the session-limit circuit can read it
+  // back after this process has moved on.
+  const recordExit = (code?: unknown): void => {
     exitObserved = true;
     if (runningRecorded && !exitedRecorded) {
-      markAttemptExited(manifestPath, options.now, options.terminalHead);
+      markAttemptExited(
+        manifestPath,
+        options.now,
+        options.terminalHead,
+        undefined,
+        typeof code === 'number' ? code : code === null ? null : undefined,
+      );
       exitedRecorded = true;
     }
   };
@@ -2087,7 +2139,7 @@ export function trackAttemptChild(
     throw new Error('Tracked child does not match the running attempt');
   }
   runningRecorded = true;
-  if (exitObserved) recordExit();
+  if (exitObserved) recordExit(child.exitCode);
   return exitedRecorded ? readAttemptManifest(manifestPath) : running;
 }
 
@@ -3038,6 +3090,7 @@ export async function createAttemptWorkspace(
             reviewApprovalPolicy: options.reviewApprovalPolicy,
           }),
       selectedLogin: options.selectedLogin,
+      ...(options.runtime === undefined ? {} : { runtime: options.runtime }),
       repository,
       processState: options.pid === undefined || options.pid === null
         ? 'preparing'

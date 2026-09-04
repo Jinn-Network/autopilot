@@ -573,3 +573,95 @@ describe('active local scheduler', () => {
     expect(plan.skips.every((skip) => !('detail' in skip))).toBe(true);
   });
 });
+
+describe('codex overflow pool (#152)', () => {
+  it('seats the claim its lane cannot in the pool instead of skipping it', () => {
+    const plan = scheduleActiveActions(input({ codexOverflow: 1 }));
+    expect(plan.actions).toEqual(expect.arrayContaining([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2, runtime: 'codex' },
+    ]));
+    expect(plan.skips.filter((skip) => skip.subject === 'issue:2')).toEqual([]);
+    expect(plan.backups.implementation).toEqual([]);
+  });
+
+  it('skips on capacity once the pool is spent, exactly as before', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [1, 2, 3].map((issueNumber) => (
+        { phase: 'implementation', intent: 'fresh', issueNumber }
+      )),
+      codexOverflow: 1,
+    }));
+    expect(plan.actions.map((action) => [action.issueNumber, action.runtime]))
+      .toEqual([[1, undefined], [2, 'codex']]);
+    expect(plan.skips).toContainEqual(
+      { phase: 'implementation', subject: 'issue:3', reason: 'capacity' },
+    );
+    expect(plan.backups.implementation)
+      .toEqual([{ kind: 'claim-implementation', intent: 'fresh', issueNumber: 3 }]);
+  });
+
+  it('prefers the pool while the claude circuit is open, keeping lane slots for what follows', () => {
+    const plan = scheduleActiveActions(input({ codexOverflow: 1, preferCodex: true }));
+    expect(plan.actions.filter((action) => action.kind === 'claim-implementation')).toEqual([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1, runtime: 'codex' },
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 2 },
+    ]);
+  });
+
+  it('never overflows the review lane', () => {
+    const plan = scheduleActiveActions(input({
+      remaining: { implementation: 1, child: 1, review: 0 },
+      codexOverflow: 5,
+    }));
+    expect(plan.actions.some((action) => action.kind === 'claim-review')).toBe(false);
+    expect(plan.skips).toContainEqual({ phase: 'review', subject: 'pr:30', reason: 'capacity' });
+  });
+
+  it('never overflows stale recovery, which re-attaches to an attempt that already exists', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [
+        {
+          phase: 'implementation',
+          intent: 'stale-recovery',
+          issueNumber: 9,
+          prNumber: 90,
+          expectedHead: HEAD,
+          branch: gitRefName('autopilot/9'),
+          claimAttempt: 'attempt-9',
+        },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 1 },
+      ],
+      remaining: { implementation: 0, child: 1, review: 1 },
+      codexOverflow: 2,
+    }));
+    expect(plan.actions.map((action) => [action.runtime, action.issueNumber]))
+      .toEqual([['codex', 1]]);
+    expect(plan.skips).toContainEqual(
+      { phase: 'implementation', subject: 'issue:9', reason: 'capacity' },
+    );
+  });
+
+  it('overflows the child lane from the same pool', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [{ phase: 'implementation', intent: 'fresh', issueNumber: 7, isChild: true }],
+      remaining: { implementation: 1, child: 0, review: 1 },
+      codexOverflow: 1,
+    }));
+    expect(plan.actions).toEqual([
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 7, child: true, runtime: 'codex' },
+    ]);
+  });
+
+  it('pauses the pool with the disk floor: an overflow worktree is a worktree', () => {
+    const plan = scheduleActiveActions(input({
+      remaining: { implementation: 0, child: 0, review: 0 },
+      newWorkPaused: true,
+      codexOverflow: 3,
+    }));
+    expect(plan.actions.some((action) => action.kind === 'claim-implementation')).toBe(false);
+    expect(plan.skips).toContainEqual(
+      expect.objectContaining({ subject: 'issue:1', reason: 'disk-floor' }),
+    );
+  });
+});

@@ -93,6 +93,7 @@ function validConfig(): unknown {
       fullReconcileSeconds: 3600,
       implementationConcurrency: 1,
       childConcurrency: 1,
+      codexOverflowSlots: 0,
       reviewConcurrency: 1,
       openPrBackpressure: 30,
     },
@@ -298,5 +299,39 @@ describe('Autopilot product configuration', () => {
     await expect(loadAutopilotConfig(repositoryRoot)).rejects.toThrow(
       new RegExp(configPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
     );
+  });
+});
+
+describe('codex overflow config (#152)', () => {
+  // Additive on the `childConcurrency` contract: every deployed config predates
+  // the key, and the default of 0 keeps every Codex code path off until asked.
+  it('defaults the Codex overflow pool to zero when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      scheduler: { codexOverflowSlots?: number };
+    };
+    delete input.scheduler.codexOverflowSlots;
+
+    expect(decodeAutopilotConfig(input).scheduler.codexOverflowSlots).toBe(0);
+  });
+
+  it('honours an explicit pool and refuses a negative one', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      scheduler: { codexOverflowSlots?: number };
+    };
+    input.scheduler.codexOverflowSlots = 2;
+    expect(decodeAutopilotConfig(input).scheduler.codexOverflowSlots).toBe(2);
+
+    input.scheduler.codexOverflowSlots = -1;
+    expect(() => decodeAutopilotConfig(input)).toThrow();
+  });
+
+  it('accepts an optional Codex model on the worker', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { codexModel?: string };
+    };
+    expect(decodeAutopilotConfig(input).worker.codexModel).toBeUndefined();
+
+    input.worker.codexModel = 'gpt-5.6-sol';
+    expect(decodeAutopilotConfig(input).worker.codexModel).toBe('gpt-5.6-sol');
   });
 });

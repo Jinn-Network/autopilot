@@ -57,6 +57,9 @@ import {
   CURSOR_BIN_ENV,
   CURSOR_MODEL_ENV,
 } from '../src/dispatcher/cursor-runtime.js';
+import { CODEX_BIN_ENV, CODEX_MODEL_ENV } from '../src/dispatcher/codex-runtime.js';
+import { nonNegativeEnvironmentInteger } from '../src/lifecycle/active-config.js';
+import { RUNTIME_CIRCUIT_FILE } from '../src/lifecycle/runtime-circuit.js';
 import {
   defaultRunner,
   type CommandRunner,
@@ -527,6 +530,13 @@ function dispatcherConfig(
     ...(environment[CURSOR_BIN_ENV] === undefined
       ? {}
       : { cursorBin: environment[CURSOR_BIN_ENV] }),
+    codexOverflowSlots: product.scheduler.codexOverflowSlots,
+    ...(environment[CODEX_BIN_ENV] === undefined
+      ? {}
+      : { codexBin: environment[CODEX_BIN_ENV] }),
+    ...((environment[CODEX_MODEL_ENV] ?? product.worker.codexModel) === undefined
+      ? {}
+      : { codexModel: environment[CODEX_MODEL_ENV] ?? product.worker.codexModel }),
   };
 }
 
@@ -1058,7 +1068,13 @@ export async function runAutopilotV2(
             config.reviewCap,
             'JINN_AUTOPILOT_REVIEW_CAP',
           ),
+          codexOverflow: nonNegativeEnvironmentInteger(
+            env.JINN_AUTOPILOT_CODEX_OVERFLOW_CAP,
+            config.codexOverflowSlots,
+            'JINN_AUTOPILOT_CODEX_OVERFLOW_CAP',
+          ),
         },
+        runtimeCircuitPath: join(loaded.paths.state, RUNTIME_CIRCUIT_FILE),
         implementationBackpressureThreshold: positiveEnvironmentInteger(
           env.JINN_AUTOPILOT_BACKPRESSURE,
           config.openPrBackpressure,

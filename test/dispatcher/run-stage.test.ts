@@ -105,6 +105,8 @@ beforeEach(() => {
   delete process.env.JINN_AUTOPILOT_RUNTIME;
   delete process.env.JINN_DISPATCHER_CURSOR_BIN;
   delete process.env.JINN_DISPATCHER_CURSOR_MODEL;
+  delete process.env.JINN_DISPATCHER_CODEX_BIN;
+  delete process.env.JINN_DISPATCHER_CODEX_MODEL;
 });
 afterEach(restoreHermesEnv);
 
@@ -303,7 +305,7 @@ describe('runStageHeadless', () => {
   });
 
   it('fails before spawn when the inherited global runtime is invalid', () => {
-    process.env.JINN_AUTOPILOT_RUNTIME = 'codex';
+    process.env.JINN_AUTOPILOT_RUNTIME = 'gemini';
     const { spawn, calls } = makeSpawn('close-0', 'ok');
 
     expect(() => runStageHeadless(BASE_OPTS, spawn))
@@ -385,5 +387,47 @@ describe('runStageHeadless', () => {
 
     expect(result.timedOut).toBe(true);
     expect(child().__killed).toBe(true);
+  });
+});
+
+describe('codex stage root (#152)', () => {
+  it('spawns a fresh Codex exec in the worktree with the inherited model', async () => {
+    process.env.JINN_DISPATCHER_CODEX_BIN = 'codex';
+    process.env.JINN_DISPATCHER_CODEX_MODEL = 'gpt-5.6-sol';
+    process.env.JINN_AUTOPILOT_RUNTIME = 'codex';
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+
+    await runStageHeadless(BASE_OPTS, spawn);
+
+    expect(calls[0].cmd).toBe('codex');
+    expect(calls[0].args[0]).toBe('exec');
+    expect(calls[0].args[calls[0].args.indexOf('-C') + 1]).toBe(BASE_OPTS.worktreePath);
+    expect(calls[0].args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(calls[0].args[calls[0].args.indexOf('-m') + 1]).toBe('gpt-5.6-sol');
+    // Stages carry no board effort; Codex's configured reasoning applies.
+    expect(calls[0].args).not.toContain('-c');
+    expect(calls[0].args.at(-1)).toContain('`codex exec`');
+  });
+
+  it('defaults the Codex binary and leaves the model to Codex when nothing is set', async () => {
+    delete process.env.JINN_DISPATCHER_CODEX_BIN;
+    delete process.env.JINN_DISPATCHER_CODEX_MODEL;
+    process.env.JINN_AUTOPILOT_RUNTIME = 'codex';
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+
+    await runStageHeadless(BASE_OPTS, spawn);
+
+    expect(calls[0].cmd).toBe('codex');
+    expect(calls[0].args).not.toContain('-m');
+  });
+
+  it('prefers an explicit binary over the environment', async () => {
+    process.env.JINN_DISPATCHER_CODEX_BIN = '/env/bin/codex';
+    process.env.JINN_AUTOPILOT_RUNTIME = 'codex';
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+
+    await runStageHeadless({ ...BASE_OPTS, codexBin: '/opt/bin/codex' }, spawn);
+
+    expect(calls[0].cmd).toBe('/opt/bin/codex');
   });
 });

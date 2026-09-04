@@ -87,6 +87,7 @@ Edit `<target>/.autopilot/config.json`:
   "implementationConcurrency": 1,
   "childConcurrency": 1,
   "reviewConcurrency": 1,
+  "codexOverflowSlots": 0,
   "openPrBackpressure": 30
 }
 ```
@@ -97,6 +98,17 @@ reconcile, and CI-failure fixes on branches that already exist);
 `reviewConcurrency` bounds review sessions. They are separate so a burst in
 one lane cannot starve the others — a deep child queue is the moment the
 engine most needs children to run and least needs new branches opened.
+
+`codexOverflowSlots` (default 0, off) adds a pool of Codex sessions that the
+implementation and child lanes may spill into when they are full: a fresh
+claim a lane cannot seat runs on `codex exec` in its own worktree instead of
+waiting. The review lane never overflows — it is the quality gate and stays
+on the process-wide runtime. The pool also carries a session-limit fallback:
+when two `claude` workers in ten minutes die within a minute of starting (the
+signature of an exhausted Claude session), new implementation work prefers the
+pool for thirty minutes, and a `claude` worker that runs normally closes the
+circuit again. The Codex CLI must be installed and logged in
+(`codex login`); `worker.codexModel` optionally pins its model.
 
 `init` defaults every concurrency field to `1`, and `childConcurrency` is
 optional: a config written before the lane existed keeps loading and gets the

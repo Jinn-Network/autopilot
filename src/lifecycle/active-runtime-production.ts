@@ -21,6 +21,8 @@ import {
 import {
   assertCursorRuntimeReady,
 } from '../dispatcher/cursor-runtime.js';
+import { assertCodexRuntimeReady } from '../dispatcher/codex-runtime.js';
+import { readRuntimeCircuit, recordRuntimeExit } from './runtime-circuit.js';
 import {
   listRunnerLiveAttempts,
   readAttemptManifest,
@@ -210,7 +212,14 @@ export interface ProductionActiveRuntimeOptions {
     /** Machine-child work, capped separately from fresh claims (#122). */
     readonly child: number;
     readonly review: number;
+    /** Codex overflow pool shared by the implementation and child lanes (#152). */
+    readonly codexOverflow?: number;
   };
+  /**
+   * Where the `claude` session-limit circuit is persisted (#152). Absent, no
+   * exit is recorded and the scheduler never prefers Codex.
+   */
+  readonly runtimeCircuitPath?: string;
   readonly implementationBackpressureThreshold: number;
   /**
    * jinn-mono#1883: canary safety knob (`JINN_AUTOPILOT_ONLY_ISSUES`),
@@ -521,6 +530,15 @@ export function makeProductionCapabilityPreflight(
       if (options.config.runtime === 'cursor') {
         assertCursorRuntimeReady(options.config.cursorBin);
       }
+      // Whenever a cycle could dispatch to Codex — as the process-wide
+      // runtime or as overflow — prove the binary launches before the cycle
+      // spends claims on workers that would die at spawn (#152).
+      if (
+        options.config.runtime === 'codex'
+        || options.config.codexOverflowSlots > 0
+      ) {
+        assertCodexRuntimeReady(options.config.codexBin);
+      }
       return { ok: true };
     } catch (error) {
       return {
@@ -573,7 +591,34 @@ export function makeProductionActiveRuntime(
     return targeted;
   };
   const track = (manifestPath: string, child: SpawnResult): void => {
-    trackAttempt(manifestPath, requireTrackable(child), { now });
+    const trackable = requireTrackable(child);
+    const tracked = trackAttempt(manifestPath, trackable, { now });
+    const circuitPath = options.runtimeCircuitPath;
+    if (circuitPath === undefined) return;
+    // Folds this child's exit into the session-limit circuit (#152). Registered
+    // after trackAttempt's own listener, so by the time it runs the manifest
+    // already carries the exit code and timestamps it reads. Advisory only:
+    // a failure here must never fail the cycle.
+    const observe = (): void => {
+      try {
+        const manifest = readAttemptManifest(manifestPath);
+        if (manifest.processState !== 'exited') return;
+        recordRuntimeExit(circuitPath, {
+          runtime: manifest.runtime ?? options.config.runtime,
+          exitCode: manifest.exitCode ?? null,
+          ...(manifest.timestamps.childStartedAt === undefined
+            ? {}
+            : { childStartedAt: manifest.timestamps.childStartedAt }),
+          ...(manifest.timestamps.childExitedAt === undefined
+            ? {}
+            : { childExitedAt: manifest.timestamps.childExitedAt }),
+        }, now());
+      } catch {
+        // See above.
+      }
+    };
+    if (tracked.processState === 'exited') observe();
+    else trackable.once('exit', observe);
   };
   const implementationPreferred = selectCredential(
     options.credentials,
@@ -971,6 +1016,11 @@ export function makeProductionActiveRuntime(
   const activeRuntime = makeActiveRuntime({
     credentials: options.credentials,
     caps: options.caps,
+    ...(options.runtimeCircuitPath === undefined
+      ? {}
+      : {
+          readRuntimeCircuit: () => readRuntimeCircuit(options.runtimeCircuitPath!, now()),
+        }),
     implementationPreferredLogin,
     implementationBackpressureThreshold:
       options.implementationBackpressureThreshold,
