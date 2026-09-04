@@ -399,4 +399,12 @@ describe('lifecycle script entrypoint', () => {
       + 'the 60s sweep budget was spent',
     ]);
   });
+
+  it('reports background reclaims as occupied disk, never as reclaimed', () => {
+    expect(renderCleanupWarnings([], 3)).toEqual([
+      '[autopilot:v2] cleanup reclaiming 3 trashed worktree(s) in the background; '
+      + 'their bytes stay occupied until each finishes',
+    ]);
+    expect(renderCleanupWarnings([], 0)).toEqual([]);
+  });
 });

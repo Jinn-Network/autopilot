@@ -18,6 +18,7 @@ import {
   writeFileSync,
   type Dirent,
 } from 'node:fs';
+import { rm as rmAsync } from 'node:fs/promises';
 import { hostname as systemHostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -3409,6 +3410,20 @@ export interface CleanupAttemptOptions {
   readonly now?: () => Date;
   /** When true, skip grace and publication proof for dead attempts. */
   readonly evictUnpublished?: boolean;
+  /**
+   * Where a removed worktree waits for its bytes to be reclaimed. Defaults to
+   * `<worktreeBase>/trash`, a sibling of `v2` on the same filesystem, so
+   * leaving the attempt is one rename; outside `v2`, so nothing reads it as an
+   * attempt. Its bytes count as occupied to the disk-floor read until gone.
+   */
+  readonly trashBase?: string;
+  /** How a trashed directory's bytes are reclaimed. A test seam. */
+  readonly reclaimTrashed?: (path: string) => Promise<void>;
+  /**
+   * When true, the worktree's bytes are gone before cleanup returns. The
+   * emergency below-floor sweep needs this to stop at the floor.
+   */
+  readonly awaitReclaim?: boolean;
 }
 
 export function freeDiskBytes(path: string): number {
@@ -3741,16 +3756,156 @@ async function provePublicationReachability(
   return null;
 }
 
+/**
+ * Trashed directories whose bytes are still being reclaimed, keyed by trash
+ * path. The daemon owns every entry: the sweep that trashed it started the
+ * reclaim, the next sweep re-adopts any it finds on disk (a daemon that died
+ * mid-reclaim leaves them behind), and the count is reported in every cycle's
+ * cleanup summary. Nothing here is detached into an unmanaged process, and
+ * nothing here is free space: the bytes stay on the volume, and the disk-floor
+ * read that gates new work sees them as occupied, until the entry is gone.
+ */
+const reclaimsInFlight = new Map<string, Promise<void>>();
+
+/** Trashed directories still being reclaimed, for the cycle log. */
+export function pendingTrashReclaims(): number {
+  return reclaimsInFlight.size;
+}
+
+/** Waits for every in-flight reclaim: tests, and an orderly shutdown. */
+export async function drainTrashReclaims(): Promise<void> {
+  await Promise.allSettled([...reclaimsInFlight.values()]);
+}
+
+function defaultReclaimTrashed(path: string): Promise<void> {
+  return rmAsync(path, { recursive: true, force: true });
+}
+
+function trashBaseFor(options: CleanupAttemptOptions): string {
+  return options.trashBase ?? join(dirname(options.v2Base), 'trash');
+}
+
+function startTrashReclaim(
+  path: string,
+  reclaim: (path: string) => Promise<void>,
+): Promise<void> {
+  const known = reclaimsInFlight.get(path);
+  if (known !== undefined) return known;
+  const done = reclaim(path)
+    .catch(() => {
+      // Not lost: the directory is still in the trash, and the next sweep
+      // adopts it again.
+    })
+    .finally(() => {
+      reclaimsInFlight.delete(path);
+    });
+  reclaimsInFlight.set(path, done);
+  return done;
+}
+
+/**
+ * Moves a directory into the trash in one rename and starts reclaiming its
+ * bytes off the daemon's thread. Returns the trash path, or null when the
+ * rename itself could not happen (a trash base on another filesystem, a path
+ * that is not a plain directory) — in which case nothing has changed and the
+ * caller falls back to removing in place.
+ */
+function trashDirectory(
+  path: string,
+  label: string,
+  options: CleanupAttemptOptions,
+): string | null {
+  const trashBase = trashBaseFor(options);
+  const trashed = join(trashBase, `${label}-${randomUUID()}`);
+  try {
+    const metadata = lstatSync(path);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) return null;
+    mkdirSync(trashBase, { recursive: true });
+    renameSync(path, trashed);
+  } catch {
+    return null;
+  }
+  startTrashReclaim(trashed, options.reclaimTrashed ?? defaultReclaimTrashed);
+  return trashed;
+}
+
+/**
+ * Re-adopts trash a previous daemon left mid-reclaim, so a restart never
+ * strands occupied bytes that nothing is working to free.
+ */
+function adoptTrashedDirectories(options: CleanupAttemptOptions): void {
+  const trashBase = trashBaseFor(options);
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(trashBase, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const reclaim = options.reclaimTrashed ?? defaultReclaimTrashed;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    startTrashReclaim(join(trashBase, entry.name), reclaim);
+  }
+}
+
+/**
+ * Removes the attempt's worktree by moving it out of the attempt in one
+ * rename and reclaiming its bytes off the daemon's thread (#148).
+ *
+ * The path this replaces — `git worktree remove` of a multi-GB checkout — was a
+ * synchronous, uninterruptible disk wait (#132). That is why the sweep needed a
+ * wall-clock budget, and why a backlog the sweep fell behind on could never be
+ * recovered: one cycle's budget removed less than half of one attempt while
+ * each cycle spawned several. A rename is a metadata write, so every eligible
+ * worktree leaves its attempt within the same cycle regardless of size;
+ * `git worktree prune` then drops the registration, which is cheap because it
+ * only stats paths; and a recursive `fs.promises.rm` on the threadpool
+ * reclaims the bytes without the cycle waiting on it.
+ *
+ * What the budget's design note protected is kept: the trashed bytes are still
+ * on the volume and the disk-floor read still sees them as occupied; the
+ * reclaim is tracked in `reclaimsInFlight`, re-adopted by the next sweep if
+ * this daemon dies, and counted in the cycle log. Nothing is detached into an
+ * unmanaged process. With `awaitReclaim`, the bytes are gone before this
+ * returns — the emergency below-floor sweep needs that, because it re-reads
+ * free space between evictions and must stop at the floor rather than evict
+ * everything dead.
+ */
 async function removeAttemptWorktree(
   manifest: AttemptManifest,
   runner: CommandRunner,
   force: boolean,
+  options: CleanupAttemptOptions,
 ): Promise<AttemptCleanupResult | null> {
   if (!existsSync(manifest.paths.worktree)) return null;
+  const trashed = trashDirectory(manifest.paths.worktree, manifest.attemptId, options);
+  if (trashed !== null) {
+    fsyncDirectory(manifest.paths.attemptDir);
+    try {
+      await withCycleStep(
+        `worktree prune ${manifest.subject}`,
+        () => runner('git', [
+          `--git-dir=${manifest.repository.gitCommonDir}`,
+          'worktree', 'prune',
+        ]),
+      );
+    } catch {
+      // The registration outlives the checkout until the next prune, and
+      // every sweep runs one. The checkout is already gone from the attempt.
+    }
+    if (options.awaitReclaim) {
+      await withCycleStep(
+        `worktree reclaim ${manifest.subject}`,
+        () => reclaimsInFlight.get(trashed) ?? Promise.resolve(),
+      );
+    }
+    return null;
+  }
   try {
-    // The incident in #132: a multi-GB `git worktree remove` sat in
-    // uninterruptible disk wait for 21+ minutes with nothing reporting it.
-    // Naming the step is what lets the daemon say "slow" instead of "hung".
+    // The rename could not happen; remove in place as before. The incident in
+    // #132: a multi-GB `git worktree remove` sat in uninterruptible disk wait
+    // for 21+ minutes with nothing reporting it. Naming the step is what lets
+    // the daemon say "slow" instead of "hung".
     await withCycleStep(
       `worktree remove ${manifest.subject}`,
       () => runner('git', [
@@ -3888,7 +4043,7 @@ export async function cleanupAttempt(
           manifest.attemptId,
         );
       }
-      const worktreeFailure = await removeAttemptWorktree(manifest, runner, true);
+      const worktreeFailure = await removeAttemptWorktree(manifest, runner, true, options);
       if (worktreeFailure !== null) return worktreeFailure;
       return removeAttemptMetadata(manifest);
     }
@@ -3931,27 +4086,30 @@ export async function cleanupAttempt(
     if (proofFailure !== null) return proofFailure;
   }
 
-  const worktreeFailure = await removeAttemptWorktree(manifest, runner, forceRemoval);
+  const worktreeFailure = await removeAttemptWorktree(manifest, runner, forceRemoval, options);
   if (worktreeFailure !== null) return worktreeFailure;
   return removeAttemptMetadata(manifest);
 }
 
 /**
- * Wall-clock budget for one cycle's attempt sweep (#132).
+ * Wall-clock budget for one cycle's attempt sweep (#132, #148).
  *
- * Cleanup is bookkeeping and must never hold the scheduler hostage, but a
- * removal already in flight cannot be interrupted: `git worktree remove` of a
- * multi-GB checkout is a synchronous, uninterruptible disk wait. So this bounds
- * how many removals a cycle STARTS, not how long the last one takes — worst
- * case is one removal running past the budget, and the incident this came from
- * was exactly one such removal. Everything still pending defers to the next
- * cycle, where the budget applies again; nothing is detached into an unmanaged
- * background process, so a deferred delete is still occupied disk and the
- * disk-floor read that gates new work sees it as occupied.
+ * Cleanup is bookkeeping and must never hold the scheduler hostage. This bounds
+ * how many removals a cycle STARTS, not how long the last one takes. Since #148
+ * a routine removal is a rename plus a `git worktree prune` — milliseconds,
+ * whatever the checkout's size — with the bytes reclaimed off the daemon's
+ * thread, so an ordinary backlog of any size clears within one cycle and the
+ * budget only matters if git itself hangs. The two waits that can still run
+ * long are the ones that must: the emergency below-floor sweep reclaims each
+ * eviction before re-reading free space, and the in-place fallback for a
+ * worktree that cannot be renamed is the uninterruptible `git worktree remove`
+ * this budget was written for. Whatever a cycle does not start defers to the
+ * next, where the budget applies again; a trashed worktree is still occupied
+ * disk, and the disk-floor read that gates new work sees it as occupied, until
+ * its reclaim finishes.
  *
- * Sixty seconds is a cycle's worth of tolerance, not a measurement: it is short
- * enough that a stuck delete cannot swallow a poll interval and long enough
- * that an ordinary backlog of small attempts clears in a single cycle.
+ * Sixty seconds is a cycle's worth of tolerance, not a measurement: short
+ * enough that a stuck removal cannot swallow a poll interval.
  */
 export const DEFAULT_ATTEMPT_SWEEP_BUDGET_MS = 60_000;
 
@@ -3995,11 +4153,11 @@ function collectHostedAttempts(v2Base: string, host: string): CollectedAttempt[]
 }
 
 function sweepOrphanAttemptDirs(
-  v2Base: string,
-  graceMs: number | undefined,
-  now: () => Date,
+  options: CleanupAttemptOptions,
   budgetSpent: () => boolean,
 ): AttemptCleanupResult[] {
+  const { v2Base, graceMs } = options;
+  const now = options.now ?? (() => new Date());
   if (graceMs === undefined) return [];
   const results: AttemptCleanupResult[] = [];
   const cutoff = now().getTime() - graceMs;
@@ -4033,7 +4191,11 @@ function sweepOrphanAttemptDirs(
             ));
             continue;
           }
-          rmSync(attemptDir, { recursive: true });
+          // A malformed attempt directory can still hold a multi-GB checkout;
+          // it leaves by the same rename as a well-formed one.
+          if (trashDirectory(attemptDir, basename(attemptDir), options) === null) {
+            rmSync(attemptDir, { recursive: true });
+          }
           results.push({
             status: 'removed',
             attemptId: basename(attemptDir),
@@ -4068,6 +4230,8 @@ export async function sweepDeadAttempts(
   // interrupt a `git worktree remove` or a recursive rmSync once it has begun.
   const budgetSpent = (): boolean => monotonicNow() - sweepStartedAt >= budgetMs;
 
+  adoptTrashedDirectories(options);
+
   if (
     diskFloorBytes !== undefined
     && diskFloorBytes > 0
@@ -4088,6 +4252,10 @@ export async function sweepDeadAttempts(
         results.push(await cleanupAttempt(attempt.manifestPath, runner, {
           ...options,
           evictUnpublished: true,
+          // Each eviction's bytes must be gone before the next free-space
+          // read, or this loop evicts everything dead instead of stopping at
+          // the floor.
+          awaitReclaim: true,
         }));
       } catch {
         results.push(retained(
@@ -4131,11 +4299,6 @@ export async function sweepDeadAttempts(
       }
     }
   }
-  results.push(...sweepOrphanAttemptDirs(
-    options.v2Base,
-    options.graceMs,
-    options.now ?? (() => new Date()),
-    budgetSpent,
-  ));
+  results.push(...sweepOrphanAttemptDirs(options, budgetSpent));
   return results;
 }
