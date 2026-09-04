@@ -1,6 +1,7 @@
 import type { NewWorkAction } from './types.js';
 import type { GitOid, GitRefName } from './types.js';
 import type { MergePolicy } from '../config/config.js';
+import type { AutopilotRuntime } from '../autopilot-runtime.js';
 
 export type ActiveCandidate =
   | {
@@ -116,6 +117,17 @@ export interface ActiveSchedulingInput {
    * `disk-floor`.
    */
   readonly newWorkPausedDetail?: string;
+  /**
+   * Free Codex overflow slots (#152), shared by the implementation and child
+   * lanes: a fresh claim a lane cannot seat may run on Codex while these last.
+   * The review lane never overflows. Absent or zero disables overflow.
+   */
+  readonly codexOverflow?: number;
+  /**
+   * The `claude` session-limit circuit is open (#152): seat fresh claims in
+   * the Codex pool first, and only fall back to lane slots once it is spent.
+   */
+  readonly preferCodex?: boolean;
 }
 
 export interface ActiveSchedulingSkip {
@@ -202,6 +214,7 @@ function capacitySkipCause(input: ActiveSchedulingInput): {
 
 function implementationAction(
   candidate: Extract<ActiveCandidate, { phase: 'implementation' }>,
+  runtime?: AutopilotRuntime,
 ): Extract<NewWorkAction, { kind: 'claim-implementation' }> {
   return {
     kind: 'claim-implementation',
@@ -214,6 +227,9 @@ function implementationAction(
           // controller the right fall-through budget. What the claim then
           // does is decided by the issue's own child marker.
           ...(candidate.isChild === true ? { child: true as const } : {}),
+          // Routing, likewise advisory to the lifecycle: which runtime the
+          // scheduler seated this claim on (#152).
+          ...(runtime === undefined ? {} : { runtime }),
         }
       : {
           intent: 'stale-recovery',
@@ -285,6 +301,13 @@ export function scheduleActiveActions(
   // "children outrank fresh implementation claims" order the caller already
   // ranked them in; the fresh pass then sees exactly the candidates it saw
   // before, in exactly the same order, minus the ones this lane took.
+  // The Codex overflow pool (#152) is one pool across both lanes below, so
+  // it is drawn down here, outside `scheduleLane`. A paused disk pauses it
+  // too: an overflow worktree is a worktree.
+  let codexRemaining = input.newWorkPaused === true
+    ? 0
+    : Math.max(0, input.codexOverflow ?? 0);
+  const preferCodex = input.preferCodex === true;
   const scheduleLane = (
     laneCandidates: readonly Extract<ActiveCandidate, { phase: 'implementation' }>[],
     remaining: number,
@@ -293,6 +316,19 @@ export function scheduleActiveActions(
     let scheduled = 0;
     for (const candidate of laneCandidates) {
       const gate = implementationGate(candidate, input, configuredLogins);
+      // Only a fresh, ungated claim may overflow: stale recovery re-attaches
+      // to an attempt that already exists on its own runtime. It overflows
+      // when its lane is full — or first, while the claude circuit is open.
+      if (
+        gate === null
+        && candidate.intent === 'fresh'
+        && codexRemaining > 0
+        && (preferCodex || scheduled >= remaining)
+      ) {
+        actions.push(implementationAction(candidate, 'codex'));
+        codexRemaining -= 1;
+        continue;
+      }
       if (scheduled >= remaining) {
         skips.push({
           phase: candidate.phase,

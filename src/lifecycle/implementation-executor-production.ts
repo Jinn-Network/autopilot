@@ -656,6 +656,7 @@ export function makeProductionImplementationActionPort(
         expectedHead: input.expectedHead,
         claimOid: input.claimOid,
         selectedLogin: input.selectedLogin,
+        ...(input.runtime === undefined ? {} : { runtime: input.runtime }),
         credential: input.credential,
         ...(input.marketplacePreparation === undefined
           ? {}

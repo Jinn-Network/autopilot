@@ -4661,3 +4661,75 @@ describe('bounded attempt cleanup', () => {
     expect(calls).toBe(2);
   });
 });
+
+describe('attempt runtime and exit code (#152)', () => {
+  it('records the routed runtime at creation and round-trips it', async () => {
+    const fixture = repositoryFixture();
+    const routed = await createAttemptWorkspace(
+      options(fixture, { runtime: 'codex', host: 'same-host' }),
+      defaultRunner,
+    );
+    expect(routed.runtime).toBe('codex');
+    expect(readAttemptManifest(routed.paths.manifest).runtime).toBe('codex');
+
+    // A manifest that predates the field, or was never routed, has none.
+    const plain = await createAttemptWorkspace(options(fixture, {
+      runnerId: 'same-host-200-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      attemptId: UUID_B,
+      host: 'same-host',
+    }), defaultRunner);
+    expect(plain.runtime).toBeUndefined();
+    expect(readAttemptManifest(plain.paths.manifest).runtime).toBeUndefined();
+  });
+
+  it('rejects a runtime the engine does not know and a non-integer exit code', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+
+    expect(() => decodeAttemptManifest({ ...raw, runtime: 'gemini' })).toThrow(/runtime/i);
+    expect(() => decodeAttemptManifest({ ...raw, exitCode: 'one' })).toThrow(/exit code/i);
+    expect(decodeAttemptManifest({ ...raw, exitCode: null }).exitCode).toBeNull();
+    expect(decodeAttemptManifest({ ...raw, exitCode: 137 }).exitCode).toBe(137);
+  });
+
+  it('records the exit code the child reported, and null for a signal death', async () => {
+    const fixture = repositoryFixture();
+    const failed = await createAttemptWorkspace(options(fixture), defaultRunner);
+    markAttemptRunning(failed.paths.manifest, 4242, () => new Date('2026-07-20T00:01:00.000Z'));
+    const child = Object.assign(new EventEmitter(), { pid: 4242 });
+    trackAttemptChild(failed.paths.manifest, child, {
+      alreadyRunning: true,
+      now: () => new Date('2026-07-20T00:01:00.500Z'),
+    });
+    child.emit('exit', 1, null);
+    expect(readAttemptManifest(failed.paths.manifest))
+      .toMatchObject({ processState: 'exited', exitCode: 1 });
+
+    const killed = await createAttemptWorkspace(options(fixture, {
+      runnerId: 'host-200-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      attemptId: UUID_B,
+    }), defaultRunner);
+    markAttemptRunning(killed.paths.manifest, 5252, () => new Date('2026-07-20T00:01:00.000Z'));
+    const signalled = Object.assign(new EventEmitter(), { pid: 5252 });
+    trackAttemptChild(killed.paths.manifest, signalled, {
+      alreadyRunning: true,
+      now: () => new Date('2026-07-20T00:01:00.500Z'),
+    });
+    signalled.emit('exit', null, 'SIGKILL');
+    expect(readAttemptManifest(killed.paths.manifest))
+      .toMatchObject({ processState: 'exited', exitCode: null });
+  });
+
+  it('records the exit code of a child that had already exited when tracking began', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+    markAttemptRunning(manifest.paths.manifest, 6262, () => new Date('2026-07-20T00:01:00.000Z'));
+    const alreadyExited = Object.assign(new EventEmitter(), { pid: 6262, exitCode: 2 });
+    const tracked = trackAttemptChild(manifest.paths.manifest, alreadyExited, {
+      alreadyRunning: true,
+      now: () => new Date('2026-07-20T00:01:00.500Z'),
+    });
+    expect(tracked).toMatchObject({ processState: 'exited', exitCode: 2 });
+  });
+});

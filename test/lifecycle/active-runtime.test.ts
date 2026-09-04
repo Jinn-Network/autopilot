@@ -133,8 +133,9 @@ describe('active runtime boundary', () => {
     });
 
     expect(runtime.readLocalState()).toEqual({
-      remaining: { implementation: 1, child: 2, review: 1 },
+      remaining: { implementation: 1, child: 2, review: 1, codexOverflow: 0 },
       newWorkPaused: false,
+      preferCodex: false,
       availableLogins: ['implementation-bot', 'review-bot'],
       implementationPreferredLogin: 'implementation-bot',
     });
@@ -166,6 +167,7 @@ describe('active runtime boundary', () => {
       implementation: 1,
       child: 1,
       review: 1,
+      codexOverflow: 0,
     });
   });
 
@@ -227,8 +229,9 @@ describe('active runtime boundary', () => {
     });
 
     expect(runtime.readLocalState()).toEqual({
-      remaining: { implementation: 0, child: 0, review: 0 },
+      remaining: { implementation: 0, child: 0, review: 0, codexOverflow: 0 },
       newWorkPaused: true,
+      preferCodex: false,
       availableLogins: ['implementation-bot', 'review-bot'],
       implementationPreferredLogin: 'implementation-bot',
     });
@@ -777,5 +780,84 @@ describe('active runtime boundary', () => {
     expect(started).toEqual([84, 85]);
     // Quota is reserved for what actually runs, not for what was scheduled.
     expect(reservations).toEqual([2]);
+  });
+});
+
+describe('codex overflow pool and session-limit circuit (#152)', () => {
+  function withCodex(overrides: Record<string, unknown> = {}) {
+    return makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 2, child: 1, review: 1, codexOverflow: 2 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+      ...overrides,
+    });
+  }
+
+  it('counts pool occupancy by the runtime each manifest records', () => {
+    const runtime = withCodex({
+      readLocalAttempts: () => [
+        { ...attempt('implement', 'implementation-bot'), runtime: 'codex' },
+        // No recorded runtime: predates the pool, charged to its lane only.
+        attempt('implement', 'implementation-bot'),
+      ],
+    });
+    expect(runtime.readLocalState().remaining).toEqual({
+      implementation: 0,
+      child: 1,
+      review: 1,
+      codexOverflow: 1,
+    });
+  });
+
+  it('prefers Codex exactly while the claude circuit reads open', () => {
+    let open = false;
+    const runtime = withCodex({ readRuntimeCircuit: () => ({ preferCodex: open }) });
+    expect(runtime.readLocalState().preferCodex).toBe(false);
+    open = true;
+    expect(runtime.readLocalState().preferCodex).toBe(true);
+  });
+
+  it('pauses the pool and the preference with the disk floor', () => {
+    const runtime = withCodex({
+      newWorkPaused: () => true,
+      readRuntimeCircuit: () => ({ preferCodex: true }),
+    });
+    const local = runtime.readLocalState();
+    expect(local.remaining.codexOverflow).toBe(0);
+    expect(local.preferCodex).toBe(false);
+  });
+
+  it('charges a Codex-routed claim against the pool at dispatch, not its lane', async () => {
+    const dispatched: string[] = [];
+    const runtime = withCodex({
+      caps: { implementation: 0, child: 1, review: 1, codexOverflow: 1 },
+      readLocalAttempts: () => [
+        { ...attempt('implement', 'implementation-bot'), runtime: 'codex' },
+      ],
+      handlers: {
+        implementation: async (action) => {
+          dispatched.push(`${action.issueNumber}:${action.runtime ?? 'lane'}`);
+          return { status: 'spawned' };
+        },
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+    // The pool's one slot is already occupied, so a routed claim is refused
+    // as full even though the lane check would not have applied to it.
+    const full = await runtime.executeAction(
+      { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1, runtime: 'codex' },
+      {} as never,
+    );
+    expect(full.outcome).toBe('skipped');
+    expect(dispatched).toEqual([]);
   });
 });

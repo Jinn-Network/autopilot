@@ -78,7 +78,14 @@ export interface ActiveRuntimeOptions {
     /** Machine-child work, capped separately from fresh claims (#122). */
     readonly child: number;
     readonly review: number;
+    /** Codex overflow pool shared by the implementation and child lanes (#152). */
+    readonly codexOverflow?: number;
   };
+  /**
+   * The `claude` session-limit circuit (#152). Absent, the scheduler never
+   * prefers Codex; overflow still seats claims a lane cannot.
+   */
+  readonly readRuntimeCircuit?: () => { readonly preferCodex: boolean };
   readonly implementationPreferredLogin: string;
   readonly implementationBackpressureThreshold: number;
   /**
@@ -218,6 +225,7 @@ export function makeActiveRuntime(
     implementation: nonNegative(options.caps.implementation, 'implementation cap'),
     child: nonNegative(options.caps.child, 'child cap'),
     review: nonNegative(options.caps.review, 'review cap'),
+    codexOverflow: nonNegative(options.caps.codexOverflow ?? 0, 'codex overflow cap'),
   };
   /**
    * Phases this cycle has already spawned (#144).
@@ -249,17 +257,24 @@ export function makeActiveRuntime(
         attempt.phase === 'implement' && attempt.childKind !== undefined
       )).length,
       review: attempts.filter((attempt) => attempt.phase === 'review').length,
+      // Overflow attempts are counted by the runtime their manifest records
+      // (#152); a manifest without one predates the pool and is not Codex.
+      codex: attempts.filter((attempt) => attempt.runtime === 'codex').length,
     };
     return {
       // The disk floor pauses every lane: a floor that only stopped fresh
       // claims would keep filling the same disk with child and review work.
       remaining: newWorkPaused
-        ? { implementation: 0, child: 0, review: 0 }
+        ? { implementation: 0, child: 0, review: 0, codexOverflow: 0 }
         : {
             implementation: Math.max(0, caps.implementation - activeByLane.implementation),
             child: Math.max(0, caps.child - activeByLane.child),
             review: Math.max(0, caps.review - activeByLane.review),
+            codexOverflow: Math.max(0, caps.codexOverflow - activeByLane.codex),
           },
+      preferCodex: newWorkPaused
+        ? false
+        : (options.readRuntimeCircuit?.().preferCodex ?? false),
       newWorkPaused,
       ...(diskHeadroom === null ? {} : { diskHeadroom }),
       availableLogins: options.credentials.logins(),
@@ -388,7 +403,15 @@ export function makeActiveRuntime(
     },
     async executeAction(action, snapshot) {
       const local = readLocalState();
-      const lane = laneForNewWorkAction(action);
+      // A claim the scheduler seated in the Codex pool (#152) is charged
+      // against the pool at dispatch, not against the lane it overflowed.
+      const overflow = action.kind === 'claim-implementation'
+        && action.intent === 'fresh'
+        && action.runtime === 'codex';
+      const lane = overflow ? null : laneForNewWorkAction(action);
+      if (overflow && local.remaining.codexOverflow === 0) {
+        return { outcome: 'skipped', reason: laneFullReason(local) };
+      }
       if (lane !== null && local.remaining[lane] === 0) {
         return { outcome: 'skipped', reason: laneFullReason(local) };
       }

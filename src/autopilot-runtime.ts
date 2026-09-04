@@ -5,7 +5,7 @@ export const AUTOPILOT_RUNTIME_ENV = 'JINN_AUTOPILOT_RUNTIME';
  * `Implementer` routing from #887). Single canonical list — parsers and CLI
  * validation derive from here, never re-list literals.
  */
-export const AUTOPILOT_RUNTIMES = ['claude', 'hermes', 'cursor'] as const;
+export const AUTOPILOT_RUNTIMES = ['claude', 'hermes', 'cursor', 'codex'] as const;
 export type AutopilotRuntime = (typeof AUTOPILOT_RUNTIMES)[number];
 export const AUTOPILOT_RUNTIME_SET: ReadonlySet<AutopilotRuntime> = new Set(
   AUTOPILOT_RUNTIMES,

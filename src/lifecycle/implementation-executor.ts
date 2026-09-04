@@ -1,4 +1,5 @@
 import type { DispatcherConfig, Effort } from '../dispatcher/types.js';
+import type { AutopilotRuntime } from '../autopilot-runtime.js';
 import type { AutopilotExecutionBackend } from '../config/execution-backend.js';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import {
@@ -161,6 +162,8 @@ interface CreateAttemptInput {
   readonly selectedLogin: string;
   readonly credential: SelectedCredential;
   readonly marketplacePreparation?: MarketplaceAttemptPreparation;
+  /** Routed runtime from the scheduler's action (#152); recorded on the manifest. */
+  readonly runtime?: AutopilotRuntime;
   /**
    * Set on machine-child claims from the issue's own child marker — the
    * execution-authority ground truth — never from the scheduler's advisory
@@ -179,6 +182,8 @@ export interface SpawnImplementationInput {
   readonly environment: NodeJS.ProcessEnv;
   readonly worktreePath: string;
   readonly logPath: string;
+  /** Routed runtime for this session (#152); absent means the process-wide one. */
+  readonly runtime?: AutopilotRuntime;
 }
 
 export interface ImplementationExecutorDeps {
@@ -495,6 +500,7 @@ export function makeCanonicalImplementationSpawner(
         ),
         worktreePath: input.worktreePath,
         effort: input.issue.effort,
+        ...(input.runtime === undefined ? {} : { runtime: input.runtime }),
         env: input.environment,
         spawnOptions: {
           detached: true,
@@ -674,6 +680,7 @@ export async function executeImplementationAction(
     return executeChildImplementationAction(
       { ...issue, child: issue.child },
       deps,
+      action.intent === 'fresh' ? action.runtime : undefined,
     );
   }
 
@@ -855,6 +862,9 @@ export async function executeImplementationAction(
     prNumber: pullRequest.number,
     selectedLogin: selection.login,
     credential: selection.credential,
+    ...(action.intent === 'fresh' && action.runtime !== undefined
+      ? { runtime: action.runtime }
+      : {}),
     ...(preparation === undefined
       ? {}
       : { marketplacePreparation: preparation }),
@@ -906,6 +916,9 @@ export async function executeImplementationAction(
             ),
             worktreePath: attempt.paths.worktree,
             logPath: attempt.paths.log,
+            ...(action.intent === 'fresh' && action.runtime !== undefined
+              ? { runtime: action.runtime }
+              : {}),
           },
         },
       });
@@ -927,6 +940,8 @@ async function executeChildImplementationAction(
     readonly child: NonNullable<ImplementationIssue['child']>;
   },
   deps: ImplementationExecutorDeps,
+  /** The scheduler's routed runtime for this claim (#152), if any. */
+  runtime?: AutopilotRuntime,
 ): Promise<ImplementationExecutionResult> {
   const issueNumber = issue.number;
   const executionBackend = deps.executionBackend ?? 'local';
@@ -1077,6 +1092,7 @@ async function executeChildImplementationAction(
     selectedLogin: selection.login,
     credential: selection.credential,
     childKind: issue.child.kind,
+    ...(runtime === undefined ? {} : { runtime }),
     ...(preparation === undefined
       ? {}
       : { marketplacePreparation: preparation }),
@@ -1128,6 +1144,7 @@ async function executeChildImplementationAction(
             ),
             worktreePath: attempt.paths.worktree,
             logPath: attempt.paths.log,
+            ...(runtime === undefined ? {} : { runtime }),
           },
         },
       });

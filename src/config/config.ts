@@ -115,6 +115,8 @@ export const autopilotConfigSchema = z.object({
     runtime: z.literal('hermes'),
     model: nonEmpty,
     provider: nonEmpty,
+    /** Passed as `-m` to Codex overflow sessions (#152); absent, Codex's own default. */
+    codexModel: nonEmpty.optional(),
     repositorySkillDirectories: z.array(repositoryRelativePath),
   }).strict(),
   scheduler: z.object({
@@ -136,6 +138,12 @@ export const autopilotConfigSchema = z.object({
      * work that unblocks the pipeline — is unrepresentable.
      */
     childConcurrency: positiveInteger.default(1),
+    /**
+     * Codex overflow pool (#152): sessions beyond the implementation and child
+     * caps that may run on Codex at once. Defaulted to 0 — off — so every
+     * existing config keeps parsing and nothing routes to Codex until asked.
+     */
+    codexOverflowSlots: nonNegativeInteger.default(0),
     reviewConcurrency: positiveInteger,
     openPrBackpressure: positiveInteger,
   }).strict(),

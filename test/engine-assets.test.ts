@@ -33,7 +33,7 @@ describe('distributable engine workflow assets', () => {
     for (const workflow of workflows) {
       expect(existsSync(join(skillsRoot, workflow, 'SKILL.md'))).toBe(true);
     }
-    for (const runtime of ['claude', 'hermes', 'cursor']) {
+    for (const runtime of ['claude', 'hermes', 'cursor', 'codex']) {
       expect(existsSync(join(
         skillsRoot,
         'autopilot-runtime',

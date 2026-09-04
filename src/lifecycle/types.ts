@@ -2,6 +2,7 @@
 // the stack vocabulary has exactly one definition and both the lifecycle and
 // the dispatcher can reach it without a cycle.
 import type { StackVerdict } from './stack-authority.js';
+import type { AutopilotRuntime } from '../autopilot-runtime.js';
 
 export type Brand<Value, Name extends string> = Value & { readonly __brand: Name };
 
@@ -415,6 +416,12 @@ export type ImplementationClaimAction =
       readonly kind: 'claim-implementation';
       readonly intent: 'fresh';
       readonly issueNumber: number;
+      /**
+       * Schedule-time runtime routing (#152): set when the scheduler seated
+       * this claim in the Codex overflow pool instead of a lane slot. Absent,
+       * the session runs on the process-wide runtime as before.
+       */
+      readonly runtime?: AutopilotRuntime;
       /**
        * Schedule-time lane tag: this claim was admitted under the `child`
        * concurrency lane rather than the implementation one (#122). Advisory

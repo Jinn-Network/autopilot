@@ -101,6 +101,7 @@
         "runtime": { "const": "hermes" },
         "model": { "type": "string", "minLength": 1 },
         "provider": { "type": "string", "minLength": 1 },
+        "codexModel": { "type": "string", "minLength": 1 },
         "repositorySkillDirectories": {
           "type": "array",
           "items": { "$ref": "#/$defs/repositoryRelativePath" }
@@ -122,6 +123,7 @@
         "fullReconcileSeconds": { "type": "integer", "minimum": 1 },
         "implementationConcurrency": { "type": "integer", "minimum": 1 },
         "childConcurrency": { "type": "integer", "minimum": 1, "default": 1 },
+        "codexOverflowSlots": { "type": "integer", "minimum": 0, "default": 0 },
         "reviewConcurrency": { "type": "integer", "minimum": 1 },
         "openPrBackpressure": { "type": "integer", "minimum": 1 }
       }

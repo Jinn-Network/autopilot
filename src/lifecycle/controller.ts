@@ -135,8 +135,12 @@ export interface LifecycleControllerDeps {
         /** Machine-child work, capped separately from fresh claims (#122). */
         readonly child: number;
         readonly review: number;
+        /** Free Codex overflow slots shared by the implementation and child lanes (#152). */
+        readonly codexOverflow?: number;
       };
       readonly newWorkPaused: boolean;
+      /** The `claude` session-limit circuit is open (#152): seat fresh claims on Codex first. */
+      readonly preferCodex?: boolean;
       /**
        * The projection behind `newWorkPaused` (#144), when one was computed.
        * Absent means the runtime fell back to reading current free bytes, and
@@ -1608,6 +1612,8 @@ async function executeActivePass(
   const scheduling = scheduleActiveActions({
     candidates: reconciliationFresh ? candidates : [],
     remaining: local.remaining,
+    codexOverflow: local.remaining.codexOverflow ?? 0,
+    preferCodex: local.preferCodex ?? false,
     availableLogins: local.availableLogins,
     implementationPreferredLogin: local.implementationPreferredLogin,
     openPipelineBacklog,
@@ -1640,7 +1646,16 @@ async function executeActivePass(
     ...('head' in action ? { head: action.head } : {}),
     action: action.kind,
     outcome: result.outcome,
-    ...(result.reason === undefined ? {} : { reason: logSafeReason(result.reason) }),
+    ...(result.reason !== undefined
+      ? { reason: logSafeReason(result.reason) }
+      // A claim the scheduler seated in the Codex pool says so at the moment
+      // it spawns (#152), so the routing is visible without a manifest read.
+      : action.kind === 'claim-implementation'
+          && action.intent === 'fresh'
+          && action.runtime === 'codex'
+          && result.outcome === 'spawned'
+        ? { reason: 'codex overflow' }
+        : {}),
   });
   // Latched by the first enqueue that proves the refusal is repository-wide,
   // and reset by the cycle ending — never persisted. Re-enabling the merge

@@ -21,7 +21,7 @@ describe('global Autopilot runtime', () => {
     expect(parseAutopilotRuntime(runtime)).toBe(runtime);
   });
 
-  it.each(['', 'codex', 'Hermes', ' claude '])(
+  it.each(['', 'gemini', 'Hermes', ' claude '])(
     'fails loudly for unsupported value %j',
     (runtime) => {
       expect(() => parseAutopilotRuntime(runtime))

@@ -6,6 +6,7 @@ import { packageHeadlessOverridePath } from './package-paths.js';
  *  out for non-claude coordinators (see buildHermesHeadlessPrompt). */
 const CLAUDE_CLI_TOKEN = '`claude -p` / `--print`';
 const CURSOR_CLI_TOKEN = '`agent -p`';
+const CODEX_CLI_TOKEN = '`codex exec`';
 
 /** The canonical headless-override block, injected into every headless session. */
 export function headlessOverride(): string {
@@ -20,6 +21,9 @@ export function headlessOverrideFor(runtime: AutopilotRuntime): string {
   }
   if (runtime === 'cursor') {
     return block.replace(CLAUDE_CLI_TOKEN, CURSOR_CLI_TOKEN);
+  }
+  if (runtime === 'codex') {
+    return block.replace(CLAUDE_CLI_TOKEN, CODEX_CLI_TOKEN);
   }
   return block;
 }
@@ -60,6 +64,21 @@ export function buildHermesHeadlessPrompt(skill: string, scenario: string): stri
 export function buildCursorHeadlessPrompt(skill: string, scenario: string): string {
   return [
     headlessOverrideFor('cursor'),
+    '',
+    `Use the ${skill} skill for the following task.`,
+    '',
+    scenario.trim(),
+  ].join('\n');
+}
+
+/**
+ * Same composition for a `codex exec` coordinator session (#152). Codex loads
+ * the named skill from the worktree's `.codex/skills`, which the repository's
+ * skill mirror keeps in step with `.claude/skills`.
+ */
+export function buildCodexHeadlessPrompt(skill: string, scenario: string): string {
+  return [
+    headlessOverrideFor('codex'),
     '',
     `Use the ${skill} skill for the following task.`,
     '',

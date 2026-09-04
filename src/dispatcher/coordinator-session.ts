@@ -1,8 +1,11 @@
 import {
+  buildCodexHeadlessPrompt,
   buildCursorHeadlessPrompt,
   buildHeadlessPrompt,
   buildHermesHeadlessPrompt,
 } from '../headless.js';
+import type { AutopilotRuntime } from '../autopilot-runtime.js';
+import { codexExecArgs, CODEX_BIN_ENV, CODEX_MODEL_ENV } from './codex-runtime.js';
 import {
   prepareHermesHome,
   type HermesHomeOpts,
@@ -62,6 +65,12 @@ export interface CoordinatorSessionSpec {
   worktreePath: string;
   /** Only implementation supplies board Effort; other sessions pass null. */
   effort: Effort | null;
+  /**
+   * Overrides the process-wide runtime for this one session (#152): the
+   * scheduler sets it when it routes a claim to the Codex overflow pool.
+   * Absent, the session runs on `cfg.runtime` exactly as before.
+   */
+  runtime?: AutopilotRuntime;
   /** Identity and caller-specific child-stage environment. */
   env: NodeJS.ProcessEnv;
   spawnOptions: {
@@ -146,11 +155,14 @@ export function spawnCoordinatorSession(
     () => spawnedPid,
     callerOnExit,
   );
-  const runtimePrompt = cfg.runtime === 'hermes'
+  const runtime = spec.runtime ?? cfg.runtime;
+  const runtimePrompt = runtime === 'hermes'
     ? buildHermesHeadlessPrompt(spec.skill, spec.scenario)
-    : cfg.runtime === 'cursor'
+    : runtime === 'cursor'
       ? buildCursorHeadlessPrompt(spec.skill, spec.scenario)
-      : buildHeadlessPrompt(spec.skill, spec.scenario);
+      : runtime === 'codex'
+        ? buildCodexHeadlessPrompt(spec.skill, spec.scenario)
+        : buildHeadlessPrompt(spec.skill, spec.scenario);
   const prompt = [
     loadCanon(spec.env, spec.worktreePath),
     '',
@@ -158,7 +170,7 @@ export function spawnCoordinatorSession(
   ].join('\n');
   const env: NodeJS.ProcessEnv = {
     ...spec.env,
-    JINN_AUTOPILOT_RUNTIME: cfg.runtime,
+    JINN_AUTOPILOT_RUNTIME: runtime,
     // Overrides any ambient JINN_AUTOPILOT_PACKAGE_DIR the operator may have
     // exported: pinned to this package's real root (works from `src/` and
     // from the bundled `dist/autopilot.js` alike), not derived from it.
@@ -166,7 +178,7 @@ export function spawnCoordinatorSession(
   };
   let result: SpawnResult;
 
-  if (cfg.runtime === 'hermes') {
+  if (runtime === 'hermes') {
     const home = (deps.prepareHermesHome ?? prepareHermesHome)({
       sessionId,
       worktreePath: spec.worktreePath,
@@ -197,7 +209,7 @@ export function spawnCoordinatorSession(
         },
       },
     );
-  } else if (cfg.runtime === 'cursor') {
+  } else if (runtime === 'cursor') {
     const resolvedModel = resolveCursorSessionModel(
       spec.kind,
       spec.effort,
@@ -220,6 +232,29 @@ export function spawnCoordinatorSession(
         },
       },
     );
+  } else if (runtime === 'codex') {
+    // Stage children the coordinator launches read the same two variables
+    // (run-stage.ts), so they follow it onto Codex rather than falling back
+    // to `claude -p` and re-entering the budget this session was routed
+    // around (#152).
+    result = deps.spawn(
+      cfg.codexBin,
+      codexExecArgs(prompt, {
+        ...(cfg.codexModel === undefined ? {} : { model: cfg.codexModel }),
+        effort: spec.effort,
+        workspace: spec.worktreePath,
+      }),
+      {
+        ...spawnOptions,
+        onExit: composedOnExit,
+        cwd: spec.worktreePath,
+        env: {
+          ...env,
+          [CODEX_BIN_ENV]: cfg.codexBin,
+          ...(cfg.codexModel === undefined ? {} : { [CODEX_MODEL_ENV]: cfg.codexModel }),
+        },
+      },
+    );
   } else {
     result = deps.spawn(
       'claude',
@@ -237,7 +272,7 @@ export function spawnCoordinatorSession(
 
   log(
     `[autopilot] coordinator dispatch session=${sessionId} ` +
-      `runtime=${cfg.runtime} pid=${result.pid ?? 'unknown'}`,
+      `runtime=${runtime} pid=${result.pid ?? 'unknown'}`,
   );
   return result;
 }
