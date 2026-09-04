@@ -33,10 +33,12 @@ import {
   decodeAttemptManifest,
   DEFAULT_ATTEMPT_SWEEP_BUDGET_MS,
   defaultRunnerId,
+  drainTrashReclaims,
   freeDiskBytes,
   listRunnerLiveAttempts,
   markAttemptExited,
   markAttemptRunning,
+  pendingTrashReclaims,
   readAttemptManifest,
   recoverMarketplaceAttemptInitializations,
   sweepDeadAttempts,
@@ -4436,6 +4438,131 @@ describe('bounded attempt cleanup', () => {
       .toHaveLength(1);
     expect(results.some((result) =>
       result.status === 'retained' && result.reason.code === 'deferred')).toBe(true);
+    expect(attempts.filter((attempt) => existsSync(attempt.paths.attemptDir)))
+      .toHaveLength(1);
+  });
+
+  it('trashes every dead worktree in one cycle and reclaims the bytes off the sweep', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const attempts = await twoDeadAttempts(fixture);
+    const trashBase = join(fixture.base, 'trash');
+    const reclaims: string[] = [];
+    const release = deferred();
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      trashBase,
+      reclaimTrashed: async (path) => {
+        reclaims.push(path);
+        await release.promise;
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+
+    // Both left their attempts in the same cycle: no deferral, whatever their size.
+    expect(results.filter((result) => result.status === 'removed')).toHaveLength(2);
+    expect(results.some((result) =>
+      result.status === 'retained' && result.reason.code === 'deferred')).toBe(false);
+    for (const attempt of attempts) {
+      expect(existsSync(attempt.paths.worktree)).toBe(false);
+      expect(existsSync(attempt.paths.attemptDir)).toBe(false);
+    }
+    // The registrations went with them: only the repository itself remains.
+    const registered = git(fixture.repo, ['worktree', 'list', '--porcelain'])
+      .split('\n')
+      .filter((line) => line.startsWith('worktree '));
+    expect(registered).toHaveLength(1);
+    // But the bytes are still on disk, owned and counted, until each reclaim
+    // finishes: a trashed worktree is occupied space, never reclaimed space.
+    expect(reclaims).toHaveLength(2);
+    expect(readdirSync(trashBase)).toHaveLength(2);
+    expect(pendingTrashReclaims()).toBe(2);
+
+    release.resolve();
+    await drainTrashReclaims();
+    expect(pendingTrashReclaims()).toBe(0);
+  });
+
+  it('reclaims trashed bytes for real by default', async () => {
+    const fixture = repositoryFixture();
+    await twoDeadAttempts(fixture);
+    const trashBase = join(fixture.base, 'trash');
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      trashBase,
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+    await drainTrashReclaims();
+
+    expect(readdirSync(trashBase)).toHaveLength(0);
+  });
+
+  it('re-adopts trash a previous daemon left behind mid-reclaim', async () => {
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    const leftover = join(trashBase, 'leftover-from-a-dead-daemon');
+    mkdirSync(leftover, { recursive: true });
+    writeFileSync(join(leftover, 'file'), 'bytes\n');
+    const reclaims: string[] = [];
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      trashBase,
+      reclaimTrashed: async (path) => {
+        reclaims.push(path);
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+    await drainTrashReclaims();
+
+    expect(reclaims).toEqual([leftover]);
+  });
+
+  it('waits for each eviction below the floor so it stops at the floor, not at empty', async () => {
+    const fixture = repositoryFixture();
+    const attempts = await twoDeadAttempts(fixture);
+    const trashBase = join(fixture.base, 'trash');
+    const floor = 20 * 1024 * 1024 * 1024;
+    let reclaimed = 0;
+    // The sweep start and the one emergency eviction fall inside the budget;
+    // the routine pass that follows finds it spent, so only the emergency
+    // pass decides what leaves.
+    let readings = 0;
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      trashBase,
+      reclaimTrashed: async () => {
+        reclaimed += 1;
+      },
+      diskFloorBytes: floor,
+      diskPath: join(fixture.base, 'v2'),
+      // Free space crosses the floor only once a reclaim has actually run —
+      // which an un-awaited rename would never let happen inside the loop.
+      readFreeDiskBytes: () => (reclaimed > 0 ? floor : floor - 1),
+      budgetMs: 60_000,
+      monotonicNow: () => {
+        readings += 1;
+        return readings <= 2 ? 0 : 60_000;
+      },
+    });
+    await drainTrashReclaims();
+
+    expect(reclaimed).toBe(1);
+    expect(results.filter((result) => result.status === 'removed')).toHaveLength(1);
     expect(attempts.filter((attempt) => existsSync(attempt.paths.attemptDir)))
       .toHaveLength(1);
   });
