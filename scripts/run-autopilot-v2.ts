@@ -70,7 +70,10 @@ import {
   ConditionalPullRequestEvidenceProbe,
   ConditionalRestClient,
   DEFAULT_ATTEMPT_SWEEP_BUDGET_MS,
-  pendingTrashReclaims,
+  countLiveTrashReclaims,
+  failedTrashReclaims,
+  trashBaseForV2,
+  type TrashReclaimFailure,
   defaultRunnerId,
   activeCleanupEnabled,
   attemptGraceMs,
@@ -449,6 +452,7 @@ export async function runCycleThenBookkeeping<Report>(input: {
 export function renderCleanupWarnings(
   results: readonly AttemptCleanupResult[],
   reclaimsInFlight = 0,
+  reclaimFailures: readonly TrashReclaimFailure[] = [],
 ): string[] {
   const lines: string[] = [];
   let deferred = 0;
@@ -479,6 +483,14 @@ export function renderCleanupWarnings(
     lines.push(
       `[autopilot:v2] cleanup reclaiming ${reclaimsInFlight} trashed `
       + 'worktree(s) in the background; their bytes stay occupied until each finishes',
+    );
+  }
+  for (const failure of reclaimFailures) {
+    // Not lost: the entry stays owned and on disk, and the next sweep retries
+    // it. Reported every cycle it persists (#150).
+    lines.push(
+      `[autopilot:v2] cleanup reclaim failed trash=${failure.entry}: ${failure.detail}; `
+      + 'the next sweep retries it',
     );
   }
   return lines;
@@ -1155,9 +1167,12 @@ export async function runAutopilotV2(
       diskFloorBytes,
       diskPath: v2AttemptsBase,
     });
-    for (const line of renderCleanupWarnings(cleanup, pendingTrashReclaims())) {
-      console.warn(line);
-    }
+    const warnings = renderCleanupWarnings(
+      cleanup,
+      countLiveTrashReclaims(trashBaseForV2(v2AttemptsBase), childIsAlive),
+      failedTrashReclaims(),
+    );
+    for (const line of warnings) console.warn(line);
   };
 
   const paintBoard = async (

@@ -407,4 +407,13 @@ describe('lifecycle script entrypoint', () => {
     ]);
     expect(renderCleanupWarnings([], 0)).toEqual([]);
   });
+
+  it('reports a failed reclaim until it clears', () => {
+    expect(renderCleanupWarnings([], 0, [
+      { trashed: '/x/trash/attempt-1-uuid', entry: 'attempt-1-uuid', detail: 'EPERM' },
+    ])).toEqual([
+      '[autopilot:v2] cleanup reclaim failed trash=attempt-1-uuid: EPERM; '
+      + 'the next sweep retries it',
+    ]);
+  });
 });
