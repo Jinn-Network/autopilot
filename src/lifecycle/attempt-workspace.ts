@@ -34,6 +34,11 @@ import { AUTOPILOT_RUNTIME_SET, type AutopilotRuntime } from '../autopilot-runti
 import { CHILD_KINDS, type ChildKind } from './child-issues.js';
 import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
+  attemptFootprintsPathForV2,
+  readStoredAttemptFootprints,
+  recordAttemptFootprint,
+} from './attempt-footprints.js';
+import {
   persistMarketplaceTaskRequest,
   verifyMarketplaceTaskRequest,
   type MarketplaceMutationWorkflow,
@@ -2008,6 +2013,33 @@ export function markAttemptRunning(
  * all when the measurement gave up. Never overwrites a footprint an earlier
  * transition already recorded — the worktree only shrinks after exit.
  */
+/**
+ * Copy a just-measured footprint into the history that outlives the manifest
+ * (#155). The manifest stays the record; a failure here is a cache miss for
+ * the projection, never a failed exit transition, so it is swallowed.
+ */
+function rememberAttemptFootprint(manifest: AttemptManifest): void {
+  if (manifest.worktreeBytes === undefined) return;
+  const endedAt = manifest.timestamps.childExitedAt;
+  if (endedAt === undefined) return;
+  try {
+    recordAttemptFootprint(attemptFootprintsPathForV2(v2BaseForManifest(manifest)), {
+      attemptId: manifest.attemptId,
+      host: manifest.host,
+      phase: manifest.phase,
+      worktreeBytes: manifest.worktreeBytes,
+      endedAt,
+    });
+  } catch {
+    // The projection falls back to defaults until the next successful record.
+  }
+}
+
+/** `<v2>/<runner>/<phase>/<attempt>/manifest.json` — the v2 base is three up. */
+function v2BaseForManifest(manifest: AttemptManifest): string {
+  return resolve(dirname(manifest.paths.manifest), '..', '..', '..');
+}
+
 function recordedFootprint(
   manifest: AttemptManifest,
   measure: (path: string) => number | null,
@@ -2044,7 +2076,7 @@ export function markAttemptExited(
   }
   const timestamp = transitionTimestamp(now);
   const validTerminalHead = terminalHead === undefined ? undefined : gitOid(terminalHead);
-  return updateAttemptManifest(manifestPath, (manifest) => {
+  const next = updateAttemptManifest(manifestPath, (manifest) => {
     if (manifest.processState !== 'running') {
       throw new Error('Only a running attempt may transition to exited');
     }
@@ -2061,6 +2093,8 @@ export function markAttemptExited(
       },
     };
   });
+  rememberAttemptFootprint(next);
+  return next;
 }
 
 export function markMarketplaceAttemptExited(
@@ -2087,6 +2121,7 @@ export function markMarketplaceAttemptExited(
     },
   });
   writeManifestAtomic(manifestPath, next);
+  rememberAttemptFootprint(next);
   return next;
 }
 
@@ -3590,17 +3625,30 @@ export function listHostAttemptFootprints(
   v2Base: string,
   host: string,
 ): readonly AttemptFootprintRecord[] {
-  return collectHostedAttempts(v2Base, filesystemSafeHostname(host))
-    .flatMap(({ manifest }) => (
-      manifest.worktreeBytes === undefined
-        ? []
-        : [{
-            phase: manifest.phase,
-            worktreeBytes: manifest.worktreeBytes,
-            endedAtMs: attemptEndedAtMs(manifest),
-          }]
-    ))
-    .sort((left, right) => left.endedAtMs - right.endedAtMs);
+  const safeHost = filesystemSafeHostname(host);
+  // The history file first (#155): it is what survives the sweep. Manifests
+  // still on disk fill in anything it has not seen — an attempt measured by a
+  // build that predates the file, or one whose record failed to write.
+  const remembered = readStoredAttemptFootprints(attemptFootprintsPathForV2(v2Base))
+    .filter((record) => record.host === safeHost);
+  const rememberedIds = new Set(remembered.map((record) => record.attemptId));
+  return [
+    ...remembered.map((record) => ({
+      phase: record.phase,
+      worktreeBytes: record.worktreeBytes,
+      endedAtMs: Date.parse(record.endedAt),
+    })),
+    ...collectHostedAttempts(v2Base, safeHost)
+      .flatMap(({ manifest }) => (
+        manifest.worktreeBytes === undefined || rememberedIds.has(manifest.attemptId)
+          ? []
+          : [{
+              phase: manifest.phase,
+              worktreeBytes: manifest.worktreeBytes,
+              endedAtMs: attemptEndedAtMs(manifest),
+            }]
+      )),
+  ].sort((left, right) => left.endedAtMs - right.endedAtMs);
 }
 
 function attemptEndedAtMs(manifest: AttemptManifest): number {
