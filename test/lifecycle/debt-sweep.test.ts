@@ -11,6 +11,7 @@ import {
   formatDebtSweepMarker,
   formatDebtSweepMarkerKey,
   formatDebtSweepTitle,
+  parseDeferredMembers,
   parseDebtSweepMarker,
   planDebtSweeps,
   type DebtSweepMember,
@@ -44,12 +45,27 @@ function followUpIssue(
 
 function port(overrides: {
   readonly open?: readonly { readonly number: number; readonly title: string; readonly body: string }[];
+  readonly closed?: readonly { readonly number: number; readonly body: string }[];
+  readonly mergedPrs?: Readonly<Record<number, { readonly number: number; readonly body: string }>>;
   readonly created?: number;
   readonly log?: unknown[];
 } = {}): DebtSweepPort {
   const open = overrides.open ?? [];
+  const closed = overrides.closed ?? [];
+  const mergedPrs = overrides.mergedPrs ?? {};
   const log = overrides.log ?? [];
   return {
+    async searchClosedByMarker(marker: string) {
+      log.push({ searchClosedByMarker: marker });
+      return closed.filter((issue) => issue.body.includes(marker));
+    },
+    async mergedClosingPullRequest(issueNumber: number) {
+      log.push({ mergedClosingPullRequest: issueNumber });
+      return mergedPrs[issueNumber] ?? null;
+    },
+    async closeIssue(issueNumber: number, comment: string) {
+      log.push({ closeIssue: { issueNumber, comment } });
+    },
     async searchOpenByMarker(marker: string): Promise<readonly OpenDebtSweepIssue[]> {
       log.push({ searchOpenByMarker: marker });
       return open
@@ -352,5 +368,176 @@ describe('fileDebtSweep', () => {
   it('states the minimum and maximum it enforces', () => {
     expect(DEBT_SWEEP_MIN_MEMBERS).toBe(3);
     expect(DEBT_SWEEP_MAX_MEMBERS).toBe(8);
+  });
+});
+
+describe('deferred members in a sweep PR body (#154)', () => {
+  it('reads only the Deferred section, up to the next heading', () => {
+    const body = [
+      'Closes #500',
+      '',
+      '## Summary',
+      'Fixed #101 and #102 (see #99 for context).',
+      '',
+      '### Deferred',
+      '- #103 — needs the format allocation',
+      '- #104: out of scope here',
+      '',
+      '## Verification',
+      '#105 was run as a check, not deferred.',
+    ].join('\n');
+    expect([...parseDeferredMembers(body)].sort()).toEqual([103, 104]);
+  });
+
+  it('is case-insensitive about the heading and empty without one', () => {
+    expect([...parseDeferredMembers('# DEFERRED\n#7 and #8')]).toEqual([7, 8]);
+    expect(parseDeferredMembers('Deferred: #7 (not a heading)').size).toBe(0);
+    expect(parseDeferredMembers('').size).toBe(0);
+  });
+});
+
+describe('fileDebtSweep against closed sweeps (#154)', () => {
+  const members: readonly DebtSweepMember[] = [
+    { number: 101, priority: 'p4' },
+    { number: 102, priority: 'p3' },
+    { number: 103, priority: 'p4' },
+  ];
+  const openFollowUps = [101, 102, 103].map((number) => ({
+    number,
+    title: `Follow-up ${number}`,
+    body: formatReviewFollowUpMarker(84, HEAD, number),
+  }));
+  const mergedSweep = {
+    number: 500,
+    body: `${formatDebtSweepMarker(84, [101, 102, 103])}\n\nBatched review follow-ups for PR #84.`,
+  };
+
+  it('closes the members a merged sweep addressed and does not re-file them', async () => {
+    const log: unknown[] = [];
+    const filed = await fileDebtSweep(
+      port({
+        open: openFollowUps,
+        closed: [mergedSweep],
+        mergedPrs: { 500: { number: 610, body: 'Closes #500\n\nAll three fixed.' } },
+        log,
+      }),
+      { parentPr: 84, members },
+    );
+    expect(filed).toEqual({
+      status: 'already-swept',
+      number: 500,
+      closedMembers: [101, 102, 103],
+      declinedMembers: [],
+    });
+    expect(log).toContainEqual({ searchClosedByMarker: formatDebtSweepMarkerKey(84) });
+    expect(log).toContainEqual({ mergedClosingPullRequest: 500 });
+    const closes = log.filter((entry) => (
+      typeof entry === 'object' && entry !== null && 'closeIssue' in entry
+    )) as { closeIssue: { issueNumber: number; comment: string } }[];
+    expect(closes.map((entry) => entry.closeIssue.issueNumber)).toEqual([101, 102, 103]);
+    expect(closes[0]!.closeIssue.comment).toContain('sweep #500');
+    expect(closes[0]!.closeIssue.comment).toContain('PR #610');
+    expect(log).not.toContainEqual(expect.objectContaining({ createIssue: expect.anything() }));
+  });
+
+  it('leaves deferred members open as debt and files them when enough remain', async () => {
+    const wider: readonly DebtSweepMember[] = [
+      ...members,
+      { number: 104, priority: 'p4' },
+      { number: 105, priority: 'p4' },
+    ];
+    const log: unknown[] = [];
+    const filed = await fileDebtSweep(
+      port({
+        open: [104, 105].map((number) => ({
+          number,
+          title: `Follow-up ${number}`,
+          body: formatReviewFollowUpMarker(84, HEAD, number),
+        })).concat(openFollowUps),
+        closed: [{ number: 500, body: formatDebtSweepMarker(84, [101, 102, 103, 104, 105]) }],
+        mergedPrs: {
+          500: { number: 610, body: 'Closes #500\n\n## Deferred\n- #103\n- #104\n- #105\n' },
+        },
+        created: 901,
+        log,
+      }),
+      { parentPr: 84, members: wider },
+    );
+    expect(filed).toMatchObject({
+      status: 'filed',
+      number: 901,
+      members: [103, 104, 105],
+      closedMembers: [101, 102],
+    });
+    const closes = log.filter((entry) => (
+      typeof entry === 'object' && entry !== null && 'closeIssue' in entry
+    )) as { closeIssue: { issueNumber: number } }[];
+    expect(closes.map((entry) => entry.closeIssue.issueNumber)).toEqual([101, 102]);
+  });
+
+  it('waits below the minimum after closing the addressed members', async () => {
+    const filed = await fileDebtSweep(
+      port({
+        open: openFollowUps,
+        closed: [mergedSweep],
+        mergedPrs: { 500: { number: 610, body: '## Deferred\n- #103\n' } },
+      }),
+      { parentPr: 84, members },
+    );
+    expect(filed).toEqual({ status: 'below-minimum', openMembers: 1, closedMembers: [101, 102] });
+  });
+
+  it('declines, without closing, the members of a sweep closed unmerged', async () => {
+    const log: unknown[] = [];
+    const filed = await fileDebtSweep(
+      port({ open: openFollowUps, closed: [mergedSweep], log }),
+      { parentPr: 84, members },
+    );
+    expect(filed).toEqual({
+      status: 'already-swept',
+      number: 500,
+      closedMembers: [],
+      declinedMembers: [101, 102, 103],
+    });
+    expect(log).not.toContainEqual(expect.objectContaining({ closeIssue: expect.anything() }));
+    expect(log).not.toContainEqual(expect.objectContaining({ createIssue: expect.anything() }));
+  });
+
+  it('lets an older merged sweep outrank a newer unmerged duplicate of it', async () => {
+    const log: unknown[] = [];
+    const filed = await fileDebtSweep(
+      port({
+        open: openFollowUps,
+        // Newest first, as the port returns them: the duplicate was closed
+        // "not planned" yesterday; the real sweep merged the day before.
+        closed: [
+          { number: 700, body: formatDebtSweepMarker(84, [101, 102, 103]) },
+          mergedSweep,
+        ],
+        mergedPrs: { 500: { number: 610, body: 'Closes #500' } },
+        log,
+      }),
+      { parentPr: 84, members },
+    );
+    expect(filed).toMatchObject({ status: 'already-swept', closedMembers: [101, 102, 103], declinedMembers: [] });
+  });
+
+  it('ignores a closed sweep for a different parent, or with no live member', async () => {
+    const log: unknown[] = [];
+    const filed = await fileDebtSweep(
+      port({
+        open: openFollowUps,
+        closed: [
+          { number: 800, body: formatDebtSweepMarker(845, [101, 102, 103]) },
+          { number: 801, body: formatDebtSweepMarker(84, [201, 202, 203]) },
+        ],
+        created: 902,
+        log,
+      }),
+      { parentPr: 84, members },
+    );
+    expect(filed).toMatchObject({ status: 'filed', number: 902, members: [101, 102, 103] });
+    expect(filed).not.toHaveProperty('closedMembers');
+    expect(log).not.toContainEqual(expect.objectContaining({ mergedClosingPullRequest: expect.anything() }));
   });
 });

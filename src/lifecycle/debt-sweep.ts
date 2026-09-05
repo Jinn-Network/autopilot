@@ -13,6 +13,14 @@
  * and nothing else: the lifecycle stays strictly 1:1, its PR closes only the
  * sweep issue, and the members are closed as a side effect by the session that
  * actually addressed them. Nothing here is persisted beyond the marker.
+ *
+ * Sessions do not always keep that last promise (#154): a merged sweep whose
+ * members were left open looks, to the next derivation, exactly like debt that
+ * was never swept, and the open-only dedup then files the identical marker
+ * again. So filing also reads the parent's CLOSED sweeps: a member a merged
+ * sweep addressed (named in its marker and not deferred in its PR body) is
+ * closed here, late, and never re-filed; a member of a sweep closed without a
+ * merge was declined by a person and is not re-filed either.
  */
 
 import {
@@ -40,8 +48,8 @@ export const DEBT_SWEEP_MARKER_TAG = 'jinn-autopilot:debt-sweep';
  * MAX: a session has to hold every member's context at once, and its PR has to
  * stay reviewable as one coherent change set. Eight is the point past which
  * both stop being true. The remainder is not dropped — it waits for the next
- * sweep, which becomes fileable the moment this one closes (dedup searches
- * OPEN sweeps only).
+ * sweep, which becomes fileable the moment this one closes: open-sweep dedup
+ * no longer holds it, and a closed sweep only holds the members it addressed.
  *
  * Both are policy, not physics, and are meant to be adjusted from observed
  * sweep outcomes rather than treated as invariants.
@@ -326,6 +334,17 @@ export interface OpenDebtSweepIssue {
   readonly title: string;
 }
 
+export interface ClosedDebtSweepIssue {
+  readonly number: number;
+  readonly body: string;
+}
+
+/** The merged pull request that closed a sweep issue. */
+export interface MergedSweepPullRequest {
+  readonly number: number;
+  readonly body: string;
+}
+
 export interface DebtSweepPort {
   /** Substring search over OPEN issue bodies. Must refuse a truncated read. */
   searchOpenByMarker(marker: string): Promise<readonly OpenDebtSweepIssue[]>;
@@ -340,6 +359,15 @@ export interface DebtSweepPort {
     readonly effort: DebtSweepEffort;
     readonly priority: DebtSweepPriority;
   }): Promise<void>;
+  /**
+   * Substring search over CLOSED issue bodies, newest first. A bounded window
+   * of recent closures, never refused for truncation: a duplicate this misses
+   * is the status quo, not a new failure.
+   */
+  searchClosedByMarker(marker: string): Promise<readonly ClosedDebtSweepIssue[]>;
+  /** The merged pull request that closed the issue, or null when none merged. */
+  mergedClosingPullRequest(issueNumber: number): Promise<MergedSweepPullRequest | null>;
+  closeIssue(issueNumber: number, comment: string): Promise<void>;
 }
 
 export type FileDebtSweepResult =
@@ -349,9 +377,94 @@ export type FileDebtSweepResult =
       readonly members: readonly number[];
       readonly priority: DebtSweepPriority;
       readonly effort: DebtSweepEffort;
+      readonly closedMembers?: readonly number[];
     }
   | { readonly status: 'already-open'; readonly number: number }
-  | { readonly status: 'below-minimum'; readonly openMembers: number };
+  | {
+      readonly status: 'below-minimum';
+      readonly openMembers: number;
+      readonly closedMembers?: readonly number[];
+    }
+  | {
+      /** Every live member was addressed or declined by a closed sweep. */
+      readonly status: 'already-swept';
+      readonly number: number;
+      readonly closedMembers: readonly number[];
+      readonly declinedMembers: readonly number[];
+    };
+
+/**
+ * Members a sweep session named under a `Deferred` heading in its PR body —
+ * the heading `sessionInstructions` asks for. Everything from that heading to
+ * the next heading counts; nothing else in the body does.
+ */
+export function parseDeferredMembers(body: string): ReadonlySet<number> {
+  const deferred = new Set<number>();
+  let inSection = false;
+  for (const line of body.split('\n')) {
+    if (/^#{1,6}\s/.test(line)) {
+      inSection = /^#{1,6}\s*deferred\b/i.test(line);
+      continue;
+    }
+    if (!inSection) continue;
+    for (const match of line.matchAll(/#(\d+)\b/g)) {
+      deferred.add(Number(match[1]));
+    }
+  }
+  return deferred;
+}
+
+interface SweptMembers {
+  /** member → the merged sweep that addressed it. */
+  readonly addressed: ReadonlyMap<number, { readonly sweep: number; readonly pr: number }>;
+  /** member → the closed-unmerged sweep a person declined it in. */
+  readonly declined: ReadonlyMap<number, number>;
+}
+
+/**
+ * What the parent's closed sweeps already settled, for the members still open.
+ *
+ * Merged sweeps are read first, so a member addressed by an older merged sweep
+ * is addressed even when a newer duplicate of it was closed unmerged — the
+ * duplicate is a symptom of the gap this closes, not a verdict on the member.
+ */
+async function resolveSweptMembers(
+  port: DebtSweepPort,
+  parentPr: number,
+  liveMembers: readonly number[],
+): Promise<SweptMembers> {
+  const addressed = new Map<number, { readonly sweep: number; readonly pr: number }>();
+  const declined = new Map<number, number>();
+  const live = new Set(liveMembers);
+  const closedSweeps = (await port.searchClosedByMarker(formatDebtSweepMarkerKey(parentPr)))
+    .flatMap((issue) => {
+      const marker = parseDebtSweepMarker(issue.body);
+      return marker === null || marker.parentPr !== parentPr
+        ? []
+        : [{ number: issue.number, members: marker.members.filter((member) => live.has(member)) }];
+    })
+    .filter((sweep) => sweep.members.length > 0);
+  const unmerged: typeof closedSweeps = [];
+  for (const sweep of closedSweeps) {
+    const pr = await port.mergedClosingPullRequest(sweep.number);
+    if (pr === null) {
+      unmerged.push(sweep);
+      continue;
+    }
+    const deferred = parseDeferredMembers(pr.body);
+    for (const member of sweep.members) {
+      if (deferred.has(member) || addressed.has(member)) continue;
+      addressed.set(member, { sweep: sweep.number, pr: pr.number });
+    }
+  }
+  for (const sweep of unmerged) {
+    for (const member of sweep.members) {
+      if (addressed.has(member) || declined.has(member)) continue;
+      declined.set(member, sweep.number);
+    }
+  }
+  return { addressed, declined };
+}
 
 /**
  * The session contract, written into the sweep body itself so it travels with
@@ -447,10 +560,38 @@ export async function fileDebtSweep(
   const titleByNumber = new Map(
     openFollowUps.map((issue) => [issue.number, issue.title]),
   );
-  const surviving = input.members.filter((member) =>
+  const live = input.members.filter((member) =>
     titleByNumber.has(member.number));
+
+  // What a closed sweep already settled (#154). Addressed members are closed
+  // here, late, with the reference their session should have left; declined
+  // members stay open but are not re-filed. Neither returns to the batch.
+  const swept = await resolveSweptMembers(port, input.parentPr, live.map((member) => member.number));
+  const closedMembers: number[] = [];
+  for (const [member, { sweep, pr }] of swept.addressed) {
+    await port.closeIssue(
+      member,
+      `Addressed in sweep #${sweep} (merged in PR #${pr}); closed by Autopilot `
+        + 'because the sweep session left it open.',
+    );
+    closedMembers.push(member);
+  }
+  const surviving = live.filter((member) => (
+    !swept.addressed.has(member.number) && !swept.declined.has(member.number)
+  ));
+  const withClosed = closedMembers.length === 0 ? {} : { closedMembers };
+  if (surviving.length === 0 && (swept.addressed.size > 0 || swept.declined.size > 0)) {
+    const settledBy = swept.addressed.values().next().value?.sweep
+      ?? swept.declined.values().next().value!;
+    return {
+      status: 'already-swept',
+      number: settledBy,
+      closedMembers,
+      declinedMembers: [...swept.declined.keys()],
+    };
+  }
   if (surviving.length < DEBT_SWEEP_MIN_MEMBERS) {
-    return { status: 'below-minimum', openMembers: surviving.length };
+    return { status: 'below-minimum', openMembers: surviving.length, ...withClosed };
   }
   const members = surviving.slice(0, DEBT_SWEEP_MAX_MEMBERS);
 
@@ -485,5 +626,5 @@ export async function fileDebtSweep(
     effort,
     priority,
   });
-  return { status: 'filed', number: created.number, members: numbers, priority, effort };
+  return { status: 'filed', number: created.number, members: numbers, priority, effort, ...withClosed };
 }
