@@ -63,7 +63,7 @@ export interface ProductionReviewFollowUpPortOptions {
   readonly projectMapping?: ProjectMapping;
 }
 
-function parseIssueList(raw: string): readonly {
+export function parseIssueList(raw: string): readonly {
   readonly number: number;
   readonly title: string;
   readonly body: string;

@@ -154,3 +154,72 @@ describe('production debt sweep filing', () => {
       .rejects.toThrow(/truncated/i);
   });
 });
+
+describe('production closed-sweep resolution (#154)', () => {
+  beforeEach(() => {
+    resetFieldCache();
+  });
+
+  it('closes members a merged sweep addressed and skips the re-file', async () => {
+    const calls: string[][] = [];
+    const result = await executeProductionFileDebtSweep(ACTION, {
+      runner: async (_command, args) => {
+        calls.push([...args]);
+        if (args[0] === 'issue' && args[1] === 'list' && args.includes('closed')) {
+          return JSON.stringify([{
+            number: 500,
+            title: 'Sweep review follow-ups for PR #84 (3 items)',
+            body: formatDebtSweepMarker(84, [101, 102, 103]),
+          }]);
+        }
+        if (args[0] === 'issue' && args[1] === 'list') {
+          return openFollowUpRows([101, 102, 103]);
+        }
+        if (args[0] === 'issue' && args[1] === 'view' && args.includes('closedByPullRequestsReferences')) {
+          return JSON.stringify({ closedByPullRequestsReferences: [{ number: 610 }] });
+        }
+        if (args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({ number: 610, mergedAt: '2026-09-03T11:58:18Z', body: 'Closes #500' });
+        }
+        if (args[0] === 'issue' && args[1] === 'close') return '';
+        throw new Error(`Unexpected gh args: ${args.join(' ')}`);
+      },
+      repo: 'Jinn-Network/mono',
+    });
+    expect(result).toEqual({
+      status: 'skipped',
+      reason: 'sweep-already-swept:500',
+      detail: 'closed=101,102,103 declined=-',
+    });
+    const closedList = calls.find((args) => args[0] === 'issue' && args[1] === 'list' && args.includes('closed'));
+    expect(closedList).toContain('sort:updated-desc');
+    const closes = calls.filter((args) => args[0] === 'issue' && args[1] === 'close');
+    expect(closes.map((args) => args[2])).toEqual(['101', '102', '103']);
+    expect(closes[0]!.join(' ')).toContain('sweep #500');
+    expect(calls.some((args) => args[0] === 'issue' && args[1] === 'create')).toBe(false);
+  });
+
+  it('treats a sweep closed without a merged PR as declined: nothing closed, nothing filed', async () => {
+    const calls: string[][] = [];
+    const result = await executeProductionFileDebtSweep(ACTION, {
+      runner: async (_command, args) => {
+        calls.push([...args]);
+        if (args[0] === 'issue' && args[1] === 'list' && args.includes('closed')) {
+          return JSON.stringify([{ number: 500, title: 't', body: formatDebtSweepMarker(84, [101, 102, 103]) }]);
+        }
+        if (args[0] === 'issue' && args[1] === 'list') return openFollowUpRows([101, 102, 103]);
+        if (args[0] === 'issue' && args[1] === 'view') {
+          return JSON.stringify({ closedByPullRequestsReferences: [] });
+        }
+        throw new Error(`Unexpected gh args: ${args.join(' ')}`);
+      },
+      repo: 'Jinn-Network/mono',
+    });
+    expect(result).toEqual({
+      status: 'skipped',
+      reason: 'sweep-already-swept:500',
+      detail: 'closed=- declined=101,102,103',
+    });
+    expect(calls.some((args) => args[1] === 'close' || args[1] === 'create')).toBe(false);
+  });
+});
