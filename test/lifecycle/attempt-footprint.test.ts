@@ -250,3 +250,70 @@ describe('attempt worktree footprint', () => {
     expect(manifest.phase).toBe('implement');
   });
 });
+
+describe('footprint history survives the sweep (#155)', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'attempt-footprint-history-'));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeRunning(v2Base: string, name: string, attemptId: string): string {
+    const attemptDir = join(v2Base, 'runner-1', 'implement', name);
+    mkdirSync(join(attemptDir, 'worktree'), { recursive: true });
+    writeFileSync(join(attemptDir, 'worktree', 'file'), 'x'.repeat(64));
+    const manifestPath = join(attemptDir, 'manifest.json');
+    writeFileSync(manifestPath, JSON.stringify(manifestFixture(root, {
+      attemptId,
+      processState: 'running',
+      pid: process.pid,
+      timestamps: {
+        createdAt: '2026-09-04T19:00:00.000Z',
+        updatedAt: '2026-09-04T19:00:00.000Z',
+        childStartedAt: '2026-09-04T19:00:00.000Z',
+      },
+      paths: {
+        attemptDir,
+        worktree: join(attemptDir, 'worktree'),
+        manifest: manifestPath,
+        log: join(attemptDir, 'session.log'),
+        ghConfigDir: join(attemptDir, 'gh-config'),
+        askpass: join(attemptDir, 'askpass'),
+        tokenFile: join(attemptDir, 'gh-token'),
+      },
+    })));
+    return manifestPath;
+  }
+
+  it('still reports an attempt whose manifest the sweep has removed', () => {
+    const v2Base = join(root, 'attempts', 'v2');
+    const manifestPath = writeRunning(v2Base, 'issue-7-a', 'aaaaaaaa-2222-4333-8444-555555555555');
+    markAttemptExited(manifestPath, () => new Date('2026-09-04T20:00:00.000Z'), undefined, () => 4096);
+    rmSync(join(v2Base, 'runner-1', 'implement', 'issue-7-a'), { recursive: true, force: true });
+    expect(listHostAttemptFootprints(v2Base, 'host-1')).toEqual([
+      { phase: 'implement', worktreeBytes: 4096, endedAtMs: Date.parse('2026-09-04T20:00:00.000Z') },
+    ]);
+  });
+
+  it('counts an attempt once while its manifest is still on disk', () => {
+    const v2Base = join(root, 'attempts', 'v2');
+    const manifestPath = writeRunning(v2Base, 'issue-7-b', 'bbbbbbbb-2222-4333-8444-555555555555');
+    markAttemptExited(manifestPath, () => new Date('2026-09-04T20:00:00.000Z'), undefined, () => 2048);
+    expect(listHostAttemptFootprints(v2Base, 'host-1')).toHaveLength(1);
+  });
+
+  it('never lets a history write failure break the exit transition', () => {
+    const v2Base = join(root, 'attempts', 'v2');
+    const manifestPath = writeRunning(v2Base, 'issue-7-c', 'cccccccc-2222-4333-8444-555555555555');
+    // A directory where the history file should be makes the rename fail.
+    mkdirSync(join(root, 'attempts', 'attempt-footprints.json'), { recursive: true });
+    const exited = markAttemptExited(manifestPath, () => new Date('2026-09-04T20:00:00.000Z'), undefined, () => 512);
+    expect(exited.processState).toBe('exited');
+    expect(exited.worktreeBytes).toBe(512);
+    expect(readAttemptManifest(manifestPath).processState).toBe('exited');
+  });
+});

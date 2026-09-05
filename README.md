@@ -131,7 +131,9 @@ charges every attempt still settling — and every spawn this cycle already made
 — its expected footprint before admitting the next one. Expected footprint
 comes from what attempts have actually cost on this host, falling back to
 `safety.attemptFootprintGb` (default `{ "implement": 8, "review": 1 }`, in GB)
-until there is history. That key is optional: a config written before it
+until there is history. Measured costs are kept in
+`~/.autopilot/repositories/<repo>/attempts/attempt-footprints.json` so they
+survive the attempt sweep. That key is optional: a config written before it
 existed keeps loading and gets those defaults. Every active cycle logs one
 `disk: free=… reserved=… floor=… settling=…` line, and a candidate the floor
 holds back reports `disk-floor` with the arithmetic that produced it.
