@@ -887,6 +887,20 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       }
       exactOpen.set(candidate.number, candidate);
     }
+    // The full oracle just re-requested every live listing page and every live
+    // head, so what it did not touch is a cursor page or a commit the reader has
+    // moved past (#163) — and this is the only place that is known.
+    const restExport = this.conditionalRest.exportCacheWithSummary({ touchedOnly: true });
+    if (restExport.summary.evictedUntouched > 0 || restExport.summary.evictedOverBudget > 0) {
+      console.warn(
+        `[autopilot] REST cache export kept ${restExport.summary.kept} entries `
+        + `(${(restExport.summary.keptChars / 1_048_576).toFixed(1)} M chars); evicted `
+        + `${restExport.summary.evictedUntouched} untouched by this full reconciliation`
+        + (restExport.summary.evictedOverBudget > 0
+          ? ` and ${restExport.summary.evictedOverBudget} over the export budget`
+          : ''),
+      );
+    }
     const next: LifecycleDiscoveryState = {
       version: 4,
       evidence: evidence(reconciled),
@@ -896,7 +910,7 @@ export class IncrementalLifecycleSnapshotSource implements LifecycleSnapshotSour
       openPullRequests: [...openAfter],
       recentlyClosedPullRequests: [...recentlyClosed],
       recentlyClosedCutoff: cutoff,
-      restCache: this.conditionalRest.exportCache(),
+      restCache: restExport.entries,
     };
     await this.cacheStore.save(next);
     this.state = next;
