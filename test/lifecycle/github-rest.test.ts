@@ -239,6 +239,51 @@ describe('ConditionalRestClient', () => {
     }]);
   });
 
+  it('exports only the endpoints touched since the restore when asked, and evicts the rest', async () => {
+    const live = 'repos/Jinn-Network/mono/issues?state=open&per_page=100';
+    const stale = 'repos/Jinn-Network/mono/issues?state=open&per_page=100&after=old-cursor';
+    const fresh = 'repos/Jinn-Network/mono/pulls/7';
+    const client = new ConditionalRestClient(async (_command, args) => (
+      args[2] === fresh ? included(200, '{"number":7}') : included(304)
+    ));
+    client.restoreCache([
+      { endpoint: live, etag: '"etag-v1"', body: '[]', nextEndpoint: null },
+      { endpoint: stale, etag: '"etag-v1"', body: '[{"number":1}]', nextEndpoint: null },
+    ]);
+    await client.getJson(live);
+    await client.getJson(fresh);
+
+    // A plain export is still the whole cache.
+    expect(client.exportCache().map((entry) => entry.endpoint)).toEqual([live, stale, fresh]);
+    const exported = client.exportCacheWithSummary({ touchedOnly: true });
+    expect(exported.entries.map((entry) => entry.endpoint)).toEqual([live, fresh]);
+    expect(exported.summary).toMatchObject({ kept: 2, evictedUntouched: 1, evictedOverBudget: 0 });
+    // The eviction is real: the process no longer holds the stale validator either.
+    expect(client.exportCache().map((entry) => entry.endpoint)).toEqual([live, fresh]);
+  });
+
+  it('drops the largest bodies first when the export would exceed its budget', async () => {
+    const client = new ConditionalRestClient(async () => included(304), { exportBudgetChars: 200 });
+    client.restoreCache([
+      {
+        endpoint: 'repos/Jinn-Network/mono/issues/1',
+        etag: '"etag-v1"',
+        body: JSON.stringify({ pad: 'x'.repeat(150) }),
+        nextEndpoint: null,
+      },
+      { endpoint: 'repos/Jinn-Network/mono/issues/2', etag: '"etag-v1"', body: '{"n":2}', nextEndpoint: null },
+      { endpoint: 'repos/Jinn-Network/mono/issues/3', etag: '"etag-v1"', body: '{"n":3}', nextEndpoint: null },
+    ]);
+
+    const exported = client.exportCacheWithSummary();
+    expect(exported.entries.map((entry) => entry.endpoint)).toEqual([
+      'repos/Jinn-Network/mono/issues/2',
+      'repos/Jinn-Network/mono/issues/3',
+    ]);
+    expect(exported.summary).toMatchObject({ kept: 2, evictedUntouched: 0, evictedOverBudget: 1 });
+    expect(exported.summary.keptChars).toBeLessThanOrEqual(200);
+  });
+
   it('rejects an invalid restored representation atomically', async () => {
     const endpoint = 'repos/Jinn-Network/mono/issues/42';
     const client = new ConditionalRestClient(async () => included(304));

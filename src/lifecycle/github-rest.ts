@@ -32,6 +32,47 @@ export interface ConditionalRestClientOptions {
   readonly usageMeter?: GitHubUsageMeter;
   readonly runnerIsMetered?: boolean;
   readonly cache?: Map<string, ConditionalRestCacheEntry>;
+  /** Test seam; production exports against {@link REST_CACHE_EXPORT_BUDGET_CHARS}. */
+  readonly exportBudgetChars?: number;
+}
+
+/**
+ * The most cached representation one export will persist, in characters
+ * (#163). The lifecycle cache is one JSON document, and V8 refuses to build a
+ * string past ~536 M characters — on mono the REST cache alone reached 530 M
+ * and every cycle died in `JSON.stringify`. Touched-only export is the real
+ * bound; this is the guard for a leak that rule does not cover, and a cache
+ * over it degrades to a few unconditional fetches rather than a wedge.
+ */
+export const REST_CACHE_EXPORT_BUDGET_CHARS = 64 * 1024 * 1024;
+
+export interface ConditionalRestExportOptions {
+  /**
+   * Persist only the endpoints requested since the cache was restored (or the
+   * client created). A full reconciliation re-requests every live listing page
+   * and every live head, so an entry it did not touch is a cursor page or a
+   * commit the reader has moved past and will never ask for again.
+   */
+  readonly touchedOnly?: boolean;
+}
+
+export interface ConditionalRestExportSummary {
+  readonly kept: number;
+  readonly keptChars: number;
+  readonly evictedUntouched: number;
+  readonly evictedOverBudget: number;
+}
+
+export interface ConditionalRestExport {
+  readonly entries: readonly PersistedConditionalRestCacheEntry[];
+  readonly summary: ConditionalRestExportSummary;
+}
+
+function entryChars(endpoint: string, entry: ConditionalRestCacheEntry): number {
+  return endpoint.length
+    + entry.etag.length
+    + entry.body.length
+    + (entry.nextEndpoint?.length ?? 0);
 }
 
 export class ConditionalRestProtocolError extends Error {
@@ -249,6 +290,9 @@ export class ConditionalRestClient {
   private readonly run: CommandRunner;
   private readonly usageMeter: GitHubUsageMeter;
   private readonly cache: Map<string, ConditionalRestCacheEntry>;
+  private readonly exportBudgetChars: number;
+  /** Endpoints requested (hit or stored) since the last restore. */
+  private readonly touched = new Set<string>();
 
   constructor(
     run: CommandRunner = defaultRunner,
@@ -259,12 +303,57 @@ export class ConditionalRestClient {
       ? run
       : makeGitHubUsageCommandRunner(run, this.usageMeter);
     this.cache = options.cache ?? new Map();
+    this.exportBudgetChars = options.exportBudgetChars ?? REST_CACHE_EXPORT_BUDGET_CHARS;
   }
 
-  exportCache(): readonly PersistedConditionalRestCacheEntry[] {
-    return [...this.cache.entries()]
+  exportCache(
+    options: ConditionalRestExportOptions = {},
+  ): readonly PersistedConditionalRestCacheEntry[] {
+    return this.exportCacheWithSummary(options).entries;
+  }
+
+  /**
+   * The export is the eviction point (#163): whatever it drops leaves the
+   * in-memory cache too, so the persisted document and the process agree. Over
+   * budget, the largest bodies go first — each is one unconditional re-fetch,
+   * and the largest carry the most of the overrun.
+   */
+  exportCacheWithSummary(
+    options: ConditionalRestExportOptions = {},
+  ): ConditionalRestExport {
+    let evictedUntouched = 0;
+    if (options.touchedOnly === true) {
+      for (const endpoint of this.cache.keys()) {
+        if (this.touched.has(endpoint)) continue;
+        this.cache.delete(endpoint);
+        evictedUntouched += 1;
+      }
+    }
+    let keptChars = 0;
+    for (const [endpoint, entry] of this.cache) keptChars += entryChars(endpoint, entry);
+    let evictedOverBudget = 0;
+    if (keptChars > this.exportBudgetChars) {
+      const largestFirst = [...this.cache.entries()]
+        .sort(([, left], [, right]) => right.body.length - left.body.length);
+      for (const [endpoint, entry] of largestFirst) {
+        if (keptChars <= this.exportBudgetChars) break;
+        this.cache.delete(endpoint);
+        keptChars -= entryChars(endpoint, entry);
+        evictedOverBudget += 1;
+      }
+    }
+    const entries = [...this.cache.entries()]
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([endpoint, entry]) => ({ endpoint, ...entry }));
+    return {
+      entries,
+      summary: {
+        kept: entries.length,
+        keptChars,
+        evictedUntouched,
+        evictedOverBudget,
+      },
+    };
   }
 
   restoreCache(entries: readonly PersistedConditionalRestCacheEntry[]): void {
@@ -286,6 +375,7 @@ export class ConditionalRestClient {
       });
     }
     this.cache.clear();
+    this.touched.clear();
     for (const [endpoint, entry] of restored) this.cache.set(endpoint, entry);
   }
 
@@ -336,6 +426,7 @@ export class ConditionalRestClient {
       const body = parseJson(cached.body, 'cached');
       if (cached.nextEndpoint !== null) assertEndpoint(cached.nextEndpoint);
       this.cache.set(endpoint, { ...cached, etag });
+      this.touched.add(endpoint);
       this.usageMeter.recordCacheHit();
       return {
         body,
@@ -353,6 +444,7 @@ export class ConditionalRestClient {
     const body = parseJson(response.body, 'response');
     const nextEndpoint = parseNextEndpoint(response);
     this.cache.set(endpoint, { etag, body: response.body, nextEndpoint });
+    this.touched.add(endpoint);
     return { body, etag, status: 200, nextEndpoint, rateLimit };
   }
 }

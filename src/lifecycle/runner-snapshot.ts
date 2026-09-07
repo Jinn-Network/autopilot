@@ -41,6 +41,10 @@ function describeSnapshotFailure(error: unknown, depth = 0): string {
   if (!(error instanceof Error)) return String(error);
   const name = error.name.length > 0 ? error.name : 'Error';
   let described = `${name}: ${error.message}`;
+  // V8's bare message names no file; on mono it was the lifecycle cache (#163).
+  if (error instanceof RangeError && /Invalid string length/.test(error.message)) {
+    described += ' (a persisted state document exceeded V8\'s maximum string length; see #163)';
+  }
   if (depth < SNAPSHOT_FAILURE_DEPTH_LIMIT) {
     if (error instanceof AggregateError) {
       described += ` {${

@@ -921,6 +921,38 @@ describe('IncrementalLifecycleSnapshotSource', () => {
     ]));
   });
 
+  it('full mode evicts persisted REST cache entries the oracle did not touch (#163)', async () => {
+    const seed = harness();
+    await seed.source.read({ mode: 'full', rateLimitFloor: 500 });
+    const directory = await mkdtemp(join(tmpdir(), 'jinn-rest-cache-evict-'));
+    await chmod(directory, 0o700);
+    await writeFile(join(directory, 'lifecycle-cache.json'), JSON.stringify({
+      ...seed.store.state!,
+      restCache: [{
+        endpoint: 'repos/Jinn-Network/mono/issues?state=open&per_page=100&after=stale-cursor',
+        etag: '"stale"',
+        body: '[]',
+        nextEndpoint: null,
+      }],
+    }), { mode: 0o600 });
+    const store = new LifecycleDiscoveryCacheStore({ stateDirectory: directory });
+    const source = new IncrementalLifecycleSnapshotSource({
+      fullReader: seed.reader,
+      restDiscovery: seed.rest as unknown as GitHubRestDiscoveryReader,
+      conditionalRest: new ConditionalRestClient(async () => {
+        throw new Error('no direct conditional REST calls expected');
+      }),
+      evidenceProbe: seed.probe,
+      cacheStore: store,
+      authorAllowlist: new Set(['oaksprout']),
+      now: () => new Date(FULL_AT),
+    });
+
+    await expect(source.read({ mode: 'full', rateLimitFloor: 500 }))
+      .resolves.toMatchObject({ snapshotMode: 'full', snapshotComplete: true });
+    expect((await store.load())!.restCache).toEqual([]);
+  });
+
   it('does not recover through an unsafe symlink cache path', async () => {
     const context = harness();
     const directory = await mkdtemp(join(tmpdir(), 'jinn-unsafe-cache-'));
