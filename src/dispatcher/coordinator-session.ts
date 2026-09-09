@@ -184,13 +184,17 @@ const AMBIENT_CLAUDE_CONFIG_FILENAME = '.claude.json';
  * The document is a file beside the session log when the caller named one —
  * every production attempt does — so the argv (and the process listing that
  * shows it) stays readable and the grant is inspectable after the fact. A
- * caller with no log path gets the same document inline, which the CLI accepts
- * as a JSON string; nothing about the isolation differs between the two.
+ * caller with no log path, or an attempt directory that cannot be written,
+ * gets the same document inline, which the CLI accepts as a JSON string.
+ * Nothing about the isolation differs between the two, which is why the write
+ * is allowed to fail: an unwritable file would otherwise cost a whole attempt
+ * to protect a convenience, and the fallback is announced rather than hidden.
  */
 function workerMcpArgs(
   spec: CoordinatorSessionSpec,
   cfg: DispatcherConfig,
   writeConfig: (path: string, contents: string) => void,
+  log: (message: string) => void,
 ): string[] {
   const document = JSON.stringify({ mcpServers: cfg.mcpServers });
   const logPath = spec.spawnOptions.logPath;
@@ -198,7 +202,15 @@ function workerMcpArgs(
     return ['--mcp-config', document, '--strict-mcp-config'];
   }
   const configPath = join(dirname(logPath), WORKER_MCP_CONFIG_FILENAME);
-  writeConfig(configPath, document);
+  try {
+    writeConfig(configPath, document);
+  } catch {
+    log(
+      `[autopilot] worker mcp: could not write ${configPath}; `
+        + 'passing the grant inline',
+    );
+    return ['--mcp-config', document, '--strict-mcp-config'];
+  }
   return ['--mcp-config', configPath, '--strict-mcp-config'];
 }
 
@@ -470,6 +482,7 @@ export function spawnCoordinatorSession(
           spec,
           cfg,
           deps.writeWorkerMcpConfig ?? writeWorkerMcpConfigFile,
+          log,
         ),
         prompt,
       ],

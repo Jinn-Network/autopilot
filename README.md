@@ -255,7 +255,10 @@ here by name, and the entry is passed to the CLI verbatim:
 ```
 
 The document is written to `mcp-config.json` in the attempt directory, beside
-`session.log`, so what a worker was granted is inspectable after the run. The
+`session.log`, so what a worker was granted is inspectable after the run; if
+that file cannot be written the same document is passed inline and one
+`worker mcp: could not write …` line says so, because an unwritable file is
+not worth losing an attempt over and changes nothing about the isolation. The
 key is optional: a config written before it existed keeps loading and grants
 nothing. The first `claude -p` worker of a cycle whose ambient
 `~/.claude.json` declares servers the engine is dropping logs one

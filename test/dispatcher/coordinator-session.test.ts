@@ -536,6 +536,50 @@ describe('worker MCP isolation (#182)', () => {
     }]);
   });
 
+  it('passes the grant inline when the document cannot be written', () => {
+    const logs: string[] = [];
+    const calls: SpawnCall[] = [];
+    spawnCoordinatorSession(
+      {
+        kind: 'implement',
+        number: 182,
+        skill: 'implement-issue',
+        scenario: 'SCENARIO-unwritable',
+        worktreePath: '/tmp/worktrees/implement-182',
+        effort: null,
+        env: {},
+        spawnOptions: {
+          detached: true,
+          stdio: 'ignore',
+          logPath: '/attempt/session.log',
+        },
+      },
+      { ...DEFAULT_CONFIG, runtime: 'claude' },
+      {
+        spawn: (cmd, args, opts) => {
+          calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+          return { pid: 1821 };
+        },
+        log: (message) => logs.push(message),
+        readTextFile: () => undefined,
+        writeWorkerMcpConfig: () => {
+          throw new Error('ENOENT: no such file or directory');
+        },
+      },
+    );
+
+    const [call] = calls;
+    // Isolation is not what degrades: the same document reaches the child,
+    // inline, and the launch is not lost to a filesystem error.
+    expect(call.args).toContain('--strict-mcp-config');
+    expect(JSON.parse(call.args[call.args.indexOf('--mcp-config') + 1]))
+      .toEqual({ mcpServers: {} });
+    expect(logs).toContain(
+      '[autopilot] worker mcp: could not write '
+        + '/attempt/mcp-config.json; passing the grant inline',
+    );
+  });
+
   it.each(['hermes', 'cursor', 'codex'] as const)(
     'leaves %s sessions untouched — the flags are `claude -p` knobs',
     (runtime) => {
