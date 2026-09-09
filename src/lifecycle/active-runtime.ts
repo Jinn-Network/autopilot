@@ -59,6 +59,12 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
+  /** Fill an ordinary board issue's Priority / Issue Type gaps (#166). */
+  triageDefaults?(
+    action: Extract<NewWorkAction, { kind: 'triage-defaults' }>,
+    credentials: CredentialPool,
+    snapshot: GitHubLifecycleSnapshot,
+  ): Promise<ActiveRuntimeResult>;
   /**
    * Hand the exact head to GitHub's merge queue. Nothing this handler returns
    * may claim the change landed: the queue merges on its own schedule, and Done
@@ -207,6 +213,9 @@ async function routeAction(
     case 'file-debt-sweep':
       return handlers.fileDebtSweep?.(action, credentials, snapshot)
         ?? unwired('file-debt-sweep');
+    case 'triage-defaults':
+      return handlers.triageDefaults?.(action, credentials, snapshot)
+        ?? unwired('triage-defaults');
     default:
       // Unreachable for the declared union; reached only by a retired or
       // not-yet-declared kind arriving from a stale plan. Skipping names it

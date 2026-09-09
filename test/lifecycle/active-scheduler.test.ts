@@ -110,6 +110,59 @@ describe('active local scheduler', () => {
     });
   });
 
+  // #166: board triage spawns no session, so it spends no lane slot — like
+  // every other `file-*` rung it is bounded where it is derived instead.
+  it('schedules triage defaults with every lane already full', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [
+        {
+          phase: 'triage-defaults',
+          issueNumber: 3983,
+          projectItemId: 'PVTI_3983',
+          issueType: 'fix',
+          priority: 'P3',
+        },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 44 },
+      ],
+      remaining: { implementation: 0, child: 0, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([
+      {
+        kind: 'triage-defaults',
+        issueNumber: 3983,
+        projectItemId: 'PVTI_3983',
+        issueType: 'fix',
+        priority: 'P3',
+      },
+    ]);
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:44',
+      reason: 'capacity',
+    });
+  });
+
+  it('names a triage-defaults candidate by its own issue', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [{
+        phase: 'triage-defaults',
+        issueNumber: 3192,
+        projectItemId: 'PVTI_3192',
+        priority: 'P3',
+      }],
+      remaining: { implementation: 0, child: 0, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([{
+      kind: 'triage-defaults',
+      issueNumber: 3192,
+      projectItemId: 'PVTI_3192',
+      priority: 'P3',
+    }]);
+    expect(plan.skips).toEqual([]);
+  });
+
   it('suppresses only fresh implementation at the GitHub backlog threshold', () => {
     const plan = scheduleActiveActions(input({ openPipelineBacklog: 10 }));
     expect(plan.actions.map((action) => action.kind)).toEqual([

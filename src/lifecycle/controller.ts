@@ -46,7 +46,11 @@ import { planDebtSweeps, rankDebtSweeps } from './debt-sweep.js';
 import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import { hasReviewFollowUpMarkerTag } from './review-follow-ups.js';
-import { triageGaps } from './triage-defaults.js';
+import {
+  planTriageDefaults,
+  triageGaps,
+  type TriageDefaultsPolicy,
+} from './triage-defaults.js';
 import type {
   AutopilotMode,
   GitOid,
@@ -128,6 +132,13 @@ export interface LifecycleControllerDeps {
    * and initialization writes manual.
    */
   readonly mergePolicy?: MergePolicy;
+  /**
+   * Board triage policy (#166). Absent means no `triage-defaults` action is
+   * ever planned: a build that wires no policy must not start writing Project
+   * fields on its own, and every deployment that does wire one gets it from
+   * config, where both keys are defaulted.
+   */
+  readonly triageDefaults?: TriageDefaultsPolicy;
   readonly active?: {
     preflight(): Promise<{ readonly ok: boolean; readonly detail?: string }>;
     readLocalState(): {
@@ -975,6 +986,7 @@ interface RankedImplementationCandidate {
 function activeCandidates(
   snapshot: GitHubLifecycleSnapshot,
   view: ReturnType<typeof deriveLifecycle>,
+  triagePolicy: TriageDefaultsPolicy | undefined,
 ): ActiveCandidate[] {
   const byPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr]));
   const repair: ActiveCandidate[] = [];
@@ -1233,7 +1245,36 @@ function activeCandidates(
     ...orderImplementationClaims(freshImplementation),
     ...other,
     ...debtSweepCandidates(snapshot),
+    ...triageDefaultsCandidates(snapshot, triagePolicy, repairingIssues),
   ];
+}
+
+/**
+ * Board triage defaults (#166), derived from the snapshot's issues rather than
+ * from the lifecycle view: an untriaged issue is precisely one the view has
+ * already ruled ineligible, so the view carries no candidate to hang this on.
+ *
+ * Withheld entirely when no policy is wired — a build that was never told what
+ * Priority to write must not invent one — and issues already queued for
+ * machine-child repair are excluded a second time here, so the two writers can
+ * never both be planned for the same field in the same cycle.
+ */
+function triageDefaultsCandidates(
+  snapshot: GitHubLifecycleSnapshot,
+  policy: TriageDefaultsPolicy | undefined,
+  repairingIssues: ReadonlySet<number>,
+): ActiveCandidate[] {
+  if (policy === undefined) return [];
+  return planTriageDefaults(
+    snapshot.issues.filter((issue) => !repairingIssues.has(issue.number)),
+    policy,
+  ).map((planned) => ({
+    phase: 'triage-defaults',
+    issueNumber: planned.issueNumber,
+    projectItemId: planned.projectItemId,
+    ...(planned.issueType === undefined ? {} : { issueType: planned.issueType }),
+    ...(planned.priority === undefined ? {} : { priority: planned.priority }),
+  }));
 }
 
 /**
@@ -1327,6 +1368,8 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
   if (
     action.kind === 'claim-implementation'
     || action.kind === 'repair-machine-child'
+    // The gap it closes is exactly what keeps the issue out of `eligible`.
+    || action.kind === 'triage-defaults'
   ) return 'eligible';
   if (action.kind === 'claim-review') return 'awaiting-review';
   if (action.kind === 'file-reconcile-child') return 'awaiting-review';
@@ -1340,7 +1383,7 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
 }
 
 function subjectForAction(action: NewWorkAction): string {
-  return action.kind === 'claim-implementation'
+  return action.kind === 'claim-implementation' || action.kind === 'triage-defaults'
     ? `issue:${action.issueNumber}`
     : action.kind === 'repair-machine-child'
       ? `issue:${action.issueNumber}/pr:${action.parentPr}`
@@ -1355,6 +1398,7 @@ function phaseForSchedulingSkip(
   if (
     skip.phase === 'implementation'
     || skip.phase === 'repair-machine-child'
+    || skip.phase === 'triage-defaults'
   ) return 'eligible';
   if (skip.phase === 'review') return 'awaiting-review';
   if (skip.phase === 'file-reconcile-child') return 'awaiting-review';
@@ -1587,7 +1631,7 @@ async function executeActivePass(
         pr.state === 'OPEN' && pr.labels.includes('engine:review')
       )).length;
   const candidates = applyMergePolicy(
-    activeCandidates(snapshot, view),
+    activeCandidates(snapshot, view, deps.triageDefaults),
     deps.mergePolicy ?? 'manual',
   ).filter((candidate) => gatingIssueNumbers(candidate).every((issueNumber) => (
     !blockedIssues.has(issueNumber)
@@ -1603,7 +1647,7 @@ async function executeActivePass(
       runnerId: deps.runnerId,
       mode: 'active',
       phase: phaseForSchedulingSkip(candidate),
-      subject: candidate.phase === 'implementation'
+      subject: candidate.phase === 'implementation' || candidate.phase === 'triage-defaults'
         ? `issue:${candidate.issueNumber}`
         : candidate.phase === 'repair-machine-child'
           ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`

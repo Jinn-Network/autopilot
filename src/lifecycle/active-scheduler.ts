@@ -1,5 +1,7 @@
 import type { NewWorkAction } from './types.js';
 import type { GitOid, GitRefName } from './types.js';
+
+type TriageDefaultsAction = Extract<NewWorkAction, { kind: 'triage-defaults' }>;
 import type { MergePolicy } from '../config/config.js';
 import type { AutopilotRuntime } from '../autopilot-runtime.js';
 
@@ -77,6 +79,19 @@ export type ActiveCandidate =
         readonly number: number;
         readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
       }[];
+    }
+  | {
+      /**
+       * Fill an ordinary board issue's triage gaps so the eligibility cascade
+       * stops refusing it (#166). Spends no concurrency lane — it spawns no
+       * session, only writes one or two Project fields — and is bounded at
+       * derivation by `MAX_TRIAGE_DEFAULTS_PER_CYCLE` instead.
+       */
+      readonly phase: 'triage-defaults';
+      readonly issueNumber: number;
+      readonly projectItemId: string;
+      readonly issueType?: TriageDefaultsAction['issueType'];
+      readonly priority?: TriageDefaultsAction['priority'];
     }
   | {
       /**
@@ -176,7 +191,7 @@ export function applyMergePolicy(
 }
 
 function subject(candidate: ActiveCandidate): string {
-  return candidate.phase === 'implementation'
+  return candidate.phase === 'implementation' || candidate.phase === 'triage-defaults'
     ? `issue:${candidate.issueNumber}`
     : candidate.phase === 'repair-machine-child'
       ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
@@ -436,6 +451,16 @@ export function scheduleActiveActions(
         kind: 'file-debt-sweep',
         parentPr: candidate.parentPr,
         members: candidate.members,
+      });
+      continue;
+    }
+    if (candidate.phase === 'triage-defaults') {
+      actions.push({
+        kind: 'triage-defaults',
+        issueNumber: candidate.issueNumber,
+        projectItemId: candidate.projectItemId,
+        ...(candidate.issueType === undefined ? {} : { issueType: candidate.issueType }),
+        ...(candidate.priority === undefined ? {} : { priority: candidate.priority }),
       });
     }
   }
