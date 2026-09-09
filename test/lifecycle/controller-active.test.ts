@@ -2197,6 +2197,8 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       reserved: 19.5 * 1024 ** 3,
       floor: 8 * 1024 ** 3,
       settling: 3,
+      // What one more attempt of each phase would cost (#159).
+      expected: { implement: 8 * 1024 ** 3, review: 1024 ** 3 },
     };
 
     it('names the projection in the disk-floor skip it caused', async () => {

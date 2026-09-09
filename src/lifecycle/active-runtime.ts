@@ -1,6 +1,10 @@
 import { withCycleStep } from '../cycle-heartbeat.js';
 import type { AttemptManifest, AttemptPhase } from './attempt-workspace.js';
-import { diskHeadroomSkipDetail, type DiskHeadroom } from './disk-headroom.js';
+import {
+  diskHeadroomAdmits,
+  diskHeadroomSkipDetail,
+  type DiskHeadroom,
+} from './disk-headroom.js';
 import type { LifecycleControllerDeps } from './controller.js';
 import type { CredentialPool } from './credentials.js';
 import { laneForNewWorkAction, type NewWorkAction } from './types.js';
@@ -280,7 +284,25 @@ export function makeActiveRuntime(
   let spawnedThisCycle: AttemptPhase[] = [];
   const readLocalState = () => {
     const diskHeadroom = options.readDiskHeadroom?.(spawnedThisCycle) ?? null;
-    const newWorkPaused = diskHeadroom?.paused ?? options.newWorkPaused?.() ?? false;
+    // The pre-#144 seam, read once: it knows nothing about phases, so with no
+    // projection wired every lane answers to the same boolean, exactly as before.
+    const newWorkPaused = diskHeadroom === null
+      ? (options.newWorkPaused?.() ?? false)
+      : diskHeadroom.paused;
+    /**
+     * Whether the disk will take one more attempt of this phase (#159).
+     *
+     * Per phase, not per cycle: `reserved` is dominated by implementations, and
+     * gating a 0.2 GB review behind them starved the lane that turns
+     * implementations into merges — 27 times on mono, with 47 GB free.
+     */
+    const admits = (phase: AttemptPhase): boolean => (
+      diskHeadroom === null
+        ? !newWorkPaused
+        : diskHeadroomAdmits(diskHeadroom, phase)
+    );
+    const admitsImplement = admits('implement');
+    const admitsReview = admits('review');
     const attempts = options.readLocalAttempts();
     // Both lanes write `implement`-phase manifests, so the split is the
     // manifest's own `childKind`. An attempt written before that field existed
@@ -308,29 +330,35 @@ export function makeActiveRuntime(
       // (#152); a manifest without one predates the pool and is not Codex.
       codex: attempts.filter((attempt) => attempt.runtime === 'codex').length,
     };
+    // A lane whose phase the disk refuses has no admissible slot, whatever its
+    // cap says. Zeroed per phase rather than per cycle (#159): the review lane
+    // keeps its slots while implementations are held back, which is the whole
+    // point — but the child, debt and overflow lanes all write `implement`
+    // worktrees, so they are refused with the implementation lane, exactly as
+    // the old whole-cycle pause refused them together.
+    const laneRemaining = (admitted: boolean, remaining: number): number =>
+      (admitted ? Math.max(0, remaining) : 0);
     return {
-      // The disk floor pauses every lane: a floor that only stopped fresh
-      // claims would keep filling the same disk with child and review work.
-      remaining: newWorkPaused
-        ? {
-            implementation: 0,
-            child: 0,
-            review: 0,
-            codexOverflow: 0,
-            ...(debtLaneOn ? { debt: 0 } : {}),
-          }
-        : {
-            implementation: Math.max(0, caps.implementation - activeByLane.implementation),
-            child: Math.max(0, caps.child - activeByLane.child),
-            review: Math.max(0, caps.review - activeByLane.review),
-            codexOverflow: Math.max(0, caps.codexOverflow - activeByLane.codex),
-            ...(debtLaneOn
-              ? { debt: Math.max(0, caps.debt - activeByLane.debt) }
-              : {}),
-          },
-      preferCodex: newWorkPaused
-        ? false
-        : (options.readRuntimeCircuit?.().preferCodex ?? false),
+      remaining: {
+        implementation: laneRemaining(
+          admitsImplement,
+          caps.implementation - activeByLane.implementation,
+        ),
+        child: laneRemaining(admitsImplement, caps.child - activeByLane.child),
+        review: laneRemaining(admitsReview, caps.review - activeByLane.review),
+        codexOverflow: laneRemaining(
+          admitsImplement,
+          caps.codexOverflow - activeByLane.codex,
+        ),
+        ...(debtLaneOn
+          ? { debt: laneRemaining(admitsImplement, caps.debt - activeByLane.debt) }
+          : {}),
+      },
+      // Overflow seats an implementation claim, so the circuit only matters
+      // while implementations can start at all.
+      preferCodex: admitsImplement
+        ? (options.readRuntimeCircuit?.().preferCodex ?? false)
+        : false,
       newWorkPaused,
       ...(diskHeadroom === null ? {} : { diskHeadroom }),
       availableLogins: options.credentials.logins(),
@@ -339,13 +367,17 @@ export function makeActiveRuntime(
   };
 
   /**
-   * The reason a lane with no remaining capacity refused this action. A paused
-   * disk and a genuinely full lane are the same zero, and only the projection
-   * can tell an operator which one they are looking at.
+   * The reason a lane with no remaining capacity refused this action. A disk
+   * that will not take this candidate and a genuinely full lane are the same
+   * zero, and only the projection can tell an operator which one they are
+   * looking at — so the refusal carries the candidate's own arithmetic (#159).
    */
-  const laneFullReason = (local: ReturnType<typeof readLocalState>): string => (
-    local.diskHeadroom?.paused === true
-      ? `disk-floor (${diskHeadroomSkipDetail(local.diskHeadroom)})`
+  const laneFullReason = (
+    local: ReturnType<typeof readLocalState>,
+    phase: AttemptPhase,
+  ): string => (
+    local.diskHeadroom !== undefined && !diskHeadroomAdmits(local.diskHeadroom, phase)
+      ? `disk-floor (${diskHeadroomSkipDetail(local.diskHeadroom, phase)})`
       : 'local phase capacity is full'
   );
 
@@ -360,15 +392,18 @@ export function makeActiveRuntime(
   } => {
     const project = options.readDiskHeadroom;
     if (project === undefined) return { admitted: size };
-    for (let admitted = 1; admitted <= size; admitted += 1) {
+    for (let member = 1; member <= size; member += 1) {
+      // Charged with the members already admitted, the projection is asked
+      // whether it affords one more review — the same question `executeAction`
+      // asks per candidate (#159), and the same arithmetic the refusal quotes.
       const projected = project([
         ...spawnedThisCycle,
-        ...Array.from({ length: admitted }, () => 'review' as const),
+        ...Array.from({ length: member - 1 }, () => 'review' as const),
       ]);
-      if (projected?.paused !== true) continue;
+      if (projected === null || diskHeadroomAdmits(projected, 'review')) continue;
       return {
-        admitted: admitted - 1,
-        refusal: `disk-floor (${diskHeadroomSkipDetail(projected)})`,
+        admitted: member - 1,
+        refusal: `disk-floor (${diskHeadroomSkipDetail(projected, 'review')})`,
       };
     }
     return { admitted: size };
@@ -465,15 +500,18 @@ export function makeActiveRuntime(
         && action.intent === 'fresh'
         && action.runtime === 'codex';
       const lane = overflow ? null : laneForNewWorkAction(action);
+      // Every lane but `review` opens an `implement` worktree, the overflow
+      // pool included, so that is the footprint the disk is asked about.
+      const phase: AttemptPhase = lane === 'review' ? 'review' : 'implement';
       if (overflow && local.remaining.codexOverflow === 0) {
-        return { outcome: 'skipped', reason: laneFullReason(local) };
+        return { outcome: 'skipped', reason: laneFullReason(local, phase) };
       }
       // A `debt` lane can only be named by an action the scheduler tagged,
       // which it only does when the lane is on, so the lookup is never
       // undefined in practice; `?? 1` keeps a stale plan from reading an
       // absent lane as full and refusing work it was admitted for.
       if (lane !== null && (local.remaining[lane] ?? 1) === 0) {
-        return { outcome: 'skipped', reason: laneFullReason(local) };
+        return { outcome: 'skipped', reason: laneFullReason(local, phase) };
       }
       const credentials = options.credentials;
       const result = await dispatchAction(

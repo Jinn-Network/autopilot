@@ -568,7 +568,7 @@ describe('active runtime boundary', () => {
       readDiskHeadroom: (pendingSpawns) => {
         seen.push([...pendingSpawns]);
         return projectDiskHeadroom({
-          free: 12 * GB,
+          free: 20 * GB,
           floor: 8 * GB,
           liveAttempts: [],
           pendingSpawns,
@@ -592,12 +592,12 @@ describe('active runtime boundary', () => {
 
     await expect(runtime.executeAction(claim(1), {} as never))
       .resolves.toEqual({ outcome: 'spawned' });
-    // Twelve gigabytes free, an eight-gigabyte floor, and eight already spoken
+    // Twenty gigabytes free, an eight-gigabyte floor, and eight already spoken
     // for: the second slot is open but the disk it would need is not.
     await expect(runtime.executeAction(claim(2), {} as never)).resolves.toEqual({
       outcome: 'skipped',
-      reason: 'disk-floor (free 12.0G \u2212 reserved 8.0G for 1 settling attempt '
-        + '< floor 8G)',
+      reason: 'disk-floor (free 20.0G \u2212 reserved 8.0G for 1 settling attempt '
+        + '\u2212 implement 8.0G < floor 8G)',
     });
     // One projection per dispatch, and the second one sees the first's charge.
     expect(seen).toEqual([[], ['implement']]);
@@ -664,7 +664,7 @@ describe('active runtime boundary', () => {
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
       readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
-        free: 10 * GB,
+        free: 12 * GB,
         floor: 8 * GB,
         liveAttempts: [],
         pendingSpawns,
@@ -706,7 +706,8 @@ describe('active runtime boundary', () => {
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
       readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
-        free: 12 * GB,
+        // Room for exactly one implementation, and nothing at all after it.
+        free: 16.5 * GB,
         floor: 8 * GB,
         liveAttempts: [],
         pendingSpawns,
@@ -737,7 +738,7 @@ describe('active runtime boundary', () => {
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
       readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
-        free: 12 * GB,
+        free: 20 * GB,
         floor: 8 * GB,
         liveAttempts: [],
         pendingSpawns,
@@ -794,7 +795,8 @@ describe('active runtime boundary', () => {
       implementationBackpressureThreshold: 30,
       readLocalAttempts: () => [],
       readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
-        free: 12 * GB,
+        // Room for the implementation claim, and not one review after it.
+        free: 16.5 * GB,
         floor: 8 * GB,
         liveAttempts: [],
         pendingSpawns,
@@ -831,13 +833,13 @@ describe('active runtime boundary', () => {
     await expect(runtime.executeReviewActions!(cohort, {} as never)).resolves.toEqual([
       {
         outcome: 'skipped',
-        reason: 'disk-floor (free 12.0G \u2212 reserved 9.0G for 2 settling attempts '
-          + '< floor 8G)',
+        reason: 'disk-floor (free 16.5G \u2212 reserved 8.0G for 1 settling attempt '
+          + '\u2212 review 1.0G < floor 8G)',
       },
       {
         outcome: 'skipped',
-        reason: 'disk-floor (free 12.0G \u2212 reserved 9.0G for 2 settling attempts '
-          + '< floor 8G)',
+        reason: 'disk-floor (free 16.5G \u2212 reserved 8.0G for 1 settling attempt '
+          + '\u2212 review 1.0G < floor 8G)',
       },
     ]);
     // Nothing reserved GitHub quota and no reviewer session started.
@@ -891,18 +893,84 @@ describe('active runtime boundary', () => {
       { outcome: 'spawned' },
       {
         outcome: 'skipped',
-        reason: 'disk-floor (free 10.0G \u2212 reserved 3.0G for 3 settling attempts '
-          + '< floor 8G)',
+        reason: 'disk-floor (free 10.0G \u2212 reserved 2.0G for 2 settling attempts '
+          + '\u2212 review 1.0G < floor 8G)',
       },
       {
         outcome: 'skipped',
-        reason: 'disk-floor (free 10.0G \u2212 reserved 3.0G for 3 settling attempts '
-          + '< floor 8G)',
+        reason: 'disk-floor (free 10.0G \u2212 reserved 2.0G for 2 settling attempts '
+          + '\u2212 review 1.0G < floor 8G)',
       },
     ]);
     expect(started).toEqual([84, 85]);
     // Quota is reserved for what actually runs, not for what was scheduled.
     expect(reservations).toEqual([2]);
+  });
+
+  // #159: admission used to be one global `free − reserved < floor` test, so
+  // implementations settling in front of a review refused the review — 47 G
+  // free and a 0.2 G reviewer turned away, 27 starved review cycles on mono.
+  describe('per-candidate admission (#159)', () => {
+    const settlingImplementation = (overrides: Record<string, unknown> = {}) =>
+      makeActiveRuntime({
+        credentials: pool(),
+        caps: { implementation: 2, child: 2, review: 2 },
+        implementationPreferredLogin: 'implementation-bot',
+        implementationBackpressureThreshold: 30,
+        readLocalAttempts: () => [],
+        readDiskHeadroom: (pendingSpawns) => projectDiskHeadroom({
+          free: 30 * GB,
+          floor: 20 * GB,
+          liveAttempts: [{ phase: 'implement', startedAtMs: NOW - 60_000 }],
+          pendingSpawns,
+          history: [],
+          defaults: { implement: 8 * GB, review: 1 * GB },
+          nowMs: NOW,
+        }),
+        preflight: async () => ({ ok: true }),
+        handlers: {
+          implementation: async () => ({ status: 'spawned' }),
+          review: async () => ({ status: 'spawned' }),
+          enqueue: async () => ({ status: 'enqueued' }),
+        },
+        ...overrides,
+      } as never);
+
+    it('admits a review and refuses an implementation in the same cycle', async () => {
+      const runtime = settlingImplementation();
+
+      // 30 − 8 − 8 = 14, under the twenty-gigabyte floor.
+      await expect(runtime.executeAction(
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 1 } as never,
+        {} as never,
+      )).resolves.toEqual({
+        outcome: 'skipped',
+        reason: 'disk-floor (free 30.0G − reserved 8.0G for 1 settling attempt '
+          + '− implement 8.0G < floor 20G)',
+      });
+      // 30 − 8 − 1 = 21, over it. The lane that turns implementations into
+      // merges is not collateral damage from an implementation burst.
+      await expect(runtime.executeReviewActions!([{
+        kind: 'claim-review',
+        issueNumber: 42,
+        prNumber: 84,
+        head: HEAD,
+      }] as never, {} as never)).resolves.toEqual([{ outcome: 'spawned' }]);
+    });
+
+    it('zeros only the lanes whose phase the disk refuses', () => {
+      const local = settlingImplementation().readLocalState();
+
+      expect(local.remaining).toEqual({
+        implementation: 0,
+        child: 0,
+        review: 2,
+        codexOverflow: 0,
+      });
+      // One lane can still start work, so the cycle is not paused — and the
+      // summary line says which.
+      expect(local.newWorkPaused).toBe(false);
+    });
   });
 });
 

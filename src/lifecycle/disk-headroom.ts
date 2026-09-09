@@ -45,6 +45,9 @@ export const ATTEMPT_FOOTPRINT_HISTORY = 10;
  */
 export const ATTEMPT_SETTLE_MS = 10 * 60 * 1000;
 
+/** Every phase a candidate can have, in the order the summary line names them. */
+const ATTEMPT_PHASES: readonly AttemptPhase[] = ['implement', 'review'];
+
 /** A live attempt, as the projection needs to see it. */
 export interface LiveAttemptFootprint {
   readonly phase: AttemptPhase;
@@ -55,13 +58,23 @@ export interface LiveAttemptFootprint {
 }
 
 export interface DiskHeadroom {
-  /** New work is paused: projected free space would sit below the floor. */
+  /**
+   * No phase can be admitted at all: even the cheapest candidate would put
+   * projected free space under the floor. A cycle can be unpaused and still
+   * refuse an implementation — see {@link diskHeadroomAdmits}.
+   */
   readonly paused: boolean;
   readonly free: number;
   readonly reserved: number;
   readonly floor: number;
   /** Attempts and this-cycle spawns whose footprint has yet to land. */
   readonly settling: number;
+  /**
+   * What one more attempt of each phase would cost on this host right now
+   * (#159), so admission can be decided per candidate rather than once for
+   * every lane at whatever the most expensive phase costs.
+   */
+  readonly expected: Readonly<Record<AttemptPhase, number>>;
 }
 
 export interface DiskHeadroomInput {
@@ -108,6 +121,15 @@ export function attemptFootprintDefaultsFromGb(
  * work builds, so the distribution has a long right tail and a mean sits under
  * most of it. The 75th percentile keeps the projection conservative without
  * letting one pathological attempt set the budget for every future one.
+ *
+ * The configured default is a floor under that percentile, never merely the
+ * fallback for an empty history (#158). A footprint is recorded from a
+ * measurement of the worktree, and every measurement is a lower bound on what
+ * the attempt occupied at its peak — the mono host learned 0.19 G for
+ * implementations it was running at 6.5 G, and reserved a thirtieth of the
+ * truth for every spawn after. Reserving too much delays a spawn; reserving
+ * too little fills the volume, so history may raise this estimate and may
+ * never lower it.
  */
 export function expectedAttemptFootprintBytes(
   phase: AttemptPhase,
@@ -120,7 +142,7 @@ export function expectedAttemptFootprintBytes(
     .map((record) => record.worktreeBytes)
     .sort((left, right) => left - right);
   if (recent.length === 0) return defaults[phase];
-  return recent[Math.ceil(0.75 * recent.length) - 1]!;
+  return Math.max(defaults[phase], recent[Math.ceil(0.75 * recent.length) - 1]!);
 }
 
 /**
@@ -132,6 +154,10 @@ export function expectedAttemptFootprintBytes(
  * A spawn counted on both sides is charged once. Subtracting it from free
  * space is what makes the floor hold against work in flight rather than only
  * against work already on disk.
+ *
+ * What the projection does NOT decide is admission: that is per candidate
+ * (#159), against `expected` — see {@link diskHeadroomAdmits}. `paused` here
+ * means only that nothing at all fits.
  *
  * A floor of zero disables the gate outright, exactly as it did before.
  */
@@ -165,13 +191,41 @@ export function projectDiskHeadroom(input: DiskHeadroomInput): DiskHeadroom {
     }
     reserve(expected(phase));
   }
-  return {
-    paused: input.floor > 0 && input.free - reserved < input.floor,
+  const projected = {
     free: input.free,
     reserved,
     floor: input.floor,
     settling,
+    expected: { implement: expected('implement'), review: expected('review') },
   };
+  return {
+    ...projected,
+    // Paused means no candidate of any phase fits — the only reading that
+    // stays true now that lanes are admitted one at a time.
+    paused: ATTEMPT_PHASES.every((phase) => !diskHeadroomAdmits(projected, phase)),
+  };
+}
+
+/**
+ * Whether one more attempt of this phase may start (#159).
+ *
+ * Admission used to be a single `free − reserved < floor` test that never
+ * asked what the candidate itself would cost, so a 0.2 GB review was refused
+ * because 8 GB implementations were settling — with 47 GB free — and the
+ * review lane, which is what converts implementations into merges, starved
+ * exactly when the engine was busiest. The candidate's own expected footprint
+ * belongs in the arithmetic: the floor's job is to refuse the *implementation*
+ * that would not fit, not every lane behind it.
+ *
+ * A floor of zero disables the gate outright, as everywhere else here.
+ */
+export function diskHeadroomAdmits(
+  headroom: Omit<DiskHeadroom, 'paused'>,
+  phase: AttemptPhase,
+): boolean {
+  if (headroom.floor <= 0) return true;
+  return headroom.free - headroom.reserved - headroom.expected[phase]
+    >= headroom.floor;
 }
 
 /** Measured bytes, always to one decimal — they are never a round number. */
@@ -189,17 +243,35 @@ function configuredGb(bytes: number): string {
  * The arithmetic behind a `disk-floor` skip, so an operator reading one line
  * can tell a full disk from a disk this cycle has already spoken for.
  */
-export function diskHeadroomSkipDetail(headroom: DiskHeadroom): string {
+export function diskHeadroomSkipDetail(
+  headroom: DiskHeadroom,
+  phase?: AttemptPhase,
+): string {
   return `free ${measuredGb(headroom.free)} − reserved ${measuredGb(headroom.reserved)} `
     + `for ${headroom.settling} settling `
     + `attempt${headroom.settling === 1 ? '' : 's'} `
+    // The candidate's own cost, when one candidate was refused (#159): an
+    // operator looking at 47 G free and a refused review can otherwise not see
+    // what was weighed against what.
+    + (phase === undefined
+      ? ''
+      : `− ${phase} ${measuredGb(headroom.expected[phase])} `)
     + `< floor ${configuredGb(headroom.floor)}`;
 }
 
-/** One line per cycle, so the governor is visible when it is NOT biting too. */
+/**
+ * One line per cycle, so the governor is visible when it is NOT biting too.
+ *
+ * `admits` names the lanes that can still start work (#159). With admission
+ * decided per candidate, "not paused" no longer means every lane is open, and
+ * an operator watching the review lane move while implementations are held
+ * back needs to see which of the two this is.
+ */
 export function diskHeadroomSummaryLine(headroom: DiskHeadroom): string {
+  const admitted = ATTEMPT_PHASES.filter((phase) => diskHeadroomAdmits(headroom, phase));
   return `disk: free=${measuredGb(headroom.free)} `
     + `reserved=${measuredGb(headroom.reserved)} `
     + `floor=${configuredGb(headroom.floor)} `
-    + `settling=${headroom.settling}`;
+    + `settling=${headroom.settling} `
+    + `admits=${admitted.length === 0 ? 'none' : admitted.join(',')}`;
 }

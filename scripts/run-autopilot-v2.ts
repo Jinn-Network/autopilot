@@ -120,6 +120,7 @@ import {
   listHostAttemptFootprints,
   listHostLiveAttempts,
   projectDiskHeadroom,
+  sampleHostAttemptFootprints,
   type AttemptPhase,
   type DiskHeadroom,
   type AttemptCleanupResult,
@@ -971,15 +972,20 @@ export async function runAutopilotV2(
         free: freeDiskBytes(v2AttemptsBase),
         floor: diskFloorBytes,
         liveAttempts: listHostLiveAttempts(v2AttemptsBase, diskHost, childIsAlive)
-          .map((manifest) => ({
-            phase: manifest.phase,
-            // Creation, not child start: the clone that writes most of the
-            // footprint happens before the child ever runs.
-            startedAtMs: Date.parse(manifest.timestamps.createdAt),
-            ...(manifest.worktreeBytes === undefined
-              ? {}
-              : { worktreeBytes: manifest.worktreeBytes }),
-          })),
+          .map((manifest) => {
+            // What this attempt is already known to hold: the recorded
+            // footprint if it has one, else the largest live sample taken of
+            // it (#158). Those bytes are already absent from `free`, so
+            // reserving them again would charge the same disk twice.
+            const known = manifest.worktreeBytes ?? manifest.worktreePeakBytes;
+            return {
+              phase: manifest.phase,
+              // Creation, not child start: the clone that writes most of the
+              // footprint happens before the child ever runs.
+              startedAtMs: Date.parse(manifest.timestamps.createdAt),
+              ...(known === undefined ? {} : { worktreeBytes: known }),
+            };
+          }),
         pendingSpawns,
         history: listHostAttemptFootprints(v2AttemptsBase, diskHost),
         defaults: attemptFootprintDefaults,
@@ -1209,6 +1215,33 @@ export async function runAutopilotV2(
     for (const line of warnings) console.warn(line);
   };
 
+  /**
+   * Teach the footprint history what an attempt costs while it still costs it
+   * (#158).
+   *
+   * The exit measurement is the smallest a worktree ever is, so on its own it
+   * taught this host 0.19 G for implementations it was running at 6.5 G. These
+   * samples are the running maximum the exit transition records instead.
+   *
+   * Bookkeeping, and last of it: it is a synchronous walk of a live checkout,
+   * so it must never delay the dispatch, the sweep that frees disk, or the
+   * board paint. Rationed by `sampleHostAttemptFootprints` to a couple of the
+   * stalest worktrees per cycle, and skipped entirely when no floor is
+   * configured, because nothing then reads the history it feeds.
+   */
+  const sampleAttemptFootprints = async (): Promise<void> => {
+    if (options.mode !== 'active' || diskFloorBytes <= 0) return;
+    try {
+      sampleHostAttemptFootprints(v2AttemptsBase, diskHost, childIsAlive);
+    } catch (error) {
+      console.warn(
+        `[autopilot:v2] attempt footprint sampling degraded: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
+
   const paintBoard = async (
     report: Awaited<ReturnType<typeof runLifecycleCycle>> | null | undefined,
   ): Promise<void> => {
@@ -1236,6 +1269,8 @@ export async function runAutopilotV2(
         // cycle reaches it exactly as a successful one does.
         async () => { await sweepAttempts(); },
         async (finished) => { await paintBoard(finished); },
+        // Last: measurement only, and the one task that walks a live checkout.
+        async () => { await sampleAttemptFootprints(); },
       ],
     });
     if (report === null) return;
