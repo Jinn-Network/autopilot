@@ -103,6 +103,10 @@
         "provider": { "type": "string", "minLength": 1 },
         "codexModel": { "type": "string", "minLength": 1 },
         "backgroundWaitCeilingMs": { "type": "integer", "minimum": 0 },
+        "mcpServers": {
+          "type": "object",
+          "propertyNames": { "minLength": 1 }
+        },
         "repositorySkillDirectories": {
           "type": "array",
           "items": { "$ref": "#/$defs/repositoryRelativePath" }

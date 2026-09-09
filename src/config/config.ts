@@ -135,6 +135,28 @@ export const autopilotConfigSchema = z.object({
      * this field existed omits the key and must keep parsing.
      */
     backgroundWaitCeilingMs: nonNegativeInteger.default(3_600_000),
+    /**
+     * The MCP servers a worker session may reach, as the `mcpServers` map of a
+     * Claude Code MCP document. The engine hands this map to every `claude -p`
+     * worker together with `--strict-mcp-config`, so it is the whole toolset:
+     * the operator's own `~/.claude.json` and any repository `.mcp.json` no
+     * longer reach a worker at all (#182).
+     *
+     * The default is the empty grant, and it is the interesting one. Before
+     * this key existed every worker inherited whoever had last run `claude` on
+     * the host -- a live Chrome DevTools bridge and the operator's personal
+     * data store under sessions acting on third-party repositories, two extra
+     * processes per worker across ten to twenty concurrent workers, and a
+     * toolset the engine did not choose. Nothing in the lifecycle needs an MCP
+     * server, so an operator who wants one grants it here, by name, on purpose.
+     *
+     * Values are `z.unknown()` on purpose: an entry is passed to the CLI
+     * verbatim, and the engine has no business knowing how a server is spelled
+     * -- only which ones are granted. Defaulted, not required: every
+     * `.autopilot/config.json` written before this field existed omits the key
+     * and must keep parsing, onto the empty grant.
+     */
+    mcpServers: z.record(nonEmpty, z.unknown()).default({}),
     repositorySkillDirectories: z.array(repositoryRelativePath),
   }).strict(),
   scheduler: z.object({

@@ -45,4 +45,10 @@ describe('review-loop types', () => {
   it('DEFAULT_CONFIG uses one process-wide Claude runtime', () => {
     expect(DEFAULT_CONFIG.runtime).toBe('claude');
   });
+
+  // #182: the fallback a worker is launched under when nothing configured one
+  // must be the empty MCP grant, never the operator's ambient server set.
+  it('DEFAULT_CONFIG grants workers no MCP servers', () => {
+    expect(DEFAULT_CONFIG.mcpServers).toEqual({});
+  });
 });
