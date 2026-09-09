@@ -23,6 +23,7 @@ import {
   repositorySkillDirectories,
 } from '../config/runtime-assets.js';
 import { packageRoot } from '../package-paths.js';
+import { terminateProcessGroup } from '../process-group.js';
 
 export interface SpawnResult {
   pid: number | undefined;
@@ -89,6 +90,22 @@ export interface CoordinatorSessionDeps {
     opts: HermesHomeOpts,
   ) => { hermesHome: string };
   log?: (message: string) => void;
+  /**
+   * Bounded SIGTERM -> SIGKILL of an exited worker's process group, returning
+   * how many signals were delivered. Injectable so tests never signal a
+   * fixture PID; production tears the real group down (#167).
+   */
+  terminateProcessGroup?: (pid: number) => Promise<number>;
+}
+
+/**
+ * Windows has no process groups to signal, and `detached` means something
+ * else there, so teardown is a no-op rather than a throw.
+ */
+function defaultTerminateProcessGroup(pid: number): Promise<number> {
+  return process.platform === 'win32'
+    ? Promise.resolve(0)
+    : terminateProcessGroup({ pid });
 }
 
 /** Canon is explicit because neither headless runtime auto-loads it reliably. */
@@ -155,16 +172,34 @@ function composeExitHandler(
   log: (message: string) => void,
   getPid: () => number | undefined,
   callerOnExit: SpawnExitHandler | undefined,
+  tearDown: (pid: number) => Promise<number>,
 ): SpawnExitHandler {
   return (code, signal) => {
+    const pid = getPid();
     const logPath = spec.spawnOptions.logPath;
     log(
       `[autopilot] coordinator exit session=${sessionId} ` +
-        `pid=${getPid() ?? 'unknown'} ` +
+        `pid=${pid ?? 'unknown'} ` +
         `code=${code ?? 'null'} signal=${signal ?? 'null'}` +
         (logPath === undefined ? '' : ` log=${logPath}`),
     );
     callerOnExit?.(code, signal);
+    if (pid === undefined) return;
+    // The worker is a group leader (`detached`), so this reaches the test
+    // runners, servers and verification jobs it started. Without it they
+    // survive as orphans holding a worktree the sweep is about to remove
+    // (#167). Advisory and un-awaited: the exit handler is synchronous, and
+    // no cleanup failure may propagate into the caller's exit bookkeeping.
+    void tearDown(pid).then((signalled) => {
+      if (signalled === 0) return;
+      log(
+        `[autopilot] coordinator teardown session=${sessionId} ` +
+          `pgid=${pid} signalled=${signalled}`,
+      );
+    }).catch(() => {
+      // A group that cannot be signalled is the sweep's problem now: it
+      // refuses to delete a worktree that still hosts a live process.
+    });
   };
 }
 
@@ -183,6 +218,7 @@ export function spawnCoordinatorSession(
     log,
     () => spawnedPid,
     callerOnExit,
+    deps.terminateProcessGroup ?? defaultTerminateProcessGroup,
   );
   const runtime = spec.runtime ?? cfg.runtime;
   const runtimePrompt = runtime === 'hermes'

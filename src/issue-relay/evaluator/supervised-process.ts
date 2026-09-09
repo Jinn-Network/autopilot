@@ -3,6 +3,7 @@ import {
   type ChildProcess,
   type SpawnOptions,
 } from 'node:child_process';
+import { killProcessGroup } from '../../process-group.js';
 
 const DEFAULT_TERMINATION_GRACE_MS = 2_000;
 const DEFAULT_REAP_TIMEOUT_MS = 2_000;
@@ -55,8 +56,7 @@ export async function runSupervisedProcess(
   if (options.abort?.aborted) throw abortError();
 
   const spawnFn = options.spawn ?? spawn;
-  const killProcessGroup = options.killProcessGroup
-    ?? ((pid: number, signal: NodeJS.Signals) => process.kill(-pid, signal));
+  const signalGroup = options.killProcessGroup ?? killProcessGroup;
   const spawnOptions: SpawnOptions = {
     ...(options.cwd ? { cwd: options.cwd } : {}),
     env: options.env,
@@ -96,7 +96,7 @@ export async function runSupervisedProcess(
       if (typeof pid === 'number') {
         if (process.platform !== 'win32') {
           try {
-            killProcessGroup(pid, value);
+            signalGroup(pid, value);
           } catch {
             // The direct child signal below is the fallback when the process
             // group no longer exists or the platform refuses negative PIDs.
