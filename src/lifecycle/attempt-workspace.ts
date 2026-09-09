@@ -4324,6 +4324,13 @@ function trashBaseFor(options: CleanupAttemptOptions): string {
  */
 export const DEFAULT_RECLAIM_CONCURRENCY = 3;
 
+/** How a reclaim owner's identity is read; a test seam in production shape. */
+function reclaimStartTimeReader(
+  options: CleanupAttemptOptions,
+): ProcessStartTimeReader {
+  return options.readProcessStartTime ?? readProcessStartTime;
+}
+
 function reclaimConcurrency(options: CleanupAttemptOptions): number {
   const configured = options.reclaimConcurrency ?? DEFAULT_RECLAIM_CONCURRENCY;
   // A zero-width pool never frees a byte, which is the incident itself; the
@@ -4393,13 +4400,67 @@ function trashedAtMs(trashed: string): number {
   }
 }
 
-function sidecarPid(sidecar: string): number | null {
+/**
+ * Who is reclaiming a trash entry: the `rm` child's pid and, since #178, the
+ * start time that proves the pid is still that `rm`.
+ *
+ * On disk it is the pid on the first line and the reading on the second — a
+ * sidecar written before #178 has only the first, which is `processStartedAt:
+ * null` and the `kill -0` verdict it always had.
+ */
+interface ReclaimOwner {
+  readonly pid: number;
+  readonly processStartedAt: string | null;
+}
+
+function renderReclaimSidecar(owner: ReclaimOwner): string {
+  return owner.processStartedAt === null
+    ? `${owner.pid}\n`
+    : `${owner.pid}\n${owner.processStartedAt}\n`;
+}
+
+function readReclaimSidecar(sidecar: string): ReclaimOwner | null {
+  let lines: string[];
   try {
-    const pid = Number.parseInt(readFileSync(sidecar, 'utf8').trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    lines = readFileSync(sidecar, 'utf8').split('\n');
   } catch {
     return null;
   }
+  const pid = Number.parseInt((lines[0] ?? '').trim(), 10);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const reading = (lines[1] ?? '').trim();
+  return {
+    pid,
+    processStartedAt: isProcessStartTimeReading(reading) ? reading : null,
+  };
+}
+
+/**
+ * Whether the reclaim a sidecar names is still running (#178) — the same rule
+ * `isAttemptProcessLive` applies to an attempt's worker, for the same reason.
+ *
+ * `kill -0` says a pid is held; after a reboot it is held by something else,
+ * and a reclaim owned by a stranger is trashed bytes nothing will ever free.
+ * A recorded start time closes that. Only a positive disagreement is fatal: a
+ * sidecar that recorded no start time, or whose start time cannot be read back
+ * now, keeps the `kill -0` verdict, because taking an entry away from a live
+ * `rm` means two `rm -rf` runs racing over one tree.
+ */
+function isReclaimOwnerLive(
+  sidecar: string,
+  isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader,
+): boolean {
+  const owner = readReclaimSidecar(sidecar);
+  if (owner === null || !isPidAlive(owner.pid)) return false;
+  if (owner.processStartedAt === null) return true;
+  let actual: string | null;
+  try {
+    actual = readStartTime(owner.pid);
+  } catch {
+    return true;
+  }
+  return actual === null || actual === owner.processStartedAt;
 }
 
 /** Trash awaiting reclaim: how many entries, and the bytes they still hold. */
@@ -4442,6 +4503,7 @@ export function summarizeTrashBacklog(trashBase: string): TrashBacklog {
 export function countLiveTrashReclaims(
   trashBase: string,
   isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader = readProcessStartTime,
 ): number {
   let entries: Dirent[];
   try {
@@ -4452,8 +4514,9 @@ export function countLiveTrashReclaims(
   let live = 0;
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.reclaim')) continue;
-    const pid = sidecarPid(join(trashBase, entry.name));
-    if (pid !== null && isPidAlive(pid)) live += 1;
+    if (isReclaimOwnerLive(join(trashBase, entry.name), isPidAlive, readStartTime)) {
+      live += 1;
+    }
   }
   return live;
 }
@@ -4494,8 +4557,17 @@ function startTrashReclaim(
     ? spawnReclaim(trashed, keepProcessAlive)
     : { pid: process.pid, promise: options.reclaimTrashed(trashed) };
   const sidecar = reclaimSidecar(trashed);
+  let processStartedAt: string | null = null;
   try {
-    writeFileSync(sidecar, `${started.pid}\n`);
+    // Taken now, while the `rm` is known to be this one: after it exits the
+    // pid says nothing, and an unreadable start time simply leaves the
+    // sidecar in the pre-#178 shape.
+    processStartedAt = reclaimStartTimeReader(options)(started.pid);
+  } catch {
+    processStartedAt = null;
+  }
+  try {
+    writeFileSync(sidecar, renderReclaimSidecar({ pid: started.pid, processStartedAt }));
   } catch {
     // Ownership is then visible only to this process; the next sweep adopts.
   }
@@ -4577,7 +4649,8 @@ interface QueuedTrashEntry {
  * an engine that died mid-reclaim, an `rm` that failed, an entry the pool had
  * no slot for last cycle — is exactly what a free slot is for, so a restart
  * never strands occupied bytes that nothing is working to free. An entry a
- * live pid owns is left to it (#150) and counts against the pool's width
+ * live reclaim owns — a pid that is alive and, since #178, still the `rm` its
+ * sidecar named — is left to it (#150) and counts against the pool's width
  * whichever engine process started it; a sidecar whose entry is already gone
  * is dropped.
  *
@@ -4590,6 +4663,7 @@ interface QueuedTrashEntry {
  */
 function startQueuedTrashReclaims(options: CleanupAttemptOptions): void {
   const trashBase = trashBaseFor(options);
+  const readStartTime = reclaimStartTimeReader(options);
   let entries: Dirent[];
   try {
     entries = readdirSync(trashBase, { withFileTypes: true });
@@ -4605,8 +4679,9 @@ function startQueuedTrashReclaims(options: CleanupAttemptOptions): void {
       continue;
     }
     if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-    const pid = sidecarPid(reclaimSidecar(path));
-    if (pid !== null && options.isPidAlive(pid)) continue;
+    if (isReclaimOwnerLive(reclaimSidecar(path), options.isPidAlive, readStartTime)) {
+      continue;
+    }
     if (reclaimsInFlight.has(path)) continue;
     queued.push({
       path,
@@ -4615,7 +4690,7 @@ function startQueuedTrashReclaims(options: CleanupAttemptOptions): void {
     });
   }
   let slots = reclaimConcurrency(options)
-    - countLiveTrashReclaims(trashBase, options.isPidAlive);
+    - countLiveTrashReclaims(trashBase, options.isPidAlive, readStartTime);
   if (slots <= 0) return;
   queued.sort((left, right) =>
     (right.bytes ?? 0) - (left.bytes ?? 0)

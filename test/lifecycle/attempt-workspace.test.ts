@@ -4719,6 +4719,97 @@ describe('bounded attempt cleanup', () => {
     expect(existsSync(join(trashBase, '.left-by-a-dead-reclaim.reclaim'))).toBe(false);
   });
 
+  // #178: `kill -0` proves a pid is held, never that it is held by the `rm`
+  // this sidecar names. After a reboot the number comes back as something
+  // else and the trashed bytes are owned by a stranger forever.
+  it('takes over a trashed entry whose reclaim pid was handed to a stranger', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    const stranded = join(trashBase, 'owner-pid-was-reused');
+    mkdirSync(stranded, { recursive: true });
+    writeFileSync(
+      join(trashBase, '.owner-pid-was-reused.reclaim'),
+      `${process.pid}\nMon Jul 20 00:00:59 2026\n`,
+    );
+    const reclaims: string[] = [];
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: (pid) => pid === process.pid,
+      // The stranger holding that pid started hours after the reclaim did.
+      readProcessStartTime: () => 'Tue Sep  8 11:22:33 2026',
+      trashBase,
+      // One slot, so the entry is only reclaimed if the stranger stopped
+      // counting as a live reclaim as well.
+      reclaimConcurrency: 1,
+      reclaimTrashed: async (path) => {
+        reclaims.push(path);
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+    await drainTrashReclaims();
+
+    expect(reclaims).toEqual([stranded]);
+  });
+
+  it('leaves a sidecar written before start times to its live pid', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    const owned = join(trashBase, 'owned-by-a-legacy-sidecar');
+    mkdirSync(owned, { recursive: true });
+    // A sidecar from before the format carried a start time: a pid and
+    // nothing else, so `kill -0` is all there is and stays the verdict.
+    writeFileSync(join(trashBase, '.owned-by-a-legacy-sidecar.reclaim'), `${process.pid}\n`);
+    const reclaims: string[] = [];
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: (pid) => pid === process.pid,
+      readProcessStartTime: () => 'Tue Sep  8 11:22:33 2026',
+      trashBase,
+      reclaimTrashed: async (path) => {
+        reclaims.push(path);
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+    await drainTrashReclaims();
+
+    expect(reclaims).toEqual([]);
+    expect(existsSync(join(trashBase, '.owned-by-a-legacy-sidecar.reclaim'))).toBe(true);
+  });
+
+  it('records the reclaim owner\'s start time beside its pid', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    const stuck = join(trashBase, 'will-not-delete');
+    mkdirSync(stuck, { recursive: true });
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      readProcessStartTime: () => 'Tue Sep  8 11:22:33 2026',
+      trashBase,
+      // A reclaim that fails keeps its sidecar, which is the file to read.
+      reclaimTrashed: async () => {
+        throw new Error('EPERM: operation not permitted');
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+    await drainTrashReclaims();
+
+    expect(readFileSync(join(trashBase, '.will-not-delete.reclaim'), 'utf8'))
+      .toBe(`${process.pid}\nTue Sep  8 11:22:33 2026\n`);
+  });
+
   it('drops a sidecar whose entry is already gone', async () => {
     const fixture = repositoryFixture();
     const trashBase = join(fixture.base, 'trash');
