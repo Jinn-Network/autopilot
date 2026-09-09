@@ -3,6 +3,7 @@ import type { AttemptFootprintRecord } from '../../src/lifecycle/attempt-workspa
 import {
   ATTEMPT_FOOTPRINT_HISTORY,
   ATTEMPT_SETTLE_MS,
+  diskHeadroomAdmits,
   diskHeadroomSkipDetail,
   diskHeadroomSummaryLine,
   expectedAttemptFootprintBytes,
@@ -12,6 +13,8 @@ import {
 
 const GB = 1024 ** 3;
 const DEFAULTS: AttemptFootprintDefaults = { implement: 8 * GB, review: 1 * GB };
+/** What one more attempt of each phase costs, as a projection reports it. */
+const EXPECTED = { implement: 8 * GB, review: 1 * GB };
 const NOW = Date.parse('2026-09-03T10:00:00.000Z');
 
 function history(
@@ -106,6 +109,7 @@ describe('disk headroom projection', () => {
       reserved: 8 * GB,
       floor: 8 * GB,
       settling: 1,
+      expected: EXPECTED,
     });
   });
 
@@ -280,6 +284,82 @@ describe('disk headroom projection', () => {
   });
 });
 
+/**
+ * #159: admission used to be one global `free − reserved < floor` test, so a
+ * 0.2 G review was refused because 8 G implementations were settling — 27
+ * starved review cycles on mono. `reserved` says nothing about what the
+ * candidate itself would cost, and the review lane is what converts
+ * implementations into merges.
+ */
+describe('per-candidate admission (#159)', () => {
+  const base = {
+    liveAttempts: [],
+    pendingSpawns: [],
+    history: [],
+    defaults: DEFAULTS,
+    nowMs: NOW,
+  } as const;
+
+  it('admits a review and refuses an implementation against the same disk', () => {
+    const headroom = projectDiskHeadroom({
+      ...base,
+      free: 47.2 * GB,
+      floor: 20 * GB,
+      liveAttempts: [
+        { phase: 'implement', startedAtMs: NOW - 60_000 },
+        { phase: 'implement', startedAtMs: NOW - 60_000 },
+        { phase: 'implement', startedAtMs: NOW - 60_000 },
+      ],
+    });
+    expect(headroom.reserved).toBe(24 * GB);
+    // 47.2 − 24 − 1 = 22.2, above the floor; 47.2 − 24 − 8 = 15.2, below it.
+    expect(diskHeadroomAdmits(headroom, 'review')).toBe(true);
+    expect(diskHeadroomAdmits(headroom, 'implement')).toBe(false);
+    // The lane that can still take work keeps the cycle unpaused.
+    expect(headroom.paused).toBe(false);
+  });
+
+  it('publishes what one more attempt of each phase would cost', () => {
+    const headroom = projectDiskHeadroom({
+      ...base,
+      free: 47.2 * GB,
+      floor: 20 * GB,
+      history: history('review', [0.18 * GB, 0.19 * GB, 0.2 * GB, 0.19 * GB]),
+    });
+    expect(headroom.expected).toEqual({ implement: 8 * GB, review: 1 * GB });
+  });
+
+  // The weaker reading of #159 — "never let one phase's reservation gate a
+  // cheaper phase" — would admit here. It must not: those bytes are committed
+  // and about to land, so the floor is genuinely spoken for, and a floor that
+  // yields to the cheapest candidate is not a floor.
+  it('refuses even a review once the reservation itself has eaten the floor', () => {
+    const headroom = projectDiskHeadroom({
+      ...base,
+      free: 47.2 * GB,
+      floor: 20 * GB,
+      liveAttempts: Array.from({ length: 4 }, () => ({
+        phase: 'implement' as const,
+        startedAtMs: NOW - 60_000,
+      })),
+    });
+    expect(headroom.reserved).toBe(32 * GB);
+    expect(diskHeadroomAdmits(headroom, 'review')).toBe(false);
+    expect(headroom.paused).toBe(true);
+  });
+
+  it('admits every phase when the floor is disabled', () => {
+    const headroom = projectDiskHeadroom({
+      ...base,
+      free: 0,
+      floor: 0,
+      pendingSpawns: ['implement', 'implement'],
+    });
+    expect(diskHeadroomAdmits(headroom, 'implement')).toBe(true);
+    expect(diskHeadroomAdmits(headroom, 'review')).toBe(true);
+  });
+});
+
 describe('disk headroom rendering', () => {
   it('renders the skip reason with the arithmetic that produced it', () => {
     expect(diskHeadroomSkipDetail({
@@ -288,6 +368,7 @@ describe('disk headroom rendering', () => {
       reserved: 19.5 * GB,
       floor: 8 * GB,
       settling: 3,
+      expected: EXPECTED,
     })).toBe('free 12.0G − reserved 19.5G for 3 settling attempts < floor 8G');
   });
 
@@ -298,7 +379,24 @@ describe('disk headroom rendering', () => {
       reserved: 8 * GB,
       floor: 8 * GB,
       settling: 1,
+      expected: EXPECTED,
     })).toBe('free 4.0G − reserved 8.0G for 1 settling attempt < floor 8G');
+  });
+
+  // #159: a refused candidate must name its own cost, or an operator reading
+  // `47.2G free` and a refused review has no way to see what was weighed.
+  it('names the candidate’s own footprint in the skip it caused', () => {
+    expect(diskHeadroomSkipDetail({
+      paused: false,
+      free: 47.2 * GB,
+      reserved: 24 * GB,
+      floor: 20 * GB,
+      settling: 3,
+      expected: EXPECTED,
+    }, 'implement')).toBe(
+      'free 47.2G − reserved 24.0G for 3 settling attempts − implement 8.0G '
+      + '< floor 20G',
+    );
   });
 
   it('renders one cycle summary line', () => {
@@ -308,6 +406,26 @@ describe('disk headroom rendering', () => {
       reserved: 8 * GB,
       floor: 8 * GB,
       settling: 1,
-    })).toBe('disk: free=40.0G reserved=8.0G floor=8G settling=1');
+      expected: EXPECTED,
+    })).toBe('disk: free=40.0G reserved=8.0G floor=8G settling=1 admits=implement,review');
+  });
+
+  it('names the lanes the projection still admits, and none when it admits none', () => {
+    expect(diskHeadroomSummaryLine({
+      paused: false,
+      free: 30 * GB,
+      reserved: 8 * GB,
+      floor: 20 * GB,
+      settling: 1,
+      expected: EXPECTED,
+    })).toBe('disk: free=30.0G reserved=8.0G floor=20G settling=1 admits=review');
+    expect(diskHeadroomSummaryLine({
+      paused: true,
+      free: 20 * GB,
+      reserved: 8 * GB,
+      floor: 20 * GB,
+      settling: 1,
+      expected: EXPECTED,
+    })).toBe('disk: free=20.0G reserved=8.0G floor=20G settling=1 admits=none');
   });
 });
