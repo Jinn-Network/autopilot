@@ -1314,13 +1314,16 @@ function sameRepositoryIdentity(
     && left.remoteUrlHash === right.remoteUrlHash;
 }
 
-function requireDedicatedMarketplaceExecutionTransition(manifest: AttemptManifest): void {
-  if (
-    manifest.execution.backend === 'marketplace'
+/** Manifests only the dedicated marketplace transitions may write. */
+function requiresDedicatedMarketplaceTransition(manifest: AttemptManifest): boolean {
+  return manifest.execution.backend === 'marketplace'
     && (manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION
       || manifest.execution.state.schemaVersion === MARKETPLACE_EXECUTION_V3_SCHEMA_VERSION
-      || manifest.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1')
-  ) {
+      || manifest.execution.state.schemaVersion === 'marketplace-evaluator-leg-v1');
+}
+
+function requireDedicatedMarketplaceExecutionTransition(manifest: AttemptManifest): void {
+  if (requiresDedicatedMarketplaceTransition(manifest)) {
     throw new Error('Marketplace execution v2 must use dedicated marketplace transition APIs');
   }
 }
@@ -3814,6 +3817,10 @@ export function sampleHostAttemptFootprints(
   const limit = options.limit ?? ATTEMPT_FOOTPRINT_SAMPLES_PER_SWEEP;
   const sampled: AttemptManifest[] = [];
   const due = listHostLiveAttempts(v2Base, host, isPidAlive)
+    // A manifest a dedicated transition owns can never be stamped, so it would
+    // sort first — never sampled — every cycle for the rest of its life and
+    // hold a slot the samplable attempts need.
+    .filter((manifest) => !requiresDedicatedMarketplaceTransition(manifest))
     .map((manifest) => ({
       manifest,
       // Never sampled: the stalest reading there is.

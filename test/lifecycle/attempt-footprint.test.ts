@@ -488,6 +488,42 @@ describe('live attempt footprint sampling (#158)', () => {
       .worktreeSampledAt).toBe('2026-09-03T10:20:00.000Z');
   });
 
+  it('never spends a slot on an attempt a dedicated transition owns', () => {
+    const v2Base = join(root, 'v2');
+    const attemptDir = join(v2Base, 'runner-1', 'implement', 'issue-7-marketplace');
+    writeLive(v2Base, 'issue-7-marketplace', {
+      execution: {
+        backend: 'marketplace',
+        state: {
+          schemaVersion: 'marketplace-execution-v2',
+          status: 'prepared',
+          requestPath: join(attemptDir, 'request.json'),
+          requestDigest: `sha256:${HASH}`,
+          solverNetSelectionPath: join(attemptDir, 'selection.json'),
+          preparedAt: '2026-09-03T10:00:00.000Z',
+          agentSoftDeadline: '2026-09-03T11:00:00.000Z',
+          adoptionDeadline: '2026-09-03T12:00:00.000Z',
+        },
+      },
+    });
+    writeLive(v2Base, 'issue-7-local', {
+      worktreeSampledAt: '2026-09-03T10:00:00.000Z',
+    });
+    const walked: string[] = [];
+    // The marketplace manifest can never carry a sample stamp, so it sorts
+    // ahead of every attempt that can — and would starve them forever.
+    sampleHostAttemptFootprints(v2Base, 'host-1', () => false, {
+      limit: 1,
+      now: () => new Date('2026-09-03T10:30:00.000Z'),
+      measure: (path) => {
+        walked.push(path);
+        return 1_000_000;
+      },
+    });
+    expect(walked).toHaveLength(1);
+    expect(walked[0]).toContain('issue-7-local');
+  });
+
   it('never lets one unmeasurable attempt stop the rest of the sweep', () => {
     const v2Base = join(root, 'v2');
     writeLive(v2Base, 'issue-7-h');
