@@ -99,6 +99,35 @@ export function loadCanon(
   return loadRuntimeCanon(environment, repositoryRoot);
 }
 
+/**
+ * `claude -p`'s print-mode background-task ceiling.
+ *
+ * After the final turn the runtime waits at most this long for background
+ * tasks the session started, then terminates the session. Its own default is
+ * 600 s, and engine sessions routinely end their last turn with verification
+ * still running, so the default kills them at the finish line after hours of
+ * work (#167: one attempt ran 9 h 41 m, checkpointed, and died here — the
+ * sweep was then re-claimed five more times).
+ */
+export const PRINT_BACKGROUND_WAIT_CEILING_ENV =
+  'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS';
+
+/**
+ * The ceiling overlay for one `claude -p` session, or nothing when the
+ * operator has already exported the variable: an explicit export is a
+ * deliberate override of the configured value and outranks it.
+ */
+function printBackgroundWaitCeiling(
+  ambient: NodeJS.ProcessEnv,
+  cfg: DispatcherConfig,
+): NodeJS.ProcessEnv {
+  const exported = ambient[PRINT_BACKGROUND_WAIT_CEILING_ENV];
+  if (exported !== undefined && exported.length > 0) return {};
+  return {
+    [PRINT_BACKGROUND_WAIT_CEILING_ENV]: String(cfg.backgroundWaitCeilingMs),
+  };
+}
+
 /** Map board Effort to Claude's CLI flag; null keeps the runtime default. */
 export function effortFlag(effort: Effort | null): string[] {
   return effort == null ? [] : ['--effort', effort.toLowerCase()];
@@ -263,7 +292,7 @@ export function spawnCoordinatorSession(
         ...spawnOptions,
         onExit: composedOnExit,
         cwd: spec.worktreePath,
-        env,
+        env: { ...env, ...printBackgroundWaitCeiling(spec.env, cfg) },
       },
     );
   }

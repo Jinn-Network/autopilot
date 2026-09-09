@@ -305,3 +305,62 @@ describe('per-session runtime override (#152)', () => {
     expect(calls[0].opts.env).toMatchObject({ JINN_AUTOPILOT_RUNTIME: 'claude' });
   });
 });
+
+describe('print-mode background wait ceiling (#167)', () => {
+  function launch(
+    runtime: AutopilotRuntime,
+    env: NodeJS.ProcessEnv,
+    backgroundWaitCeilingMs = DEFAULT_CONFIG.backgroundWaitCeilingMs,
+  ): SpawnCall {
+    const calls: SpawnCall[] = [];
+    spawnCoordinatorSession(
+      {
+        kind: 'implement',
+        number: 167,
+        skill: 'implement-issue',
+        scenario: 'SCENARIO-ceiling',
+        worktreePath: '/tmp/worktrees/implement-167',
+        effort: 'High',
+        env,
+        spawnOptions: { detached: true, stdio: 'ignore' },
+      },
+      { ...DEFAULT_CONFIG, runtime, backgroundWaitCeilingMs },
+      {
+        spawn: (cmd, args, opts) => {
+          calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+          return { pid: 1670 };
+        },
+        prepareHermesHome: () => ({ hermesHome: '/tmp/hermes-homes/implement-167' }),
+        log: () => {},
+      },
+    );
+    return calls[0];
+  }
+
+  it('sets the configured ceiling for claude sessions', () => {
+    expect(launch('claude', {}).opts.env).toMatchObject({
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '3600000',
+    });
+  });
+
+  it('passes a zero ceiling through as wait-indefinitely', () => {
+    expect(launch('claude', {}, 0).opts.env).toMatchObject({
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '0',
+    });
+  });
+
+  it('never overrides a ceiling the operator already exported', () => {
+    expect(launch('claude', { CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '900000' })
+      .opts.env).toMatchObject({
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '900000',
+    });
+  });
+
+  it.each(['hermes', 'cursor', 'codex'] as const)(
+    'leaves %s sessions untouched — the ceiling is a `claude -p` knob',
+    (runtime) => {
+      expect((launch(runtime, {}).opts.env as Record<string, string>)
+        .CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS).toBeUndefined();
+    },
+  );
+});

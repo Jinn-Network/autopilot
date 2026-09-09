@@ -169,6 +169,37 @@ rest are picked up by later cycles. Every cycle also logs one
 only issues that pass the triage cascade — the claimable number, not the
 open-issue number.
 
+## Worker session lifetime
+
+```json
+"worker": {
+  "backgroundWaitCeilingMs": 3600000
+}
+```
+
+`claude -p` waits for the background tasks a session started after its final
+turn, then terminates the session. Its own ceiling is 600 s, which kills
+engine sessions at the finish line: a session that has worked for hours,
+checkpointed its fix and is re-running verification in the background is
+terminated before it can mark the implementation phase complete, and the whole
+multi-stage skill is re-run on the next claim. `worker.backgroundWaitCeilingMs`
+raises that ceiling to an hour by default and is passed to every `claude -p`
+worker as `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`. `0` means wait indefinitely.
+The key is optional: a config written before it existed keeps loading and gets
+the hour. An operator who exports `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`
+themselves outranks the config — the exported value is passed through
+untouched. The ceiling is a `claude -p` knob only; hermes, cursor and codex
+workers never see it.
+
+When a worker exits, its process group is torn down — `SIGTERM`, a ten-second
+grace, then `SIGKILL` — so background jobs it started (test runners, servers)
+cannot outlive it as orphans holding a worktree that is about to be deleted.
+A teardown that found something alive logs one
+`[autopilot] coordinator teardown session=… pgid=… signalled=…` line.
+Independently, the attempt sweep refuses to remove a worktree that still hosts
+a live process, retaining it with a `live` reason until a later cycle finds
+the process gone.
+
 ## Read-only smoke
 
 ```text
