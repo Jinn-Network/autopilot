@@ -3849,6 +3849,7 @@ describe('backlog composition (#127)', () => {
       followUps: 1,
       children: 1,
       sweeps: 1,
+      umbrellas: 0,
       actionable: 2,
       ordinaryByPriority: { p0: 0, p1: 1, p2: 0, p3: 0, p4: 0, unset: 0 },
       untriaged: { noType: 0, noPriority: 0, noBlockedOn: 0 },
@@ -3856,6 +3857,26 @@ describe('backlog composition (#127)', () => {
       // residue: a per-parent sweep can still reach it.
       residue: 0,
     });
+  });
+
+  // #160: `ordinary=` means "work the lane can reach", and an umbrella is
+  // never claimable however completely it is triaged. Counting one there is
+  // the same overstatement #166 fixed for untriaged issues.
+  it('excludes an umbrella from ordinary and counts it separately', async () => {
+    const report = await backlogFor([
+      issue(92, { body: 'umbrella; children own implementation' }),
+      issue(93, { labels: ['umbrella'] }),
+      issue(94, { body: 'Part of the umbrella epic.' }),
+    ]);
+    expect(report.backlog).toMatchObject({
+      ordinary: 1,
+      umbrellas: 2,
+      actionable: 1,
+    });
+    // An umbrella is a shape, not neglect: it must not be reported as a gap
+    // somebody is supposed to close.
+    expect(report.backlog.untriaged)
+      .toEqual({ noType: 0, noPriority: 0, noBlockedOn: 0 });
   });
 
   it('counts follow-ups no per-parent sweep can reach as residue (#168)', async () => {
@@ -3876,10 +3897,12 @@ describe('backlog composition (#127)', () => {
       issue(71, { body: FOLLOW_UP_BODY }),
       issue(72, { body: CHILD_BODY }),
       issue(73, { body: DEBT_SWEEP_BODY }),
+      issue(74, { body: 'umbrella; children own implementation' }),
     ]);
     const human = renderLifecycleHuman(report);
     expect(human.split('\n')).toContain(
-      'backlog: ordinary=1 follow-ups=1 children=1 sweeps=1 (actionable=2) residue=0',
+      'backlog: ordinary=1 follow-ups=1 children=1 sweeps=1 umbrellas=1 '
+        + '(actionable=2) residue=0',
     );
   });
 

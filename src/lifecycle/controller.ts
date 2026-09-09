@@ -36,6 +36,7 @@ import {
   parseChildMarker,
   resolveChildTriageExpectation,
 } from './child-issues.js';
+import { isUmbrellaIssue } from './umbrella-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
 import {
   diskHeadroomSkipDetail,
@@ -309,6 +310,14 @@ export interface LifecycleBacklogSummary {
   readonly followUps: number;
   readonly children: number;
   readonly sweeps: number;
+  /**
+   * Open umbrella issues (#160): work whose children own implementation, so no
+   * claim lane will ever reach it. Counted apart from `ordinary` for exactly
+   * the reason an untriaged issue is — reporting unclaimable work as claimable
+   * is what made both lanes look starved against a backlog that was not there
+   * — and apart from `untriaged` because a shape is not a gap anyone can close.
+   */
+  readonly umbrellas: number;
   readonly actionable: number;
   /** Per-priority counts for the ORDINARY set only — follow-ups, children, and sweeps are excluded. */
   readonly ordinaryByPriority: Readonly<Record<LifecycleBacklogPriorityKey, number>>;
@@ -837,19 +846,27 @@ function hasDebtSweepMarkerTag(body: string): boolean {
   return body.includes(DEBT_SWEEP_MARKER_TAG);
 }
 
-type LifecycleBacklogClass = 'sweep' | 'child' | 'follow-up' | 'ordinary';
+type LifecycleBacklogClass = 'sweep' | 'child' | 'follow-up' | 'umbrella' | 'ordinary';
 
 /**
  * Classification precedence for #127: debt-sweep -> machine child -> review
- * follow-up -> ordinary. An issue can carry more than one marker (a stale
- * follow-up marker left on an issue later folded into a sweep, say); the
+ * follow-up -> umbrella -> ordinary. An issue can carry more than one marker (a
+ * stale follow-up marker left on an issue later folded into a sweep, say); the
  * first one recognized in this order wins.
+ *
+ * Umbrella (#160) sits last of the four because the three above it are exact
+ * machine-written markers on machine-filed work, while an umbrella is a shape a
+ * human declared about work of any kind.
  */
-function classifyBacklogIssue(issue: { readonly body?: string }): LifecycleBacklogClass {
+function classifyBacklogIssue(issue: {
+  readonly body?: string;
+  readonly labels?: readonly string[];
+}): LifecycleBacklogClass {
   const body = issue.body ?? '';
   if (hasDebtSweepMarkerTag(body)) return 'sweep';
   if (isMachineChildIssue({ body })) return 'child';
   if (hasReviewFollowUpMarkerTag(body)) return 'follow-up';
+  if (isUmbrellaIssue({ body, labels: issue.labels })) return 'umbrella';
   return 'ordinary';
 }
 
@@ -885,6 +902,7 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
   let followUps = 0;
   let children = 0;
   let sweeps = 0;
+  let umbrellas = 0;
   let noType = 0;
   let noPriority = 0;
   let noBlockedOn = 0;
@@ -896,9 +914,12 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
       children += 1;
     } else if (backlogClass === 'follow-up') {
       followUps += 1;
+    } else if (backlogClass === 'umbrella') {
+      umbrellas += 1;
     } else {
-      // Ordinary issues only: machine children have their own repair, and
-      // follow-ups and sweeps are machine-filed with triage already applied.
+      // Ordinary issues only: machine children have their own repair,
+      // follow-ups and sweeps are machine-filed with triage already applied,
+      // and an umbrella's unset fields are not gaps anyone should close (#160).
       const gaps = triageGaps(issue);
       if (gaps.noType) noType += 1;
       if (gaps.noPriority) noPriority += 1;
@@ -914,6 +935,7 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
     followUps,
     children,
     sweeps,
+    umbrellas,
     actionable: ordinary + sweeps,
     ordinaryByPriority,
     untriaged: { noType, noPriority, noBlockedOn },
@@ -2632,6 +2654,7 @@ function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[
   return [
     `backlog: ordinary=${backlog.ordinary} follow-ups=${backlog.followUps} `
       + `children=${backlog.children} sweeps=${backlog.sweeps} `
+      + `umbrellas=${backlog.umbrellas} `
       + `(actionable=${backlog.actionable}) residue=${backlog.residue}`,
     `backlog ordinary priority: ${
       [...BACKLOG_PRIORITY_KEYS, 'unset' as const]
