@@ -4048,6 +4048,36 @@ function isAttemptChildLive(
     && isAttemptProcessLive(manifest, isPidAlive, readStartTime);
 }
 
+/**
+ * Whether a spent sweep budget may still remove this attempt (#179).
+ *
+ * The budget bounds the expensive half of cleanup: the `git fetch` that proves
+ * an attempt's work was published, the `git status --untracked-files=all` walk
+ * of a whole checkout, and the in-place `git worktree remove` git cannot be
+ * interrupted in. An attempt whose child is dead and whose grace has elapsed
+ * skips every one of them — its removal is a rename and a prune — so deferring
+ * it buys the scheduler nothing and costs the disk everything: 18 dead
+ * worktrees held ~40 GB in `attempts/v2` while admission starved, because the
+ * cycles that could have trashed them in milliseconds each spent their budget
+ * on slower work first.
+ *
+ * Nothing else about the removal is skipped. The #167 live-process guard still
+ * runs, and a worktree that still hosts a live process is still retained.
+ */
+function isEagerlyRemovable(
+  manifest: AttemptManifest,
+  options: CleanupAttemptOptions,
+): boolean {
+  if (isAttemptChildLive(
+    manifest,
+    options.isPidAlive,
+    options.readProcessStartTime ?? readProcessStartTime,
+  )) {
+    return false;
+  }
+  return graceAllowsForceRemoval(manifest, options);
+}
+
 function retained(
   code: CleanupReasonCode,
   detail: string,
@@ -4854,6 +4884,9 @@ export async function cleanupAttempt(
  *
  * Sixty seconds is a cycle's worth of tolerance, not a measurement: short
  * enough that a stuck removal cannot swallow a poll interval.
+ *
+ * Since #179 it no longer defers a dead attempt past its grace, whose removal
+ * needs none of the work this bounds — see `isEagerlyRemovable`.
  */
 export const DEFAULT_ATTEMPT_SWEEP_BUDGET_MS = 60_000;
 
@@ -5027,7 +5060,7 @@ export async function sweepDeadAttempts(
           results.push(retained('malformed', 'Attempt manifest could not be strictly decoded.'));
           continue;
         }
-        if (budgetSpent()) {
+        if (budgetSpent() && !isEagerlyRemovable(manifest, options)) {
           results.push(retained(
             'deferred',
             DEFERRED_CLEANUP_DETAIL,

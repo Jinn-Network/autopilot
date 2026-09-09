@@ -4444,6 +4444,89 @@ describe('bounded attempt cleanup', () => {
     expect(existsSync(survivor.paths.manifest)).toBe(false);
   });
 
+  // #179: the budget bounds the expensive half of cleanup — the fetch that
+  // proves publication, the status walk of a whole checkout, the in-place
+  // removal git cannot be interrupted in. A dead attempt past its grace needs
+  // none of them: its removal is a rename. Leaving one in `attempts/v2`
+  // because deletes elsewhere were slow is how 18 dead worktrees came to hold
+  // ~40 GB while admission starved.
+  it('trashes a dead attempt past its grace even when the budget is spent', async () => {
+    const fixture = repositoryFixture();
+    const attempts = await twoDeadAttempts(fixture);
+    const trashBase = join(fixture.base, 'trash');
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      graceMs: 60_000,
+      now: () => new Date('2026-07-20T01:00:00.000Z'),
+      trashBase,
+      reclaimTrashed: async () => {},
+      budgetMs: 60_000,
+      monotonicNow: halfBudgetPerReading(),
+    });
+    await drainTrashReclaims();
+
+    expect(results.filter((result) => result.status === 'removed')).toHaveLength(2);
+    expect(results.some((result) =>
+      result.status === 'retained' && result.reason.code === 'deferred')).toBe(false);
+    for (const attempt of attempts) {
+      expect(existsSync(attempt.paths.worktree)).toBe(false);
+      expect(existsSync(attempt.paths.attemptDir)).toBe(false);
+    }
+  });
+
+  // The #167 guard is not part of the expensive half and is not skipped with
+  // it: a spent budget is a reason to remove a dead worktree sooner, never a
+  // reason to remove one out from under the processes still running in it.
+  it('never trashes a worktree that still hosts a live process, budget spent or not', async () => {
+    const fixture = repositoryFixture();
+    const attempts = await twoDeadAttempts(fixture);
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      graceMs: 60_000,
+      now: () => new Date('2026-07-20T01:00:00.000Z'),
+      trashBase: join(fixture.base, 'trash'),
+      listProcessesUnder: async () => [4242],
+      budgetMs: 60_000,
+      monotonicNow: halfBudgetPerReading(),
+    });
+
+    expect(results).toHaveLength(2);
+    expect(results.every((result) =>
+      result.status === 'retained' && result.reason.code === 'live')).toBe(true);
+    for (const attempt of attempts) {
+      expect(existsSync(attempt.paths.worktree)).toBe(true);
+    }
+  });
+
+  // The other half of the same rule: an attempt still inside its grace has to
+  // prove its work was published before the worktree goes, and that proof is
+  // exactly what the budget bounds. It defers as it always did (#133).
+  it('still defers a dead attempt inside its grace when the budget is spent', async () => {
+    const fixture = repositoryFixture();
+    await twoDeadAttempts(fixture);
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      graceMs: 60 * 60 * 1000,
+      now: () => new Date('2026-07-20T00:03:00.000Z'),
+      trashBase: join(fixture.base, 'trash'),
+      budgetMs: 60_000,
+      monotonicNow: halfBudgetPerReading(),
+    });
+
+    expect(results.filter((result) =>
+      result.status === 'retained' && result.reason.code === 'deferred'))
+      .toHaveLength(1);
+  });
+
   it('leaves a deferred removal occupying disk rather than counting it as reclaimed', async () => {
     const fixture = repositoryFixture();
     const attempts = await twoDeadAttempts(fixture);
