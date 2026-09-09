@@ -75,7 +75,9 @@ import {
   DEFAULT_ATTEMPT_SWEEP_BUDGET_MS,
   countLiveTrashReclaims,
   failedTrashReclaims,
+  summarizeTrashBacklog,
   trashBaseForV2,
+  type TrashBacklog,
   type TrashReclaimFailure,
   defaultRunnerId,
   activeCleanupEnabled,
@@ -119,6 +121,7 @@ import {
   attemptFootprintDefaultsFromGb,
   listHostAttemptFootprints,
   listHostLiveAttempts,
+  measuredGb,
   projectDiskHeadroom,
   sampleHostAttemptFootprints,
   type AttemptPhase,
@@ -457,6 +460,7 @@ export function renderCleanupWarnings(
   results: readonly AttemptCleanupResult[],
   reclaimsInFlight = 0,
   reclaimFailures: readonly TrashReclaimFailure[] = [],
+  backlog?: TrashBacklog & { readonly concurrency: number },
 ): string[] {
   const lines: string[] = [];
   let deferred = 0;
@@ -487,6 +491,14 @@ export function renderCleanupWarnings(
     lines.push(
       `[autopilot:v2] cleanup reclaiming ${reclaimsInFlight} trashed `
       + 'worktree(s) in the background; their bytes stay occupied until each finishes',
+    );
+  }
+  if (backlog !== undefined && backlog.count > backlog.concurrency) {
+    // Deeper than one cycle can start, so the queue is what an operator is
+    // actually waiting on (#179) — the line above names only the pool's width.
+    lines.push(
+      `[autopilot:v2] cleanup reclaim backlog: ${backlog.count} worktree(s), `
+      + `${measuredGb(backlog.bytes)}`,
     );
   }
   for (const failure of reclaimFailures) {
@@ -991,6 +1003,7 @@ export async function runAutopilotV2(
         defaults: attemptFootprintDefaults,
         nowMs: Date.now(),
         cycleStartedAtMs,
+        trash: summarizeTrashBacklog(trashBaseForV2(v2AttemptsBase)),
       });
     } catch {
       return null;
@@ -1208,10 +1221,15 @@ export async function runAutopilotV2(
       diskPath: v2AttemptsBase,
       reclaimConcurrency: loaded.config.cleanup.reclaimConcurrency,
     });
+    const trashBase = trashBaseForV2(v2AttemptsBase);
     const warnings = renderCleanupWarnings(
       cleanup,
-      countLiveTrashReclaims(trashBaseForV2(v2AttemptsBase), childIsAlive),
+      countLiveTrashReclaims(trashBase, childIsAlive),
       failedTrashReclaims(),
+      {
+        ...summarizeTrashBacklog(trashBase),
+        concurrency: loaded.config.cleanup.reclaimConcurrency,
+      },
     );
     for (const line of warnings) console.warn(line);
   };

@@ -1,4 +1,8 @@
-import type { AttemptFootprintRecord, AttemptPhase } from './attempt-workspace.js';
+import type {
+  AttemptFootprintRecord,
+  AttemptPhase,
+  TrashBacklog,
+} from './attempt-workspace.js';
 
 /**
  * Projected disk headroom (#144).
@@ -75,6 +79,14 @@ export interface DiskHeadroom {
    * every lane at whatever the most expensive phase costs.
    */
   readonly expected: Readonly<Record<AttemptPhase, number>>;
+  /**
+   * Dead worktrees whose bytes have not come back yet (#179).
+   *
+   * Reported, never counted: this disk is already occupied and already absent
+   * from `free`. It is here so one line can distinguish a full disk from a
+   * reclaim backlog — the first needs an operator, the second needs a moment.
+   */
+  readonly trash: TrashBacklog;
 }
 
 export interface DiskHeadroomInput {
@@ -102,6 +114,12 @@ export interface DiskHeadroomInput {
    * Omitted, every pending spawn is charged in full: the pre-#146 behavior.
    */
   readonly cycleStartedAtMs?: number;
+  /**
+   * What the trash still holds (#179), as the caller measured it. Omitted, the
+   * projection reports an empty trash — the reading a caller that does not
+   * know gives, and the pre-#179 line.
+   */
+  readonly trash?: TrashBacklog;
 }
 
 export function attemptFootprintDefaultsFromGb(
@@ -197,6 +215,7 @@ export function projectDiskHeadroom(input: DiskHeadroomInput): DiskHeadroom {
     floor: input.floor,
     settling,
     expected: { implement: expected('implement'), review: expected('review') },
+    trash: input.trash ?? { count: 0, bytes: 0 },
   };
   return {
     ...projected,
@@ -229,7 +248,7 @@ export function diskHeadroomAdmits(
 }
 
 /** Measured bytes, always to one decimal — they are never a round number. */
-function measuredGb(bytes: number): string {
+export function measuredGb(bytes: number): string {
   return `${(bytes / BYTES_PER_GB).toFixed(1)}G`;
 }
 
@@ -265,7 +284,9 @@ export function diskHeadroomSkipDetail(
  * `admits` names the lanes that can still start work (#159). With admission
  * decided per candidate, "not paused" no longer means every lane is open, and
  * an operator watching the review lane move while implementations are held
- * back needs to see which of the two this is.
+ * back needs to see which of the two this is. `trash` names the dead worktrees
+ * whose bytes have not come back yet (#179), so a starved cycle can be read as
+ * a backlog rather than as a full disk.
  */
 export function diskHeadroomSummaryLine(headroom: DiskHeadroom): string {
   const admitted = ATTEMPT_PHASES.filter((phase) => diskHeadroomAdmits(headroom, phase));
@@ -273,5 +294,10 @@ export function diskHeadroomSummaryLine(headroom: DiskHeadroom): string {
     + `reserved=${measuredGb(headroom.reserved)} `
     + `floor=${configuredGb(headroom.floor)} `
     + `settling=${headroom.settling} `
+    // Occupied disk that is already on its way out (#179). Without it,
+    // `admits=none` reads the same whether the volume is genuinely full or
+    // 40 G of dead worktrees are queued behind the reclaim pool — and those
+    // want opposite things from whoever is reading.
+    + `trash=${headroom.trash.count} (${measuredGb(headroom.trash.bytes)}) `
     + `admits=${admitted.length === 0 ? 'none' : admitted.join(',')}`;
 }

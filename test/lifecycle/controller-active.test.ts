@@ -2199,6 +2199,8 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       settling: 3,
       // What one more attempt of each phase would cost (#159).
       expected: { implement: 8 * 1024 ** 3, review: 1024 ** 3 },
+      // Dead worktrees whose bytes have not come back yet (#179).
+      trash: { count: 2, bytes: 12 * 1024 ** 3 },
     };
 
     it('names the projection in the disk-floor skip it caused', async () => {
@@ -2235,7 +2237,9 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
 
       expect(report.disk).toEqual({ ...headroom, paused: false, reserved: 0, settling: 0 });
       expect(renderLifecycleHuman(report))
-        .toContain('disk: free=12.0G reserved=0.0G floor=8G settling=0');
+        .toContain(
+          'disk: free=12.0G reserved=0.0G floor=8G settling=0 trash=2 (12.0G)',
+        );
     });
 
     it('omits the disk line entirely when no projection was computed', async () => {

@@ -4402,6 +4402,42 @@ function sidecarPid(sidecar: string): number | null {
   }
 }
 
+/** Trash awaiting reclaim: how many entries, and the bytes they still hold. */
+export interface TrashBacklog {
+  readonly count: number;
+  readonly bytes: number;
+}
+
+/**
+ * What the trash still occupies (#179).
+ *
+ * These bytes are on the volume and already absent from free space; nothing
+ * here is a projection. It exists so an operator reading `admits=none` can
+ * tell a full disk — free space that has to be freed — from a reclaim backlog,
+ * which frees itself if the engine is given a moment.
+ *
+ * `bytes` is the sum of the size estimates recorded at trash time, so an entry
+ * nothing measured contributes nothing: the count is exact and the bytes are a
+ * lower bound. Measuring for real would be a `du` over every trash entry every
+ * cycle, on the disk this is reporting on.
+ */
+export function summarizeTrashBacklog(trashBase: string): TrashBacklog {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(trashBase, { withFileTypes: true });
+  } catch {
+    return { count: 0, bytes: 0 };
+  }
+  let count = 0;
+  let bytes = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    count += 1;
+    bytes += trashedBytes(join(trashBase, entry.name)) ?? 0;
+  }
+  return { count, bytes };
+}
+
 /** Live reclaims under `trashBase`, whichever engine process started them. */
 export function countLiveTrashReclaims(
   trashBase: string,

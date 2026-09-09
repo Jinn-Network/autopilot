@@ -145,8 +145,11 @@ until there is history. Measured costs are kept in
 `~/.autopilot/repositories/<repo>/attempts/attempt-footprints.json` so they
 survive the attempt sweep. That key is optional: a config written before it
 existed keeps loading and gets those defaults. Every active cycle logs one
-`disk: free=… reserved=… floor=… settling=…` line, and a candidate the floor
-holds back reports `disk-floor` with the arithmetic that produced it.
+`disk: free=… reserved=… floor=… settling=… trash=… admits=…` line, and a
+candidate the floor holds back reports `disk-floor` with the arithmetic that
+produced it. `trash=N (xG)` is the dead worktrees whose bytes have not come
+back yet, so `admits=none` can be read as a reclaim backlog rather than as a
+full disk.
 
 ## Reclaiming dead worktrees
 
@@ -163,7 +166,9 @@ removal at a time frees them, which is how 18 of them came to hold ~40 GB
 while admission starved under a 20 GB floor. `cleanup.reclaimConcurrency`
 (default `3`) is how many of those removals run at once on this host, biggest
 worktrees first, so the volume comes back faster than the engine spends it.
-The pool is host-wide and survives restarts: each removal is owned by a
+When the queue is deeper than one cycle can start, the sweep also logs
+`cleanup reclaim backlog: N worktree(s), xG`. The pool is host-wide and
+survives restarts: each removal is owned by a
 recorded pid, and the next sweep tops the pool up rather than starting a
 second removal of the same directory. Raise it on a host with disk to spare;
 `0` is refused, because a pool that never frees a byte is the failure it
