@@ -65,6 +65,12 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
+  /** Close an umbrella whose declared children have all closed (#160). */
+  closeUmbrella?(
+    action: Extract<NewWorkAction, { kind: 'close-umbrella' }>,
+    credentials: CredentialPool,
+    snapshot: GitHubLifecycleSnapshot,
+  ): Promise<ActiveRuntimeResult>;
   /** File one residue sweep across several merged parents, by area (#168). */
   fileResidueSweep?(
     action: Extract<NewWorkAction, { kind: 'file-residue-sweep' }>,
@@ -228,6 +234,9 @@ async function routeAction(
     case 'triage-defaults':
       return handlers.triageDefaults?.(action, credentials, snapshot)
         ?? unwired('triage-defaults');
+    case 'close-umbrella':
+      return handlers.closeUmbrella?.(action, credentials, snapshot)
+        ?? unwired('close-umbrella');
     case 'file-residue-sweep':
       return handlers.fileResidueSweep?.(action, credentials, snapshot)
         ?? unwired('file-residue-sweep');

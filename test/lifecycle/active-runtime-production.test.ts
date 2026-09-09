@@ -510,6 +510,53 @@ describe('production active runtime preflight', () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  // #160: the production runtime must reach the umbrella closer under the
+  // implement credential, without preparing an attempt workspace.
+  it('wires the umbrella closure to the production closer', async () => {
+    const spawn = vi.fn(() => {
+      throw new Error('local spawn must remain untouched');
+    });
+    const live = { state: 'OPEN' };
+    const closes = [];
+    const runner = vi.fn(async (_command, args) => {
+      if (args[0] === 'api' && args.some((arg) => arg.includes('UmbrellaClosureState'))) {
+        return JSON.stringify({
+          data: {
+            repository: {
+              umbrella: {
+                number: 2448,
+                state: live.state,
+                body: 'umbrella; children own implementation',
+                labels: { nodes: [] },
+              },
+              child0: { __typename: 'Issue', number: 2449, state: 'CLOSED' },
+            },
+          },
+        });
+      }
+      if (args[0] === 'issue' && args[1] === 'close') {
+        closes.push(args.join(' '));
+        live.state = 'CLOSED';
+        return '';
+      }
+      throw new Error(`unexpected command: ${args.join(' ')}`);
+    });
+    const active = marketplaceRuntime({ spawn, runner });
+
+    await expect(active.executeAction({
+      kind: 'close-umbrella',
+      issueNumber: 2448,
+      childIssueNumbers: [2449],
+    }, {} as never)).resolves.toEqual({
+      outcome: 'closed',
+      reason: 'children #2449',
+    });
+    expect(closes).toEqual([
+      'issue close 2448 --repo Jinn-Network/mono --reason completed',
+    ]);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it('exposes a marketplace adoption factory bound to runtime authority inputs', () => {
     const readSnapshot = vi.fn(async () => ({ snapshotComplete: true }));
     const factory = vi.fn(() => ({

@@ -73,6 +73,7 @@ import {
   executeProductionFileResidueSweep,
 } from './debt-sweep-production.js';
 import { executeProductionTriageDefaults } from './triage-defaults-production.js';
+import { executeProductionUmbrellaClosure } from './umbrella-issues-production.js';
 import { withSelectedCredential } from './production-auth.js';
 import {
   makeProductionReconciliationWriter,
@@ -1311,6 +1312,26 @@ export function makeProductionActiveRuntime(
                   projectNumber: options.projectMapping.number,
                   projectMapping: options.projectMapping,
                 }),
+          }),
+          runner,
+        );
+      },
+
+      // One issue close and no session, so it takes the implement credential
+      // the same way board triage does and never touches an attempt workspace.
+      closeUmbrella: async (action, credentials) => {
+        const selection = selectCredential(credentials, { phase: 'implement' });
+        if (selection.status !== 'selected') {
+          return { status: 'skipped', reason: 'credential-unavailable' };
+        }
+        return withSelectedCredential(
+          selection.credential,
+          ambient,
+          ({ run }) => executeProductionUmbrellaClosure(action, {
+            runner: run,
+            ...(options.repositorySlug === undefined
+              ? {}
+              : { repo: options.repositorySlug }),
           }),
           runner,
         );

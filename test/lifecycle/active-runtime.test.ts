@@ -472,6 +472,65 @@ describe('active runtime boundary', () => {
     expect(seen).toEqual([action]);
   });
 
+  // #160: an umbrella closure spawns no session either, so it reaches its
+  // handler with every lane full and degrades the same way when unwired.
+  it('routes a close-umbrella action to its handler with every lane full', async () => {
+    const seen: unknown[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 0, child: 0, review: 0 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+        closeUmbrella: async (action) => {
+          seen.push(action);
+          return { status: 'closed', detail: 'children #2449, #2450' };
+        },
+      },
+    });
+    const action = {
+      kind: 'close-umbrella' as const,
+      issueNumber: 2448,
+      childIssueNumbers: [2449, 2450],
+    };
+
+    await expect(runtime.executeAction(action, {} as never)).resolves.toEqual({
+      outcome: 'closed',
+      reason: 'children #2449, #2450',
+    });
+    expect(seen).toEqual([action]);
+  });
+
+  it('degrades to a skip when no close-umbrella handler is wired', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, child: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    await expect(runtime.executeAction({
+      kind: 'close-umbrella',
+      issueNumber: 2448,
+      childIssueNumbers: [2449],
+    }, {} as never)).resolves.toEqual({
+      outcome: 'skipped',
+      reason: 'close-umbrella handler unavailable',
+    });
+  });
+
   it('degrades to a skip when no triage-defaults handler is wired', async () => {
     const runtime = makeActiveRuntime({
       credentials: pool(),
