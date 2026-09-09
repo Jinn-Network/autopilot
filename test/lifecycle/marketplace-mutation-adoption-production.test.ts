@@ -205,7 +205,7 @@ function authorityRunner(manifest: ReturnType<typeof fixture>['manifest']) {
     if (command === 'gh' && args[0] === 'api') {
       const path = args[1] ?? '';
       if (path.includes('/pulls/2101/files')) {
-        return JSON.stringify([[]]);
+        return JSON.stringify([]);
       }
       if (path.includes('/pulls/2101')) {
         return JSON.stringify({
@@ -1134,9 +1134,7 @@ describe('production marketplace authority surfaces', () => {
         });
       }
       if (command === 'gh' && args.some((arg) => arg.includes('/pulls/2101/files'))) {
-        return JSON.stringify([
-          [{ filename: 'packages/autopilot/src/engine.ts' }],
-        ]);
+        return JSON.stringify(['packages/autopilot/src/engine.ts']);
       }
       if (command === 'gh' && args.some((arg) => arg.endsWith('/contents/.github/CODEOWNERS'))) {
         return JSON.stringify({

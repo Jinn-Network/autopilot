@@ -2147,7 +2147,7 @@ describe('production review session reviewed-diff digest', () => {
           && endpoint.startsWith('repos/Jinn-Network/mono/pulls/84/files')
         ) {
           // `gh api --paginate --slurp` returns one array per page.
-          return JSON.stringify([changedFiles.map((filename) => ({ filename }))]);
+          return JSON.stringify(changedFiles);
         }
         if (
           cmd === 'gh'

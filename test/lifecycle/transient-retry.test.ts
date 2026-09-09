@@ -487,8 +487,8 @@ describe('argv derived from production call sites', () => {
         if (args[0] === 'api' && args[1]?.includes('/compare/')) {
           return JSON.stringify({ status: 'ahead' });
         }
-        if (args[0] === 'api' && args[1]?.endsWith('/files?per_page=100')) {
-          return JSON.stringify([[{ filename: 'GREETING.md' }]]);
+        if (args[0] === 'api' && args[1]?.includes('/files?per_page=100')) {
+          return JSON.stringify(['GREETING.md']);
         }
         if (args[0] === 'api') {
           return JSON.stringify({

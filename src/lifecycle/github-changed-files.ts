@@ -15,6 +15,45 @@ import {
 
 export const GITHUB_CHANGED_FILES_MAX = 3_000;
 
+/** GitHub's own maximum for `pulls/{n}/files`, so the fewest pages possible. */
+const CHANGED_FILES_PER_PAGE = 100;
+
+/**
+ * Pages this read will issue before it stops. `pulls/{n}/files` serves at most
+ * {@link GITHUB_CHANGED_FILES_MAX} files, which is also the point past which
+ * pagination stops being completeness proof, so a further page could only
+ * either come back empty or — for a server answering differently than
+ * documented — page for ever.
+ */
+const CHANGED_FILES_MAX_PAGES = Math.ceil(
+  GITHUB_CHANGED_FILES_MAX / CHANGED_FILES_PER_PAGE,
+);
+
+/**
+ * The projection that keeps patch text out of this process (#165).
+ *
+ * `pulls/{n}/files` returns a `patch` for every file, and only `filename` is
+ * ever read from it. Asking `gh` for all pages at once (`--paginate --slurp`)
+ * therefore concatenated every patch of every page into `defaultRunner`'s 10 MB
+ * `execFile` buffer to extract a few hundred bytes per file: Jinn-Network/mono
+ * #4136 (1,919 files, −417,658 lines, every deleted line carried as patch text)
+ * could not be read at all, and its review claim failed
+ * `stdout maxBuffer length exceeded` nine cycles running — never reviewed,
+ * never parked, never escalated.
+ *
+ * `--jq` runs inside `gh`, which is the only place the projection can run and
+ * still keep the patches off the pipe. It is mutually exclusive with `--slurp`
+ * there, so the pages are requested one at a time below rather than by
+ * `--paginate`; that also keeps each page individually metered by
+ * `makeGitHubUsageCommandRunner`, which counts a `--paginate` command's pages
+ * only when it can read them back out of a slurped array.
+ *
+ * The filter emits one JSON array per page rather than one bare string per
+ * file: a filename may legally contain a newline, and line-delimited output
+ * would silently split it into two files.
+ */
+const CHANGED_FILES_FILTER = '[.[].filename]';
+
 export type {
   ReviewedDiffDigestResult,
   ReviewedDiffDigestUnavailableReason,
@@ -52,24 +91,60 @@ export interface ReadExactChangedFilesOptions {
 }
 
 function filenames(raw: unknown, context: string): string[] {
-  if (
-    !Array.isArray(raw)
-    || !raw.every((page) => Array.isArray(page))
-  ) {
+  if (!Array.isArray(raw)) {
     throw new Error(`${context} changed-file read was incomplete`);
   }
-  return (raw as Array<Array<{ filename?: unknown }>>).flat().map((file) => {
-    if (typeof file.filename !== 'string') {
+  return raw.map((filename) => {
+    if (typeof filename !== 'string') {
       throw new Error(`Malformed ${context.toLowerCase()} changed file`);
     }
-    return file.filename;
+    return filename;
   });
+}
+
+/**
+ * Read the changed-file list one page at a time, projected to filenames by
+ * {@link CHANGED_FILES_FILTER}.
+ *
+ * `changedFileCount` is the PR metadata's own `changed_files`, already read and
+ * bound to the exact head above. It is used only to stop early — it is never
+ * evidence that the list is complete, which stays with the caller's three-way
+ * check against the filenames actually returned.
+ */
+async function readChangedFilenames(
+  options: ReadExactChangedFilesOptions,
+  repositorySlug: string,
+  changedFileCount: number,
+): Promise<string[]> {
+  const files: string[] = [];
+  for (let page = 1; page <= CHANGED_FILES_MAX_PAGES; page += 1) {
+    const pageFiles = filenames(JSON.parse(await options.run('gh', [
+      'api',
+      `repos/${repositorySlug}/pulls/${options.prNumber}/files`
+        + `?per_page=${CHANGED_FILES_PER_PAGE}&page=${page}`,
+      '--jq',
+      CHANGED_FILES_FILTER,
+    ])), options.context);
+    files.push(...pageFiles);
+    if (
+      pageFiles.length < CHANGED_FILES_PER_PAGE
+      || files.length >= changedFileCount
+    ) break;
+  }
+  return files;
 }
 
 /**
  * Bind changed-file policy to the exact REST head/base snapshot. GitHub caps
  * this endpoint at 3,000 files, so pagination alone is never completeness
  * proof.
+ *
+ * Only filenames are read, and only filenames are requested — see
+ * {@link CHANGED_FILES_FILTER} for why the difference is load-bearing (#165).
+ * A changed-file set too large to prove complete is not a failure of this read:
+ * it returns `complete: false`, which every caller already routes to a human
+ * (`review-executor-production.ts`'s `humanSurface`, and the enqueue gate's
+ * `changedFilesComplete`).
  */
 export async function readExactChangedFiles(
   options: ReadExactChangedFilesOptions,
@@ -96,12 +171,7 @@ export async function readExactChangedFiles(
     );
   }
   const files = options.readFiles === undefined
-    ? filenames(JSON.parse(await options.run('gh', [
-      'api',
-      `repos/${repositorySlug}/pulls/${options.prNumber}/files?per_page=100`,
-      '--paginate',
-      '--slurp',
-    ])), options.context)
+    ? await readChangedFilenames(options, repositorySlug, metadata.changed_files)
     : [...await options.readFiles(options.prNumber)];
   if (!files.every((file) => typeof file === 'string')) {
     throw new Error(`Malformed ${options.context.toLowerCase()} changed file`);
