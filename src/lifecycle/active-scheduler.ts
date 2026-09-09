@@ -1,9 +1,9 @@
 import type { NewWorkAction } from './types.js';
 import type { GitOid, GitRefName } from './types.js';
-
-type TriageDefaultsAction = Extract<NewWorkAction, { kind: 'triage-defaults' }>;
 import type { MergePolicy } from '../config/config.js';
 import type { AutopilotRuntime } from '../autopilot-runtime.js';
+
+type TriageDefaultsAction = Extract<NewWorkAction, { kind: 'triage-defaults' }>;
 
 export type ActiveCandidate =
   | {
