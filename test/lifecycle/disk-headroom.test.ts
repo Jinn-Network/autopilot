@@ -34,12 +34,35 @@ describe('expected attempt footprint', () => {
   });
 
   it('takes the p75 of same-phase history by nearest rank', () => {
-    // Sorted: 1,2,3,4 → ceil(0.75*4) = 3 → the third smallest.
+    // Sorted: 9,10,11,12 → ceil(0.75*4) = 3 → the third smallest.
     expect(expectedAttemptFootprintBytes(
       'implement',
-      history('implement', [3, 1, 4, 2]),
+      history('implement', [11 * GB, 9 * GB, 12 * GB, 10 * GB]),
       DEFAULTS,
-    )).toBe(3);
+    )).toBe(11 * GB);
+  });
+
+  // #158: `worktreeBytes` is measured once, at the exit transition, which is
+  // the smallest a worktree ever is. The mono host recorded 0.19 G exits for
+  // implementations observed live at 6.5 G, so p75 of that history reserved a
+  // thirtieth of what the attempt took and the 8 G fallback was never reached
+  // again. History may raise the estimate; it may never lower it.
+  it('never lets history reserve less than the configured default', () => {
+    expect(expectedAttemptFootprintBytes(
+      'implement',
+      history('implement', [0.19 * GB, 0.19 * GB, 0.2 * GB, 0.19 * GB]),
+      DEFAULTS,
+    )).toBe(8 * GB);
+  });
+
+  it('still lets history raise the estimate above the default', () => {
+    // The 12.9 G worktrees the same host measured: over-reserving costs a
+    // delayed spawn, under-reserving costs the volume.
+    expect(expectedAttemptFootprintBytes(
+      'implement',
+      history('implement', [12 * GB, 12.9 * GB, 13 * GB, 12.5 * GB]),
+      DEFAULTS,
+    )).toBe(12.9 * GB);
   });
 
   it('ignores history recorded for the other phase', () => {
@@ -52,12 +75,12 @@ describe('expected attempt footprint', () => {
 
   it(`consults only the last ${ATTEMPT_FOOTPRINT_HISTORY} same-phase attempts`, () => {
     const stale = Array.from({ length: 20 }, () => 100 * GB);
-    const recent = Array.from({ length: ATTEMPT_FOOTPRINT_HISTORY }, () => 2 * GB);
+    const recent = Array.from({ length: ATTEMPT_FOOTPRINT_HISTORY }, () => 9 * GB);
     expect(expectedAttemptFootprintBytes(
       'implement',
       history('implement', [...stale, ...recent]),
       DEFAULTS,
-    )).toBe(2 * GB);
+    )).toBe(9 * GB);
   });
 });
 
@@ -141,6 +164,21 @@ describe('disk headroom projection', () => {
     });
     expect(settled.reserved).toBe(0);
     expect(settled.settling).toBe(0);
+  });
+
+  // #158, at the level an operator sees it: four implementations settling and
+  // a history of nothing but exit-sized records must still reserve four whole
+  // attempts, not four fifths of one.
+  it('reserves the configured default against a history of tiny exits', () => {
+    const headroom = projectDiskHeadroom({
+      ...base,
+      free: 54 * GB,
+      floor: 15 * GB,
+      history: history('implement', [0.19 * GB, 0.19 * GB, 0.19 * GB, 0.2 * GB]),
+      pendingSpawns: ['implement', 'implement', 'implement', 'implement'],
+    });
+    expect(headroom.reserved).toBe(32 * GB);
+    expect(headroom.settling).toBe(4);
   });
 
   it('reserves a review spawn its own smaller footprint', () => {

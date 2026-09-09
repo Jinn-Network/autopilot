@@ -108,6 +108,15 @@ export function attemptFootprintDefaultsFromGb(
  * work builds, so the distribution has a long right tail and a mean sits under
  * most of it. The 75th percentile keeps the projection conservative without
  * letting one pathological attempt set the budget for every future one.
+ *
+ * The configured default is a floor under that percentile, never merely the
+ * fallback for an empty history (#158). A footprint is recorded from a
+ * measurement of the worktree, and every measurement is a lower bound on what
+ * the attempt occupied at its peak — the mono host learned 0.19 G for
+ * implementations it was running at 6.5 G, and reserved a thirtieth of the
+ * truth for every spawn after. Reserving too much delays a spawn; reserving
+ * too little fills the volume, so history may raise this estimate and may
+ * never lower it.
  */
 export function expectedAttemptFootprintBytes(
   phase: AttemptPhase,
@@ -120,7 +129,7 @@ export function expectedAttemptFootprintBytes(
     .map((record) => record.worktreeBytes)
     .sort((left, right) => left - right);
   if (recent.length === 0) return defaults[phase];
-  return recent[Math.ceil(0.75 * recent.length) - 1]!;
+  return Math.max(defaults[phase], recent[Math.ceil(0.75 * recent.length) - 1]!);
 }
 
 /**
