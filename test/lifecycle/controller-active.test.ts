@@ -1793,9 +1793,9 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       kind: 'file-debt-sweep',
       parentPr: 84,
       members: [
-        { number: 101, priority: 'p4' },
-        { number: 102, priority: 'p3' },
-        { number: 103, priority: 'p4' },
+        { number: 101, priority: 'p4', effort: 'low' },
+        { number: 102, priority: 'p3', effort: 'low' },
+        { number: 103, priority: 'p4', effort: 'low' },
       ],
     }]);
   });
@@ -1848,10 +1848,12 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       kind: 'file-residue-sweep',
       area: 'packages/core',
       parentPrs: [84, 85],
+      // Effort rides along so the filing can widen the member cap for an
+      // all-Low batch (#168).
       members: [
-        { number: 101, priority: 'p4' },
-        { number: 102, priority: 'p4' },
-        { number: 103, priority: 'p4' },
+        { number: 101, priority: 'p4', effort: 'low' },
+        { number: 102, priority: 'p4', effort: 'low' },
+        { number: 103, priority: 'p4', effort: 'low' },
       ],
     }]);
   });

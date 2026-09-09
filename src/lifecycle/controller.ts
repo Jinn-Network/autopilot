@@ -1360,6 +1360,8 @@ function globalDebtSweepInput(
       number: issue.number,
       body: issue.body,
       priority: issue.priority,
+      // Member Effort, for the widened all-Low member cap (#168).
+      effort: issue.effort,
     })),
     openPullRequestNumbers: new Set(
       snapshot.pullRequests

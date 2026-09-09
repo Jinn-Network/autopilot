@@ -78,6 +78,8 @@ export type ActiveCandidate =
       readonly members: readonly {
         readonly number: number;
         readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+        /** Project Effort; absent is not Low (#168). Widens the member cap when every member is Low. */
+        readonly effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       }[];
     }
   | {
@@ -107,6 +109,8 @@ export type ActiveCandidate =
       readonly members: readonly {
         readonly number: number;
         readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+        /** Project Effort; absent is not Low (#168). Widens the member cap when every member is Low. */
+        readonly effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       }[];
     }
   | {

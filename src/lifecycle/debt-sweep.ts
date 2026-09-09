@@ -58,6 +58,21 @@ export const DEBT_SWEEP_MIN_MEMBERS = 3;
 export const DEBT_SWEEP_MAX_MEMBERS = 8;
 
 /**
+ * The member cap for a batch whose members are ALL effort Low (#168).
+ *
+ * `DEBT_SWEEP_MAX_MEMBERS` is sized on how much independent context a session
+ * can hold at once, and that is a property of the members, not of their count.
+ * Twelve Low findings in one area cost a session less than eight mixed ones
+ * from one parent, and the observed merged-sweep mean is 3.8 members — so this
+ * cap binds essentially only on residue batches, which is exactly where the
+ * throughput has to come from.
+ *
+ * Opt-in on proof: an unread or unset Effort is NOT Low, so a batch the board
+ * has not triaged stays at the narrower cap.
+ */
+export const DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS = 12;
+
+/**
  * How many sweeps one cycle may file.
  *
  * `planDebtSweeps` is complete by design — on a repository with a real backlog
@@ -75,6 +90,8 @@ export const DEBT_SWEEP_MAX_PER_CYCLE = 3;
 
 export type DebtSweepPriority = 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
 export type DebtSweepEffort = 'medium' | 'high' | 'xhigh';
+/** Project Effort of a sweep MEMBER, lowercased. Distinct from the sweep's own. */
+export type DebtSweepMemberEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /**
  * The elevation ceiling, and the whole point of the mechanism.
@@ -132,6 +149,12 @@ const ANY_DEBT_SWEEP_MARKER_KEY = `<!-- ${DEBT_SWEEP_MARKER_TAG} `;
 export interface DebtSweepMember {
   readonly number: number;
   readonly priority: DebtSweepPriority;
+  /**
+   * Project Effort as read from the board. Absent when the board has no value
+   * or the caller could not supply one — which is never read as Low, so the
+   * widened all-Low cap can only be reached on evidence.
+   */
+  readonly effort?: DebtSweepMemberEffort;
 }
 
 export interface DebtSweepCluster {
@@ -289,6 +312,32 @@ export function residueAreaKey(body: string): string {
     : segments[0]!;
 }
 
+const MEMBER_EFFORTS: readonly DebtSweepMemberEffort[] = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+];
+
+function memberEffort(raw: string | null | undefined): DebtSweepMemberEffort | undefined {
+  const normalized = (raw ?? '').toLowerCase();
+  return (MEMBER_EFFORTS as readonly string[]).includes(normalized)
+    ? normalized as DebtSweepMemberEffort
+    : undefined;
+}
+
+/**
+ * How many members this batch may carry: the widened all-Low cap when every
+ * member is proven Low, the ordinary cap otherwise. See
+ * {@link DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS}.
+ */
+export function debtSweepMemberCap(members: readonly DebtSweepMember[]): number {
+  return members.length > 0 && members.every((member) => member.effort === 'low')
+    ? DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS
+    : DEBT_SWEEP_MAX_MEMBERS;
+}
+
 function priorityRank(priority: DebtSweepPriority): number {
   return PRIORITY_ORDER.indexOf(priority);
 }
@@ -334,6 +383,8 @@ export interface DebtSweepSourceIssue {
   readonly body?: string | null;
   /** Project Priority as read from the board (`P0`…`P4`), or unset. */
   readonly priority?: string | null;
+  /** Project Effort as read from the board (`Low`…`Max`), or unset. */
+  readonly effort?: string | null;
 }
 
 export interface PlanDebtSweepsInput {
@@ -395,9 +446,11 @@ function sweepableFollowUps(input: PlanDebtSweepsInput): {
     if (input.openPullRequestNumbers.has(parentPr)) continue;
     if (input.closedUnmergedParentPrs?.has(parentPr) === true) continue;
     const members = byParent.get(parentPr) ?? [];
+    const effort = memberEffort(issue.effort);
     members.push({
       number: issue.number,
       priority: memberPriority(issue.priority),
+      ...(effort === undefined ? {} : { effort }),
     });
     byParent.set(parentPr, members);
     areaByMember.set(issue.number, residueAreaKey(body));
@@ -439,7 +492,7 @@ export function planDebtSweeps(
     // Oldest first, so the cap leaves the newest behind and the remainder is
     // the batch that has had the least chance to be worked any other way.
     const ordered = [...all].sort((left, right) => left.number - right.number);
-    const members = ordered.slice(0, DEBT_SWEEP_MAX_MEMBERS);
+    const members = ordered.slice(0, debtSweepMemberCap(ordered));
     clusters.push({
       parentPr,
       members,
@@ -531,7 +584,7 @@ export function planResidueSweeps(
     const ordered = [...entries].sort(
       (left, right) => left.member.number - right.member.number,
     );
-    const taken = ordered.slice(0, residueMemberCap(ordered.map((entry) => entry.member)));
+    const taken = ordered.slice(0, debtSweepMemberCap(ordered.map((entry) => entry.member)));
     const members = taken.map((entry) => entry.member);
     clusters.push({
       area,
@@ -544,11 +597,6 @@ export function planResidueSweeps(
     });
   }
   return clusters;
-}
-
-/** Member cap for a residue batch. Widened for all-Low batches by #168 part 2. */
-function residueMemberCap(_members: readonly DebtSweepMember[]): number {
-  return DEBT_SWEEP_MAX_MEMBERS;
 }
 
 /**
@@ -875,7 +923,7 @@ export async function fileDebtSweep(
   if (surviving.length < DEBT_SWEEP_MIN_MEMBERS) {
     return { status: 'below-minimum', openMembers: surviving.length, ...withClosed };
   }
-  const members = surviving.slice(0, DEBT_SWEEP_MAX_MEMBERS);
+  const members = surviving.slice(0, debtSweepMemberCap(surviving));
 
   const numbers = members.map((member) => member.number);
   const marker = formatDebtSweepMarker(input.parentPr, numbers);
@@ -1108,7 +1156,7 @@ export async function fileResidueSweep(
   if (surviving.length < DEBT_SWEEP_MIN_MEMBERS) {
     return { status: 'below-minimum', openMembers: surviving.length, ...withClosed };
   }
-  const members = surviving.slice(0, residueMemberCap(surviving));
+  const members = surviving.slice(0, debtSweepMemberCap(surviving));
 
   const numbers = members.map((member) => member.number);
   const parentPrs = [...new Set(numbers.map((number) => parentByNumber.get(number)!))]

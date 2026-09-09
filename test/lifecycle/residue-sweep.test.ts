@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEBT_SWEEP_MARKER_TAG,
+  DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS,
   DEBT_SWEEP_MAX_MEMBERS,
   DEBT_SWEEP_MAX_PER_CYCLE,
   DEBT_SWEEP_MIN_MEMBERS,
   RESIDUE_AREA_UNKNOWN,
   countResidueFollowUps,
+  debtSweepMemberCap,
   fileResidueSweep,
   formatResidueSweepMarker,
   formatResidueSweepMarkerKey,
@@ -295,5 +297,77 @@ describe('fileResidueSweep', () => {
     );
     expect(filed).toEqual({ status: 'below-minimum', openMembers: 1 });
     expect(DEBT_SWEEP_MIN_MEMBERS).toBe(3);
+  });
+});
+
+describe('all-Low batches (#168 part 2)', () => {
+  it('caps an all-Low batch at 12 and anything else at 8', () => {
+    const low = (count: number): readonly DebtSweepMember[] => Array.from(
+      { length: count },
+      (_unused, index) => ({ number: index + 1, priority: 'p4' as const, effort: 'low' as const }),
+    );
+    expect(DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS).toBe(12);
+    expect(debtSweepMemberCap(low(12))).toBe(DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS);
+    expect(debtSweepMemberCap([...low(11), { number: 99, priority: 'p4', effort: 'medium' }]))
+      .toBe(DEBT_SWEEP_MAX_MEMBERS);
+    // An unread effort is not Low: the wider cap is opt-in on proof, never on
+    // absence of evidence.
+    expect(debtSweepMemberCap([...low(11), { number: 99, priority: 'p4' }]))
+      .toBe(DEBT_SWEEP_MAX_MEMBERS);
+  });
+
+  it('lets an all-Low residue batch carry twelve members', () => {
+    const clusters = planResidueSweeps({
+      issues: Array.from({ length: 14 }, (_unused, index) => ({
+        ...followUpIssue(101 + index, 200 + index, { area: 'packages/core' }),
+        effort: 'Low',
+      })),
+      openPullRequestNumbers: new Set<number>(),
+    });
+    expect(clusters[0]!.members).toHaveLength(DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS);
+    expect(clusters[0]!.remainingMembers).toBe(2);
+  });
+
+  it('keeps a residue batch with one Medium member at eight', () => {
+    const clusters = planResidueSweeps({
+      issues: Array.from({ length: 14 }, (_unused, index) => ({
+        ...followUpIssue(101 + index, 200 + index, { area: 'packages/core' }),
+        effort: index === 13 ? 'Medium' : 'Low',
+      })),
+      openPullRequestNumbers: new Set<number>(),
+    });
+    expect(clusters[0]!.members).toHaveLength(DEBT_SWEEP_MAX_MEMBERS);
+  });
+
+  it('applies the same widened cap to a per-parent sweep', () => {
+    const clusters = planDebtSweeps({
+      issues: Array.from({ length: 14 }, (_unused, index) => ({
+        ...followUpIssue(101 + index, 84, { area: 'packages/core' }),
+        effort: 'Low',
+      })),
+      openPullRequestNumbers: new Set<number>(),
+    });
+    expect(clusters[0]!.members).toHaveLength(DEBT_SWEEP_MAX_LOW_EFFORT_MEMBERS);
+  });
+
+  it('files an all-Low residue batch of twelve', async () => {
+    const numbers = Array.from({ length: 12 }, (_unused, index) => 101 + index);
+    const log: unknown[] = [];
+    const filed = await fileResidueSweep(
+      port({
+        log,
+        open: numbers.map((number) => ({
+          number,
+          title: `Follow-up ${number}`,
+          body: formatReviewFollowUpMarker(84, HEAD, number),
+        })),
+      }),
+      {
+        area: 'packages/core',
+        members: numbers.map((number) => ({ number, priority: 'p4' as const, effort: 'low' as const })),
+        parentPrs: [84],
+      },
+    );
+    expect(filed).toMatchObject({ status: 'filed', members: numbers });
   });
 });
