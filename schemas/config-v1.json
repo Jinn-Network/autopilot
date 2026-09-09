@@ -137,6 +137,14 @@
           "type": "array",
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 }
+        },
+        "defaultPriority": {
+          "enum": ["P0", "P1", "P2", "P3", "P4"],
+          "default": "P3"
+        },
+        "inferIssueType": {
+          "type": "boolean",
+          "default": true
         }
       }
     },

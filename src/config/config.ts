@@ -149,6 +149,29 @@ export const autopilotConfigSchema = z.object({
   }).strict(),
   triage: z.object({
     allowedAuthors: z.array(nonEmpty).min(1),
+    /**
+     * Priority written to a board issue that has none (#166). An issue with no
+     * Priority is refused by the eligibility cascade and never claimed, so
+     * without a default it waits for a human who may never look. `P3` is
+     * deliberately unambitious: it makes the issue claimable without letting
+     * untriaged work outrank anything an operator ranked by hand.
+     *
+     * Only the five options the Project Priority field actually carries are
+     * representable — anything else names no option id the write could use.
+     */
+    defaultPriority: z.enum(['P0', 'P1', 'P2', 'P3', 'P4']).default('P3'),
+    /**
+     * Infer a missing native Issue Type from an explicit conventional title
+     * prefix (#166). Disarmable because the type decides what kind of session
+     * runs — a `design` issue produces a spec, a `refactor` expects stacked
+     * PRs — so an operator who does not want the engine choosing at all can
+     * turn it off and keep the Priority default.
+     *
+     * Both keys are defaulted, not required: every deployed
+     * `.autopilot/config.json` carries a `triage` block with `allowedAuthors`
+     * alone and must keep parsing unchanged.
+     */
+    inferIssueType: z.boolean().default(true),
   }).strict(),
   safety: z.object({
     staleAfterSeconds: positiveSeconds,
