@@ -46,6 +46,7 @@ import { planDebtSweeps, rankDebtSweeps } from './debt-sweep.js';
 import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import { hasReviewFollowUpMarkerTag } from './review-follow-ups.js';
+import { triageGaps } from './triage-defaults.js';
 import type {
   AutopilotMode,
   GitOid,
@@ -271,6 +272,12 @@ type LifecycleBacklogPriorityKey = 'p0' | 'p1' | 'p2' | 'p3' | 'p4' | 'unset';
  * actually reach. Follow-ups and children are real open issues but neither
  * competes for an ordinary claim the way a sweep does, so they are reported
  * separately rather than folded into `actionable`.
+ *
+ * `ordinary` counts only issues that pass the triage cascade (#166). An issue
+ * with no Issue Type or no Priority is refused an ordinary claim, so counting
+ * it here reported unclaimable work as claimable — on the mono board that was
+ * twenty issues, some twelve days old, while both lanes reported starvation.
+ * Those issues are named by `untriaged` instead, so nothing disappears.
  */
 export interface LifecycleBacklogSummary {
   readonly ordinary: number;
@@ -280,6 +287,15 @@ export interface LifecycleBacklogSummary {
   readonly actionable: number;
   /** Per-priority counts for the ORDINARY set only — follow-ups, children, and sweeps are excluded. */
   readonly ordinaryByPriority: Readonly<Record<LifecycleBacklogPriorityKey, number>>;
+  /**
+   * Ordinary open issues the triage cascade refuses, counted per missing
+   * field (#166). The two counts are independent, not a partition: an issue
+   * missing both fields is named by both.
+   */
+  readonly untriaged: {
+    readonly noType: number;
+    readonly noPriority: number;
+  };
 }
 
 export interface LifecycleLogEvent {
@@ -803,8 +819,10 @@ function classifyBacklogIssue(issue: { readonly body?: string }): LifecycleBackl
 const BACKLOG_PRIORITY_KEYS = ['p0', 'p1', 'p2', 'p3', 'p4'] as const;
 
 /**
- * Unset or unrecognized Priority buckets under `unset` — unset-priority
- * issues are triage gaps, not exclusions, and still count as ordinary (#127).
+ * Unrecognized Priority buckets under `unset`. An ABSENT Priority no longer
+ * reaches this function: since #166 an unset-priority issue is untriaged and
+ * never counted as ordinary, so the bucket now catches only a board value the
+ * five known options do not name.
  */
 function backlogPriorityKey(priority: string | null | undefined): LifecycleBacklogPriorityKey {
   if (priority === null || priority === undefined) return 'unset';
@@ -829,6 +847,8 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
   let followUps = 0;
   let children = 0;
   let sweeps = 0;
+  let noType = 0;
+  let noPriority = 0;
   for (const issue of issues) {
     const backlogClass = classifyBacklogIssue(issue);
     if (backlogClass === 'sweep') {
@@ -838,6 +858,12 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
     } else if (backlogClass === 'follow-up') {
       followUps += 1;
     } else {
+      // Ordinary issues only: machine children have their own repair, and
+      // follow-ups and sweeps are machine-filed with triage already applied.
+      const gaps = triageGaps(issue);
+      if (gaps.noType) noType += 1;
+      if (gaps.noPriority) noPriority += 1;
+      if (gaps.noType || gaps.noPriority) continue;
       ordinary += 1;
       ordinaryByPriority[backlogPriorityKey(issue.priority)] += 1;
     }
@@ -849,6 +875,7 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
     sweeps,
     actionable: ordinary + sweeps,
     ordinaryByPriority,
+    untriaged: { noType, noPriority },
   };
 }
 
@@ -2446,13 +2473,18 @@ function paritySummary(
 }
 
 /**
- * Renders the open-issue composition (#127) as two lines: the exact
+ * Renders the open-issue composition (#127) as three lines: the exact
  * `backlog: ordinary=N follow-ups=M children=K sweeps=S (actionable=A)`
- * summary, and a per-priority breakdown of the ordinary set only. Both flow
- * through the one renderer, so both the per-cycle log (the continuous
- * cadence's own stdout) and `autopilot status` (the same renderer run
- * on-demand) show the composition — never derived, persisted, or scheduled
- * on; purely a read of the summary the controller already computed.
+ * summary, a per-priority breakdown of the ordinary set only, and the
+ * untriaged gap counts (#166). All three flow through the one renderer, so
+ * both the per-cycle log (the continuous cadence's own stdout) and
+ * `autopilot status` (the same renderer run on-demand) show the composition —
+ * never derived, persisted, or scheduled on; purely a read of the summary the
+ * controller already computed.
+ *
+ * The untriaged line is emitted unconditionally, zeros included: a line that
+ * appears only when it has something to say cannot be told from a build where
+ * the count is not derived at all.
  */
 function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[] {
   return [
@@ -2464,6 +2496,8 @@ function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[
         .map((key) => `${key}=${backlog.ordinaryByPriority[key]}`)
         .join(' ')
     }`,
+    `untriaged: no-type=${backlog.untriaged.noType} `
+      + `no-priority=${backlog.untriaged.noPriority}`,
   ];
 }
 

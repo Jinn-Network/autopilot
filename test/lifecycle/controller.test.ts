@@ -3266,6 +3266,7 @@ describe('operator usage summary', () => {
       backlog: {
         ordinary: 0, followUps: 0, children: 0, sweeps: 0, actionable: 0,
         ordinaryByPriority: { p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unset: 0 },
+        untriaged: { noType: 0, noPriority: 0 },
       },
     };
     const retried = new GitHubUsageMeter();
@@ -3750,14 +3751,41 @@ describe('backlog composition (#127)', () => {
     });
   });
 
-  it('counts an unset-priority issue as ordinary, bucketed under "unset"', async () => {
+  // #166: `ordinary=` is the number an operator reads as "work the lane can
+  // reach". An unset-priority issue is refused by the eligibility cascade, so
+  // counting it there overstated the claimable backlog by exactly the issues
+  // nobody could claim; it is reported under `untriaged:` instead.
+  it('excludes an unset-priority issue from ordinary and reports it as untriaged', async () => {
     const report = await backlogFor([
       issue(52, { priority: null }),
     ]);
-    expect(report.backlog.ordinary).toBe(1);
+    expect(report.backlog.ordinary).toBe(0);
+    expect(report.backlog.actionable).toBe(0);
+    expect(report.backlog.untriaged).toEqual({ noType: 0, noPriority: 1 });
     expect(report.backlog.ordinaryByPriority).toEqual({
-      p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unset: 1,
+      p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unset: 0,
     });
+  });
+
+  it('excludes an issue with no native Issue Type from ordinary too', async () => {
+    const report = await backlogFor([
+      issue(57, { shape: null }),
+      issue(58, { shape: null, priority: null }),
+      issue(59),
+    ]);
+    expect(report.backlog.ordinary).toBe(1);
+    // An issue missing both fields is named by both counts: they are two
+    // independent gap counts, not a partition.
+    expect(report.backlog.untriaged).toEqual({ noType: 2, noPriority: 1 });
+  });
+
+  it('counts untriaged gaps for ordinary issues only', async () => {
+    const report = await backlogFor([
+      issue(64, { priority: null, body: CHILD_BODY }),
+      issue(65, { priority: null, body: FOLLOW_UP_BODY }),
+      issue(66, { priority: null, body: DEBT_SWEEP_BODY }),
+    ]);
+    expect(report.backlog.untriaged).toEqual({ noType: 0, noPriority: 0 });
   });
 
   it('covers only the ordinary set in the per-priority breakdown', async () => {
@@ -3792,6 +3820,7 @@ describe('backlog composition (#127)', () => {
       sweeps: 1,
       actionable: 2,
       ordinaryByPriority: { p0: 0, p1: 1, p2: 0, p3: 0, p4: 0, unset: 0 },
+      untriaged: { noType: 0, noPriority: 0 },
     });
   });
 
@@ -3812,12 +3841,39 @@ describe('backlog composition (#127)', () => {
     const report = await backlogFor([
       issue(80, { priority: 'P0' }),
       issue(81, { priority: 'P2' }),
-      issue(82, { priority: null }),
     ]);
     const human = renderLifecycleHuman(report);
     expect(human.split('\n')).toContain(
-      'backlog ordinary priority: p0=1 p1=0 p2=1 p3=0 p4=0 unset=1',
+      'backlog ordinary priority: p0=1 p1=0 p2=1 p3=0 p4=0 unset=0',
     );
+  });
+
+  // #166: the whole point of the line is that an operator sees the gap
+  // without grepping hundreds of per-issue lines for it.
+  it('renders the untriaged line in the exact specified format', async () => {
+    const report = await backlogFor([
+      issue(83, { shape: null, title: 'do the thing' }),
+      issue(84, { priority: null }),
+      issue(85, { shape: null, priority: null, title: 'do the other thing' }),
+    ]);
+    expect(renderLifecycleHuman(report).split('\n')).toContain(
+      'untriaged: no-type=2 no-priority=2',
+    );
+  });
+
+  it('renders the untriaged line even when every issue is fully triaged', async () => {
+    // A line that only appears when it has something to say cannot be told
+    // from a build where the count is not derived at all.
+    const report = await backlogFor([issue(86)]);
+    expect(renderLifecycleHuman(report).split('\n')).toContain(
+      'untriaged: no-type=0 no-priority=0',
+    );
+  });
+
+  it('carries the untriaged counts on the report so JSON output has them', async () => {
+    const report = await backlogFor([issue(87, { priority: null })]);
+    expect(JSON.parse(renderLifecycleJson(report)).backlog.untriaged)
+      .toEqual({ noType: 0, noPriority: 1 });
   });
 
   it('excludes closed issues: composition is derived only from snapshot.issues', async () => {
