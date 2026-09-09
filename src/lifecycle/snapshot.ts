@@ -12,6 +12,7 @@ import {
   mappingDiagnosticSignature,
 } from './codecs.js';
 import { parseChildMarker, isMachineChildIssue, type ChildKind } from './child-issues.js';
+import { isUmbrellaIssue } from './umbrella-issues.js';
 import { isReviewedDiffDigest } from './reviewed-diff-digest.js';
 import {
   describeStackBreak,
@@ -1096,8 +1097,20 @@ function eligibilityEvidence(
   hasClaimBranch = false,
   followUpBlock: ReviewFollowUpBlock | null = null,
   stackBlock: { readonly parentPr: number; readonly record: StackChainRecord } | null = null,
+  umbrella = false,
 ): { readonly reason: IssueEligibilityReason; readonly detail: string } {
   if (eligible) return { reason: 'eligible', detail: 'All implementation admission gates pass' };
+  // First of the whole cascade on purpose (#160). Every other arm names a
+  // condition somebody could resolve — set the Issue Type, land the blocker,
+  // add the author. An umbrella's own body says implementation belongs to its
+  // children, so nothing an operator does to it makes it claimable, and any
+  // other explanation would send them to fix a field that changes nothing.
+  if (umbrella) {
+    return {
+      reason: 'not-selected',
+      detail: 'Issue is an umbrella; children own implementation',
+    };
+  }
   if (issue.blockedOn === 'Another issue' && !stackReady.has(issue.number)) {
     const blockers = issue.blockedByIssues.map((number) => `#${number}`).join(', ');
     return {
@@ -1276,10 +1289,14 @@ function lifecycleItems(
     // A machine child works on its parent's branch, so a parent sitting on a
     // dead stack has nowhere to deliver (issue #114).
     const stackBlock = childStackBlock(issue, stackChains);
+    // An umbrella declares that its children own implementation, so a fresh
+    // claim on it can only reach Stage 0 and park (#160).
+    const umbrella = isUmbrellaIssue({ body: issue.body, labels: issueLabels });
     const eligible = selectedReady
       && !sourceHumanHold
       && followUpBlock === null
-      && stackBlock === null;
+      && stackBlock === null
+      && !umbrella;
     const holdDetail = issue.blockedOn === 'Human'
       ? 'Project Blocked on is Human'
       : externalHumanLabel(issueLabels) !== undefined
@@ -1300,6 +1317,7 @@ function lifecycleItems(
         claimBranchIssues.has(issue.number),
         followUpBlock,
         stackBlock,
+        umbrella,
       );
     const sourceHumanReason: HumanReason | undefined = sourceHumanHold
       ? {

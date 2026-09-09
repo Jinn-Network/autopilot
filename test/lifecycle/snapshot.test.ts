@@ -2947,6 +2947,81 @@ describe('buildGitHubLifecycleSnapshot', () => {
     });
   });
 
+  // Umbrella issues (#160). The shape is upstream of implementation: a session
+  // can only discover at Stage 0 that there is nothing to build, so the cascade
+  // has to refuse the claim and name the shape instead.
+  const composeIssuesOnly = (issues) => composeGitHubLifecycleSnapshot({
+    project: {
+      items: [],
+      rateLimit: { remaining: 4_000, used: 1_000, resetAt: '2026-07-20T13:00:00.000Z' },
+      currentSprintIterationId: 'sprint',
+    },
+    issues,
+    pullRequests: [],
+    branches: [],
+  }, {
+    authorAllowlist: new Set(['trusted']),
+    capturedAt: '2026-07-20T12:00:00.000Z',
+    snapshotMode: 'incremental',
+    lastFullReconciliationAt: '2026-07-20T11:00:00.000Z',
+    githubUsage: {
+      graphqlRequests: 3,
+      graphqlCost: 20,
+      graphqlRemaining: 3_980,
+      graphqlResetAt: '2026-07-20T13:00:00.000Z',
+      restRequests: 2,
+      restNotModified: 0,
+      cacheHits: 0,
+    },
+  });
+
+  it('refuses a fresh claim on an umbrella and names the shape', () => {
+    for (const overlay of [
+      { body: 'Type: `feat` — umbrella; children own implementation' },
+      { body: '**Umbrella only — no direct implementation in this issue.**' },
+      { labels: ['umbrella'] },
+    ]) {
+      const snapshot = composeIssuesOnly([
+        { ...issue(), number: 88, status: 'Todo', body: '', ...overlay },
+      ]);
+      expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 88)).toMatchObject({
+        eligible: false,
+        eligibilityReason: 'not-selected',
+        eligibilityDetail: 'Issue is an umbrella; children own implementation',
+      });
+    }
+  });
+
+  it('leaves an ordinary issue that merely says "umbrella" eligible', () => {
+    const snapshot = composeIssuesOnly([{
+      ...issue(),
+      number: 89,
+      status: 'Todo',
+      body: 'Part of the umbrella epic; implement the poller here.',
+    }]);
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 89)).toMatchObject({
+      eligible: true,
+      eligibilityReason: 'eligible',
+    });
+  });
+
+  it('reports the umbrella shape ahead of the triage gaps it also has', () => {
+    // An untriaged umbrella must not read as "Priority is not set": that sends
+    // triage to fill the gap and hands the claim lane an issue it must refuse.
+    const snapshot = composeIssuesOnly([{
+      ...issue(),
+      number: 90,
+      status: null,
+      shape: null,
+      priority: null,
+      body: 'umbrella; children own implementation',
+    }]);
+    expect(snapshot.lifecycle.items.find((item) => item.issueNumber === 90)).toMatchObject({
+      eligible: false,
+      eligibilityDetail: 'Issue is an umbrella; children own implementation',
+    });
+  });
+
   it('reports the triage failure, not the parent PR, for an untriaged review follow-up', async () => {
     const untriaged = { ...followUpIssue(101), shape: null };
     const source = reader({
