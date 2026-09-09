@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defaultRunner, type CommandRunner } from '../../src/dispatcher/issue-source.js';
 import { SelectedCredential } from '../../src/lifecycle/credentials.js';
@@ -4691,6 +4691,131 @@ describe('bounded attempt cleanup', () => {
     await sweep();
     await drainTrashReclaims();
     expect(calls).toBe(2);
+  });
+
+  // #179: tonight's incident was 18 dead worktrees holding ~40 GB while
+  // admission starved. Reclamation is the slow half, so it runs as a pool
+  // whose width an operator sets, and which entry goes first decides how much
+  // of the volume comes back this cycle.
+  it('reclaims at most the configured number at once, largest known bytes first', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    mkdirSync(trashBase, { recursive: true });
+    for (const [name, bytes] of [
+      ['small', 1_000_000_000],
+      ['largest', 9_000_000_000],
+      ['medium', 5_000_000_000],
+      ['tiny', 1024],
+      ['large', 7_000_000_000],
+    ] as const) {
+      mkdirSync(join(trashBase, name), { recursive: true });
+      writeFileSync(join(trashBase, `.${name}.size`), `${bytes}\n`);
+    }
+    const reclaims: string[] = [];
+    const release = deferred();
+    const sweep = () => sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      // The pool's own pid sidecars are what occupy its slots, so the pid
+      // they record has to read as live here.
+      isPidAlive: (pid) => pid === process.pid,
+      trashBase,
+      reclaimTrashed: async (path) => {
+        reclaims.push(basename(path));
+        await release.promise;
+        rmSync(path, { recursive: true, force: true });
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+
+    await sweep();
+    expect(reclaims).toEqual(['largest', 'large', 'medium']);
+
+    // A second cycle while all three are still running starts nothing more:
+    // the pool is a host-wide width, not a per-cycle allowance.
+    await sweep();
+    expect(reclaims).toEqual(['largest', 'large', 'medium']);
+
+    release.resolve();
+    await drainTrashReclaims();
+    await sweep();
+    await drainTrashReclaims();
+    expect(reclaims).toEqual(['largest', 'large', 'medium', 'small', 'tiny']);
+  });
+
+  it('falls back to oldest-first when nothing recorded a trash entry size', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const trashBase = join(fixture.base, 'trash');
+    mkdirSync(trashBase, { recursive: true });
+    for (const [name, minute] of [
+      ['newest', '03'],
+      ['oldest', '01'],
+      ['middle', '02'],
+    ] as const) {
+      const path = join(trashBase, name);
+      mkdirSync(path, { recursive: true });
+      const when = new Date(`2026-09-09T20:${minute}:00.000Z`);
+      utimesSync(path, when, when);
+    }
+    const reclaims: string[] = [];
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: (pid) => pid === process.pid,
+      trashBase,
+      reclaimConcurrency: 2,
+      reclaimTrashed: async (path) => {
+        reclaims.push(basename(path));
+        rmSync(path, { recursive: true, force: true });
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+    await drainTrashReclaims();
+
+    expect(reclaims).toEqual(['oldest', 'middle']);
+  });
+
+  it('records what the manifest knows the worktree cost beside its trash entry', async () => {
+    await drainTrashReclaims();
+    const fixture = repositoryFixture();
+    const attempts = await twoDeadAttempts(fixture);
+    const trashBase = join(fixture.base, 'trash');
+    const release = deferred();
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => false,
+      trashBase,
+      reclaimTrashed: async () => {
+        await release.promise;
+      },
+      budgetMs: 60_000,
+      monotonicNow: () => 0,
+    });
+
+    // A `du` over a trash entry is exactly the synchronous walk of the disk
+    // this whole mechanism exists to avoid, so the ordering estimate is the
+    // footprint the attempt already measured, carried across the rename.
+    const recorded = readdirSync(trashBase)
+      .filter((name) => name.endsWith('.size'))
+      .map((name) => Number.parseInt(
+        readFileSync(join(trashBase, name), 'utf8').trim(),
+        10,
+      ))
+      .sort((left, right) => left - right);
+    expect(recorded).toEqual(
+      attempts.map((attempt) => attempt.worktreeBytes)
+        .sort((left, right) => left - right),
+    );
+
+    release.resolve();
+    await drainTrashReclaims();
   });
 });
 

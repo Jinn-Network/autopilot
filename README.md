@@ -148,6 +148,28 @@ existed keeps loading and gets those defaults. Every active cycle logs one
 `disk: free=… reserved=… floor=… settling=…` line, and a candidate the floor
 holds back reports `disk-floor` with the arithmetic that produced it.
 
+## Reclaiming dead worktrees
+
+```json
+"cleanup": {
+  "reclaimConcurrency": 3
+}
+```
+
+A dead attempt's worktree leaves `attempts/v2` in one rename, but its bytes
+stay on the volume until an `rm -rf` finishes, and a node_modules-heavy 6 GB
+checkout takes minutes. Dispatch produces dead worktrees faster than one
+removal at a time frees them, which is how 18 of them came to hold ~40 GB
+while admission starved under a 20 GB floor. `cleanup.reclaimConcurrency`
+(default `3`) is how many of those removals run at once on this host, biggest
+worktrees first, so the volume comes back faster than the engine spends it.
+The pool is host-wide and survives restarts: each removal is owned by a
+recorded pid, and the next sweep tops the pool up rather than starting a
+second removal of the same directory. Raise it on a host with disk to spare;
+`0` is refused, because a pool that never frees a byte is the failure it
+exists to prevent. The key is optional — a config written before it existed
+keeps loading and gets the three.
+
 ## Board triage defaults
 
 An issue on the Project board with no **Priority**, no native **Issue Type**,

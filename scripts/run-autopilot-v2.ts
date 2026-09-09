@@ -1206,6 +1206,7 @@ export async function runAutopilotV2(
       now: () => new Date(),
       diskFloorBytes,
       diskPath: v2AttemptsBase,
+      reclaimConcurrency: loaded.config.cleanup.reclaimConcurrency,
     });
     const warnings = renderCleanupWarnings(
       cleanup,

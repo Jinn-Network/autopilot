@@ -3704,6 +3704,13 @@ export interface CleanupAttemptOptions {
   /** How a trashed directory's bytes are reclaimed. A test seam. */
   readonly reclaimTrashed?: (path: string) => Promise<void>;
   /**
+   * How many trashed worktrees may be reclaimed at once, across every engine
+   * process on this host (#179). Defaults to
+   * {@link DEFAULT_RECLAIM_CONCURRENCY}; production passes the operator's
+   * `cleanup.reclaimConcurrency`.
+   */
+  readonly reclaimConcurrency?: number;
+  /**
    * When true, the worktree's bytes are gone before cleanup returns. The
    * emergency below-floor sweep needs this to stop at the floor.
    */
@@ -4270,8 +4277,90 @@ function trashBaseFor(options: CleanupAttemptOptions): string {
   return options.trashBase ?? trashBaseForV2(options.v2Base);
 }
 
+/**
+ * Trashed worktrees whose bytes may be coming back at once (#179).
+ *
+ * Trashing is a rename and costs nothing; reclaiming is the slow half — a
+ * node_modules-heavy 6 GB checkout takes minutes of `rm -rf` on a loaded host
+ * — and dispatch produces dead worktrees faster than one reclaim at a time
+ * frees them. On the night this was written, 18 dead worktrees held ~40 GB
+ * while admission starved under a 20 GB floor.
+ *
+ * Three, not "as many as there are": every reclaim is disk I/O on the volume
+ * the engine's live workers are also building in, so the pool has to be wide
+ * enough to outpace dispatch and narrow enough that it never becomes the
+ * reason a build is slow. An operator whose host has the spindles for more
+ * raises `cleanup.reclaimConcurrency`.
+ */
+export const DEFAULT_RECLAIM_CONCURRENCY = 3;
+
+function reclaimConcurrency(options: CleanupAttemptOptions): number {
+  const configured = options.reclaimConcurrency ?? DEFAULT_RECLAIM_CONCURRENCY;
+  // A zero-width pool never frees a byte, which is the incident itself; the
+  // config schema refuses one, and nothing else may introduce one either.
+  return Number.isInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_RECLAIM_CONCURRENCY;
+}
+
 function reclaimSidecar(trashed: string): string {
   return join(dirname(trashed), `.${basename(trashed)}.reclaim`);
+}
+
+/**
+ * Where a trash entry's size estimate is recorded, beside its pid sidecar.
+ *
+ * The pool reclaims the biggest bytes first, and measuring a trash entry is
+ * the synchronous walk of a multi-GB tree this whole mechanism exists to
+ * avoid. So the estimate is whatever the attempt's manifest already knew —
+ * carried across the rename, because the manifest does not survive it.
+ */
+function trashSizeSidecar(trashed: string): string {
+  return join(dirname(trashed), `.${basename(trashed)}.size`);
+}
+
+const TRASH_SIDECAR_SUFFIXES = ['.reclaim', '.size'] as const;
+
+/** The trash entry a sidecar file belongs to, or null when it names none. */
+function sidecarOwner(trashBase: string, fileName: string): string | null {
+  if (!fileName.startsWith('.')) return null;
+  for (const suffix of TRASH_SIDECAR_SUFFIXES) {
+    if (fileName.endsWith(suffix)) {
+      return join(trashBase, fileName.slice(1, -suffix.length));
+    }
+  }
+  return null;
+}
+
+function recordTrashedBytes(trashed: string, bytes: number | undefined): void {
+  if (bytes === undefined || !Number.isFinite(bytes) || bytes <= 0) return;
+  try {
+    writeFileSync(trashSizeSidecar(trashed), `${Math.round(bytes)}\n`);
+  } catch {
+    // The entry then sorts as unknown — oldest-first — and nothing else changes.
+  }
+}
+
+/** The recorded estimate for a trash entry, or null when nothing recorded one. */
+function trashedBytes(trashed: string): number | null {
+  try {
+    const value = Number.parseInt(
+      readFileSync(trashSizeSidecar(trashed), 'utf8').trim(),
+      10,
+    );
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** When a trash entry was last written; the tiebreak when no size is known. */
+function trashedAtMs(trashed: string): number {
+  try {
+    return statSync(trashed).mtimeMs;
+  } catch {
+    return 0;
+  }
 }
 
 function sidecarPid(sidecar: string): number | null {
@@ -4349,6 +4438,7 @@ function startTrashReclaim(
       reclaimFailures.delete(trashed);
       try {
         rmSync(sidecar, { force: true });
+        rmSync(trashSizeSidecar(trashed), { force: true });
       } catch {
         // A stale sidecar for a gone entry is dropped by the next sweep.
       }
@@ -4379,6 +4469,7 @@ function trashDirectory(
   path: string,
   label: string,
   options: CleanupAttemptOptions,
+  estimatedBytes?: number,
 ): string | null {
   const trashBase = trashBaseFor(options);
   const trashed = join(trashBase, `${label}-${randomUUID()}`);
@@ -4390,17 +4481,48 @@ function trashDirectory(
   } catch {
     return null;
   }
-  startTrashReclaim(trashed, options, options.awaitReclaim === true);
+  recordTrashedBytes(trashed, estimatedBytes);
+  if (options.awaitReclaim === true) {
+    // The emergency below-floor sweep re-reads free space between evictions
+    // and must have these bytes back before the next read, so it takes a slot
+    // over the pool's width rather than queueing behind reclaims that may not
+    // finish this cycle. It evicts one attempt at a time, so it can add at
+    // most one reclaim to whatever the pool is already running.
+    startTrashReclaim(trashed, options, true);
+  } else {
+    // Not necessarily this entry: the pool takes the biggest bytes first, and
+    // this one may not be them.
+    startQueuedTrashReclaims(options);
+  }
   return trashed;
 }
 
+interface QueuedTrashEntry {
+  readonly path: string;
+  /** The recorded estimate, or null when nothing recorded one. */
+  readonly bytes: number | null;
+  readonly trashedAtMs: number;
+}
+
 /**
- * Re-adopts trash no live reclaim owns — an engine that died mid-reclaim, or
- * an `rm` that failed — so a restart never strands occupied bytes that nothing
- * is working to free. An entry a live pid owns is left to it (#150), and a
- * sidecar whose entry is already gone is dropped.
+ * Fills the reclaim pool from the trash, biggest known bytes first (#179).
+ *
+ * This is also the adoption path it grew out of: trash no live reclaim owns —
+ * an engine that died mid-reclaim, an `rm` that failed, an entry the pool had
+ * no slot for last cycle — is exactly what a free slot is for, so a restart
+ * never strands occupied bytes that nothing is working to free. An entry a
+ * live pid owns is left to it (#150) and counts against the pool's width
+ * whichever engine process started it; a sidecar whose entry is already gone
+ * is dropped.
+ *
+ * Ordering is by the estimate recorded at trash time, which is the attempt's
+ * own measured footprint — never a `du` over the trash, which would be the
+ * synchronous walk of the disk this mechanism exists to avoid. An entry
+ * nothing measured sorts as unknown, behind every known size and oldest-first
+ * among its peers, so a host with no footprint history at all still drains its
+ * trash in a sensible order.
  */
-function adoptTrashedDirectories(options: CleanupAttemptOptions): void {
+function startQueuedTrashReclaims(options: CleanupAttemptOptions): void {
   const trashBase = trashBaseFor(options);
   let entries: Dirent[];
   try {
@@ -4408,17 +4530,34 @@ function adoptTrashedDirectories(options: CleanupAttemptOptions): void {
   } catch {
     return;
   }
+  const queued: QueuedTrashEntry[] = [];
   for (const entry of entries) {
     const path = join(trashBase, entry.name);
-    if (entry.isFile() && entry.name.endsWith('.reclaim')) {
-      const owned = join(trashBase, entry.name.slice(1, -'.reclaim'.length));
-      if (!existsSync(owned)) rmSync(path, { force: true });
+    if (entry.isFile()) {
+      const owned = sidecarOwner(trashBase, entry.name);
+      if (owned !== null && !existsSync(owned)) rmSync(path, { force: true });
       continue;
     }
     if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
     const pid = sidecarPid(reclaimSidecar(path));
     if (pid !== null && options.isPidAlive(pid)) continue;
-    startTrashReclaim(path, options, false);
+    if (reclaimsInFlight.has(path)) continue;
+    queued.push({
+      path,
+      bytes: trashedBytes(path),
+      trashedAtMs: trashedAtMs(path),
+    });
+  }
+  let slots = reclaimConcurrency(options)
+    - countLiveTrashReclaims(trashBase, options.isPidAlive);
+  if (slots <= 0) return;
+  queued.sort((left, right) =>
+    (right.bytes ?? 0) - (left.bytes ?? 0)
+    || left.trashedAtMs - right.trashedAtMs);
+  for (const entry of queued) {
+    if (slots <= 0) break;
+    startTrashReclaim(entry.path, options, false);
+    slots -= 1;
   }
 }
 
@@ -4452,7 +4591,16 @@ async function removeAttemptWorktree(
   options: CleanupAttemptOptions,
 ): Promise<AttemptCleanupResult | null> {
   if (!existsSync(manifest.paths.worktree)) return null;
-  const trashed = trashDirectory(manifest.paths.worktree, manifest.attemptId, options);
+  const trashed = trashDirectory(
+    manifest.paths.worktree,
+    manifest.attemptId,
+    options,
+    // What this attempt is known to have cost, so the pool can put the
+    // biggest bytes first (#179). The recorded footprint if the exit
+    // transition measured one, else the largest live sample taken of it
+    // (#158); neither, and the entry drains oldest-first.
+    manifest.worktreeBytes ?? manifest.worktreePeakBytes,
+  );
   if (trashed !== null) {
     fsyncDirectory(manifest.paths.attemptDir);
     try {
@@ -4826,7 +4974,7 @@ export async function sweepDeadAttempts(
   // interrupt a `git worktree remove` or a recursive rmSync once it has begun.
   const budgetSpent = (): boolean => monotonicNow() - sweepStartedAt >= budgetMs;
 
-  adoptTrashedDirectories(options);
+  startQueuedTrashReclaims(options);
 
   if (
     diskFloorBytes !== undefined
