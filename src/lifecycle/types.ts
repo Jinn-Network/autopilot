@@ -518,17 +518,19 @@ export type NewWorkAction =
   | {
       /**
        * Fill the triage gaps that make an ordinary board issue unclaimable
-       * (#166): a missing Project Priority, and a missing native Issue Type
-       * that an explicit conventional title prefix names. At least one of the
-       * two is always present — an action with neither writes nothing and is
-       * never planned.
+       * (#166, #171): a missing Project Priority, a missing native Issue Type
+       * that an explicit conventional title prefix names, and an empty Project
+       * `Blocked on`. At least one of the three is always present — an action
+       * with none writes nothing and is never planned.
        *
        * Never planned for a machine child: that issue's expected triage lives
        * on its own marker and `repair-machine-child` owns it.
        *
        * `issueType` and `priority` are structurally the dispatcher's
        * `IssueShape` and `Priority`, spelled out here so this module stays the
-       * leaf it is.
+       * leaf it is. `blockedOn` is narrower than the board field on purpose:
+       * `Human` and `Another issue` are operator decisions, so the only value
+       * this engine ever writes is the absence of a block.
        */
       readonly kind: 'triage-defaults';
       readonly issueNumber: number;
@@ -537,6 +539,7 @@ export type NewWorkAction =
         | 'feat' | 'fix' | 'refactor' | 'spike' | 'chore'
         | 'docs' | 'test' | 'incident' | 'design';
       readonly priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4';
+      readonly blockedOn?: 'Nothing';
     }
   | {
       /**

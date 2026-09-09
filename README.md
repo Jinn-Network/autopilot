@@ -150,9 +150,9 @@ holds back reports `disk-floor` with the arithmetic that produced it.
 
 ## Board triage defaults
 
-An issue on the Project board with no **Priority**, or no native **Issue
-Type**, is refused by the eligibility cascade and never claimed. Autopilot
-fills those two gaps itself:
+An issue on the Project board with no **Priority**, no native **Issue Type**,
+or an empty **Blocked on** is refused by the eligibility cascade and never
+claimed. Autopilot fills those three gaps itself:
 
 ```json
 "triage": {
@@ -169,15 +169,18 @@ Issue Type **only** from an explicit conventional title prefix — `fix:`,
 `feat(scope)`, `chore …`, `refactor`, `docs`, `test`, `design`, `spike`,
 `incident`. A title with no prefix keeps no type and is never guessed at: the
 type decides what kind of session runs, so a wrong guess costs more than the
-wait. Machine children are left to their own repair.
+wait. An empty `Blocked on` is written `Nothing` — the absence of a block
+spelled out, which is what the cascade requires; `Human` and `Another issue`
+are deliberate operator holds and are never touched. Machine children are left
+to their own repair.
 
 Both keys are optional — a config written before they existed keeps loading
 and gets these defaults. At most ten issues are triaged per cycle, so a first
 run over a neglected board cannot turn one cycle into a mutation burst; the
 rest are picked up by later cycles. Every cycle also logs one
-`untriaged: no-type=… no-priority=…` line, and `backlog: ordinary=` counts
-only issues that pass the triage cascade — the claimable number, not the
-open-issue number.
+`untriaged: no-type=… no-priority=… no-blocked-on=…` line, and
+`backlog: ordinary=` counts only issues that pass the triage cascade — the
+claimable number, not the open-issue number.
 
 ## Worker session lifetime
 

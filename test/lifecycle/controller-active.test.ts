@@ -375,6 +375,53 @@ describe('active lifecycle controller', () => {
         .toContain('triage-defaults issue:3192: applied (priority P3).');
     });
 
+    // #171: the third gate. Priority and Issue Type set is not enough — a
+    // board row whose Blocked on was never touched is still refused.
+    it('plans Blocked on = Nothing for a board row that has none', async () => {
+      const actions: unknown[] = [];
+      const controller = triageDeps(untriagedSnapshot([{
+        number: 3910,
+        shape: 'fix',
+        priority: 'P2',
+        blockedOn: null,
+      }]));
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'applied', reason: 'blocked-on Nothing' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([{
+        kind: 'triage-defaults',
+        issueNumber: 3910,
+        projectItemId: 'PVTI_3983',
+        blockedOn: 'Nothing',
+      }]);
+      expect(renderLifecycleHuman(report).split('\n'))
+        .toContain('triage-defaults issue:3910: applied (blocked-on Nothing).');
+    });
+
+    it('plans all three gaps as one action', async () => {
+      const actions: unknown[] = [];
+      const controller = triageDeps(untriagedSnapshot([{ blockedOn: null }]));
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'applied', reason: 'type fix, priority P3, blocked-on Nothing' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([{
+        kind: 'triage-defaults',
+        issueNumber: 3983,
+        projectItemId: 'PVTI_3983',
+        issueType: 'fix',
+        priority: 'P3',
+        blockedOn: 'Nothing',
+      }]);
+    });
+
     it('leaves a machine child to its own repair', async () => {
       const actions: unknown[] = [];
       const controller = triageDeps(untriagedSnapshot([{
@@ -429,7 +476,7 @@ describe('active lifecycle controller', () => {
       // The remainder is not lost: the line still names every gap, and the
       // next cycle re-derives the fifteen this one did not reach.
       expect(renderLifecycleHuman(report).split('\n'))
-        .toContain('untriaged: no-type=0 no-priority=25');
+        .toContain('untriaged: no-type=0 no-priority=25 no-blocked-on=0');
     });
   });
 

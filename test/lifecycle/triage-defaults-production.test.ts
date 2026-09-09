@@ -76,6 +76,7 @@ function mapping(): NonNullable<ProductionTriageDefaultsOptions['projectMapping'
 function state(input: {
   readonly issueType: string | null;
   readonly priority: string | null;
+  readonly blockedOn?: string | null;
   readonly issueState?: string;
   readonly itemIssueNumber?: number;
   readonly repository?: string;
@@ -100,6 +101,9 @@ function state(input: {
           repository: { nameWithOwner: input.repository ?? 'Jinn-Network/mono' },
         },
         priority: input.priority === null ? null : { name: input.priority },
+        blockedOn: input.blockedOn === undefined || input.blockedOn === null
+          ? null
+          : { name: input.blockedOn },
       },
     },
   });
@@ -122,8 +126,16 @@ function options(
  * so the readback guard and the final readback are exercised against something
  * that actually moves.
  */
-function board(initial: { issueType: string | null; priority: string | null }) {
-  const live = { ...initial };
+function board(initial: {
+  issueType: string | null;
+  priority: string | null;
+  blockedOn?: string | null;
+}) {
+  const live = {
+    issueType: initial.issueType,
+    priority: initial.priority,
+    blockedOn: initial.blockedOn === undefined ? 'Nothing' : initial.blockedOn,
+  };
   const commands: string[] = [];
   const runner = async (_cmd: string, args: readonly string[]): Promise<string> => {
     if (args[0] === 'api' && args.some((arg) => arg.includes('TriageDefaultsState'))) {
@@ -137,8 +149,10 @@ function board(initial: { issueType: string | null; priority: string | null }) {
       return '{"data":{}}';
     }
     if (args[0] === 'project' && args[1] === 'item-edit') {
+      const fieldId = String(args[args.indexOf('--field-id') + 1]);
       commands.push(`item-edit:${String(args[args.indexOf('--single-select-option-id') + 1])}`);
-      live.priority = 'P3';
+      if (fieldId === 'PVTSSF_blocked') live.blockedOn = 'Nothing';
+      else live.priority = 'P3';
       return '';
     }
     throw new Error(`unexpected command: ${args.join(' ')}`);
@@ -154,7 +168,7 @@ describe('production board triage defaults (#166)', () => {
       .resolves.toEqual({ status: 'applied', detail: 'type fix, priority P3' });
     expect(fake.commands.filter((command) => command !== 'read'))
       .toEqual(['type:typeId=IT_fix', 'item-edit:opt_p3']);
-    expect(fake.live).toEqual({ issueType: 'fix', priority: 'P3' });
+    expect(fake.live).toEqual({ issueType: 'fix', priority: 'P3', blockedOn: 'Nothing' });
   });
 
   it('writes only the Priority when the action names no type', async () => {
@@ -205,6 +219,154 @@ describe('production board triage defaults (#166)', () => {
       });
     expect(fake.commands.filter((command) => command !== 'read'))
       .toEqual(['item-edit:opt_p3']);
+  });
+
+  // #171: the third gate. A board row added without touching Blocked on
+  // reads empty, and the cascade refuses it as "Project Blocked on is unset".
+  it('writes Blocked on = Nothing for an empty board field and reports it', async () => {
+    const fake = board({ issueType: 'fix', priority: 'P1', blockedOn: null });
+
+    await expect(executeProductionTriageDefaults(
+      {
+        kind: 'triage-defaults',
+        issueNumber: 3983,
+        projectItemId: 'PVTI_3983',
+        blockedOn: 'Nothing',
+      },
+      options(fake.runner),
+    )).resolves.toEqual({ status: 'applied', detail: 'blocked-on Nothing' });
+    expect(fake.commands.filter((command) => command !== 'read'))
+      .toEqual(['item-edit:b_nothing']);
+    expect(fake.live.blockedOn).toBe('Nothing');
+  });
+
+  it('writes all three gaps in one action and names them in order', async () => {
+    const fake = board({ issueType: null, priority: null, blockedOn: null });
+
+    await expect(executeProductionTriageDefaults(
+      { ...ACTION, blockedOn: 'Nothing' },
+      options(fake.runner),
+    )).resolves.toEqual({
+      status: 'applied',
+      detail: 'type fix, priority P3, blocked-on Nothing',
+    });
+    expect(fake.commands.filter((command) => command !== 'read'))
+      .toEqual(['type:typeId=IT_fix', 'item-edit:opt_p3', 'item-edit:b_nothing']);
+    expect(fake.live)
+      .toEqual({ issueType: 'fix', priority: 'P3', blockedOn: 'Nothing' });
+  });
+
+  // `Human` and `Another issue` are deliberate operator values: the readback
+  // guard must refuse them exactly as it refuses a Priority set underneath.
+  it('refuses and reports a Blocked on that was set underneath', async () => {
+    const fake = board({ issueType: 'fix', priority: 'P1', blockedOn: 'Human' });
+
+    await expect(executeProductionTriageDefaults(
+      {
+        kind: 'triage-defaults',
+        issueNumber: 3983,
+        projectItemId: 'PVTI_3983',
+        blockedOn: 'Nothing',
+      },
+      options(fake.runner),
+    )).resolves.toEqual({
+      status: 'skipped',
+      reason: 'Blocked on Human was set underneath',
+    });
+    expect(fake.commands.filter((command) => command !== 'read')).toEqual([]);
+  });
+
+  it('fails closed when the final readback does not show the Blocked on write', async () => {
+    await expect(executeProductionTriageDefaults(
+      {
+        kind: 'triage-defaults',
+        issueNumber: 3983,
+        projectItemId: 'PVTI_3983',
+        blockedOn: 'Nothing',
+      },
+      options(async (_cmd, args) => {
+        if (args[0] === 'api' && args.some((arg) => arg.includes('TriageDefaultsState'))) {
+          return state({ issueType: 'fix', priority: 'P1', blockedOn: null });
+        }
+        if (args[0] === 'project' && args[1] === 'item-edit') return '';
+        throw new Error(`unexpected command: ${args.join(' ')}`);
+      }),
+    )).rejects.toThrow(/final readback/i);
+  });
+
+  it('reads the project field list once for both board writes', async () => {
+    const live = {
+      issueType: 'fix' as string | null,
+      priority: null as string | null,
+      blockedOn: null as string | null,
+    };
+    let fieldLists = 0;
+    const result = await executeProductionTriageDefaults(
+      {
+        kind: 'triage-defaults',
+        issueNumber: 3983,
+        projectItemId: 'PVTI_3983',
+        priority: 'P3',
+        blockedOn: 'Nothing',
+      },
+      {
+        runner: async (_cmd, args) => {
+          if (args[0] === 'api' && args.some((arg) => arg.includes('TriageDefaultsState'))) {
+            return state(live);
+          }
+          if (args[0] === 'project' && args[1] === 'field-list') {
+            fieldLists += 1;
+            return JSON.stringify({
+              fields: [
+                {
+                  id: 'PVTSSF_blocked',
+                  name: 'Blocked on',
+                  options: [
+                    { id: 'b_nothing', name: 'Nothing' },
+                    { id: 'b_human', name: 'Human' },
+                  ],
+                },
+                {
+                  id: 'PVTSSF_effort',
+                  name: 'Effort',
+                  options: [
+                    { id: 'e_low', name: 'Low' },
+                    { id: 'e_medium', name: 'Medium' },
+                    { id: 'e_high', name: 'High' },
+                    { id: 'e_xhigh', name: 'XHigh' },
+                    { id: 'e_max', name: 'Max' },
+                  ],
+                },
+                {
+                  id: 'PVTSSF_priority',
+                  name: 'Priority',
+                  options: [
+                    { id: 'opt_p0', name: 'P0' },
+                    { id: 'opt_p1', name: 'P1' },
+                    { id: 'opt_p2', name: 'P2' },
+                    { id: 'opt_p3', name: 'P3' },
+                    { id: 'opt_p4', name: 'P4' },
+                  ],
+                },
+              ],
+            });
+          }
+          if (args[0] === 'project' && args[1] === 'item-edit') {
+            const fieldId = String(args[args.indexOf('--field-id') + 1]);
+            if (fieldId === 'PVTSSF_blocked') live.blockedOn = 'Nothing';
+            else live.priority = 'P3';
+            return '';
+          }
+          throw new Error(`unexpected command: ${args.join(' ')}`);
+        },
+        repo: 'Jinn-Network/mono',
+        projectOwner: 'Jinn-Network',
+        projectNumber: 1,
+      },
+    );
+
+    expect(result).toEqual({ status: 'applied', detail: 'priority P3, blocked-on Nothing' });
+    expect(fieldLists).toBe(1);
   });
 
   it('refuses a Project item that does not belong to the named issue', async () => {

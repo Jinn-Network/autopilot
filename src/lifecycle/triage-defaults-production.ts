@@ -1,12 +1,15 @@
 /**
- * Production board-triage writer (#166).
+ * Production board-triage writer (#166, #171).
  *
  * The mutation surface is exactly the machine-child repair's: one
- * `updateIssueIssueType` GraphQL mutation for the native Issue Type, and one
- * `gh project item-edit` for the Project Priority, each guarded by a readback
- * taken immediately before the write. The guard is the whole point — a field a
- * human filled in between the snapshot and the write must be left alone, and
- * the refusal reported rather than swallowed.
+ * `updateIssueIssueType` GraphQL mutation for the native Issue Type, and a
+ * `gh project item-edit` for each board field — Priority and `Blocked on` —
+ * each guarded by a readback taken immediately before the write. The guard is
+ * the whole point: a field a human filled in between the snapshot and the
+ * write must be left alone, and the refusal reported rather than swallowed.
+ * That guard is also why `Blocked on` is safe to default at all — `Human` and
+ * `Another issue` are operator decisions, and the readback is what proves
+ * neither is what this write would overwrite.
  *
  * What differs from the child repair is the READ. The child repair pages the
  * whole Project to find its item; this action already carries the item id the
@@ -68,6 +71,9 @@ query TriageDefaultsState(
       priority: fieldValueByName(name: "Priority") {
         ... on ProjectV2ItemFieldSingleSelectValue { name }
       }
+      blockedOn: fieldValueByName(name: "Blocked on") {
+        ... on ProjectV2ItemFieldSingleSelectValue { name }
+      }
     }
   }
 }
@@ -97,6 +103,7 @@ interface TriageDefaultsState {
   readonly issueType: string | null;
   readonly projectId: string;
   readonly priority: string | null;
+  readonly blockedOn: string | null;
 }
 
 function optionalSelectName(value: unknown, label: string): string | null {
@@ -195,6 +202,7 @@ async function readTriageDefaultsState(
     issueType: optionalSelectName((issue as { issueType?: unknown }).issueType, 'Issue Type'),
     projectId: (node as { project: { id: string } }).project.id,
     priority: optionalSelectName((node as { priority?: unknown }).priority, 'Priority'),
+    blockedOn: optionalSelectName((node as { blockedOn?: unknown }).blockedOn, 'Blocked on'),
   };
 }
 
@@ -256,40 +264,81 @@ function createIssueTypeIdResolver(
   };
 }
 
-async function priorityOptionId(
+interface ProjectFieldOption {
+  readonly fieldId: string;
+  readonly optionId: string;
+}
+
+/**
+ * Board field ids for the two `item-edit` writes, from config where an
+ * operator pinned them and from the Project otherwise. The discovery read is
+ * memoised for the life of the caller: one action can name both Priority and
+ * `Blocked on`, and paying for a whole `field-list` twice to write two options
+ * off the same board is a round trip nobody needs.
+ */
+function createProjectFieldResolver(
   runner: CommandRunner,
-  priority: NonNullable<TriageDefaultsAction['priority']>,
   projectMapping: ProjectMapping | undefined,
   projectOwner: string,
   projectNumber: number,
-): Promise<{ readonly fieldId: string; readonly optionId: string }> {
-  if (projectMapping !== undefined) {
-    const key = priority.toLowerCase() as 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
-    return {
-      fieldId: projectMapping.fields.priority.id,
-      optionId: projectMapping.fields.priority.options[key],
-    };
-  }
-  const fields = parseTriageFields(await runner('gh', [
-    'project', 'field-list', String(projectNumber),
-    '--owner', projectOwner,
-    '--format', 'json',
-  ]));
-  const optionId = fields.priority.options[priority];
-  if (optionId === undefined) {
-    throw new Error(`Project Priority field carries no ${priority} option`);
-  }
-  return { fieldId: fields.priority.fieldId, optionId };
+): {
+  readonly priority: (
+    priority: NonNullable<TriageDefaultsAction['priority']>,
+  ) => Promise<ProjectFieldOption>;
+  readonly blockedOnNothing: () => Promise<ProjectFieldOption>;
+} {
+  type ProjectFields = ReturnType<typeof parseTriageFields>;
+  let discovered: Promise<ProjectFields> | undefined;
+  const discover = async (): Promise<ProjectFields> => parseTriageFields(
+    await runner('gh', [
+      'project', 'field-list', String(projectNumber),
+      '--owner', projectOwner,
+      '--format', 'json',
+    ]),
+  );
+  return {
+    priority: async (priority) => {
+      if (projectMapping !== undefined) {
+        const key = priority.toLowerCase() as 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+        return {
+          fieldId: projectMapping.fields.priority.id,
+          optionId: projectMapping.fields.priority.options[key],
+        };
+      }
+      discovered ??= discover();
+      const fields = await discovered;
+      const optionId = fields.priority.options[priority];
+      if (optionId === undefined) {
+        throw new Error(`Project Priority field carries no ${priority} option`);
+      }
+      return { fieldId: fields.priority.fieldId, optionId };
+    },
+    blockedOnNothing: async () => {
+      if (projectMapping !== undefined) {
+        return {
+          fieldId: projectMapping.fields.blockedOn.id,
+          optionId: projectMapping.fields.blockedOn.options.nothing,
+        };
+      }
+      discovered ??= discover();
+      const fields = await discovered;
+      return {
+        fieldId: fields.blockedOn.fieldId,
+        optionId: fields.blockedOn.nothingOptionId,
+      };
+    },
+  };
 }
 
 /**
  * Applies one issue's triage defaults, or reports why it did not.
  *
  * `applied` names what was written, in the exact shape the cycle log renders
- * (`triage-defaults issue:N: applied (type fix, priority P3)`). A gap that
- * closed underneath is refused and named; when every gap closed underneath
- * nothing was written and the action reports `skipped`, which is the right
- * answer — a human filling the field in IS the outcome this action wanted.
+ * (`triage-defaults issue:N: applied (type fix, priority P3, blocked-on
+ * Nothing)`). A gap that closed underneath is refused and named; when every
+ * gap closed underneath nothing was written and the action reports `skipped`,
+ * which is the right answer — a human filling the field in IS the outcome
+ * this action wanted.
  */
 export async function executeProductionTriageDefaults(
   action: TriageDefaultsAction,
@@ -299,7 +348,11 @@ export async function executeProductionTriageDefaults(
   readonly detail?: string;
   readonly reason?: string;
 }> {
-  if (action.issueType === undefined && action.priority === undefined) {
+  if (
+    action.issueType === undefined
+    && action.priority === undefined
+    && action.blockedOn === undefined
+  ) {
     throw new Error('Triage-defaults action names no field to write');
   }
   const runner = options.runner ?? defaultRunner;
@@ -307,6 +360,12 @@ export async function executeProductionTriageDefaults(
   const projectOwner = options.projectOwner ?? ORG;
   const projectNumber = options.projectNumber ?? PROJECT_NUMBER;
   const resolveIssueTypeId = createIssueTypeIdResolver(runner, repo, options.projectMapping);
+  const projectFields = createProjectFieldResolver(
+    runner,
+    options.projectMapping,
+    projectOwner,
+    projectNumber,
+  );
   const refresh = (): Promise<TriageDefaultsState> =>
     readTriageDefaultsState(runner, action, repo);
 
@@ -342,13 +401,7 @@ export async function executeProductionTriageDefaults(
     if (current.priority !== null) {
       refused.push(`Priority ${current.priority} was set underneath`);
     } else {
-      const field = await priorityOptionId(
-        runner,
-        action.priority,
-        options.projectMapping,
-        projectOwner,
-        projectNumber,
-      );
+      const field = await projectFields.priority(action.priority);
       current = await refresh();
       if (current.priority !== null) {
         refused.push(`Priority ${current.priority} was set underneath`);
@@ -370,6 +423,34 @@ export async function executeProductionTriageDefaults(
     }
   }
 
+  // Last, so the applied detail reads in the order the fields were named:
+  // `type fix, priority P3, blocked-on Nothing`.
+  if (action.blockedOn !== undefined) {
+    if (current.blockedOn !== null) {
+      refused.push(`Blocked on ${current.blockedOn} was set underneath`);
+    } else {
+      const field = await projectFields.blockedOnNothing();
+      current = await refresh();
+      if (current.blockedOn !== null) {
+        refused.push(`Blocked on ${current.blockedOn} was set underneath`);
+      } else {
+        await runner('gh', [
+          'project',
+          'item-edit',
+          '--id',
+          action.projectItemId,
+          '--project-id',
+          current.projectId,
+          '--field-id',
+          field.fieldId,
+          '--single-select-option-id',
+          field.optionId,
+        ]);
+        applied.push(`blocked-on ${action.blockedOn}`);
+      }
+    }
+  }
+
   if (applied.length === 0) {
     return { status: 'skipped', reason: refused.join('; ') };
   }
@@ -383,6 +464,9 @@ export async function executeProductionTriageDefaults(
       : null,
     applied.includes(`priority ${action.priority}`) && final.priority === null
       ? 'Priority'
+      : null,
+    applied.includes(`blocked-on ${action.blockedOn}`) && final.blockedOn === null
+      ? 'Blocked on'
       : null,
   ].filter((value): value is string => value !== null);
   if (unwritten.length > 0) {

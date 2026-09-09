@@ -20,6 +20,7 @@ function issue(
     body: '',
     shape: 'feat',
     priority: 'P1',
+    blockedOn: 'Nothing',
     status: 'Todo',
     onBoard: true,
     projectItemId: `PVTI_${number}`,
@@ -58,15 +59,33 @@ describe('conventional title-prefix inference (#166)', () => {
   });
 });
 
-describe('triage gaps (#166)', () => {
-  it('names the two missing fields independently', () => {
-    expect(triageGaps(issue(1))).toEqual({ noType: false, noPriority: false });
+describe('triage gaps (#166, #171)', () => {
+  it('names the three missing fields independently', () => {
+    expect(triageGaps(issue(1)))
+      .toEqual({ noType: false, noPriority: false, noBlockedOn: false });
     expect(triageGaps(issue(2, { shape: null })))
-      .toEqual({ noType: true, noPriority: false });
+      .toEqual({ noType: true, noPriority: false, noBlockedOn: false });
     expect(triageGaps(issue(3, { priority: null })))
-      .toEqual({ noType: false, noPriority: true });
-    expect(triageGaps(issue(4, { shape: null, priority: null })))
-      .toEqual({ noType: true, noPriority: true });
+      .toEqual({ noType: false, noPriority: true, noBlockedOn: false });
+    expect(triageGaps(issue(4, { blockedOn: null })))
+      .toEqual({ noType: false, noPriority: false, noBlockedOn: true });
+    expect(triageGaps(issue(5, { shape: null, priority: null, blockedOn: null })))
+      .toEqual({ noType: true, noPriority: true, noBlockedOn: true });
+  });
+
+  // #171: an empty Blocked on is the third gate the cascade refuses on, and
+  // the one that kept nineteen of #166's twenty issues unclaimable.
+  it('reads an empty Blocked on as untriaged', () => {
+    expect(isUntriaged(issue(8, { blockedOn: null }))).toBe(true);
+  });
+
+  // `Human` and `Another issue` are holds an operator chose, not fields
+  // nobody filled in: counting them relabels parked work as neglected work.
+  it('reads an operator-set Blocked on as no gap at all', () => {
+    for (const blockedOn of ['Human', 'Another issue'] as const) {
+      expect(triageGaps(issue(9, { blockedOn })).noBlockedOn).toBe(false);
+      expect(isUntriaged(issue(9, { blockedOn }))).toBe(false);
+    }
   });
 
   it('reads an off-board issue as missing its Priority', () => {
@@ -94,6 +113,39 @@ describe('planTriageDefaults (#166)', () => {
       POLICY,
     )).toEqual([
       { issueNumber: 11, projectItemId: 'PVTI_11', issueType: 'fix' },
+    ]);
+  });
+
+  it('plans Blocked on = Nothing for a board issue whose Blocked on is empty', () => {
+    expect(planTriageDefaults([issue(21, { blockedOn: null })], POLICY)).toEqual([
+      { issueNumber: 21, projectItemId: 'PVTI_21', blockedOn: 'Nothing' },
+    ]);
+  });
+
+  it('never writes over a Blocked on an operator set', () => {
+    expect(planTriageDefaults([
+      issue(22, { blockedOn: 'Human' }),
+      issue(23, { blockedOn: 'Another issue' }),
+    ], POLICY)).toEqual([]);
+  });
+
+  it('plans all three gaps as one action', () => {
+    expect(planTriageDefaults(
+      [issue(24, {
+        shape: null,
+        priority: null,
+        blockedOn: null,
+        title: 'docs: explain the cascade',
+      })],
+      POLICY,
+    )).toEqual([
+      {
+        issueNumber: 24,
+        projectItemId: 'PVTI_24',
+        issueType: 'docs',
+        priority: 'P3',
+        blockedOn: 'Nothing',
+      },
     ]);
   });
 
@@ -162,5 +214,28 @@ describe('planTriageDefaults (#166)', () => {
     // oldest gaps closed first, and the order is the same every cycle.
     expect(planned.map((entry) => entry.issueNumber))
       .toEqual([176, 177, 178, 179, 180, 181, 182, 183, 184, 185]);
+  });
+
+  // The bound counts issues, not fields (#171): three gaps on one issue is
+  // still one issue's worth of the cycle's budget.
+  it('counts issues, not fields, against the per-cycle bound', () => {
+    const neglected = Array.from({ length: 25 }, (_, index) => (
+      issue(300 + index, {
+        shape: null,
+        priority: null,
+        blockedOn: null,
+        title: 'fix: neglected',
+      })
+    ));
+    const planned = planTriageDefaults(neglected, POLICY);
+
+    expect(planned).toHaveLength(MAX_TRIAGE_DEFAULTS_PER_CYCLE);
+    expect(planned[0]).toEqual({
+      issueNumber: 300,
+      projectItemId: 'PVTI_300',
+      issueType: 'fix',
+      priority: 'P3',
+      blockedOn: 'Nothing',
+    });
   });
 });

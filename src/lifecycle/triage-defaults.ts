@@ -7,7 +7,7 @@
  * refusal: twenty ordinary issues sat unclaimable on the mono board, some for
  * twelve days, while both implementation lanes reported starvation.
  *
- * So the engine fills the two gaps it can fill safely, and reports the rest:
+ * So the engine fills the three gaps it can fill safely, and reports the rest:
  *
  *  - A missing Priority becomes the configured default. Priority decides claim
  *    order, and a conservative default only makes the issue reachable — it
@@ -17,20 +17,25 @@
  *    produces a spec, a `refactor` expects stacked PRs), so a wrong guess is
  *    worse than a wait: with no prefix, the type stays unset forever and the
  *    issue is reported as `no-type` instead.
+ *  - An EMPTY `Blocked on` becomes `Nothing` (#171). A board row added without
+ *    touching the field reads neither `Nothing` nor `Human`, and the cascade
+ *    refuses it as "Project Blocked on is unset" — which is what still held
+ *    nineteen of the twenty issues #166 was written for. `Nothing` is the
+ *    absence of a block spelled out, so writing it asserts nothing new.
  *
  * Pure and total: this module decides, it never writes. The board mutation and
  * its readback guard live in `triage-defaults-production.ts`.
  */
 
 import { isMachineChildIssue } from './child-issues.js';
-import type { IssueShape, Priority, ProjectStatus } from '../dispatcher/types.js';
+import type { BlockedOn, IssueShape, Priority, ProjectStatus } from '../dispatcher/types.js';
 
 /**
  * How many issues one cycle may triage.
  *
  * `planTriageDefaults` is complete by design: the first armed cycle over a
  * neglected board can name dozens of issues at once, and each of them costs a
- * readback plus one or two Project mutations. Turning one cycle into a
+ * readback plus up to three Project mutations. Turning one cycle into a
  * mutation burst against a board a human is also editing is not recoverable by
  * waiting; the remainder is, because nothing about an untriaged issue decays
  * and the next cycle re-derives it unchanged.
@@ -66,6 +71,8 @@ export interface TriageDefaultsIssue {
   /** The repository's NATIVE Issue Type, not a board field. */
   readonly shape: IssueShape | null;
   readonly priority: Priority | null;
+  /** The Project board field, not a native one; `null` is the unset gap. */
+  readonly blockedOn: BlockedOn | null;
   readonly status: ProjectStatus | null;
   readonly onBoard: boolean;
   readonly projectItemId: string | null;
@@ -80,45 +87,52 @@ export interface TriageDefaultsPolicy {
 export interface TriageGaps {
   readonly noType: boolean;
   readonly noPriority: boolean;
+  readonly noBlockedOn: boolean;
 }
 
+/** The facts every gap is read from — structurally a subset of `PolledIssue`. */
+type TriageSubject = {
+  readonly shape: IssueShape | null;
+  readonly priority: Priority | null;
+  readonly blockedOn: BlockedOn | null;
+};
+
 /**
- * The two gaps the eligibility cascade refuses on, read independently so the
+ * The three gaps the eligibility cascade refuses on, read independently so the
  * summary can count them separately. An issue with no board row necessarily
  * has no Priority — Priority is a board field — so it lands in `noPriority`
  * without needing a bucket of its own.
  *
- * `Blocked on: Human` is deliberately NOT a gap: it is a hold an operator
- * chose, not a field nobody filled in, and folding it in here would relabel
- * parked work as neglected work.
+ * `Blocked on: Human` and `Blocked on: Another issue` are deliberately NOT
+ * gaps: they are holds an operator chose, not fields nobody filled in, and
+ * folding them in here would relabel parked work as neglected work. Only the
+ * empty field is a gap.
  */
-export function triageGaps(issue: {
-  readonly shape: IssueShape | null;
-  readonly priority: Priority | null;
-}): TriageGaps {
+export function triageGaps(issue: TriageSubject): TriageGaps {
   return {
     noType: issue.shape === null,
     noPriority: issue.priority === null,
+    noBlockedOn: issue.blockedOn === null,
   };
 }
 
-export function isUntriaged(issue: {
-  readonly shape: IssueShape | null;
-  readonly priority: Priority | null;
-}): boolean {
+export function isUntriaged(issue: TriageSubject): boolean {
   const gaps = triageGaps(issue);
-  return gaps.noType || gaps.noPriority;
+  return gaps.noType || gaps.noPriority || gaps.noBlockedOn;
 }
 
 /**
- * One issue's planned defaults. At least one of `issueType` / `priority` is
- * always present — an issue with nothing to write is not planned at all.
+ * One issue's planned defaults. At least one of `issueType` / `priority` /
+ * `blockedOn` is always present — an issue with nothing to write is not
+ * planned at all. `blockedOn` is `'Nothing'` or absent: the other two board
+ * values are operator decisions this planner never produces.
  */
 export interface TriageDefaultsPlanItem {
   readonly issueNumber: number;
   readonly projectItemId: string;
   readonly issueType?: IssueShape;
   readonly priority?: Priority;
+  readonly blockedOn?: 'Nothing';
 }
 
 /**
@@ -137,9 +151,9 @@ export function planTriageDefaults(
   const planned: TriageDefaultsPlanItem[] = [];
   for (const issue of [...issues].sort((left, right) => left.number - right.number)) {
     if (isMachineChildIssue({ body: issue.body })) continue;
-    // Both writes need a Project item to edit — the Priority write literally,
-    // and the type write because an issue off the board is not work this
-    // engine has been handed at all.
+    // Every write needs a Project item to edit — the two board writes
+    // literally, and the type write because an issue off the board is not
+    // work this engine has been handed at all.
     if (!issue.onBoard || issue.projectItemId === null) continue;
     if (issue.status === 'Done') continue;
     const gaps = triageGaps(issue);
@@ -147,12 +161,14 @@ export function planTriageDefaults(
       ? inferIssueShapeFromTitle(issue.title)
       : null;
     const priority = gaps.noPriority ? policy.defaultPriority : null;
-    if (issueType === null && priority === null) continue;
+    const blockedOn = gaps.noBlockedOn ? 'Nothing' as const : null;
+    if (issueType === null && priority === null && blockedOn === null) continue;
     planned.push({
       issueNumber: issue.number,
       projectItemId: issue.projectItemId,
       ...(issueType === null ? {} : { issueType }),
       ...(priority === null ? {} : { priority }),
+      ...(blockedOn === null ? {} : { blockedOn }),
     });
     if (planned.length === MAX_TRIAGE_DEFAULTS_PER_CYCLE) break;
   }

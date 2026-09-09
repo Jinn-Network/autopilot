@@ -297,11 +297,12 @@ type LifecycleBacklogPriorityKey = 'p0' | 'p1' | 'p2' | 'p3' | 'p4' | 'unset';
  * competes for an ordinary claim the way a sweep does, so they are reported
  * separately rather than folded into `actionable`.
  *
- * `ordinary` counts only issues that pass the triage cascade (#166). An issue
- * with no Issue Type or no Priority is refused an ordinary claim, so counting
- * it here reported unclaimable work as claimable — on the mono board that was
- * twenty issues, some twelve days old, while both lanes reported starvation.
- * Those issues are named by `untriaged` instead, so nothing disappears.
+ * `ordinary` counts only issues that pass the triage cascade (#166, #171). An
+ * issue with no Issue Type, no Priority, or an empty `Blocked on` is refused
+ * an ordinary claim, so counting it here reported unclaimable work as
+ * claimable — on the mono board that was twenty issues, some twelve days old,
+ * while both lanes reported starvation. Those issues are named by `untriaged`
+ * instead, so nothing disappears.
  */
 export interface LifecycleBacklogSummary {
   readonly ordinary: number;
@@ -313,12 +314,15 @@ export interface LifecycleBacklogSummary {
   readonly ordinaryByPriority: Readonly<Record<LifecycleBacklogPriorityKey, number>>;
   /**
    * Ordinary open issues the triage cascade refuses, counted per missing
-   * field (#166). The two counts are independent, not a partition: an issue
-   * missing both fields is named by both.
+   * field (#166, #171). The three counts are independent, not a partition: an
+   * issue missing two fields is named by both. `noBlockedOn` counts only the
+   * EMPTY board field — `Human` and `Another issue` are operator holds, not
+   * neglect.
    */
   readonly untriaged: {
     readonly noType: number;
     readonly noPriority: number;
+    readonly noBlockedOn: number;
   };
   /**
    * Open review follow-ups on merged parents that no per-parent sweep can
@@ -883,6 +887,7 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
   let sweeps = 0;
   let noType = 0;
   let noPriority = 0;
+  let noBlockedOn = 0;
   for (const issue of issues) {
     const backlogClass = classifyBacklogIssue(issue);
     if (backlogClass === 'sweep') {
@@ -897,7 +902,8 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
       const gaps = triageGaps(issue);
       if (gaps.noType) noType += 1;
       if (gaps.noPriority) noPriority += 1;
-      if (gaps.noType || gaps.noPriority) continue;
+      if (gaps.noBlockedOn) noBlockedOn += 1;
+      if (gaps.noType || gaps.noPriority || gaps.noBlockedOn) continue;
       ordinary += 1;
       ordinaryByPriority[backlogPriorityKey(issue.priority)] += 1;
     }
@@ -910,7 +916,7 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
     sweeps,
     actionable: ordinary + sweeps,
     ordinaryByPriority,
-    untriaged: { noType, noPriority },
+    untriaged: { noType, noPriority, noBlockedOn },
     residue: residueInput === null ? 0 : countResidueFollowUps(residueInput),
   };
 }
@@ -1305,6 +1311,7 @@ function triageDefaultsCandidates(
     projectItemId: planned.projectItemId,
     ...(planned.issueType === undefined ? {} : { issueType: planned.issueType }),
     ...(planned.priority === undefined ? {} : { priority: planned.priority }),
+    ...(planned.blockedOn === undefined ? {} : { blockedOn: planned.blockedOn }),
   }));
 }
 
@@ -2611,8 +2618,8 @@ function paritySummary(
  * Renders the open-issue composition (#127) as three lines: the exact
  * `backlog: ordinary=N follow-ups=M children=K sweeps=S (actionable=A)`
  * summary, a per-priority breakdown of the ordinary set only, and the
- * untriaged gap counts (#166). All three flow through the one renderer, so
- * both the per-cycle log (the continuous cadence's own stdout) and
+ * untriaged gap counts (#166, #171). All three flow through the one renderer,
+ * so both the per-cycle log (the continuous cadence's own stdout) and
  * `autopilot status` (the same renderer run on-demand) show the composition —
  * never derived, persisted, or scheduled on; purely a read of the summary the
  * controller already computed.
@@ -2632,7 +2639,8 @@ function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[
         .join(' ')
     }`,
     `untriaged: no-type=${backlog.untriaged.noType} `
-      + `no-priority=${backlog.untriaged.noPriority}`,
+      + `no-priority=${backlog.untriaged.noPriority} `
+      + `no-blocked-on=${backlog.untriaged.noBlockedOn}`,
   ];
 }
 

@@ -143,6 +143,26 @@ describe('active local scheduler', () => {
     });
   });
 
+  // #171: the Blocked on default rides the same action as the other two.
+  it('carries the Blocked on default through to the action', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [{
+        phase: 'triage-defaults',
+        issueNumber: 3910,
+        projectItemId: 'PVTI_3910',
+        blockedOn: 'Nothing',
+      }],
+      remaining: { implementation: 0, child: 0, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([{
+      kind: 'triage-defaults',
+      issueNumber: 3910,
+      projectItemId: 'PVTI_3910',
+      blockedOn: 'Nothing',
+    }]);
+  });
+
   it('names a triage-defaults candidate by its own issue', () => {
     const plan = scheduleActiveActions(input({
       candidates: [{
