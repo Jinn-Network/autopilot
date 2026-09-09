@@ -12,12 +12,21 @@ import {
 } from './config/config.js';
 import { packageRoot } from './package-paths.js';
 import { readCapabilityAttestation } from './lifecycle/capability-attestation.js';
+import {
+  summarizeTrashBacklog,
+  trashBaseForV2,
+  type TrashBacklog,
+} from './lifecycle/attempt-workspace.js';
+import { measuredGb } from './lifecycle/disk-headroom.js';
 
 export type DoctorRunner = (
   command: string,
   args: string[],
   options?: { cwd?: string; env?: Record<string, string> },
 ) => Promise<string>;
+
+export const DISK_REMEDY =
+  'Free disk space or deliberately lower safety.diskFloorGb.';
 
 export const GIT_REF_CAPABILITIES_REMEDY =
   'Run `autopilot doctor --refresh-capabilities`, then rerun `autopilot doctor`.';
@@ -243,18 +252,63 @@ function validateSafePaths(loaded: LoadedAutopilotConfig): string {
   return `machine state is confined to ${resolvedRoot}`;
 }
 
-function validateDisk(loaded: LoadedAutopilotConfig): string {
-  let path = loaded.paths.root;
+/**
+ * What to tell an operator whose disk is under the floor (#179).
+ *
+ * "Free disk space" is the wrong instruction whenever the engine's own reclaim
+ * queue already holds more than the shortfall: those bytes are dead worktrees
+ * on their way out, a few at a time, and an operator who deletes something
+ * else — or drops the floor — has acted on a reading that was about to fix
+ * itself. It is the right instruction whenever the trash could not cover the
+ * gap even if it drained completely.
+ */
+export function diskShortfallRemedy(
+  shortfallBytes: number,
+  trash: TrashBacklog,
+): string {
+  if (trash.count === 0 || trash.bytes <= shortfallBytes) return DISK_REMEDY;
+  return `${trash.count} trashed worktree(s) hold ${measuredGb(trash.bytes)} `
+    + `awaiting reclaim, more than the ${measuredGb(shortfallBytes)} shortfall: `
+    + 'the sweep frees them a few at a time (cleanup.reclaimConcurrency). '
+    + 'Wait for the backlog to drain, raise cleanup.reclaimConcurrency, or '
+    + 'free disk space.';
+}
+
+/** Free bytes on the volume that holds this repository's machine state. */
+function availableDiskBytes(root: string): number {
+  let path = root;
   while (!existsSync(path)) path = resolve(path, '..');
   const stats = statfsSync(path);
-  const availableGb = Number(stats.bavail) * Number(stats.bsize) / 1_000_000_000;
-  if (availableGb < loaded.config.safety.diskFloorGb) {
-    throw new Error(
-      `${availableGb.toFixed(1)} GB free is below the configured `
-      + `${loaded.config.safety.diskFloorGb} GB floor`,
+  return Number(stats.bavail) * Number(stats.bsize);
+}
+
+function diskCheck(loaded: LoadedAutopilotConfig): DoctorCheck {
+  let available: number;
+  try {
+    available = availableDiskBytes(loaded.paths.root);
+  } catch (error) {
+    return check(
+      'disk',
+      'blocking',
+      error instanceof Error ? error.message : String(error),
+      DISK_REMEDY,
     );
   }
-  return `${availableGb.toFixed(1)} GB available`;
+  const availableGb = available / 1_000_000_000;
+  const floorGb = loaded.config.safety.diskFloorGb;
+  if (availableGb >= floorGb) {
+    return check('disk', 'pass', `${availableGb.toFixed(1)} GB available`);
+  }
+  return check(
+    'disk',
+    'blocking',
+    `${availableGb.toFixed(1)} GB free is below the configured `
+    + `${floorGb} GB floor`,
+    diskShortfallRemedy(
+      (floorGb - availableGb) * 1_000_000_000,
+      summarizeTrashBacklog(trashBaseForV2(join(loaded.paths.attempts, 'v2'))),
+    ),
+  );
 }
 
 export async function runDoctor(input: {
@@ -516,11 +570,7 @@ export async function runDoctor(input: {
     () => validateSafePaths(loaded),
     'Move AUTOPILOT_HOME to a private, repository-scoped location and correct its permissions.',
   ));
-  checks.push(await attempt(
-    'disk',
-    () => validateDisk(loaded),
-    'Free disk space or deliberately lower safety.diskFloorGb.',
-  ));
+  checks.push(diskCheck(loaded));
 
   if (!input.skipCapabilityAttestation) {
     checks.push(await attempt(

@@ -133,7 +133,9 @@ Optional one-off overrides:
 - `JINN_AUTOPILOT_BACKPRESSURE`
 
 If `doctor` blocks on disk space, free space or deliberately lower
-`safety.diskFloorGb` in that target config (default remains `10`).
+`safety.diskFloorGb` in that target config (default remains `10`). When the
+shortfall is smaller than what the engine's own trash is already queued to
+reclaim, `doctor` says so instead: those bytes are coming back on their own.
 
 The floor is evaluated against *projected* free space, not only current free
 space: a spawn's worktree lands minutes after the spawn, so the scheduler
