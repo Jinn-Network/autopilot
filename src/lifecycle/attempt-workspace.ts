@@ -210,20 +210,39 @@ export interface AttemptManifest {
    */
   readonly exitCode?: number | null;
   /**
-   * Bytes this attempt's worktree occupied when the child exited (#144).
+   * The footprint this attempt is recorded as having cost (#144).
    *
-   * Written once, at the exit transition, because that is the moment the
-   * worktree is both at its largest and still on disk. Additive and optional
-   * on exactly the `childKind` pattern: every manifest written before this
-   * field existed decodes unchanged and simply contributes no history. The
-   * disk-headroom projection reads these to learn what a phase actually costs
-   * on this host, and falls back to the configured default until enough of
-   * them exist.
+   * Written once, at the exit transition, from the larger of the measurement
+   * taken there and the largest live sample the attempt was seen at (#158) —
+   * the exit measurement alone is the *smallest* a worktree ever is, and
+   * teaching the projection that number under-reserved every later spawn.
+   * Additive and optional on exactly the `childKind` pattern: every manifest
+   * written before this field existed decodes unchanged and simply contributes
+   * no history. The disk-headroom projection reads these to learn what a phase
+   * actually costs on this host, above the configured default.
    *
-   * Absent also means "the measurement gave up" (see `measureWorktreeBytes`),
-   * so a missing value never asserts a small footprint.
+   * Absent also means "the measurement gave up" (see `measureWorktreeBytes`)
+   * and nothing sampled it while it ran, so a missing value never asserts a
+   * small footprint.
    */
   readonly worktreeBytes?: number;
+  /**
+   * The largest this attempt's worktree has been measured at while it ran
+   * (#158), or absent until something has measured it.
+   *
+   * A running maximum rather than the latest reading: the disk had to hold the
+   * largest, whatever the attempt deleted afterwards. Over-reserving costs a
+   * delayed spawn, under-reserving costs the volume.
+   */
+  readonly worktreePeakBytes?: number;
+  /**
+   * When the live worktree was last walked (#158), whatever the walk returned.
+   *
+   * Recorded even when the measurement gave up, because it is what rations the
+   * walks: a checkout too large to measure would otherwise be walked again
+   * every cycle for nothing, on the very disk the projection protects.
+   */
+  readonly worktreeSampledAt?: string;
   readonly paths: AttemptPaths;
   readonly timestamps: AttemptTimestamps;
 }
@@ -811,11 +830,20 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'pid',
     'terminalHead',
     'worktreeBytes',
+    'worktreePeakBytes',
+    'worktreeSampledAt',
     'paths',
     'timestamps',
     'runtime',
     'exitCode',
-  ], 'attempt manifest', ['execution', 'runtime', 'exitCode', 'sweep']);
+  ], 'attempt manifest', [
+    'execution',
+    'runtime',
+    'exitCode',
+    'sweep',
+    'worktreePeakBytes',
+    'worktreeSampledAt',
+  ]);
   if (manifest.version !== 2) throw new Error('Unsupported attempt manifest version');
   const phase = manifest.phase;
   if (phase !== 'implement' && phase !== 'review') {
@@ -910,6 +938,12 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const worktreeBytes = manifest.worktreeBytes === undefined
     ? undefined
     : nonNegativeInteger(manifest.worktreeBytes, 'worktree bytes');
+  const worktreePeakBytes = manifest.worktreePeakBytes === undefined
+    ? undefined
+    : nonNegativeInteger(manifest.worktreePeakBytes, 'worktree peak bytes');
+  const worktreeSampledAt = manifest.worktreeSampledAt === undefined
+    ? undefined
+    : isoTimestamp(stringField(manifest.worktreeSampledAt, 'worktree sampled timestamp'));
   const runtime = manifest.runtime === undefined
     ? undefined
     : decodeAttemptRuntime(manifest.runtime);
@@ -1005,6 +1039,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     pid,
     ...(terminalHead === undefined ? {} : { terminalHead }),
     ...(worktreeBytes === undefined ? {} : { worktreeBytes }),
+    ...(worktreePeakBytes === undefined ? {} : { worktreePeakBytes }),
+    ...(worktreeSampledAt === undefined ? {} : { worktreeSampledAt }),
     ...(runtime === undefined ? {} : { runtime }),
     ...(exitCode === undefined ? {} : { exitCode }),
     paths,
@@ -1302,6 +1338,10 @@ export function updateAttemptManifest(
     // Learned at the exit transition, not at creation (#144), and never
     // rewritten once present — see `recordedFootprint`.
     'worktreeBytes',
+    // Learned while the attempt runs (#158): the peak only ever rises, and
+    // the sample stamp moves with every walk.
+    'worktreePeakBytes',
+    'worktreeSampledAt',
     'timestamps',
     'exitCode',
   ]);
@@ -2076,7 +2116,15 @@ function recordedFootprint(
   const endStep = beginCycleStep(`attempt worktree measure ${manifest.subject}`);
   try {
     const measured = measure(manifest.paths.worktree);
-    return measured === null ? {} : { worktreeBytes: measured };
+    // The larger of the two readings (#158). The exit walk sees the worktree
+    // after the child stopped writing and after anything it cleaned up on its
+    // way out; a live sample saw what the disk actually had to hold. Whichever
+    // is bigger is the honest footprint, and either alone may be missing.
+    const peak = manifest.worktreePeakBytes;
+    const footprint = measured === null
+      ? peak
+      : Math.max(measured, peak ?? 0);
+    return footprint === undefined ? {} : { worktreeBytes: footprint };
   } finally {
     endStep();
   }
@@ -3672,6 +3720,122 @@ export function listHostLiveAttempts(
   return collectHostedAttempts(v2Base, filesystemSafeHostname(host))
     .filter(({ manifest }) => isRunnerLiveAttempt(manifest, isPidAlive))
     .map(({ manifest }) => manifest);
+}
+
+/**
+ * How long a live attempt's footprint sample stays good enough (#158).
+ *
+ * Every sample is a synchronous walk of a whole checkout, so the window is
+ * what stops the engine from paying for one per attempt per cycle. Ten minutes
+ * is the same scale as `ATTEMPT_SETTLE_MS`: it is roughly how long an attempt
+ * takes to write the bulk of its footprint, so a worktree cannot double in
+ * size unobserved, and an attempt living an hour is still measured several
+ * times.
+ */
+export const ATTEMPT_FOOTPRINT_SAMPLE_MS = 10 * 60 * 1000;
+
+/**
+ * Live worktrees walked per sweep.
+ *
+ * Deliberately far below the number of attempts a busy host runs: the samples
+ * only have to converge on the peak over an attempt's lifetime, and the cost
+ * of hurrying is seconds of synchronous I/O on the disk this whole projection
+ * exists to protect.
+ */
+export const ATTEMPT_FOOTPRINT_SAMPLES_PER_SWEEP = 2;
+
+/**
+ * Measure one live worktree and keep the largest reading ever taken of it
+ * (#158).
+ *
+ * The maximum, never the latest: the disk had to hold the largest, whatever
+ * the attempt deleted afterwards, and that is the number a later spawn must be
+ * reserved against. The sample stamp is written whatever the walk returned, so
+ * a checkout too large to measure is not re-walked every cycle.
+ */
+export function sampleAttemptWorktreePeak(
+  manifestPath: string,
+  measure: (path: string) => number | null = measureWorktreeBytes,
+  now: () => Date = () => new Date(),
+): AttemptManifest {
+  const timestamp = transitionTimestamp(now);
+  return updateAttemptManifest(manifestPath, (manifest) => {
+    // Named for the heartbeat (#132), like the exit measurement: a cycle that
+    // sits for seconds in a walk must say what it is sitting in.
+    const endStep = beginCycleStep(`attempt worktree sample ${manifest.subject}`);
+    let measured: number | null;
+    try {
+      measured = measure(manifest.paths.worktree);
+    } finally {
+      endStep();
+    }
+    const peak = measured === null
+      ? manifest.worktreePeakBytes
+      : Math.max(measured, manifest.worktreePeakBytes ?? 0);
+    return {
+      ...manifest,
+      ...(peak === undefined ? {} : { worktreePeakBytes: peak }),
+      worktreeSampledAt: timestamp,
+      timestamps: { ...manifest.timestamps, updatedAt: timestamp },
+    };
+  });
+}
+
+export interface SampleHostAttemptFootprintsOptions {
+  /** Worktrees walked in this sweep; defaults to {@link ATTEMPT_FOOTPRINT_SAMPLES_PER_SWEEP}. */
+  readonly limit?: number;
+  /** How old a sample must be to be worth retaking; defaults to {@link ATTEMPT_FOOTPRINT_SAMPLE_MS}. */
+  readonly staleMs?: number;
+  readonly now?: () => Date;
+  readonly measure?: (path: string) => number | null;
+}
+
+/**
+ * Walk the stalest few live worktrees on this host, so the footprint history
+ * learns what an attempt costs at its peak rather than at its exit (#158).
+ *
+ * Rationed two ways — a per-sweep limit and a staleness window — and ordered
+ * oldest-sample-first, so every live attempt is measured in turn rather than
+ * the same one repeatedly. An attempt nothing has sampled yet sorts first.
+ *
+ * Bookkeeping, not a transition: a worktree that vanished between the listing
+ * and the walk, or a manifest a dedicated transition owns, is skipped rather
+ * than thrown on. Nothing here may fail a cycle.
+ */
+export function sampleHostAttemptFootprints(
+  v2Base: string,
+  host: string,
+  isPidAlive: (pid: number) => boolean,
+  options: SampleHostAttemptFootprintsOptions = {},
+): readonly AttemptManifest[] {
+  const now = options.now ?? (() => new Date());
+  const nowMs = now().getTime();
+  const staleMs = options.staleMs ?? ATTEMPT_FOOTPRINT_SAMPLE_MS;
+  const limit = options.limit ?? ATTEMPT_FOOTPRINT_SAMPLES_PER_SWEEP;
+  const sampled: AttemptManifest[] = [];
+  const due = listHostLiveAttempts(v2Base, host, isPidAlive)
+    .map((manifest) => ({
+      manifest,
+      // Never sampled: the stalest reading there is.
+      sampledAtMs: manifest.worktreeSampledAt === undefined
+        ? Number.NEGATIVE_INFINITY
+        : Date.parse(manifest.worktreeSampledAt),
+    }))
+    .filter((entry) => nowMs - entry.sampledAtMs >= staleMs)
+    .sort((left, right) => left.sampledAtMs - right.sampledAtMs)
+    .slice(0, Math.max(0, limit));
+  for (const entry of due) {
+    try {
+      sampled.push(sampleAttemptWorktreePeak(
+        entry.manifest.paths.manifest,
+        options.measure,
+        now,
+      ));
+    } catch {
+      // The next sweep picks it up; it is still the stalest thing on the host.
+    }
+  }
+  return sampled;
 }
 
 /** One recorded attempt footprint, as the headroom projection consumes it. */
