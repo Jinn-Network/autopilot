@@ -398,6 +398,10 @@ describe('live attempt footprint sampling (#158)', () => {
     expect(shrunk.worktreePeakBytes).toBe(6_500_000_000);
     expect(shrunk.worktreeSampledAt).toBe('2026-09-03T10:40:00.000Z');
     expect(readAttemptManifest(manifestPath).worktreePeakBytes).toBe(6_500_000_000);
+    // A measurement is an observation, not a transition: `updatedAt` dates the
+    // last transition, and the sweep's grace clock reads it for an attempt
+    // that never reached an exit.
+    expect(shrunk.timestamps.updatedAt).toBe('2026-09-03T10:00:00.000Z');
   });
 
   it('records the sample time even when the walk gave up', () => {

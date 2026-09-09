@@ -3775,11 +3775,14 @@ export function sampleAttemptWorktreePeak(
     const peak = measured === null
       ? manifest.worktreePeakBytes
       : Math.max(measured, manifest.worktreePeakBytes ?? 0);
+    // `timestamps.updatedAt` is deliberately left alone: it dates the last
+    // lifecycle transition, and the sweep's grace clock reads it for an
+    // attempt that never reached an exit. A measurement is an observation, not
+    // a transition, and must not keep resetting that clock.
     return {
       ...manifest,
       ...(peak === undefined ? {} : { worktreePeakBytes: peak }),
       worktreeSampledAt: timestamp,
-      timestamps: { ...manifest.timestamps, updatedAt: timestamp },
     };
   });
 }
