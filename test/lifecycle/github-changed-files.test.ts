@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  GITHUB_CHANGED_FILES_MAX,
   readExactChangedFiles,
   readExactCompareEvidence,
   readExactCompareStatus,
@@ -8,6 +9,7 @@ import { reviewedDiffDigestFromCompare } from '../../src/lifecycle/reviewed-diff
 import { chooseIntegrationLadderAction } from '../../src/lifecycle/integration-ladder.js';
 import { evaluateEnqueueGate, type EnqueueCandidate } from '../../src/lifecycle/enqueue-executor.js';
 import { gitOid, gitRefName } from '../../src/lifecycle/types.js';
+import type { CommandRunner } from '../../src/dispatcher/issue-source.js';
 
 const HEAD = gitOid('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
 const BASE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -43,7 +45,7 @@ describe('readExactCompareEvidence', () => {
         }
         if (args[1]!.startsWith('repos/Jinn-Network/mono/pulls/101/files?')) {
           if (options.filesFail === true) throw new Error('HTTP 500');
-          return JSON.stringify([changedFiles.map((filename) => ({ filename }))]);
+          return JSON.stringify(changedFiles);
         }
         return JSON.stringify(compare);
       },
@@ -93,7 +95,9 @@ describe('readExactCompareEvidence', () => {
       compareBaseTipOid: gitOid(BASE_TIP),
       reviewedDiffDigest: expected.status === 'digest' ? expected.digest : undefined,
     });
-    expect(calls).toContain(`repos/Jinn-Network/mono/pulls/101/files?per_page=100`);
+    expect(calls).toContain(
+      'repos/Jinn-Network/mono/pulls/101/files?per_page=100&page=1',
+    );
   });
 
   it('omits compareBaseTipOid when the compare response has no base_commit.sha', async () => {
@@ -189,6 +193,129 @@ describe('readExactCompareEvidence', () => {
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('#101'));
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('a..b'));
     warnSpy.mockRestore();
+  });
+});
+
+/**
+ * Regression for #165. Nine consecutive review claims on Jinn-Network/mono#4136
+ * — `chore(topology): retire the unused legacy reference tree`, 1,919 files and
+ * −417,658 lines — ended `failed (stdout maxBuffer length exceeded)`, so the PR
+ * never got a review, never parked and never escalated.
+ *
+ * `pulls/{n}/files` carries a `patch` for every file, and the read asked for
+ * every page of it at once (`--paginate --slurp`), so a deletion PR's entire
+ * deleted text was concatenated into `defaultRunner`'s 10 MB `execFile` buffer
+ * (`src/dispatcher/issue-source.ts:101`) to extract nothing but the filenames.
+ * The endpoint's patches are dead weight here: `filenames(...)` throws every
+ * other field away.
+ */
+describe('readExactChangedFiles reads filenames, never patch text (#165)', () => {
+  const FILES = 'repos/Jinn-Network/mono/pulls/4136/files?per_page=100';
+
+  function recorder(
+    pages: ReadonlyArray<readonly string[]>,
+    options: { readonly changedFiles?: number } = {},
+  ): { readonly run: CommandRunner; argv: () => string[][] } {
+    const argv: string[][] = [];
+    const changedFiles = options.changedFiles
+      ?? pages.reduce((count, page) => count + page.length, 0);
+    return {
+      run: async (_command, args) => {
+        argv.push([...args]);
+        if (args[1] === 'repos/Jinn-Network/mono/pulls/4136') {
+          return JSON.stringify({
+            changed_files: changedFiles,
+            head: { sha: HEAD },
+            base: { ref: 'next', sha: BASE },
+          });
+        }
+        const page = Number(/[?&]page=(\d+)$/.exec(args[1] ?? '')?.[1] ?? '0');
+        // `gh --jq` prints the filter's result, so a page is a bare string
+        // array — no `patch`, no `blob_url`, no per-file object at all.
+        return JSON.stringify(pages[page - 1] ?? []);
+      },
+      argv: () => argv,
+    };
+  }
+
+  async function read(run: CommandRunner) {
+    return readExactChangedFiles({
+      run,
+      prNumber: 4136,
+      expectedHead: HEAD,
+      expectedBaseRefName: 'next',
+      context: 'Review',
+      repositorySlug: 'Jinn-Network/mono',
+    });
+  }
+
+  it('asks GitHub for the filename field alone', async () => {
+    const recording = recorder([['docs/legacy/a.md', 'docs/legacy/b.md']]);
+    const changed = await read(recording.run);
+
+    expect(changed.files).toEqual(['docs/legacy/a.md', 'docs/legacy/b.md']);
+    expect(changed.complete).toBe(true);
+    // The projection runs inside `gh`, which is the only place it can run and
+    // still keep the patches out of this process's stdout buffer.
+    expect(recording.argv()).toEqual([
+      ['api', 'repos/Jinn-Network/mono/pulls/4136'],
+      ['api', `${FILES}&page=1`, '--jq', '[.[].filename]'],
+    ]);
+  });
+
+  it('pages the list itself so one response never carries every page', async () => {
+    const page = (prefix: string, count: number) => Array.from(
+      { length: count },
+      (_unused, index) => `src/${prefix}/f${index}.ts`,
+    );
+    const recording = recorder([page('a', 100), page('b', 100), page('c', 50)]);
+    const changed = await read(recording.run);
+
+    expect(changed.files).toHaveLength(250);
+    expect(changed.files[249]).toBe('src/c/f49.ts');
+    expect(changed.complete).toBe(true);
+    expect(recording.argv().map((args) => args[1])).toEqual([
+      'repos/Jinn-Network/mono/pulls/4136',
+      `${FILES}&page=1`,
+      `${FILES}&page=2`,
+      `${FILES}&page=3`,
+    ]);
+  });
+
+  /**
+   * The endpoint stops serving at 3,000 files, which is what
+   * `GITHUB_CHANGED_FILES_MAX` already encodes: past it no pagination is
+   * completeness proof, so paging further would buy nothing and a page that
+   * kept answering would loop for ever.
+   */
+  it('stops at the 3,000-file ceiling instead of paging without end', async () => {
+    const recording = recorder(
+      Array.from({ length: 40 }, (_unused, page) => Array.from(
+        { length: 100 },
+        (_ignored, index) => `src/p${page}/f${index}.ts`,
+      )),
+      { changedFiles: 4_000 },
+    );
+    const changed = await read(recording.run);
+
+    expect(changed.files).toHaveLength(GITHUB_CHANGED_FILES_MAX);
+    // 30 file pages, plus the PR metadata read.
+    expect(recording.argv()).toHaveLength(31);
+    expect(changed.complete).toBe(false);
+  });
+
+  it('reads no more pages than the PR metadata says exist', async () => {
+    const recording = recorder([Array.from(
+      { length: 100 },
+      (_unused, index) => `src/f${index}.ts`,
+    )]);
+    const changed = await read(recording.run);
+
+    expect(changed.files).toHaveLength(100);
+    expect(changed.complete).toBe(true);
+    // A full first page is not evidence of a second one when the metadata
+    // already accounts for every file.
+    expect(recording.argv()).toHaveLength(2);
   });
 });
 

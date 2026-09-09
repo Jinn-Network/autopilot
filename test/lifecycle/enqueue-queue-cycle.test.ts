@@ -342,7 +342,7 @@ function harness(fixture: Fixture = {}, options: HarnessOptions = {}) {
       });
     }
     if (endpoint?.startsWith(`repos/${SLUG}/pulls/84/files?`)) {
-      return JSON.stringify([[{ filename: 'README.md' }]]);
+      return JSON.stringify(['README.md']);
     }
     if (endpoint?.startsWith(`repos/${SLUG}/contents/.github/CODEOWNERS`)) {
       return JSON.stringify({ content: Buffer.from('').toString('base64') });

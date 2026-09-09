@@ -199,7 +199,7 @@ describe('reading a reviewed diff digest', () => {
         endpoints.push(endpoint);
         if (endpoint === 'repos/Jinn-Network/mono/pulls/84') return metadata;
         if (endpoint.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
-          return JSON.stringify([[{ filename: 'src/a.ts' }]]);
+          return JSON.stringify(['src/a.ts']);
         }
         return JSON.stringify({ status: 'ahead', files: [compareFile()] });
       },
@@ -227,7 +227,7 @@ describe('reading a reviewed diff digest', () => {
         }
         if (endpoint === 'repos/Jinn-Network/mono/pulls/84') return metadata;
         if (endpoint.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
-          return JSON.stringify([[{ filename: 'src/a.ts' }]]);
+          return JSON.stringify(['src/a.ts']);
         }
         return JSON.stringify({ status: 'ahead', files: [compareFile()] });
       },
@@ -245,7 +245,7 @@ describe('reading a reviewed diff digest', () => {
         const endpoint = args.find((arg) => arg.startsWith('repos/'))!;
         if (endpoint === 'repos/Jinn-Network/mono/pulls/84') return metadata;
         if (endpoint.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
-          return JSON.stringify([[{ filename: 'src/a.ts' }]]);
+          return JSON.stringify(['src/a.ts']);
         }
         return JSON.stringify('not-an-object');
       },

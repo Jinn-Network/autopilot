@@ -177,7 +177,7 @@ function candidateRunner(changedFiles: number, filenames: readonly string[]) {
       });
     }
     if (endpoint?.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
-      return JSON.stringify([filenames.map((filename) => ({ filename }))]);
+      return JSON.stringify(filenames);
     }
     if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
       // GitHub enforces the CODEOWNERS at the base branch *tip*. Reading the
@@ -877,7 +877,7 @@ function carriedRunner(compareFiles: unknown, filenames: readonly string[] = ['G
       });
     }
     if (endpoint?.startsWith('repos/Jinn-Network/mono/pulls/84/files?')) {
-      return JSON.stringify([filenames.map((filename) => ({ filename }))]);
+      return JSON.stringify(filenames);
     }
     if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
       return JSON.stringify({

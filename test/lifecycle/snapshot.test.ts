@@ -270,9 +270,7 @@ describe('view and merge gate agree on a carried approval', () => {
           });
         }
         if (endpoint.startsWith('repos/Jinn-Network/mono/pulls/101/files?')) {
-          return JSON.stringify([
-            compareFiles.map((file) => ({ filename: file.filename })),
-          ]);
+          return JSON.stringify(compareFiles.map((file) => file.filename));
         }
         if (endpoint.startsWith('repos/Jinn-Network/mono/contents/')) {
           return JSON.stringify({ content: Buffer.from('').toString('base64') });
@@ -1226,7 +1224,7 @@ describe('buildGitHubLifecycleSnapshot', () => {
             `repos/Jinn-Network/mono/pulls/${derivedMergeAction.prNumber}/files?`,
           )
         ) {
-          return JSON.stringify([[{ filename: 'README.md' }]]);
+          return JSON.stringify(['README.md']);
         }
         if (endpoint?.startsWith('repos/Jinn-Network/mono/contents/.github/CODEOWNERS')) {
           return JSON.stringify({ content: Buffer.from('').toString('base64') });
