@@ -216,6 +216,8 @@ export interface ProductionActiveRuntimeOptions {
     /** Machine-child work, capped separately from fresh claims (#122). */
     readonly child: number;
     readonly review: number;
+    /** Debt sweeps, capped separately when the lane is opted in (#168); 0 = off. */
+    readonly debt?: number;
     /** Codex overflow pool shared by the implementation and child lanes (#152). */
     readonly codexOverflow?: number;
   };

@@ -157,6 +157,23 @@ export const autopilotConfigSchema = z.object({
      */
     childConcurrency: positiveInteger.default(1),
     /**
+     * Debt sweeps get their own lane, off by default (#168).
+     *
+     * A sweep is capped at P2 by design, so in a shared implementation lane
+     * it loses every cycle to P0/P1 work — 13 of 14 open sweeps were skipped
+     * for capacity in the cycle that motivated this. Its own lane is the only
+     * way accumulated debt gets worked without letting it outrank incident-
+     * and release-shaped work, which is exactly what raising its priority
+     * would do.
+     *
+     * `0` — the default, and what every config written before this field
+     * existed decodes to — means NO debt lane: sweeps compete in the
+     * implementation lane exactly as they do today, and nothing anywhere
+     * reads a sweep tag. `nonNegativeInteger`, not `positiveInteger`, because
+     * that off state has to be representable.
+     */
+    debtConcurrency: nonNegativeInteger.default(0),
+    /**
      * Codex overflow pool (#152): sessions beyond the implementation and child
      * caps that may run on Codex at once. Defaulted to 0 — off — so every
      * existing config keeps parsing and nothing routes to Codex until asked.

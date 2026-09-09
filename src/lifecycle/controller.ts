@@ -154,6 +154,12 @@ export interface LifecycleControllerDeps {
         /** Machine-child work, capped separately from fresh claims (#122). */
         readonly child: number;
         readonly review: number;
+        /**
+         * Debt sweeps, when the operator opted the lane in (#168). ABSENT
+         * means the lane is off and sweeps compete in the implementation
+         * lane, which is the default.
+         */
+        readonly debt?: number;
         /** Free Codex overflow slots shared by the implementation and child lanes (#152). */
         readonly codexOverflow?: number;
       };
@@ -1057,11 +1063,16 @@ function activeCandidates(
         body: issueSource?.body,
         labels: item.labels,
       });
+      // A sweep issue by its own marker (#168). Advisory: read only by the
+      // scheduler, and only while the debt lane is configured on.
+      const isSweep = !isChild
+        && hasDebtSweepMarkerTag(issueSource?.body ?? '');
       const freshCandidate: ActiveCandidate = {
         phase: 'implementation',
         intent: 'fresh',
         issueNumber: item.issueNumber,
         ...(isChild ? { isChild: true } : {}),
+        ...(isSweep ? { isSweep: true } : {}),
       };
       // Both lanes rank the same way (#102): the child lane has its own cap
       // now, so the order it walks its own queue in decides which child runs.
@@ -1802,26 +1813,41 @@ async function executeActivePass(
   // candidate that refuses is not remembered, so it is claimable again the
   // moment GitHub state changes (the stack collapses, the base is retargeted)
   // with no manual step and no cache to invalidate.
+  // The debt lane's queues exist only while that lane does (#168), so with it
+  // off every structure below has exactly the three entries it had before and
+  // the lane loop walks exactly the three lanes it walked before.
+  const debtLaneOn = local.remaining.debt !== undefined;
+  const activeLanes: readonly NewWorkLane[] = debtLaneOn
+    ? ['implementation', 'child', 'review', 'debt']
+    : ['implementation', 'child', 'review'];
   const remainingBackups = {
     implementation: [...scheduling.backups.implementation],
     child: [...scheduling.backups.child],
     review: [...scheduling.backups.review],
+    debt: [...(scheduling.backups.debt ?? [])],
   };
   const scheduledInLane = (lane: NewWorkLane): number => scheduling.actions.filter(
     (action) => laneForNewWorkAction(action) === lane,
   ).length;
-  const laneCandidates = {
+  const laneCandidates: Record<NewWorkLane, number> = {
     implementation: scheduledInLane('implementation')
       + scheduling.backups.implementation.length,
     child: scheduledInLane('child') + scheduling.backups.child.length,
     review: scheduledInLane('review') + scheduling.backups.review.length,
+    debt: scheduledInLane('debt') + (scheduling.backups.debt?.length ?? 0),
   };
-  const spawnedByLane = { implementation: 0, child: 0, review: 0 };
+  const spawnedByLane: Record<NewWorkLane, number> = {
+    implementation: 0, child: 0, review: 0, debt: 0,
+  };
   // One budget per lane, not one shared between them: a child queue that
   // spends five refusals must not leave fresh work with none, or either lane
   // can silently consume the other's release valve.
-  const fallThroughAttempts = { implementation: 0, child: 0, review: 0 };
-  const fallThroughExhausted = { implementation: false, child: false, review: false };
+  const fallThroughAttempts: Record<NewWorkLane, number> = {
+    implementation: 0, child: 0, review: 0, debt: 0,
+  };
+  const fallThroughExhausted: Record<NewWorkLane, boolean> = {
+    implementation: false, child: false, review: false, debt: false,
+  };
   const promoteBackup = <T extends NewWorkAction>(
     lane: NewWorkLane,
     queue: T[],
@@ -1951,9 +1977,10 @@ async function executeActivePass(
     actionEvents.push(actionEvent(action, result));
     index += 1;
   }
-  for (const lane of ['implementation', 'child', 'review'] as const) {
-    // Both implementation lanes claim eligible issues; only their capacity
-    // differs, so they share the phase and are told apart by the subject.
+  for (const lane of activeLanes) {
+    // Every implementation-shaped lane claims eligible issues; only their
+    // capacity differs, so they share the phase and are told apart by the
+    // subject — `lane:implementation`, `lane:child`, `lane:debt`.
     const phase: LifecyclePhase = lane === 'review' ? 'awaiting-review' : 'eligible';
     if (fallThroughExhausted[lane]) {
       actionEvents.push({
@@ -1974,7 +2001,7 @@ async function executeActivePass(
     // does. One line per cycle per lane, derived and never counted across
     // cycles, so nothing has to be persisted or reset.
     if (
-      local.remaining[lane] > 0
+      (local.remaining[lane] ?? 0) > 0
       && laneCandidates[lane] > 0
       && spawnedByLane[lane] === 0
     ) {
@@ -1986,7 +2013,7 @@ async function executeActivePass(
         subject: `lane:${lane}`,
         action: 'schedule',
         outcome: 'starved',
-        reason: `${local.remaining[lane]} slot(s) free and ${laneCandidates[lane]} eligible `
+        reason: `${local.remaining[lane]!} slot(s) free and ${laneCandidates[lane]} eligible `
           + 'candidate(s), but nothing spawned this cycle',
       });
     }

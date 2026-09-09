@@ -922,6 +922,36 @@ describe('attempt workspace and manifest', () => {
       .not.toContain('token');
   });
 
+  it('records the debt-lane tag on implementation manifests and nowhere else (#168)', async () => {
+    const fixture = repositoryFixture();
+    const uuid = (digit: string) => `${digit.repeat(8)}-${digit.repeat(4)}`
+      + `-4${digit.repeat(3)}-8${digit.repeat(3)}-${digit.repeat(12)}`;
+
+    // With the debt lane off, nothing tags the claim and the field is absent —
+    // which is also every manifest written before the field existed.
+    const untagged = await createAttemptWorkspace(options(fixture), defaultRunner);
+    expect(untagged.sweep).toBeUndefined();
+    expect(Object.keys(
+      JSON.parse(readFileSync(untagged.paths.manifest, 'utf8')) as Record<string, unknown>,
+    )).not.toContain('sweep');
+
+    const tagged = await createAttemptWorkspace(options(fixture, {
+      attemptId: uuid('9'),
+      sweep: true,
+    }), defaultRunner);
+    expect(tagged.sweep).toBe(true);
+    expect(readAttemptManifest(tagged.paths.manifest).sweep).toBe(true);
+    expect(readAttemptManifest(tagged.paths.manifest)).toEqual(tagged);
+
+    const raw = JSON.parse(
+      readFileSync(untagged.paths.manifest, 'utf8'),
+    ) as Record<string, unknown>;
+    expect(() => decodeAttemptManifest({ ...raw, sweep: false }))
+      .toThrow(/sweep flag/i);
+    expect(() => decodeAttemptManifest({ ...raw, sweep: 'yes' }))
+      .toThrow(/sweep flag/i);
+  });
+
   it('records an optional child kind on implementation manifests and nowhere else', async () => {
     const fixture = repositoryFixture();
     const uuid = (digit: string) => `${digit.repeat(8)}-${digit.repeat(4)}`

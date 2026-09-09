@@ -142,6 +142,10 @@ export interface DispatcherConfig {
    *  open-PR backlog, so a deep child queue is the moment the engine most needs
    *  them to run and least needs new branches opened. */
   childCap: number;
+  /** Max simultaneous debt-sweep sessions, when the debt lane is on (#168).
+   *  `0` — the default — means no debt lane: sweeps draw from concurrencyCap
+   *  exactly as they do today. Source: `scheduler.debtConcurrency`. */
+  debtCap: number;
   /** The opt-in label that gates review-pr participation. */
   engineReviewLabel: string;
   /**
@@ -256,6 +260,7 @@ export const DEFAULT_CONFIG: DispatcherConfig = {
   authorAllowlist: [],
   reviewCap: 3,
   childCap: 1,
+  debtCap: 0,
   engineReviewLabel: 'engine:review',
   reviewBotLogin: '',
   implGhToken: '',

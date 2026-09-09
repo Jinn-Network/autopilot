@@ -86,6 +86,7 @@ Edit `<target>/.autopilot/config.json`:
   "fullReconcileSeconds": 3600,
   "implementationConcurrency": 1,
   "childConcurrency": 1,
+  "debtConcurrency": 0,
   "reviewConcurrency": 1,
   "codexOverflowSlots": 0,
   "openPrBackpressure": 30
@@ -110,6 +111,14 @@ pool for thirty minutes, and a `claude` worker that runs normally closes the
 circuit again. The Codex CLI must be installed and logged in
 (`codex login`); `worker.codexModel` optionally pins its model.
 
+`debtConcurrency` (default `0`, off) gives debt sweeps — the batched review
+follow-ups the engine files itself — their own lane. A sweep is capped at P2
+by design, so while it shares the implementation lane it loses every cycle to
+P0/P1 work and the follow-up backlog only grows. Set it to `1` or more and
+sweeps schedule from their own slots instead, appearing as `lane:debt` in the
+starvation and fall-through lines; at `0` nothing is tagged for the lane and
+scheduling is exactly as it was.
+
 `init` defaults every concurrency field to `1`, and `childConcurrency` is
 optional: a config written before the lane existed keeps loading and gets the
 same `1`. After changing them, restart the daemon (`autopilot stop` then
@@ -119,6 +128,7 @@ Optional one-off overrides:
 
 - `JINN_AUTOPILOT_IMPLEMENTATION_CAP`
 - `JINN_AUTOPILOT_CHILD_CAP`
+- `JINN_AUTOPILOT_DEBT_CAP`
 - `JINN_AUTOPILOT_REVIEW_CAP`
 - `JINN_AUTOPILOT_BACKPRESSURE`
 

@@ -171,6 +171,12 @@ interface CreateAttemptInput {
    * capacity accounting reads as the implementation lane (#122).
    */
   readonly childKind?: NonNullable<ImplementationIssue['child']>['kind'];
+  /**
+   * The scheduler admitted this claim under the `debt` lane (#168). Carried
+   * from the action, not derived from the issue, because it records which
+   * lane's slot the attempt spends — see `AttemptManifest.sweep`.
+   */
+  readonly sweep?: true;
 }
 
 export interface SpawnImplementationInput {
@@ -864,6 +870,9 @@ export async function executeImplementationAction(
     credential: selection.credential,
     ...(action.intent === 'fresh' && action.runtime !== undefined
       ? { runtime: action.runtime }
+      : {}),
+    ...(action.intent === 'fresh' && action.sweep === true
+      ? { sweep: true as const }
       : {}),
     ...(preparation === undefined
       ? {}
