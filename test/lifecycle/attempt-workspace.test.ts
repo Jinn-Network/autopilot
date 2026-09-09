@@ -36,6 +36,7 @@ import {
   drainTrashReclaims,
   failedTrashReclaims,
   freeDiskBytes,
+  listHostLiveAttempts,
   listRunnerLiveAttempts,
   markAttemptExited,
   markAttemptRunning,
@@ -4925,5 +4926,146 @@ describe('attempt process identity beyond the bare PID (#161)', () => {
       .toThrow(/process start time/i);
     expect(() => decodeAttemptManifest({ ...running, processStartedAt: 42 }))
       .toThrow(/process start time/i);
+  });
+
+  it('drops an attempt whose PID was reused from this runner’s live count', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+    markAttemptRunning(
+      manifest.paths.manifest,
+      4242,
+      () => new Date('2026-07-20T00:01:00.000Z'),
+      () => START_TIME,
+    );
+    const v2Base = join(fixture.base, 'v2');
+
+    // The PID answers `kill -0` either way; only the start time separates the
+    // worker from whatever inherited its number across the reboot.
+    expect(countRunnerLiveAttempts(v2Base, manifest.runnerId, () => true, () => START_TIME))
+      .toBe(1);
+    expect(listRunnerLiveAttempts(
+      v2Base,
+      manifest.runnerId,
+      () => true,
+      () => 'Tue Sep  8 09:00:00 2026',
+    )).toEqual([]);
+    expect(listHostLiveAttempts(
+      v2Base,
+      manifest.host,
+      () => true,
+      () => 'Tue Sep  8 09:00:00 2026',
+    )).toEqual([]);
+  });
+
+  it('keeps counting an attempt whose identity is unproven rather than mismatched', async () => {
+    const fixture = repositoryFixture();
+    const legacy = await createAttemptWorkspace(options(fixture), defaultRunner);
+    markAttemptRunning(
+      legacy.paths.manifest,
+      4242,
+      () => new Date('2026-07-20T00:01:00.000Z'),
+      () => null,
+    );
+    const recorded = await createAttemptWorkspace(options(fixture, {
+      attemptId: UUID_B,
+    }), defaultRunner);
+    markAttemptRunning(
+      recorded.paths.manifest,
+      4243,
+      () => new Date('2026-07-20T00:01:00.000Z'),
+      () => START_TIME,
+    );
+    const v2Base = join(fixture.base, 'v2');
+
+    // A manifest that recorded no identity keeps the plain `kill -0` verdict,
+    // and so does one whose identity cannot be read back now.
+    expect(countRunnerLiveAttempts(
+      v2Base,
+      legacy.runnerId,
+      () => true,
+      () => 'Tue Sep  8 09:00:00 2026',
+    )).toBe(1);
+    expect(countRunnerLiveAttempts(v2Base, legacy.runnerId, () => true, () => null)).toBe(2);
+    expect(countRunnerLiveAttempts(v2Base, legacy.runnerId, () => false, () => START_TIME))
+      .toBe(0);
+  });
+
+  it('sweeps a running attempt whose PID was reused, and retains the real worker', async () => {
+    const fixture = repositoryFixture();
+    const reused = await createAttemptWorkspace(options(fixture), defaultRunner);
+    markAttemptRunning(
+      reused.paths.manifest,
+      4242,
+      () => new Date('2026-07-20T00:01:00.000Z'),
+      () => START_TIME,
+    );
+    const v2Base = join(fixture.base, 'v2');
+
+    await expect(cleanupAttempt(reused.paths.manifest, defaultRunner, {
+      v2Base,
+      isPidAlive: () => true,
+      readProcessStartTime: () => START_TIME,
+    })).resolves.toMatchObject({
+      status: 'retained',
+      attemptId: UUID_A,
+      reason: { code: 'live' },
+    });
+
+    await expect(cleanupAttempt(reused.paths.manifest, defaultRunner, {
+      v2Base,
+      isPidAlive: () => true,
+      readProcessStartTime: () => 'Tue Sep  8 09:00:00 2026',
+    })).resolves.toEqual({ status: 'removed', attemptId: UUID_A });
+  });
+
+  it('lets a marketplace process lease pass to a new claimant when the PID was reused', async () => {
+    const fixture = repositoryFixture();
+    const submitted = await createSubmittedMarketplaceAttempt(fixture);
+    claimMarketplaceAttemptProcess(submitted.paths.manifest, {
+      pid: 4242,
+      isPidAlive: () => true,
+      readProcessStartTime: () => START_TIME,
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+    expect(readAttemptManifest(submitted.paths.manifest).processStartedAt).toBe(START_TIME);
+
+    expect(() => claimMarketplaceAttemptProcess(submitted.paths.manifest, {
+      pid: 5252,
+      isPidAlive: () => true,
+      readProcessStartTime: () => START_TIME,
+      now: () => new Date('2026-07-28T12:04:00.000Z'),
+    })).toThrow(/live PID/);
+
+    const reclaimed = claimMarketplaceAttemptProcess(submitted.paths.manifest, {
+      pid: 5252,
+      isPidAlive: () => true,
+      readProcessStartTime: (pid) => (pid === 4242 ? 'Tue Sep  8 09:00:00 2026' : START_TIME),
+      now: () => new Date('2026-07-28T12:05:00.000Z'),
+    });
+    expect(reclaimed.pid).toBe(5252);
+    expect(reclaimed.processStartedAt).toBe(START_TIME);
+  });
+
+  it('re-takes a marketplace lease that records another process behind the claimant’s own PID', async () => {
+    const fixture = repositoryFixture();
+    const submitted = await createSubmittedMarketplaceAttempt(fixture);
+    claimMarketplaceAttemptProcess(submitted.paths.manifest, {
+      pid: 4242,
+      isPidAlive: () => true,
+      readProcessStartTime: () => 'Tue Sep  8 09:00:00 2026',
+      now: () => new Date('2026-07-28T12:03:00.000Z'),
+    });
+
+    // An engine that came up after a reboot on the PID its predecessor held:
+    // it does hold the lease, so the claim stands — but the identity on the
+    // manifest is the predecessor's, and leaving it there would read as a
+    // reused PID to everything that checks.
+    const retaken = claimMarketplaceAttemptProcess(submitted.paths.manifest, {
+      pid: 4242,
+      isPidAlive: () => true,
+      readProcessStartTime: () => START_TIME,
+      now: () => new Date('2026-07-28T12:04:00.000Z'),
+    });
+    expect(retaken).toMatchObject({ pid: 4242, processStartedAt: START_TIME });
   });
 });
