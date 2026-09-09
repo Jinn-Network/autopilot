@@ -31,6 +31,11 @@ import {
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { beginCycleStep, withCycleStep } from '../cycle-heartbeat.js';
 import { AUTOPILOT_RUNTIME_SET, type AutopilotRuntime } from '../autopilot-runtime.js';
+import {
+  isProcessStartTimeReading,
+  readProcessStartTime,
+  type ProcessStartTimeReader,
+} from '../process-start-time.js';
 import { CHILD_KINDS, type ChildKind } from './child-issues.js';
 import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
@@ -194,6 +199,25 @@ export interface AttemptManifest {
   readonly repository: AttemptRepositoryIdentity;
   readonly processState: AttemptProcessState;
   readonly pid: number | null;
+  /**
+   * The kernel's start time for `pid`, read at the moment the PID was recorded
+   * (#161) and compared verbatim afterwards — an opaque token, never a
+   * timestamp to parse (see `readProcessStartTime`).
+   *
+   * `pid` alone is not identity: after a reboot or a long sleep the kernel
+   * hands the number to something unrelated, `kill -0` answers yes, and the
+   * attempt holds a lane seat and its worktree until someone notices. A reused
+   * PID cannot carry the start time the original process had, so a reading
+   * that disagrees with this one proves the worker is gone.
+   *
+   * Additive and optional on exactly the `childKind` pattern, and fail-safe in
+   * the same direction: absent means "this attempt's identity was never
+   * recorded" — every manifest written before the field existed, and every
+   * host where `ps` could not be read — and those keep the plain `kill -0`
+   * verdict rather than have a possibly-live worker declared dead. Valid only
+   * alongside a PID.
+   */
+  readonly processStartedAt?: string;
   readonly terminalHead?: string;
   /**
    * The coordinator runtime this attempt was dispatched on (#152). Recorded so
@@ -828,6 +852,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'repository',
     'processState',
     'pid',
+    'processStartedAt',
     'terminalHead',
     'worktreeBytes',
     'worktreePeakBytes',
@@ -843,6 +868,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'sweep',
     'worktreePeakBytes',
     'worktreeSampledAt',
+    'processStartedAt',
   ]);
   if (manifest.version !== 2) throw new Error('Unsupported attempt manifest version');
   const phase = manifest.phase;
@@ -932,6 +958,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   }
   const decodedProcessState = processState(manifest.processState);
   const pid = nullablePid(manifest.pid);
+  const processStartedAt = decodeProcessStartedAt(manifest.processStartedAt, pid);
   const terminalHead = manifest.terminalHead === undefined
     ? undefined
     : gitOid(stringField(manifest.terminalHead, 'terminal head'));
@@ -1037,6 +1064,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     repository: decodeRepositoryIdentity(manifest.repository),
     processState: decodedProcessState,
     pid,
+    ...(processStartedAt === undefined ? {} : { processStartedAt }),
     ...(terminalHead === undefined ? {} : { terminalHead }),
     ...(worktreeBytes === undefined ? {} : { worktreeBytes }),
     ...(worktreePeakBytes === undefined ? {} : { worktreePeakBytes }),
@@ -1046,6 +1074,17 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     paths,
     timestamps,
   };
+}
+
+function decodeProcessStartedAt(value: unknown, pid: number | null): string | undefined {
+  if (value === undefined) return undefined;
+  if (!isProcessStartTimeReading(value)) {
+    throw new Error('Invalid attempt process start time');
+  }
+  if (pid === null) {
+    throw new Error('Attempt process start time requires a recorded PID');
+  }
+  return value;
 }
 
 function decodeAttemptRuntime(value: unknown): AutopilotRuntime {
@@ -1096,6 +1135,8 @@ function writeManifestAtomic(path: string, manifest: AttemptManifest): void {
 export interface MarketplaceAttemptProcessClaimOptions {
   readonly pid?: number;
   readonly isPidAlive?: (pid: number) => boolean;
+  /** See `CleanupAttemptOptions.readProcessStartTime` (#161). */
+  readonly readProcessStartTime?: ProcessStartTimeReader;
   readonly now?: () => Date;
 }
 
@@ -1188,19 +1229,27 @@ export function claimMarketplaceAttemptProcess(
     'marketplace process PID',
   );
   const isPidAlive = options.isPidAlive ?? marketplaceProcessPidIsAlive;
+  const readStartTime = options.readProcessStartTime ?? readProcessStartTime;
   return withMarketplaceStateTransitionLock(manifestPath, () => {
     const current = readAttemptManifest(manifestPath);
     assertMarketplaceProcessClaimable(current);
     if (current.processState === 'exited') {
       throw new Error('Exited marketplace attempt cannot acquire a process lease');
     }
-    if (current.processState === 'running' && current.pid === claimantPid) {
+    if (
+      current.processState === 'running'
+      && current.pid === claimantPid
+      // The claimant is certainly alive — it is the one asking — so this asks
+      // only whether the identity on the manifest is still its own. An engine
+      // that came up on its predecessor's PID holds the lease either way, but
+      // it must replace the identity rather than replay someone else's (#161).
+      && isAttemptProcessLive(current, () => true, readStartTime)
+    ) {
       return current;
     }
     if (
       current.processState === 'running'
-      && current.pid !== null
-      && isPidAlive(current.pid)
+      && isAttemptProcessLive(current, isPidAlive, readStartTime)
     ) {
       throw new Error('Marketplace attempt process lease is held by a live PID');
     }
@@ -1208,10 +1257,15 @@ export function claimMarketplaceAttemptProcess(
     if (Date.parse(timestamp) < Date.parse(current.timestamps.updatedAt)) {
       throw new Error('Marketplace process claim predates the manifest update');
     }
+    const processStartedAt = recordableProcessStartTime(claimantPid, readStartTime);
     const claimed = decodeAttemptManifest({
       ...current,
       processState: 'running',
       pid: claimantPid,
+      // Always the claimant's own identity, never the outgoing holder's (#161):
+      // an inherited reading would describe a PID this manifest no longer
+      // names, and would read as "reused" the moment anyone checked.
+      processStartedAt,
       timestamps: {
         ...current.timestamps,
         updatedAt: timestamp,
@@ -1337,6 +1391,8 @@ export function updateAttemptManifest(
   const progressiveManifestFields = new Set([
     'processState',
     'pid',
+    // Learned with the PID it identifies, at the running transition (#161).
+    'processStartedAt',
     'terminalHead',
     // Learned at the exit transition, not at creation (#144), and never
     // rewritten once present — see `recordedFootprint`.
@@ -2052,13 +2108,37 @@ function transitionTimestamp(now: () => Date): string {
   return isoTimestamp(timestamp);
 }
 
+/**
+ * The PID's start time when it is worth recording, and `undefined` when it is
+ * not (#161). A reader that throws, or answers with something no comparison
+ * could use, must cost nothing beyond the identity this attempt then lacks.
+ */
+function recordableProcessStartTime(
+  pid: number,
+  readStartTime: ProcessStartTimeReader,
+): string | undefined {
+  let reading: string | null;
+  try {
+    reading = readStartTime(pid);
+  } catch {
+    return undefined;
+  }
+  return isProcessStartTimeReading(reading) ? reading : undefined;
+}
+
 export function markAttemptRunning(
   manifestPath: string,
   pid: number,
   now: () => Date = () => new Date(),
+  readStartTime: ProcessStartTimeReader = readProcessStartTime,
 ): AttemptManifest {
   const validPid = positiveInteger(pid, 'PID');
   const timestamp = transitionTimestamp(now);
+  // Read here, while the child is certainly the process behind the PID: this
+  // is the only moment the engine can prove what it is recording (#161). A
+  // failed reading records nothing and leaves the attempt on the plain
+  // `kill -0` verdict — never a reason to fail the transition.
+  const processStartedAt = recordableProcessStartTime(validPid, readStartTime);
   return updateAttemptManifest(manifestPath, (current) => {
     if (current.processState !== 'preparing') {
       throw new Error('Only a preparing attempt may transition to running');
@@ -2067,6 +2147,7 @@ export function markAttemptRunning(
       ...current,
       processState: 'running',
       pid: validPid,
+      ...(processStartedAt === undefined ? {} : { processStartedAt }),
       timestamps: {
         ...current.timestamps,
         updatedAt: timestamp,
@@ -3474,18 +3555,51 @@ export function anchorEvidenceFromEvaluatorManifest(
   };
 }
 
+/**
+ * Whether the PID this manifest records is still the child it recorded (#161).
+ *
+ * `kill -0` answers the first half — something holds the number. The recorded
+ * start time answers the half that matters after a reboot or a long sleep,
+ * when the number has been handed to a stranger: a reused PID cannot carry the
+ * start time the worker had.
+ *
+ * Only a positive disagreement is fatal. An attempt that recorded no identity,
+ * or whose identity cannot be read back now, keeps the `kill -0` verdict —
+ * declaring a possibly-live worker dead would take its worktree out from under
+ * it and let its issue be claimed twice, which is worse than the seat this
+ * leaves held for one more cycle.
+ */
+export function isAttemptProcessLive(
+  manifest: Pick<AttemptManifest, 'pid' | 'processStartedAt'>,
+  isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader = readProcessStartTime,
+): boolean {
+  if (manifest.pid === null || !isPidAlive(manifest.pid)) return false;
+  const recorded = manifest.processStartedAt;
+  if (recorded === undefined) return true;
+  let actual: string | null;
+  try {
+    actual = readStartTime(manifest.pid);
+  } catch {
+    return true;
+  }
+  return actual === null || actual === recorded;
+}
+
 export function countRunnerLiveAttempts(
   v2Base: string,
   runnerId: string,
   isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader = readProcessStartTime,
 ): number {
-  return listRunnerLiveAttempts(v2Base, runnerId, isPidAlive).length;
+  return listRunnerLiveAttempts(v2Base, runnerId, isPidAlive, readStartTime).length;
 }
 
 export function listRunnerLiveAttempts(
   v2Base: string,
   runnerId: string,
   isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader = readProcessStartTime,
 ): AttemptManifest[] {
   safeComponent(runnerId, 'runner ID');
   const runnerDir = join(v2Base, runnerId);
@@ -3497,7 +3611,7 @@ export function listRunnerLiveAttempts(
         const manifest = readAttemptManifest(manifestPath);
         if (
           manifest.runnerId === runnerId
-          && isRunnerLiveAttempt(manifest, isPidAlive)
+          && isRunnerLiveAttempt(manifest, isPidAlive, readStartTime)
         ) {
           attempts.push(manifest);
         }
@@ -3513,10 +3627,10 @@ export function listRunnerLiveAttempts(
 function isRunnerLiveAttempt(
   manifest: AttemptManifest,
   isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader,
 ): boolean {
   const processRunningWithLivePid = manifest.processState === 'running'
-    && manifest.pid !== null
-    && isPidAlive(manifest.pid);
+    && isAttemptProcessLive(manifest, isPidAlive, readStartTime);
   if (manifest.execution.backend === 'marketplace') {
     const state = manifest.execution.state;
     if (state.schemaVersion === MARKETPLACE_EVALUATOR_LEG_SCHEMA_VERSION) {
@@ -3569,6 +3683,11 @@ export type AttemptCleanupResult =
 export interface CleanupAttemptOptions {
   readonly v2Base: string;
   readonly isPidAlive: (pid: number) => boolean;
+  /**
+   * How a live PID's identity is read back (#161). A test seam; production
+   * uses `readProcessStartTime`.
+   */
+  readonly readProcessStartTime?: ProcessStartTimeReader;
   readonly env?: Record<string, string>;
   /** Grace period before dead dirty/ahead/preparing attempts may be removed. */
   readonly graceMs?: number;
@@ -3719,9 +3838,10 @@ export function listHostLiveAttempts(
   v2Base: string,
   host: string,
   isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader = readProcessStartTime,
 ): readonly AttemptManifest[] {
   return collectHostedAttempts(v2Base, filesystemSafeHostname(host))
-    .filter(({ manifest }) => isRunnerLiveAttempt(manifest, isPidAlive))
+    .filter(({ manifest }) => isRunnerLiveAttempt(manifest, isPidAlive, readStartTime))
     .map(({ manifest }) => manifest);
 }
 
@@ -3915,10 +4035,10 @@ function graceAllowsForceRemoval(
 function isAttemptChildLive(
   manifest: AttemptManifest,
   isPidAlive: (pid: number) => boolean,
+  readStartTime: ProcessStartTimeReader,
 ): boolean {
   return manifest.processState === 'running'
-    && manifest.pid !== null
-    && isPidAlive(manifest.pid);
+    && isAttemptProcessLive(manifest, isPidAlive, readStartTime);
 }
 
 function retained(
@@ -4416,7 +4536,11 @@ export async function cleanupAttempt(
         manifest.attemptId,
       );
     }
-    if (options.isPidAlive(manifest.pid)) {
+    if (isAttemptProcessLive(
+      manifest,
+      options.isPidAlive,
+      options.readProcessStartTime ?? readProcessStartTime,
+    )) {
       return retained('live', 'Attempt child PID is still live.', manifest.attemptId);
     }
     markAttemptExited(manifestPath);
@@ -4710,7 +4834,11 @@ export async function sweepDeadAttempts(
     && readFreeDiskBytes(diskPath) < diskFloorBytes
   ) {
     const deadAttempts = collectHostedAttempts(options.v2Base, host)
-      .filter((attempt) => !isAttemptChildLive(attempt.manifest, options.isPidAlive))
+      .filter((attempt) => !isAttemptChildLive(
+        attempt.manifest,
+        options.isPidAlive,
+        options.readProcessStartTime ?? readProcessStartTime,
+      ))
       .sort((left, right) =>
         attemptEndedAtMs(left.manifest) - attemptEndedAtMs(right.manifest));
     for (const attempt of deadAttempts) {
