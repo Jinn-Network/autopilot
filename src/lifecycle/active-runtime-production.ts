@@ -69,6 +69,7 @@ import {
 } from './ci-rerun-production.js';
 import { repairProductionMachineChild } from './child-issues-production.js';
 import { executeProductionFileDebtSweep } from './debt-sweep-production.js';
+import { executeProductionTriageDefaults } from './triage-defaults-production.js';
 import { withSelectedCredential } from './production-auth.js';
 import {
   makeProductionReconciliationWriter,
@@ -1266,6 +1267,34 @@ export function makeProductionActiveRuntime(
           selection.credential,
           ambient,
           ({ run }) => executeProductionFileDebtSweep(action, {
+            runner: run,
+            ...(options.repositorySlug === undefined
+              ? {}
+              : { repo: options.repositorySlug }),
+            ...(options.projectMapping === undefined
+              ? {}
+              : {
+                  projectOwner: options.projectMapping.owner,
+                  projectNumber: options.projectMapping.number,
+                  projectMapping: options.projectMapping,
+                }),
+          }),
+          runner,
+        );
+      },
+
+      // Two Project-field writes and no session, so it takes the implement
+      // credential the same way the child repair does and never touches an
+      // attempt workspace.
+      triageDefaults: async (action, credentials) => {
+        const selection = selectCredential(credentials, { phase: 'implement' });
+        if (selection.status !== 'selected') {
+          return { status: 'skipped', reason: 'credential-unavailable' };
+        }
+        return withSelectedCredential(
+          selection.credential,
+          ambient,
+          ({ run }) => executeProductionTriageDefaults(action, {
             runner: run,
             ...(options.repositorySlug === undefined
               ? {}
