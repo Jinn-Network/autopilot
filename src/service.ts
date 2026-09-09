@@ -26,6 +26,7 @@ import {
   type CycleHeartbeat,
 } from './cycle-heartbeat.js';
 import type { DoctorReport } from './doctor.js';
+import { readProcessStartTime } from './process-start-time.js';
 
 export const INTERNAL_DAEMON_ACTIVE_ONCE_ENV =
   'JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE';
@@ -425,13 +426,33 @@ export interface DaemonMetadata {
   readonly consecutiveFailedCycles?: number;
   /** Additive (#139): the excerpt behind the current streak; absent when 0. */
   readonly lastCycleFailureExcerpt?: string;
+  /**
+   * Additive (#178): the rules `processStartedAt` was rendered under. `'utc'`
+   * is the pinned `TZ=UTC`/`LC_ALL=C` rendering of `readProcessStartTime`,
+   * which renders one string for as long as the process lives.
+   *
+   * Absent on every record written before #178 — whose reading is in whatever
+   * timezone and locale the host had at start, and so cannot be compared
+   * verbatim against a pinned reading — and on a record still carrying the
+   * #140 fallback, which is not a rendering at all. Both are healed at the
+   * cycle boundary (`healUnpinnedStartTime`) and, until then, accepted by
+   * `classifyDaemonRecord` through one re-render under the old rules.
+   */
+  readonly processStartTimeRendering?: 'utc';
+}
+
+/** Whether `processStartedAt` is the pinned reading this build takes (#178). */
+function hasPinnedStartTime(
+  record: Pick<DaemonMetadata, 'processStartTimeRendering'>,
+): boolean {
+  return record.processStartTimeRendering === 'utc';
 }
 
 /**
  * The start time a daemon records when `ps lstart` cannot be read at start
  * (jinn-autopilot#140). It is deliberately a form no real `ps` reading can
  * equal, so a record still carrying it is unproven — but it must be *transient*
- * (`healStartTimeFallback`) rather than the permanent dead end #95 documented.
+ * (`healUnpinnedStartTime`) rather than the permanent dead end #95 documented.
  */
 export function startTimeFallback(pid: number): string {
   return `pid-${pid}`;
@@ -444,25 +465,32 @@ export function isStartTimeFallback(
 }
 
 /**
- * How many cycle boundaries a daemon spends trying to replace its own fallback
- * with a real `ps` reading. Bounded because a host where `ps` is unreadable at
- * start is usually a host where it stays unreadable, and an unbounded retry
- * would pay for a process spawn on every cycle forever; three boundaries is
- * enough for the transient causes (a fork that hit a momentary resource limit,
- * a PATH a login shell had not finished exporting).
+ * How many cycle boundaries a daemon spends trying to replace an unpinned
+ * `processStartedAt` with a pinned reading. Bounded because a host where `ps`
+ * is unreadable at start is usually a host where it stays unreadable, and an
+ * unbounded retry would pay for a process spawn on every cycle forever; three
+ * boundaries is enough for the transient causes (a fork that hit a momentary
+ * resource limit, a PATH a login shell had not finished exporting).
  */
-export const START_TIME_FALLBACK_HEAL_ATTEMPTS = 3;
+export const START_TIME_HEAL_ATTEMPTS = 3;
 
 /**
- * One cycle boundary's attempt to upgrade the fallback in `record`. Returns the
- * real start time to persist, or null when there is nothing to write — the
- * record already carries a real reading, the attempts are spent, or this read
+ * One cycle boundary's attempt to give `record` a pinned start time. Returns
+ * the reading to persist, or null when there is nothing to write — the record
+ * already carries a pinned reading, the attempts are spent, or this read
  * failed. Failure is silent by construction: an unhealed record is exactly as
  * safe as it was before, and #140's second remedy (control-socket identity)
  * gives the operator an exit either way.
+ *
+ * Two records need this. The #140 fallback (`pid-<pid>`), which `ps` could not
+ * read at start; and (#178) a record written before the rendering was pinned,
+ * whose string is in the host's own timezone and locale and so cannot be
+ * compared verbatim later. Both are exactly "no pinned reading recorded".
  */
-export async function healStartTimeFallback(input: {
-  readonly record: Pick<DaemonMetadata, 'pid' | 'processStartedAt'>;
+export async function healUnpinnedStartTime(input: {
+  readonly record: Pick<
+    DaemonMetadata, 'pid' | 'processStartedAt' | 'processStartTimeRendering'
+  >;
   readonly attemptsSpent: number;
   readonly read: (pid: number) => Promise<string | null>;
 }): Promise<{
@@ -470,8 +498,8 @@ export async function healStartTimeFallback(input: {
   readonly processStartedAt: string | null;
 }> {
   if (
-    !isStartTimeFallback(input.record)
-    || input.attemptsSpent >= START_TIME_FALLBACK_HEAL_ATTEMPTS
+    hasPinnedStartTime(input.record)
+    || input.attemptsSpent >= START_TIME_HEAL_ATTEMPTS
   ) {
     return { attemptsSpent: input.attemptsSpent, processStartedAt: null };
   }
@@ -498,11 +526,47 @@ export type DaemonClassification =
   | 'binary-drift'
   | 'unsafe-live-mismatch';
 
+/**
+ * Whether the live process's start time is the one `record` names (#178).
+ *
+ * The pinned reading is the only one a record written since #178 may be
+ * compared against. A record written before it holds the host's own rendering
+ * of that instant, which is a different string for the same live process — so
+ * it gets exactly one more chance: the same reading re-rendered under the old
+ * rules. Nothing here weakens the rule that decides liveness — only a start
+ * time the live process actually has can match either way — and a record that
+ * says it is pinned is never given the second chance, so a reused pid whose
+ * unpinned rendering happens to collide proves nothing.
+ */
+function startTimeMatches(
+  record: Pick<DaemonMetadata, 'processStartedAt' | 'processStartTimeRendering'>,
+  actual: {
+    readonly processStartedAt: string | null;
+    readonly unpinnedProcessStartedAt?: string | null;
+  },
+): boolean {
+  if (
+    actual.processStartedAt !== null
+    && actual.processStartedAt === record.processStartedAt
+  ) {
+    return true;
+  }
+  if (hasPinnedStartTime(record)) return false;
+  const unpinned = actual.unpinnedProcessStartedAt ?? null;
+  return unpinned !== null && unpinned === record.processStartedAt;
+}
+
 export function classifyDaemonRecord(
   record: DaemonMetadata,
   actual: {
     readonly processAlive: boolean;
     readonly processStartedAt: string | null;
+    /**
+     * The same reading under the pre-#178 rules, for a record written before
+     * the rendering was pinned. Optional: absent (or null) is "not read", and
+     * a record that needs it then stays unproven, exactly as before.
+     */
+    readonly unpinnedProcessStartedAt?: string | null;
     readonly repository: string;
     readonly executableFingerprint: string;
   },
@@ -513,7 +577,7 @@ export function classifyDaemonRecord(
   // repository's daemon. Only the executable fingerprint may legitimately
   // drift (e.g. `yarn build` rewrote dist under a still-running daemon), and
   // that alone downgrades to 'binary-drift' rather than the unsafe verdict.
-  const identityMatches = actual.processStartedAt === record.processStartedAt
+  const identityMatches = startTimeMatches(record, actual)
     && actual.repository === record.repository;
   if (!identityMatches) return 'unsafe-live-mismatch';
   return actual.executableFingerprint === record.executableFingerprint
@@ -665,6 +729,17 @@ function readCurrentCycleStep(path: string): CycleStepReading | null {
 
 async function processStartedAt(pid: number): Promise<string | null> {
   if (!processAlive(pid)) return null;
+  return readProcessStartTime(pid);
+}
+
+/**
+ * The same reading under the rules every daemon record was written with
+ * before #178: `ps` in whatever timezone and locale this host happens to
+ * carry. Used for one comparison against a record that predates the pin, and
+ * for nothing else — see `startTimeMatches`.
+ */
+async function unpinnedProcessStartedAt(pid: number): Promise<string | null> {
+  if (!processAlive(pid)) return null;
   const child = spawn('ps', ['-p', String(pid), '-o', 'lstart='], {
     stdio: ['ignore', 'pipe', 'ignore'],
   });
@@ -696,9 +771,19 @@ export async function inspectDaemon(input: {
   const metadata = readDaemonMetadata(input.loaded);
   if (metadata == null) return { classification: 'not-running', metadata: null };
   const repository = input.loaded.config.repository.slug;
+  const pinned = await processStartedAt(metadata.pid);
+  // A second `ps` only for the record that can need it: written before the
+  // pin, not the #140 fallback (which no rendering can equal), and not
+  // already proven by the pinned reading.
+  const needsUnpinned = !hasPinnedStartTime(metadata)
+    && !isStartTimeFallback(metadata)
+    && pinned !== metadata.processStartedAt;
   const classification = classifyDaemonRecord(metadata, {
     processAlive: processAlive(metadata.pid),
-    processStartedAt: await processStartedAt(metadata.pid),
+    processStartedAt: pinned,
+    unpinnedProcessStartedAt: needsUnpinned
+      ? await unpinnedProcessStartedAt(metadata.pid)
+      : null,
     repository,
     executableFingerprint: executableFingerprint(input.entryPath),
   });
@@ -885,11 +970,12 @@ export async function runDaemon(input: {
   // start (#139): a daemon that has just started has failed no cycles, so a
   // restart is the operator-visible reset.
   let consecutiveFailedCycles = 0;
-  // Daemon-process-local (#140): boundaries spent trying to replace a
-  // start-time fallback with a real `ps` reading.
+  // Daemon-process-local (#140): boundaries spent trying to replace an
+  // unpinned start time with a pinned `ps` reading.
   let startTimeHealAttempts = 0;
   let stopping = false;
   let wake: (() => void) | undefined;
+  const startTimeReading = await processStartedAt(process.pid);
   let metadata: DaemonMetadata = {
     schemaVersion: 1,
     pid: process.pid,
@@ -898,8 +984,10 @@ export async function runDaemon(input: {
     // drift or already-running. It is no longer permanent (#140): the first
     // cycle boundaries re-read `ps` and upgrade it, and until one succeeds the
     // control socket is the second identity channel `stopService` asks.
-    processStartedAt: (await processStartedAt(process.pid))
-      ?? startTimeFallback(process.pid),
+    processStartedAt: startTimeReading ?? startTimeFallback(process.pid),
+    // Only a reading is a rendering, and every reading this build takes is the
+    // pinned one (#178); the fallback is marked by its absence.
+    processStartTimeRendering: startTimeReading === null ? undefined : 'utc',
     startedAt: new Date().toISOString(),
     repository: input.loaded.config.repository.slug,
     executableFingerprint: executableFingerprint(input.entryPath),
@@ -972,10 +1060,11 @@ export async function runDaemon(input: {
         break;
       }
 
-      // #140: a record written with the start-time fallback is unprovable by
-      // `ps`, so the first boundaries re-read it and rewrite the field the
-      // moment `ps` answers. Bounded and silent — see `healStartTimeFallback`.
-      const heal = await healStartTimeFallback({
+      // #140/#178: a record without a pinned reading — the fallback `ps`
+      // could not replace at start, or a rendering from before the pin — is
+      // unprovable by comparison, so the first boundaries re-read `ps` and
+      // rewrite the field the moment it answers. Bounded and silent.
+      const heal = await healUnpinnedStartTime({
         record: metadata,
         attemptsSpent: startTimeHealAttempts,
         read: processStartedAt,
@@ -984,6 +1073,7 @@ export async function runDaemon(input: {
       if (heal.processStartedAt !== null) {
         metadata = updateMetadata(input.loaded, metadata, {
           processStartedAt: heal.processStartedAt,
+          processStartTimeRendering: 'utc',
         });
       }
 
