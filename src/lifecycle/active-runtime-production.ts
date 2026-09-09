@@ -1288,7 +1288,7 @@ export function makeProductionActiveRuntime(
         );
       },
 
-      // Two Project-field writes and no session, so it takes the implement
+      // Board-field writes and no session, so it takes the implement
       // credential the same way the child repair does and never touches an
       // attempt workspace.
       triageDefaults: async (action, credentials) => {

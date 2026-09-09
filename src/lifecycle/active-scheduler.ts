@@ -91,8 +91,8 @@ export type ActiveCandidate =
   | {
       /**
        * Fill an ordinary board issue's triage gaps so the eligibility cascade
-       * stops refusing it (#166). Spends no concurrency lane — it spawns no
-       * session, only writes one or two Project fields — and is bounded at
+       * stops refusing it (#166, #171). Spends no concurrency lane — it spawns
+       * no session, only writes up to three Project fields — and is bounded at
        * derivation by `MAX_TRIAGE_DEFAULTS_PER_CYCLE` instead.
        */
       readonly phase: 'triage-defaults';
@@ -100,6 +100,7 @@ export type ActiveCandidate =
       readonly projectItemId: string;
       readonly issueType?: TriageDefaultsAction['issueType'];
       readonly priority?: TriageDefaultsAction['priority'];
+      readonly blockedOn?: TriageDefaultsAction['blockedOn'];
     }
   | {
       /**
@@ -539,6 +540,7 @@ export function scheduleActiveActions(
         projectItemId: candidate.projectItemId,
         ...(candidate.issueType === undefined ? {} : { issueType: candidate.issueType }),
         ...(candidate.priority === undefined ? {} : { priority: candidate.priority }),
+        ...(candidate.blockedOn === undefined ? {} : { blockedOn: candidate.blockedOn }),
       });
       continue;
     }

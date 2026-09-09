@@ -59,7 +59,7 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
-  /** Fill an ordinary board issue's Priority / Issue Type gaps (#166). */
+  /** Fill an ordinary board issue's Priority / Issue Type / Blocked on gaps (#166, #171). */
   triageDefaults?(
     action: Extract<NewWorkAction, { kind: 'triage-defaults' }>,
     credentials: CredentialPool,
