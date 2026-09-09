@@ -178,6 +178,15 @@
         "carryover": { "type": "boolean" }
       }
     },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reclaimConcurrency"],
+      "default": { "reclaimConcurrency": 3 },
+      "properties": {
+        "reclaimConcurrency": { "type": "integer", "minimum": 1, "default": 3 }
+      }
+    },
     "mergePolicy": { "enum": ["manual", "safe-auto"] },
     "maintainerSkills": {
       "type": "object",

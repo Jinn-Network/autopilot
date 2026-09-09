@@ -239,6 +239,26 @@ export const autopilotConfigSchema = z.object({
     // already has this key written by init's default template.
     carryover: z.boolean(),
   }).strict(),
+  /**
+   * How fast the engine takes its own dead work off the disk (#179).
+   *
+   * `safety.cleanup` decides whether the sweep runs at all; this decides how
+   * quickly what it trashes actually stops occupying the volume. Trashing a
+   * dead worktree is a rename and costs nothing, but reclaiming a
+   * node_modules-heavy 6 GB checkout takes minutes, and dispatch produces dead
+   * worktrees faster than one reclaim at a time frees them: 18 of them held
+   * ~40 GB while admission starved under a 20 GB floor.
+   *
+   * `reclaimConcurrency` is how many of those removals may run at once on this
+   * host. Three is wide enough to outpace dispatch and narrow enough that the
+   * pool never becomes the reason a live worker's build is slow. Defaulted,
+   * not required: every `.autopilot/config.json` written before this block
+   * existed omits it and must keep parsing. `positiveInteger` rejects 0 -- a
+   * pool that never frees a byte is the incident, not a configuration.
+   */
+  cleanup: z.object({
+    reclaimConcurrency: positiveInteger.default(3),
+  }).strict().default({ reclaimConcurrency: 3 }),
   mergePolicy: z.enum(['manual', 'safe-auto']),
   maintainerSkills: z.object({
     host: z.enum(['claude', 'codex', 'cursor']),

@@ -112,6 +112,9 @@ function validConfig(): unknown {
       children: true,
       carryover: true,
     },
+    cleanup: {
+      reclaimConcurrency: 3,
+    },
     mergePolicy: 'manual',
     maintainerSkills: {
       host: 'codex',
@@ -183,6 +186,45 @@ describe('Autopilot product configuration', () => {
     };
     unknownPhase.safety.attemptFootprintGb = { implement: 8, review: 1, enqueue: 1 };
     expect(() => decodeAutopilotConfig(unknownPhase)).toThrow();
+  });
+
+  // #179: dead-worktree reclamation is what keeps free space ahead of
+  // dispatch, and every deployed `.autopilot/config.json` predates the block
+  // entirely — an absent one must keep parsing and land on the three
+  // concurrent reclaims the incident needed.
+  it('defaults the reclaim concurrency when the cleanup block is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      cleanup?: unknown;
+    };
+    delete input.cleanup;
+
+    expect(decodeAutopilotConfig(input).cleanup)
+      .toEqual({ reclaimConcurrency: 3 });
+  });
+
+  it('round-trips a configured reclaim concurrency', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      cleanup: { reclaimConcurrency: number };
+    };
+    input.cleanup.reclaimConcurrency = 6;
+
+    expect(decodeAutopilotConfig(input).cleanup.reclaimConcurrency).toBe(6);
+  });
+
+  // Zero is not a cheaper pool, it is a pool that never frees a byte — which
+  // is the incident itself. `positiveInteger` makes it unrepresentable.
+  it('rejects a zero reclaim concurrency or an unknown cleanup key', () => {
+    const zero = validConfig() as ReturnType<typeof validConfig> & {
+      cleanup: { reclaimConcurrency: number };
+    };
+    zero.cleanup.reclaimConcurrency = 0;
+    expect(() => decodeAutopilotConfig(zero)).toThrow();
+
+    const unknown = validConfig() as ReturnType<typeof validConfig> & {
+      cleanup: Record<string, number>;
+    };
+    unknown.cleanup.sweepBudgetMs = 60_000;
+    expect(() => decodeAutopilotConfig(unknown)).toThrow();
   });
 
   // #167: every `.autopilot/config.json` on disk predates the worker

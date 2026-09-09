@@ -16,6 +16,8 @@ const DEFAULTS: AttemptFootprintDefaults = { implement: 8 * GB, review: 1 * GB }
 /** What one more attempt of each phase costs, as a projection reports it. */
 const EXPECTED = { implement: 8 * GB, review: 1 * GB };
 const NOW = Date.parse('2026-09-03T10:00:00.000Z');
+/** A host whose trash is empty: nothing has been swept, or all of it is gone. */
+const NO_TRASH = { count: 0, bytes: 0 } as const;
 
 function history(
   phase: 'implement' | 'review',
@@ -110,6 +112,7 @@ describe('disk headroom projection', () => {
       floor: 8 * GB,
       settling: 1,
       expected: EXPECTED,
+      trash: NO_TRASH,
     });
   });
 
@@ -282,6 +285,25 @@ describe('disk headroom projection', () => {
   it('still pauses on current free space alone when nothing is reserved', () => {
     expect(projectDiskHeadroom({ ...base, free: 3.5 * GB }).paused).toBe(true);
   });
+
+  // #179: the projection reports what the trash still holds so the cycle
+  // summary can, but never counts it: those bytes are occupied and already
+  // absent from `free`.
+  it('reports an empty trash when the caller measured none', () => {
+    expect(projectDiskHeadroom({ ...base, free: 40 * GB }).trash)
+      .toEqual({ count: 0, bytes: 0 });
+  });
+
+  it('carries the trash the caller measured into the projection', () => {
+    const headroom = projectDiskHeadroom({
+      ...base,
+      free: 40 * GB,
+      trash: { count: 18, bytes: 40.2 * GB },
+    });
+
+    expect(headroom.trash).toEqual({ count: 18, bytes: 40.2 * GB });
+    expect(headroom.reserved).toBe(0);
+  });
 });
 
 /**
@@ -369,6 +391,7 @@ describe('disk headroom rendering', () => {
       floor: 8 * GB,
       settling: 3,
       expected: EXPECTED,
+      trash: NO_TRASH,
     })).toBe('free 12.0G − reserved 19.5G for 3 settling attempts < floor 8G');
   });
 
@@ -380,6 +403,7 @@ describe('disk headroom rendering', () => {
       floor: 8 * GB,
       settling: 1,
       expected: EXPECTED,
+      trash: NO_TRASH,
     })).toBe('free 4.0G − reserved 8.0G for 1 settling attempt < floor 8G');
   });
 
@@ -393,6 +417,7 @@ describe('disk headroom rendering', () => {
       floor: 20 * GB,
       settling: 3,
       expected: EXPECTED,
+      trash: NO_TRASH,
     }, 'implement')).toBe(
       'free 47.2G − reserved 24.0G for 3 settling attempts − implement 8.0G '
       + '< floor 20G',
@@ -407,7 +432,11 @@ describe('disk headroom rendering', () => {
       floor: 8 * GB,
       settling: 1,
       expected: EXPECTED,
-    })).toBe('disk: free=40.0G reserved=8.0G floor=8G settling=1 admits=implement,review');
+      trash: NO_TRASH,
+    })).toBe(
+      'disk: free=40.0G reserved=8.0G floor=8G settling=1 trash=0 (0.0G) '
+      + 'admits=implement,review',
+    );
   });
 
   it('names the lanes the projection still admits, and none when it admits none', () => {
@@ -418,7 +447,11 @@ describe('disk headroom rendering', () => {
       floor: 20 * GB,
       settling: 1,
       expected: EXPECTED,
-    })).toBe('disk: free=30.0G reserved=8.0G floor=20G settling=1 admits=review');
+      trash: NO_TRASH,
+    })).toBe(
+      'disk: free=30.0G reserved=8.0G floor=20G settling=1 trash=0 (0.0G) '
+      + 'admits=review',
+    );
     expect(diskHeadroomSummaryLine({
       paused: true,
       free: 20 * GB,
@@ -426,6 +459,29 @@ describe('disk headroom rendering', () => {
       floor: 20 * GB,
       settling: 1,
       expected: EXPECTED,
-    })).toBe('disk: free=20.0G reserved=8.0G floor=20G settling=1 admits=none');
+      trash: NO_TRASH,
+    })).toBe(
+      'disk: free=20.0G reserved=8.0G floor=20G settling=1 trash=0 (0.0G) '
+      + 'admits=none',
+    );
+  });
+
+  // #179: `admits=none` alone cannot tell a full disk from a reclaim backlog,
+  // and the two want opposite things from an operator — free space, or wait.
+  // The bytes queued for reclamation are occupied disk, counted in `free=`
+  // already, and coming back on their own.
+  it('reports what the trash still holds beside what is free', () => {
+    expect(diskHeadroomSummaryLine({
+      paused: true,
+      free: 20 * GB,
+      reserved: 8 * GB,
+      floor: 20 * GB,
+      settling: 1,
+      expected: EXPECTED,
+      trash: { count: 18, bytes: 40.2 * GB },
+    })).toBe(
+      'disk: free=20.0G reserved=8.0G floor=20G settling=1 trash=18 (40.2G) '
+      + 'admits=none',
+    );
   });
 });

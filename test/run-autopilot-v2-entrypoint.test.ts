@@ -408,6 +408,30 @@ describe('lifecycle script entrypoint', () => {
     expect(renderCleanupWarnings([], 0)).toEqual([]);
   });
 
+  // #179: `reclaiming N in the background` names only what is running. When
+  // the queue behind it is deeper than one cycle can start, the operator
+  // reading `admits=none` needs the size of the queue, not the width of the
+  // pool.
+  it('reports a reclaim queue deeper than one cycle can start', () => {
+    expect(renderCleanupWarnings([], 3, [], {
+      count: 18,
+      bytes: 40.2 * 1024 ** 3,
+      concurrency: 3,
+    })).toEqual([
+      '[autopilot:v2] cleanup reclaiming 3 trashed worktree(s) in the background; '
+      + 'their bytes stay occupied until each finishes',
+      '[autopilot:v2] cleanup reclaim backlog: 18 worktree(s), 40.2G',
+    ]);
+  });
+
+  it('stays quiet about a trash the pool is already keeping up with', () => {
+    expect(renderCleanupWarnings([], 0, [], {
+      count: 3,
+      bytes: 6 * 1024 ** 3,
+      concurrency: 3,
+    })).toEqual([]);
+  });
+
   it('reports a failed reclaim until it clears', () => {
     expect(renderCleanupWarnings([], 0, [
       { trashed: '/x/trash/attempt-1-uuid', entry: 'attempt-1-uuid', detail: 'EPERM' },

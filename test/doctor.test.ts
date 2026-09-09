@@ -9,6 +9,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import fixture from './fixtures/non-jinn-autopilot-config.json';
 import {
+  DISK_REMEDY,
+  diskShortfallRemedy,
   GIT_REF_CAPABILITIES_REMEDY,
   runDoctor,
   type DoctorRunner,
@@ -260,5 +262,29 @@ describe('autopilot doctor', () => {
       expect.objectContaining({ id: 'configuration', status: 'blocking' }),
     ]);
     expect(report.blocking).toBe(true);
+  });
+});
+
+// #179: below the floor, "free disk space" is the wrong instruction whenever
+// the engine's own reclaim queue already holds more than the shortfall — the
+// bytes are coming back, and an operator who deletes something else, or drops
+// the floor, acted on a reading that was about to fix itself.
+describe('the disk remedy under a reclaim backlog', () => {
+  const GB = 1024 ** 3;
+
+  it('names the backlog when it holds more than the shortfall', () => {
+    expect(diskShortfallRemedy(10 * GB, { count: 18, bytes: 40.2 * GB })).toBe(
+      '18 trashed worktree(s) hold 40.2G awaiting reclaim, more than the 10.0G '
+      + 'shortfall: the sweep frees them a few at a time '
+      + '(cleanup.reclaimConcurrency). Wait for the backlog to drain, raise '
+      + 'cleanup.reclaimConcurrency, or free disk space.',
+    );
+  });
+
+  it('asks for disk space when the trash cannot cover the shortfall', () => {
+    expect(diskShortfallRemedy(50 * GB, { count: 18, bytes: 40.2 * GB }))
+      .toBe(DISK_REMEDY);
+    expect(diskShortfallRemedy(1 * GB, { count: 0, bytes: 0 }))
+      .toBe(DISK_REMEDY);
   });
 });
