@@ -3704,6 +3704,10 @@ describe('backlog composition (#127)', () => {
   const CHILD_BODY = '<!-- jinn-autopilot:child pr=101 kind=review-finding -->';
   const FOLLOW_UP_BODY =
     '<!-- jinn-autopilot:review-follow-up pr=101 head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa index=0 -->';
+  // Parent 101 is the fixture's own OPEN pull request; 102 and 103 are not in
+  // the snapshot at all, which on a proven-global view means merged.
+  const RESIDUE_FOLLOW_UP_BODIES = [102, 103].map((parent) =>
+    `<!-- jinn-autopilot:review-follow-up pr=${parent} head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa index=0 -->`);
 
   function issue(
     number: number,
@@ -3821,7 +3825,22 @@ describe('backlog composition (#127)', () => {
       actionable: 2,
       ordinaryByPriority: { p0: 0, p1: 1, p2: 0, p3: 0, p4: 0, unset: 0 },
       untriaged: { noType: 0, noPriority: 0 },
+      // The follow-up's parent already carries an open sweep, so it is not
+      // residue: a per-parent sweep can still reach it.
+      residue: 0,
     });
+  });
+
+  it('counts follow-ups no per-parent sweep can reach as residue (#168)', async () => {
+    const report = await backlogFor([
+      issue(64, { body: FOLLOW_UP_BODY }),
+      issue(65, { body: RESIDUE_FOLLOW_UP_BODIES[0]! }),
+      issue(66, { body: RESIDUE_FOLLOW_UP_BODIES[1]! }),
+    ]);
+    // Two merged parents with one follow-up each: both below the per-parent
+    // floor, so both are residue and neither is fileable on its own. The
+    // third follow-up's parent is still OPEN, so it is held, not residue.
+    expect(report.backlog).toMatchObject({ followUps: 3, sweeps: 0, residue: 2 });
   });
 
   it('renders the per-cycle backlog log line in the exact specified format', async () => {
@@ -3833,7 +3852,7 @@ describe('backlog composition (#127)', () => {
     ]);
     const human = renderLifecycleHuman(report);
     expect(human.split('\n')).toContain(
-      'backlog: ordinary=1 follow-ups=1 children=1 sweeps=1 (actionable=2)',
+      'backlog: ordinary=1 follow-ups=1 children=1 sweeps=1 (actionable=2) residue=0',
     );
   });
 

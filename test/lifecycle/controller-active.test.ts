@@ -1800,6 +1800,62 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
     }]);
   });
 
+  function residueSweepSnapshot(): GitHubLifecycleSnapshot {
+    const head = 'a'.repeat(40);
+    const followUp = (number: number, parentPr: number, area: string) => ({
+      number,
+      title: `Follow-up ${number}`,
+      body: `${formatReviewFollowUpMarker(parentPr, head, number)}\n\n`
+        + `See \`${area}/thing.ts\`.`,
+      labels: [],
+      shape: 'chore',
+      blockedOn: 'Nothing',
+      blockedByIssues: [],
+      effort: 'Low',
+      priority: 'P4',
+      status: 'Todo',
+      onBoard: true,
+      author: 'implementation-bot',
+      projectItemId: `PVTI_${number}`,
+      inCurrentSprint: false,
+    });
+    return {
+      ...snapshot(),
+      issues: [
+        // Two merged parents, 2 + 1 members, one area: one residue sweep of 3.
+        followUp(101, 84, 'packages/core'),
+        followUp(102, 84, 'packages/core'),
+        followUp(103, 85, 'packages/core'),
+        // A lone residue in another area waits for company.
+        followUp(104, 86, 'packages/edge'),
+      ],
+      pullRequests: [],
+      lifecycle: { items: [] },
+    };
+  }
+
+  it('emits one residue-sweep filing action across parents, by area (#168)', async () => {
+    const actions: unknown[] = [];
+    const controller = deps({ readSnapshot: async () => residueSweepSnapshot() });
+    controller.active!.executeAction = async (action) => {
+      actions.push(action);
+      return { outcome: 'filed' };
+    };
+
+    await runLifecycleCycle('active', controller);
+
+    expect(actions).toEqual([{
+      kind: 'file-residue-sweep',
+      area: 'packages/core',
+      parentPrs: [84, 85],
+      members: [
+        { number: 101, priority: 'p4' },
+        { number: 102, priority: 'p4' },
+        { number: 103, priority: 'p4' },
+      ],
+    }]);
+  });
+
   it('files no debt sweep from a scoped or incomplete snapshot', async () => {
     for (const partial of [
       { snapshotAuthority: 'scoped', globalOpenPipelineBacklog: 0 },

@@ -525,6 +525,24 @@ export type NewWorkAction =
     }
   | {
       /**
+       * File one residue sweep (#168): review follow-ups left behind on
+       * SEVERAL merged parents, each below the per-parent floor, batched by
+       * area. Its own kind rather than a widened `file-debt-sweep` because it
+       * names no parent at all — the subject is the area — and the per-parent
+       * path must stay byte-identical.
+       */
+      readonly kind: 'file-residue-sweep';
+      /** `packages/<name>`, a first path segment, or `unknown` (`debt-sweep.ts`). */
+      readonly area: string;
+      /** The merged parents the members came from, ascending. */
+      readonly parentPrs: readonly number[];
+      readonly members: readonly {
+        readonly number: number;
+        readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+      }[];
+    }
+  | {
+      /**
        * Hand the exact head to GitHub's merge queue. The queue, not this
        * engine, constructs and lands the merge commit, so nothing downstream of
        * a successful enqueue may claim the change is merged.

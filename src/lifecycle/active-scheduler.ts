@@ -95,6 +95,22 @@ export type ActiveCandidate =
     }
   | {
       /**
+       * Batch residue — follow-ups left on several merged parents, each below
+       * the per-parent floor — into one sweep issue keyed by area (#168).
+       * Spends no concurrency lane, exactly like `file-debt-sweep`, and is
+       * bounded at derivation by `DEBT_SWEEP_MAX_PER_CYCLE`; its dedup is
+       * member-level and re-checked live at execution.
+       */
+      readonly phase: 'file-residue-sweep';
+      readonly area: string;
+      readonly parentPrs: readonly number[];
+      readonly members: readonly {
+        readonly number: number;
+        readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+      }[];
+    }
+  | {
+      /**
        * Hand the exact head to GitHub's merge queue. The queue builds and lands
        * the merge commit; this engine only puts the PR in line.
        */
@@ -197,6 +213,8 @@ function subject(candidate: ActiveCandidate): string {
       ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
       : candidate.phase === 'file-debt-sweep'
         ? `pr:${candidate.parentPr}`
+        : candidate.phase === 'file-residue-sweep'
+          ? `area:${candidate.area}`
     : `pr:${candidate.prNumber}`;
 }
 
@@ -210,6 +228,7 @@ export function gatingIssueNumbers(
   candidate: ActiveCandidate,
 ): readonly number[] {
   return candidate.phase === 'file-debt-sweep'
+    || candidate.phase === 'file-residue-sweep'
     ? candidate.members.map((member) => member.number)
     : [candidate.issueNumber];
 }
@@ -461,6 +480,15 @@ export function scheduleActiveActions(
         projectItemId: candidate.projectItemId,
         ...(candidate.issueType === undefined ? {} : { issueType: candidate.issueType }),
         ...(candidate.priority === undefined ? {} : { priority: candidate.priority }),
+      });
+      continue;
+    }
+    if (candidate.phase === 'file-residue-sweep') {
+      actions.push({
+        kind: 'file-residue-sweep',
+        area: candidate.area,
+        parentPrs: candidate.parentPrs,
+        members: candidate.members,
       });
     }
   }

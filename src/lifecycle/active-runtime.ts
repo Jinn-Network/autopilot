@@ -65,6 +65,12 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
+  /** File one residue sweep across several merged parents, by area (#168). */
+  fileResidueSweep?(
+    action: Extract<NewWorkAction, { kind: 'file-residue-sweep' }>,
+    credentials: CredentialPool,
+    snapshot: GitHubLifecycleSnapshot,
+  ): Promise<ActiveRuntimeResult>;
   /**
    * Hand the exact head to GitHub's merge queue. Nothing this handler returns
    * may claim the change landed: the queue merges on its own schedule, and Done
@@ -216,6 +222,9 @@ async function routeAction(
     case 'triage-defaults':
       return handlers.triageDefaults?.(action, credentials, snapshot)
         ?? unwired('triage-defaults');
+    case 'file-residue-sweep':
+      return handlers.fileResidueSweep?.(action, credentials, snapshot)
+        ?? unwired('file-residue-sweep');
     default:
       // Unreachable for the declared union; reached only by a retired or
       // not-yet-declared kind arriving from a stale plan. Skipping names it

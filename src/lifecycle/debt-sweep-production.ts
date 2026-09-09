@@ -19,12 +19,16 @@ import { REPO } from '../dispatcher/constants.js';
 import type { ProjectMapping } from '../config/config.js';
 import {
   fileDebtSweep,
+  fileResidueSweep,
   type ClosedDebtSweepIssue,
-  type DebtSweepPort,
   type FileDebtSweepResult,
+  type FileResidueSweepResult,
   type MergedSweepPullRequest,
+  type OpenDebtSweepIssueBody,
+  type ResidueSweepPort,
 } from './debt-sweep.js';
 import {
+  makeProductionOpenIssueBodyReader,
   makeProductionReviewFollowUpPort,
   parseIssueList,
 } from './review-follow-ups-production.js';
@@ -49,9 +53,13 @@ export interface ProductionDebtSweepOptions {
 
 export function makeProductionDebtSweepPort(
   options: ProductionDebtSweepOptions = {},
-): DebtSweepPort {
+): ResidueSweepPort {
   const runner = options.runner ?? defaultRunner;
   const repo = options.repo ?? REPO;
+  const openBodies = makeProductionOpenIssueBodyReader({
+    ...(options.runner === undefined ? {} : { runner: options.runner }),
+    ...(options.repo === undefined ? {} : { repo: options.repo }),
+  });
   const followUps = makeProductionReviewFollowUpPort({
     ...(options.runner === undefined ? {} : { runner: options.runner }),
     ...(options.repo === undefined ? {} : { repo: options.repo }),
@@ -70,6 +78,13 @@ export function makeProductionDebtSweepPort(
   });
   return {
     ...followUps,
+    async searchOpenBodiesByMarker(marker): Promise<readonly OpenDebtSweepIssueBody[]> {
+      return (await openBodies(marker)).map((issue) => ({
+        number: issue.number,
+        title: issue.title,
+        body: issue.body,
+      }));
+    },
     async searchClosedByMarker(marker): Promise<readonly ClosedDebtSweepIssue[]> {
       const raw = await runner('gh', [
         'issue',
@@ -189,10 +204,58 @@ function runtimeResult(result: FileDebtSweepResult): {
   return { status: 'filed', detail: `sweep:${result.number}${closed(result.closedMembers)}` };
 }
 
+function residueRuntimeResult(result: FileResidueSweepResult): {
+  readonly status: string;
+  readonly detail?: string;
+  readonly reason?: string;
+} {
+  const closed = (members: readonly number[] | undefined): string => (
+    members === undefined || members.length === 0 ? '' : ` closed=${members.join(',')}`
+  );
+  if (result.status === 'already-swept') {
+    return {
+      status: 'skipped',
+      reason: `residue-sweep-already-swept:${result.number}`,
+      detail: `closed=${result.closedMembers.join(',') || '-'} declined=${result.declinedMembers.join(',') || '-'}`,
+    };
+  }
+  if (result.status === 'below-minimum') {
+    // Not a failure: the batch shrank between the snapshot and the filing —
+    // a member closed, or another sweep took it first.
+    return {
+      status: 'skipped',
+      reason: `residue-sweep-below-minimum:${result.openMembers}`,
+      ...(closed(result.closedMembers) === '' ? {} : { detail: closed(result.closedMembers).trim() }),
+    };
+  }
+  return {
+    status: 'filed',
+    detail: `residue-sweep:${result.number} area=${result.area}${closed(result.closedMembers)}`,
+  };
+}
+
+export async function executeProductionFileResidueSweep(
+  action: Extract<NewWorkAction, { kind: 'file-residue-sweep' }>,
+  options: ProductionDebtSweepOptions & {
+    readonly port?: ResidueSweepPort;
+  } = {},
+): Promise<{
+  readonly status: string;
+  readonly detail?: string;
+  readonly reason?: string;
+}> {
+  const port = options.port ?? makeProductionDebtSweepPort(options);
+  return residueRuntimeResult(await fileResidueSweep(port, {
+    area: action.area,
+    members: action.members,
+    parentPrs: action.parentPrs,
+  }));
+}
+
 export async function executeProductionFileDebtSweep(
   action: Extract<NewWorkAction, { kind: 'file-debt-sweep' }>,
   options: ProductionDebtSweepOptions & {
-    readonly port?: DebtSweepPort;
+    readonly port?: ResidueSweepPort;
   } = {},
 ): Promise<{
   readonly status: string;
