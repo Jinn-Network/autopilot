@@ -1143,6 +1143,11 @@ export async function runAutopilotV2(
           defaultPriority: loaded.config.triage.defaultPriority,
           inferIssueType: loaded.config.triage.inferIssueType,
         },
+        // Umbrella closure (#160). Recognition and the fresh-claim refusal are
+        // always on; this arms the close-umbrella action, which is refusal-
+        // guarded and idempotent (a closed, human-held or still-open-child
+        // umbrella is skipped, never failed).
+        closeCompletedUmbrellas: true,
         snapshotFailureMode: options.once ? 'throw' : 'report',
       });
     } catch (error) {

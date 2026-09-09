@@ -193,6 +193,21 @@ describe('planTriageDefaults (#166)', () => {
     )).toEqual([]);
   });
 
+  // #160: triage exists to make an issue claimable. An umbrella never is, so
+  // closing its gaps buys nothing and spends one of the ten capped writes a
+  // claimable issue needs.
+  it('leaves an umbrella untriaged', () => {
+    expect(planTriageDefaults([
+      issue(21, {
+        body: 'umbrella; children own implementation',
+        shape: null,
+        priority: null,
+        blockedOn: null,
+      }),
+      issue(22, { labels: ['umbrella'], priority: null }),
+    ], POLICY)).toEqual([]);
+  });
+
   it('skips an issue with no board row, a Done issue, and a fully triaged issue', () => {
     expect(planTriageDefaults([
       issue(17, { onBoard: false, projectItemId: null, priority: null }),

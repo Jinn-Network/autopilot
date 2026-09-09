@@ -543,6 +543,22 @@ export type NewWorkAction =
     }
   | {
       /**
+       * Close an umbrella issue whose children are all closed (#160). The
+       * umbrella's own acceptance criterion is that its children exist and
+       * land, so this is its actual end state — and the thing a human is
+       * otherwise left to remember, since no session ever claims an umbrella.
+       *
+       * `childIssueNumbers` is the evidence, carried so the cycle log names
+       * what was closed rather than asserting completion unexplained. It is
+       * never empty: an umbrella that declared no children has not met its own
+       * criterion and is never planned.
+       */
+      readonly kind: 'close-umbrella';
+      readonly issueNumber: number;
+      readonly childIssueNumbers: readonly number[];
+    }
+  | {
+      /**
        * File one residue sweep (#168): review follow-ups left behind on
        * SEVERAL merged parents, each below the per-parent floor, batched by
        * area. Its own kind rather than a widened `file-debt-sweep` because it

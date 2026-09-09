@@ -36,6 +36,7 @@ import {
   parseChildMarker,
   resolveChildTriageExpectation,
 } from './child-issues.js';
+import { isUmbrellaIssue, planUmbrellaClosures } from './umbrella-issues.js';
 import { classifyCiChecks, isCiGreen } from './ci-classifier.js';
 import {
   diskHeadroomSkipDetail,
@@ -146,6 +147,14 @@ export interface LifecycleControllerDeps {
    * config, where both keys are defaulted.
    */
   readonly triageDefaults?: TriageDefaultsPolicy;
+  /**
+   * Arm umbrella closure (#160). Absent or false means no `close-umbrella`
+   * action is ever planned: recognising the shape costs nothing and is always
+   * on, but closing somebody's issue is a mutation, and a build that was never
+   * told to make it must not start making it. Recognition and refusal are
+   * unaffected either way.
+   */
+  readonly closeCompletedUmbrellas?: boolean;
   readonly active?: {
     preflight(): Promise<{ readonly ok: boolean; readonly detail?: string }>;
     readLocalState(): {
@@ -309,6 +318,14 @@ export interface LifecycleBacklogSummary {
   readonly followUps: number;
   readonly children: number;
   readonly sweeps: number;
+  /**
+   * Open umbrella issues (#160): work whose children own implementation, so no
+   * claim lane will ever reach it. Counted apart from `ordinary` for exactly
+   * the reason an untriaged issue is — reporting unclaimable work as claimable
+   * is what made both lanes look starved against a backlog that was not there
+   * — and apart from `untriaged` because a shape is not a gap anyone can close.
+   */
+  readonly umbrellas: number;
   readonly actionable: number;
   /** Per-priority counts for the ORDINARY set only — follow-ups, children, and sweeps are excluded. */
   readonly ordinaryByPriority: Readonly<Record<LifecycleBacklogPriorityKey, number>>;
@@ -837,19 +854,27 @@ function hasDebtSweepMarkerTag(body: string): boolean {
   return body.includes(DEBT_SWEEP_MARKER_TAG);
 }
 
-type LifecycleBacklogClass = 'sweep' | 'child' | 'follow-up' | 'ordinary';
+type LifecycleBacklogClass = 'sweep' | 'child' | 'follow-up' | 'umbrella' | 'ordinary';
 
 /**
  * Classification precedence for #127: debt-sweep -> machine child -> review
- * follow-up -> ordinary. An issue can carry more than one marker (a stale
- * follow-up marker left on an issue later folded into a sweep, say); the
+ * follow-up -> umbrella -> ordinary. An issue can carry more than one marker (a
+ * stale follow-up marker left on an issue later folded into a sweep, say); the
  * first one recognized in this order wins.
+ *
+ * Umbrella (#160) sits last of the four because the three above it are exact
+ * machine-written markers on machine-filed work, while an umbrella is a shape a
+ * human declared about work of any kind.
  */
-function classifyBacklogIssue(issue: { readonly body?: string }): LifecycleBacklogClass {
+function classifyBacklogIssue(issue: {
+  readonly body?: string;
+  readonly labels?: readonly string[];
+}): LifecycleBacklogClass {
   const body = issue.body ?? '';
   if (hasDebtSweepMarkerTag(body)) return 'sweep';
   if (isMachineChildIssue({ body })) return 'child';
   if (hasReviewFollowUpMarkerTag(body)) return 'follow-up';
+  if (isUmbrellaIssue({ body, labels: issue.labels })) return 'umbrella';
   return 'ordinary';
 }
 
@@ -885,6 +910,7 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
   let followUps = 0;
   let children = 0;
   let sweeps = 0;
+  let umbrellas = 0;
   let noType = 0;
   let noPriority = 0;
   let noBlockedOn = 0;
@@ -896,9 +922,12 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
       children += 1;
     } else if (backlogClass === 'follow-up') {
       followUps += 1;
+    } else if (backlogClass === 'umbrella') {
+      umbrellas += 1;
     } else {
-      // Ordinary issues only: machine children have their own repair, and
-      // follow-ups and sweeps are machine-filed with triage already applied.
+      // Ordinary issues only: machine children have their own repair,
+      // follow-ups and sweeps are machine-filed with triage already applied,
+      // and an umbrella's unset fields are not gaps anyone should close (#160).
       const gaps = triageGaps(issue);
       if (gaps.noType) noType += 1;
       if (gaps.noPriority) noPriority += 1;
@@ -914,6 +943,7 @@ function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSumm
     followUps,
     children,
     sweeps,
+    umbrellas,
     actionable: ordinary + sweeps,
     ordinaryByPriority,
     untriaged: { noType, noPriority, noBlockedOn },
@@ -1018,6 +1048,7 @@ function activeCandidates(
   snapshot: GitHubLifecycleSnapshot,
   view: ReturnType<typeof deriveLifecycle>,
   triagePolicy: TriageDefaultsPolicy | undefined,
+  closeCompletedUmbrellas: boolean | undefined,
 ): ActiveCandidate[] {
   const byPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr]));
   const repair: ActiveCandidate[] = [];
@@ -1282,8 +1313,38 @@ function activeCandidates(
     ...other,
     ...debtSweepCandidates(snapshot),
     ...triageDefaultsCandidates(snapshot, triagePolicy, repairingIssues),
+    ...umbrellaClosureCandidates(snapshot, closeCompletedUmbrellas),
     ...residueSweepCandidates(snapshot),
   ];
+}
+
+/**
+ * Umbrella closures (#160), derived from the snapshot's issues rather than
+ * from the lifecycle view for the same reason board triage is: an umbrella is
+ * precisely an issue the view has already ruled ineligible, so the view carries
+ * no candidate to hang this on.
+ *
+ * Withheld entirely when the closure is not armed, and refused on anything
+ * short of a proven-global, proven-complete view. Absence from `snapshot.issues`
+ * is the ENTIRE evidence that a child closed, and absence only means that when
+ * the issue set is known to be the whole set — a scoped pre-dispatch pass reads
+ * a handful of issues and would read every child it cannot see as closed. Every
+ * other consumer of absence in this engine gets to fail safe by releasing; this
+ * one would fail by closing somebody's issue, so it fails closed instead.
+ * Nothing is lost: the next global cycle re-derives it.
+ */
+function umbrellaClosureCandidates(
+  snapshot: GitHubLifecycleSnapshot,
+  closeCompletedUmbrellas: boolean | undefined,
+): ActiveCandidate[] {
+  if (closeCompletedUmbrellas !== true) return [];
+  if (snapshot.snapshotComplete !== true) return [];
+  if (snapshot.snapshotAuthority === 'scoped') return [];
+  return planUmbrellaClosures(snapshot.issues).map((planned) => ({
+    phase: 'close-umbrella',
+    issueNumber: planned.issueNumber,
+    childIssueNumbers: planned.childIssueNumbers,
+  }));
 }
 
 /**
@@ -1444,6 +1505,8 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
     || action.kind === 'repair-machine-child'
     // The gap it closes is exactly what keeps the issue out of `eligible`.
     || action.kind === 'triage-defaults'
+    // Likewise the shape it acts on: the umbrella sits in `eligible`, refused.
+    || action.kind === 'close-umbrella'
   ) return 'eligible';
   if (action.kind === 'claim-review') return 'awaiting-review';
   if (action.kind === 'file-reconcile-child') return 'awaiting-review';
@@ -1459,7 +1522,9 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
 }
 
 function subjectForAction(action: NewWorkAction): string {
-  return action.kind === 'claim-implementation' || action.kind === 'triage-defaults'
+  return action.kind === 'claim-implementation'
+    || action.kind === 'triage-defaults'
+    || action.kind === 'close-umbrella'
     ? `issue:${action.issueNumber}`
     : action.kind === 'repair-machine-child'
       ? `issue:${action.issueNumber}/pr:${action.parentPr}`
@@ -1477,6 +1542,7 @@ function phaseForSchedulingSkip(
     skip.phase === 'implementation'
     || skip.phase === 'repair-machine-child'
     || skip.phase === 'triage-defaults'
+    || skip.phase === 'close-umbrella'
   ) return 'eligible';
   if (skip.phase === 'review') return 'awaiting-review';
   if (skip.phase === 'file-reconcile-child') return 'awaiting-review';
@@ -1711,7 +1777,7 @@ async function executeActivePass(
         pr.state === 'OPEN' && pr.labels.includes('engine:review')
       )).length;
   const candidates = applyMergePolicy(
-    activeCandidates(snapshot, view, deps.triageDefaults),
+    activeCandidates(snapshot, view, deps.triageDefaults, deps.closeCompletedUmbrellas),
     deps.mergePolicy ?? 'manual',
   ).filter((candidate) => gatingIssueNumbers(candidate).every((issueNumber) => (
     !blockedIssues.has(issueNumber)
@@ -1727,7 +1793,9 @@ async function executeActivePass(
       runnerId: deps.runnerId,
       mode: 'active',
       phase: phaseForSchedulingSkip(candidate),
-      subject: candidate.phase === 'implementation' || candidate.phase === 'triage-defaults'
+      subject: candidate.phase === 'implementation'
+        || candidate.phase === 'triage-defaults'
+        || candidate.phase === 'close-umbrella'
         ? `issue:${candidate.issueNumber}`
         : candidate.phase === 'repair-machine-child'
           ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
@@ -2632,6 +2700,7 @@ function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[
   return [
     `backlog: ordinary=${backlog.ordinary} follow-ups=${backlog.followUps} `
       + `children=${backlog.children} sweeps=${backlog.sweeps} `
+      + `umbrellas=${backlog.umbrellas} `
       + `(actionable=${backlog.actionable}) residue=${backlog.residue}`,
     `backlog ordinary priority: ${
       [...BACKLOG_PRIORITY_KEYS, 'unset' as const]

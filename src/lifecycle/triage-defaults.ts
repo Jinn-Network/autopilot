@@ -28,6 +28,7 @@
  */
 
 import { isMachineChildIssue } from './child-issues.js';
+import { isUmbrellaIssue } from './umbrella-issues.js';
 import type { BlockedOn, IssueShape, Priority, ProjectStatus } from '../dispatcher/types.js';
 
 /**
@@ -68,6 +69,8 @@ export interface TriageDefaultsIssue {
   readonly number: number;
   readonly title: string;
   readonly body?: string;
+  /** Native GitHub labels; read only for the umbrella exclusion (#160). */
+  readonly labels?: readonly string[];
   /** The repository's NATIVE Issue Type, not a board field. */
   readonly shape: IssueShape | null;
   readonly priority: Priority | null;
@@ -143,6 +146,11 @@ export interface TriageDefaultsPlanItem {
  * Machine children are excluded categorically: they carry their own expected
  * triage on their marker and the machine-child repair owns it. Two writers for
  * one field is how a board starts oscillating.
+ *
+ * Umbrellas are excluded for the opposite reason (#160): triage exists to make
+ * an issue claimable, an umbrella never is however completely it is triaged,
+ * and one of the ten capped writes spent on it is one a claimable issue does
+ * not get.
  */
 export function planTriageDefaults(
   issues: readonly TriageDefaultsIssue[],
@@ -151,6 +159,7 @@ export function planTriageDefaults(
   const planned: TriageDefaultsPlanItem[] = [];
   for (const issue of [...issues].sort((left, right) => left.number - right.number)) {
     if (isMachineChildIssue({ body: issue.body })) continue;
+    if (isUmbrellaIssue({ body: issue.body, labels: issue.labels })) continue;
     // Every write needs a Project item to edit — the two board writes
     // literally, and the type write because an issue off the board is not
     // work this engine has been handed at all.

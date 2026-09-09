@@ -480,6 +480,114 @@ describe('active lifecycle controller', () => {
     });
   });
 
+  // #160: closing the umbrella when its children close is the umbrella's own
+  // end state, and the thing a human is otherwise left to remember.
+  describe('umbrella closure', () => {
+    const UMBRELLA_BODY = 'umbrella; children own implementation\n'
+      + '- [x] #2449\n- [x] #2450\n';
+
+    function umbrellaSnapshot(
+      issues: readonly Record<string, unknown>[],
+    ): GitHubLifecycleSnapshot {
+      return {
+        ...snapshot(),
+        issues: issues.map((overrides) => ({
+          number: 2448,
+          title: 'feat: the poller programme',
+          body: UMBRELLA_BODY,
+          labels: [],
+          shape: 'feat',
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Low',
+          priority: 'P2',
+          status: 'Todo',
+          onBoard: true,
+          author: 'implementation-bot',
+          projectItemId: 'PVTI_2448',
+          inCurrentSprint: false,
+          ...overrides,
+        })),
+        lifecycle: { items: [] },
+      };
+    }
+
+    function umbrellaDeps(
+      snapshotValue: GitHubLifecycleSnapshot,
+    ): LifecycleControllerDeps {
+      return deps({
+        readSnapshot: async () => snapshotValue,
+        closeCompletedUmbrellas: true,
+      });
+    }
+
+    it('closes an umbrella whose declared children are all gone, naming them', async () => {
+      const actions: unknown[] = [];
+      const controller = umbrellaDeps(umbrellaSnapshot([{}]));
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'closed', reason: 'children #2449, #2450' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([{
+        kind: 'close-umbrella',
+        issueNumber: 2448,
+        childIssueNumbers: [2449, 2450],
+      }]);
+      expect(renderLifecycleHuman(report).split('\n'))
+        .toContain('close-umbrella issue:2448: closed (children #2449, #2450).');
+    });
+
+    it('holds while a declared child is still open', async () => {
+      const actions: unknown[] = [];
+      const controller = umbrellaDeps(umbrellaSnapshot([
+        {},
+        { number: 2449, body: '', title: 'fix: the first child', projectItemId: 'PVTI_2449' },
+      ]));
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'closed' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([]);
+    });
+
+    it('plans nothing at all when the closure is not armed', async () => {
+      const actions: unknown[] = [];
+      const controller = deps({ readSnapshot: async () => umbrellaSnapshot([{}]) });
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'closed' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([]);
+    });
+
+    it('refuses to derive a closure on a scoped view', async () => {
+      // Absence from the open set is the whole evidence a child closed, and a
+      // scoped view reads every issue it cannot see as closed.
+      const actions: unknown[] = [];
+      const controller = umbrellaDeps({
+        ...umbrellaSnapshot([{}]),
+        snapshotAuthority: 'scoped',
+      });
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'closed' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([]);
+    });
+  });
+
   it('threads the same immutable cycle snapshot into reconciliation and active execution', async () => {
     let writerSnapshot: GitHubLifecycleSnapshot | undefined;
     let actionSnapshot: GitHubLifecycleSnapshot | undefined;
