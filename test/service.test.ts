@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -18,7 +18,7 @@ import {
   daemonActiveOnceEnvironment,
   daemonCycleStatus,
   formatCycleDuration,
-  healStartTimeFallback,
+  healUnpinnedStartTime,
   inspectDaemon,
   INTERNAL_DAEMON_ACTIVE_ONCE_ENV,
   isStartTimeFallback,
@@ -30,7 +30,7 @@ import {
   runDaemon,
   serviceSocketPath,
   serviceStatus,
-  START_TIME_FALLBACK_HEAL_ATTEMPTS,
+  START_TIME_HEAL_ATTEMPTS,
   startCycleWatchdog,
   startService,
   stopService,
@@ -811,8 +811,8 @@ describe('the start-time fallback is transient, not permanent', () => {
     };
     let attemptsSpent = 0;
 
-    for (let boundary = 0; boundary < START_TIME_FALLBACK_HEAL_ATTEMPTS; boundary += 1) {
-      const heal = await healStartTimeFallback({
+    for (let boundary = 0; boundary < START_TIME_HEAL_ATTEMPTS; boundary += 1) {
+      const heal = await healUnpinnedStartTime({
         record,
         attemptsSpent,
         read: async () => {
@@ -823,7 +823,13 @@ describe('the start-time fallback is transient, not permanent', () => {
       });
       attemptsSpent = heal.attemptsSpent;
       if (heal.processStartedAt !== null) {
-        record = { ...record, processStartedAt: heal.processStartedAt };
+        // As the daemon writes it: the reading and the rendering it was taken
+        // under, which is what stops the next boundary re-reading.
+        record = {
+          ...record,
+          processStartedAt: heal.processStartedAt,
+          processStartTimeRendering: 'utc',
+        };
       }
     }
 
@@ -834,16 +840,28 @@ describe('the start-time fallback is transient, not permanent', () => {
     expect(record.startedAt).toBe(metadata.startedAt);
   });
 
-  it('never touches a record that already carries a real start time', async () => {
+  it('never touches a record that already carries a pinned start time', async () => {
     let calls = 0;
-    const heal = await healStartTimeFallback({
-      record: metadata,
+    const heal = await healUnpinnedStartTime({
+      record: { ...metadata, processStartTimeRendering: 'utc' },
       attemptsSpent: 0,
       read: async () => { calls += 1; return HEALED_START_TIME; },
     });
 
     expect(heal).toEqual({ attemptsSpent: 0, processStartedAt: null });
     expect(calls).toBe(0);
+
+    // A real reading taken before the pin (#178) is not that: it is a string
+    // the host's own timezone produced, so the boundary replaces it.
+    const unpinned = await healUnpinnedStartTime({
+      record: metadata,
+      attemptsSpent: 0,
+      read: async () => { calls += 1; return HEALED_START_TIME; },
+    });
+
+    expect(unpinned)
+      .toEqual({ attemptsSpent: 1, processStartedAt: HEALED_START_TIME });
+    expect(calls).toBe(1);
   });
 
   it('gives up silently after three boundaries when ps never becomes readable', async () => {
@@ -852,7 +870,7 @@ describe('the start-time fallback is transient, not permanent', () => {
     let attemptsSpent = 0;
 
     for (let boundary = 0; boundary < 6; boundary += 1) {
-      const heal = await healStartTimeFallback({
+      const heal = await healUnpinnedStartTime({
         record,
         attemptsSpent,
         read: async () => {
@@ -864,9 +882,9 @@ describe('the start-time fallback is transient, not permanent', () => {
       expect(heal.processStartedAt).toBeNull();
     }
 
-    expect(START_TIME_FALLBACK_HEAL_ATTEMPTS).toBe(3);
-    expect(calls).toBe(START_TIME_FALLBACK_HEAL_ATTEMPTS);
-    expect(attemptsSpent).toBe(START_TIME_FALLBACK_HEAL_ATTEMPTS);
+    expect(START_TIME_HEAL_ATTEMPTS).toBe(3);
+    expect(calls).toBe(START_TIME_HEAL_ATTEMPTS);
+    expect(attemptsSpent).toBe(START_TIME_HEAL_ATTEMPTS);
     expect(record.processStartedAt).toBe('pid-36859');
   });
 
@@ -1328,13 +1346,160 @@ describe('control-socket identity is the fallback record\'s second channel', () 
 
       expect(isStartTimeFallback(unhealed)).toBe(true);
       expect(readFileSync(fixture.psCallsPath, 'utf8').trim())
-        .toBe(String(1 + START_TIME_FALLBACK_HEAL_ATTEMPTS));
+        .toBe(String(1 + START_TIME_HEAL_ATTEMPTS));
       expect(JSON.parse(await sendControl(record.socketPath, 'identity')))
         .toMatchObject({ pid: record.pid, startedAt: record.startedAt });
     } finally {
       process.env.PATH = previousPath;
       if (daemon !== null) {
         const record = readDaemonMetadata(fixture.loaded);
+        if (record !== null) await sendControl(record.socketPath, 'stop');
+        await daemon;
+      }
+    }
+  }, 30_000);
+});
+
+/**
+ * A fixed offset no host runs on by accident, so the pinned reading and the
+ * host's own rendering of one start time are always five hours apart here.
+ */
+const LOCAL_TIME_ZONE = 'Etc/GMT-5';
+
+/** How an old daemon read a start time: whatever timezone the host had. */
+function unpinnedStartTime(pid: number): string {
+  return spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+    encoding: 'utf8',
+  }).stdout.trim();
+}
+
+/** How every reader takes one now: pinned, so the string cannot drift. */
+function pinnedStartTime(pid: number): string {
+  return spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+    encoding: 'utf8',
+    env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' },
+  }).stdout.trim();
+}
+
+describe('the daemon start time is a pinned rendering, with a bridge for the old one', () => {
+  // One instant, two renderings: UTC, and a host five hours ahead of it.
+  const pinned = 'Thu Jul 23 21:00:00 2026';
+  const unpinned = 'Fri Jul 24 02:00:00 2026';
+  const legacy: DaemonMetadata = { ...metadata, processStartedAt: unpinned };
+
+  it('accepts a record written before the pin when the old rules still render it', () => {
+    expect(classifyDaemonRecord(legacy, {
+      processAlive: true,
+      processStartedAt: pinned,
+      unpinnedProcessStartedAt: unpinned,
+      repository: metadata.repository,
+      executableFingerprint: metadata.executableFingerprint,
+    })).toBe('already-running');
+  });
+
+  it('still refuses a live pid neither rendering can prove', () => {
+    expect(classifyDaemonRecord(legacy, {
+      processAlive: true,
+      processStartedAt: 'Thu Jul 23 20:59:00 2026',
+      unpinnedProcessStartedAt: 'Fri Jul 24 01:59:00 2026',
+      repository: metadata.repository,
+      executableFingerprint: metadata.executableFingerprint,
+    })).toBe('unsafe-live-mismatch');
+  });
+
+  it('gives a record that already carries the pinned rendering no second chance', () => {
+    // The pid-reuse case the guard exists for: the record says it holds a
+    // pinned reading, so an unpinned reading that happens to match it is not
+    // evidence of anything and must never be consulted.
+    expect(classifyDaemonRecord(
+      { ...legacy, processStartTimeRendering: 'utc' },
+      {
+        processAlive: true,
+        processStartedAt: pinned,
+        unpinnedProcessStartedAt: unpinned,
+        repository: metadata.repository,
+        executableFingerprint: metadata.executableFingerprint,
+      },
+    )).toBe('unsafe-live-mismatch');
+  });
+
+  it('lets stop signal a live daemon whose record predates the pin', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-start-time-pin-'));
+    const live = spawnLiveProcess();
+    const previousTz = process.env.TZ;
+    process.env.TZ = LOCAL_TIME_ZONE;
+
+    try {
+      // Exactly what is on disk right now on every host running a daemon
+      // started before this change: a rendering in the host's own timezone.
+      const recorded = unpinnedStartTime(live.child.pid!);
+      expect(recorded).not.toBe('');
+      expect(recorded).not.toBe(pinnedStartTime(live.child.pid!));
+      writeFileSync(join(dir, 'daemon.json'), `${JSON.stringify({
+        ...metadata,
+        pid: live.child.pid!,
+        processStartedAt: recorded,
+        socketPath: join(dir, 'control.sock'),
+      })}\n`, { mode: 0o600 });
+
+      const result = await stopService({
+        loaded: loadedFixture(dir, dir),
+        entryPath: '/dev/null',
+        force: true,
+      });
+
+      expect(result).toEqual({ status: 'forced' });
+      await expect(exitedWithin(live.exited, 2_000)).resolves.toBe(true);
+    } finally {
+      if (previousTz === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTz;
+      live.child.kill('SIGKILL');
+    }
+  });
+
+  it('records its own start time under the pinned rendering, and says so', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-pin-daemon-'));
+    const binDirectory = join(dir, 'bin');
+    mkdirSync(binDirectory, { mode: 0o700 });
+    // A `ps` that answers with the timezone and locale it was called under:
+    // the daemon must pin both, whatever the host itself is set to.
+    writeFileSync(join(binDirectory, 'ps'), [
+      '#!/bin/sh',
+      'printf "%s\\n" "TZ=$TZ LC_ALL=$LC_ALL"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const entryPath = join(dir, 'engine-child.mjs');
+    writeFileSync(entryPath, 'process.exit(0);\n', { mode: 0o700 });
+    writeFileSync(join(dir, 'config.json'), '{"schemaVersion":1}\n', { mode: 0o600 });
+    const loaded = {
+      ...loadedFixture(dir, dir),
+      config: {
+        repository: { slug: metadata.repository },
+        scheduler: { pollSeconds: 1 },
+      },
+    } as unknown as LoadedAutopilotConfig;
+    const previousPath = process.env.PATH;
+    const previousTz = process.env.TZ;
+    process.env.PATH = binDirectory;
+    process.env.TZ = LOCAL_TIME_ZONE;
+    let daemon: Promise<void> | null = null;
+
+    try {
+      daemon = runDaemon({
+        loaded,
+        entryPath,
+        environment: { PATH: binDirectory },
+      });
+      const record = await waitForRecord(loaded, () => true);
+
+      expect(record.processStartedAt).toBe('TZ=UTC LC_ALL=C');
+      expect(record.processStartTimeRendering).toBe('utc');
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousTz === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTz;
+      if (daemon !== null) {
+        const record = readDaemonMetadata(loaded);
         if (record !== null) await sendControl(record.socketPath, 'stop');
         await daemon;
       }
