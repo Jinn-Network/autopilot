@@ -87,6 +87,7 @@ function validConfig(): unknown {
       model: 'gpt-5.6-sol',
       provider: 'openai-codex',
       backgroundWaitCeilingMs: 3_600_000,
+      mcpServers: {},
       repositorySkillDirectories: ['.agents/skills'],
     },
     scheduler: {
@@ -249,6 +250,55 @@ describe('Autopilot product configuration', () => {
     input.worker.backgroundWaitCeilingMs = 0;
 
     expect(decodeAutopilotConfig(input).worker.backgroundWaitCeilingMs).toBe(0);
+  });
+
+  // #182: workers are launched with `--strict-mcp-config`, so the only MCP
+  // servers they can reach are the ones this key names. Every deployed
+  // `.autopilot/config.json` predates it, and an absent key must decode to the
+  // empty grant -- no servers at all -- rather than to "whatever the operator
+  // has in `~/.claude.json`".
+  it('grants workers no MCP servers when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { mcpServers?: Record<string, unknown> };
+    };
+    delete input.worker.mcpServers;
+
+    expect(decodeAutopilotConfig(input).worker.mcpServers).toEqual({});
+  });
+
+  // A granted server is handed to the CLI as-is: the engine owns which servers
+  // reach a worker, never how one is spelled, so no field of an entry may be
+  // dropped, renamed or defaulted on the way through.
+  it('passes a granted MCP server through verbatim', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { mcpServers?: Record<string, unknown> };
+    };
+    input.worker.mcpServers = {
+      'jinn-notes': {
+        command: 'npx',
+        args: ['-y', 'jinn-notes-mcp'],
+        env: { JINN_NOTES_TOKEN: 'token' },
+      },
+    };
+
+    expect(decodeAutopilotConfig(input).worker.mcpServers).toEqual({
+      'jinn-notes': {
+        command: 'npx',
+        args: ['-y', 'jinn-notes-mcp'],
+        env: { JINN_NOTES_TOKEN: 'token' },
+      },
+    });
+  });
+
+  // The grant is a name -> server map. An array, or a string, is a config
+  // mistake that would otherwise reach the CLI as a malformed document.
+  it('rejects an MCP grant that is not a map of server names', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { mcpServers?: unknown };
+    };
+    input.worker.mcpServers = ['jinn-notes'];
+
+    expect(() => decodeAutopilotConfig(input)).toThrow();
   });
 
   // Same additive contract `codeOwnerLogins` established: every deployed

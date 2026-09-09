@@ -215,6 +215,15 @@ export interface DispatcherConfig {
    */
   backgroundWaitCeilingMs: number;
   /**
+   * The MCP servers a `claude -p` worker may reach, handed to the CLI as the
+   * `mcpServers` map of an engine-owned document alongside
+   * `--strict-mcp-config`. Empty -- the default -- means no MCP servers at
+   * all, which is what the lifecycle needs; before #182 a worker instead
+   * inherited whatever the operator's `~/.claude.json` declared. Entries are
+   * opaque here and passed through verbatim. Source: `worker.mcpServers`.
+   */
+  mcpServers: Record<string, unknown>;
+  /**
    * Arm the delivery→PR bridge (issue #1892, spec
    * 2026-07-20-autopilot-marketplace-execution.md §"Delivery → PR bridge
    * (host-side)"): poll the marketplace indexer for delivered `jinn-repo.v1`
@@ -278,6 +287,7 @@ export const DEFAULT_CONFIG: DispatcherConfig = {
   cursorModel: DEFAULT_CURSOR_REVIEW_MODEL,
   cursorBin: DEFAULT_CURSOR_BIN,
   backgroundWaitCeilingMs: 60 * 60 * 1000,
+  mcpServers: {},
   marketplaceBridgeEnabled: false,
   marketplaceIndexerUrl: '',
   marketplaceIpfsGatewayUrl: 'https://gateway.autonolas.tech',
