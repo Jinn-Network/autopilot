@@ -203,6 +203,14 @@ export interface DispatcherConfig {
   /** Cursor Agent CLI binary. Source: `JINN_DISPATCHER_CURSOR_BIN`. */
   cursorBin: string;
   /**
+   * `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` for `claude -p` workers: how long
+   * the runtime waits for a session's own background tasks after its final
+   * turn before terminating it. Zero means wait indefinitely. Source:
+   * `worker.backgroundWaitCeilingMs`; see the config schema for why the
+   * runtime's own 600 s default is not survivable here (#167).
+   */
+  backgroundWaitCeilingMs: number;
+  /**
    * Arm the delivery→PR bridge (issue #1892, spec
    * 2026-07-20-autopilot-marketplace-execution.md §"Delivery → PR bridge
    * (host-side)"): poll the marketplace indexer for delivered `jinn-repo.v1`
@@ -264,6 +272,7 @@ export const DEFAULT_CONFIG: DispatcherConfig = {
   hermesPythonPath: DEFAULT_HERMES_PYTHON,
   cursorModel: DEFAULT_CURSOR_REVIEW_MODEL,
   cursorBin: DEFAULT_CURSOR_BIN,
+  backgroundWaitCeilingMs: 60 * 60 * 1000,
   marketplaceBridgeEnabled: false,
   marketplaceIndexerUrl: '',
   marketplaceIpfsGatewayUrl: 'https://gateway.autonolas.tech',

@@ -86,6 +86,7 @@ function validConfig(): unknown {
       runtime: 'hermes',
       model: 'gpt-5.6-sol',
       provider: 'openai-codex',
+      backgroundWaitCeilingMs: 3_600_000,
       repositorySkillDirectories: ['.agents/skills'],
     },
     scheduler: {
@@ -181,6 +182,30 @@ describe('Autopilot product configuration', () => {
     };
     unknownPhase.safety.attemptFootprintGb = { implement: 8, review: 1, enqueue: 1 };
     expect(() => decodeAutopilotConfig(unknownPhase)).toThrow();
+  });
+
+  // #167: every `.autopilot/config.json` on disk predates the worker
+  // background-wait ceiling and omits the key, so an absent one must keep
+  // parsing and land on the hour that replaces `claude -p`'s 600 s default.
+  it('defaults the worker background-wait ceiling to an hour when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { backgroundWaitCeilingMs?: number };
+    };
+    delete input.worker.backgroundWaitCeilingMs;
+
+    expect(decodeAutopilotConfig(input).worker.backgroundWaitCeilingMs)
+      .toBe(3_600_000);
+  });
+
+  // Zero is the documented "wait indefinitely" setting, so it must survive
+  // decoding rather than being rejected as a non-positive duration.
+  it('accepts a zero worker background-wait ceiling as wait-indefinitely', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { backgroundWaitCeilingMs: number };
+    };
+    input.worker.backgroundWaitCeilingMs = 0;
+
+    expect(decodeAutopilotConfig(input).worker.backgroundWaitCeilingMs).toBe(0);
   });
 
   // Same additive contract `codeOwnerLogins` established: every deployed

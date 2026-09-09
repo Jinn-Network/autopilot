@@ -117,6 +117,24 @@ export const autopilotConfigSchema = z.object({
     provider: nonEmpty,
     /** Passed as `-m` to Codex overflow sessions (#152); absent, Codex's own default. */
     codexModel: nonEmpty.optional(),
+    /**
+     * How long a `claude -p` worker waits for its own background tasks after
+     * the final turn before the runtime terminates the session
+     * (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`).
+     *
+     * `claude -p`'s own default is 600 s, and #167 is what that costs: a
+     * session that had worked for 9 h 41 m, checkpointed its fix, and was
+     * re-running verification in the background was killed at the finish line
+     * before it could mark the implementation phase complete — so the sweep
+     * was re-claimed five more times, each re-running the whole multi-stage
+     * skill. An hour is a verification run's worth of tolerance.
+     *
+     * Zero means "wait indefinitely" (the runtime's own semantics), which is
+     * why this is `nonNegativeInteger` rather than a positive duration.
+     * Defaulted, not required: every `.autopilot/config.json` written before
+     * this field existed omits the key and must keep parsing.
+     */
+    backgroundWaitCeilingMs: nonNegativeInteger.default(3_600_000),
     repositorySkillDirectories: z.array(repositoryRelativePath),
   }).strict(),
   scheduler: z.object({

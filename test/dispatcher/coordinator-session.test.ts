@@ -217,7 +217,12 @@ describe.each(['claude', 'hermes', 'cursor', 'codex'] as const)(
           },
         },
         { ...DEFAULT_CONFIG, runtime },
-        { spawn, log: (message) => logs.push(message) },
+        {
+          spawn,
+          log: (message) => logs.push(message),
+          // 5151 is a fixture PID: never signal a real process group for it.
+          terminateProcessGroup: async () => 0,
+        },
       );
 
       const onExit = calls[0].opts.onExit as
@@ -303,5 +308,137 @@ describe('per-session runtime override (#152)', () => {
     );
     expect(calls[0].cmd).toBe('claude');
     expect(calls[0].opts.env).toMatchObject({ JINN_AUTOPILOT_RUNTIME: 'claude' });
+  });
+});
+
+describe('print-mode background wait ceiling (#167)', () => {
+  function launch(
+    runtime: AutopilotRuntime,
+    env: NodeJS.ProcessEnv,
+    backgroundWaitCeilingMs = DEFAULT_CONFIG.backgroundWaitCeilingMs,
+  ): SpawnCall {
+    const calls: SpawnCall[] = [];
+    spawnCoordinatorSession(
+      {
+        kind: 'implement',
+        number: 167,
+        skill: 'implement-issue',
+        scenario: 'SCENARIO-ceiling',
+        worktreePath: '/tmp/worktrees/implement-167',
+        effort: 'High',
+        env,
+        spawnOptions: { detached: true, stdio: 'ignore' },
+      },
+      { ...DEFAULT_CONFIG, runtime, backgroundWaitCeilingMs },
+      {
+        spawn: (cmd, args, opts) => {
+          calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+          return { pid: 1670 };
+        },
+        prepareHermesHome: () => ({ hermesHome: '/tmp/hermes-homes/implement-167' }),
+        log: () => {},
+      },
+    );
+    return calls[0];
+  }
+
+  it('sets the configured ceiling for claude sessions', () => {
+    expect(launch('claude', {}).opts.env).toMatchObject({
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '3600000',
+    });
+  });
+
+  it('passes a zero ceiling through as wait-indefinitely', () => {
+    expect(launch('claude', {}, 0).opts.env).toMatchObject({
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '0',
+    });
+  });
+
+  it('never overrides a ceiling the operator already exported', () => {
+    expect(launch('claude', { CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '900000' })
+      .opts.env).toMatchObject({
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '900000',
+    });
+  });
+
+  it.each(['hermes', 'cursor', 'codex'] as const)(
+    'leaves %s sessions untouched — the ceiling is a `claude -p` knob',
+    (runtime) => {
+      expect((launch(runtime, {}).opts.env as Record<string, string>)
+        .CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS).toBeUndefined();
+    },
+  );
+});
+
+describe('worker process-group teardown (#167)', () => {
+  function launchAndExit(
+    terminateProcessGroup: (pid: number) => Promise<number>,
+  ): { logs: string[]; exit: () => void } {
+    const calls: SpawnCall[] = [];
+    const logs: string[] = [];
+    spawnCoordinatorSession(
+      {
+        kind: 'implement',
+        number: 167,
+        skill: 'implement-issue',
+        scenario: 'SCENARIO-teardown',
+        worktreePath: '/tmp/worktrees/implement-167',
+        effort: null,
+        env: {},
+        spawnOptions: { detached: true, stdio: 'ignore' },
+      },
+      { ...DEFAULT_CONFIG, runtime: 'claude' },
+      {
+        spawn: (cmd, args, opts) => {
+          calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+          return { pid: 9090 };
+        },
+        log: (message) => logs.push(message),
+        terminateProcessGroup,
+      },
+    );
+    const onExit = calls[0].opts.onExit as
+      (code: number | null, signal: NodeJS.Signals | null) => void;
+    return { logs, exit: () => { onExit(0, null); } };
+  }
+
+  async function settle(): Promise<void> {
+    await new Promise((resolve) => { setImmediate(resolve); });
+    await new Promise((resolve) => { setImmediate(resolve); });
+  }
+
+  it('tears the exited worker down by process group', async () => {
+    const seen: number[] = [];
+    const { logs, exit } = launchAndExit(async (pid) => {
+      seen.push(pid);
+      return 2;
+    });
+
+    exit();
+    await settle();
+
+    expect(seen).toEqual([9090]);
+    expect(logs).toContain(
+      '[autopilot] coordinator teardown session=implement-167 pgid=9090 signalled=2',
+    );
+  });
+
+  it('says nothing when the worker left no process group behind', async () => {
+    const { logs, exit } = launchAndExit(async () => 0);
+
+    exit();
+    await settle();
+
+    expect(logs.some((line) => line.includes('coordinator teardown'))).toBe(false);
+  });
+
+  it('keeps a failed teardown advisory rather than throwing at the exit handler', async () => {
+    const { logs, exit } = launchAndExit(async () => {
+      throw new Error('kill refused');
+    });
+
+    expect(() => { exit(); }).not.toThrow();
+    await settle();
+    expect(logs.some((line) => line.includes('coordinator teardown'))).toBe(false);
   });
 });
