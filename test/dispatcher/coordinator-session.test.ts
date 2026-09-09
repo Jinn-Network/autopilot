@@ -442,3 +442,170 @@ describe('worker process-group teardown (#167)', () => {
     expect(logs.some((line) => line.includes('coordinator teardown'))).toBe(false);
   });
 });
+
+describe('worker MCP isolation (#182)', () => {
+  type Written = { path: string; contents: string };
+
+  function launch(options: {
+    runtime?: AutopilotRuntime;
+    mcpServers?: Record<string, unknown>;
+    env?: NodeJS.ProcessEnv;
+    logPath?: string;
+    ambient?: Record<string, string>;
+    log?: (message: string) => void;
+    writes?: Written[];
+  } = {}): SpawnCall {
+    const calls: SpawnCall[] = [];
+    const writes = options.writes ?? [];
+    spawnCoordinatorSession(
+      {
+        kind: 'implement',
+        number: 182,
+        skill: 'implement-issue',
+        scenario: 'SCENARIO-mcp',
+        worktreePath: '/tmp/worktrees/implement-182',
+        effort: 'High',
+        env: options.env ?? {},
+        spawnOptions: {
+          detached: true,
+          stdio: 'ignore',
+          ...(options.logPath === undefined ? {} : { logPath: options.logPath }),
+        },
+      },
+      {
+        ...DEFAULT_CONFIG,
+        runtime: options.runtime ?? 'claude',
+        ...(options.mcpServers === undefined
+          ? {}
+          : { mcpServers: options.mcpServers }),
+      },
+      {
+        spawn: (cmd, args, opts) => {
+          calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+          return { pid: 1820 };
+        },
+        prepareHermesHome: () => ({ hermesHome: '/tmp/hermes-homes/implement-182' }),
+        log: options.log ?? (() => {}),
+        readTextFile: (path) => (options.ambient ?? {})[path],
+        writeWorkerMcpConfig: (path, contents) => { writes.push({ path, contents }); },
+      },
+    );
+    return calls[0];
+  }
+
+  function mcpDocument(call: SpawnCall, writes: Written[]): unknown {
+    const value = call.args[call.args.indexOf('--mcp-config') + 1];
+    const written = writes.find((entry) => entry.path === value);
+    return JSON.parse(written === undefined ? value : written.contents);
+  }
+
+  it('refuses every MCP configuration but the engine’s own', () => {
+    const call = launch();
+
+    expect(call.args).toContain('--strict-mcp-config');
+    expect(call.args).toContain('--mcp-config');
+    // The variadic `--mcp-config <configs...>` would eat the prompt, so the
+    // document is followed by a flag and the prompt stays the last operand.
+    expect(call.args[call.args.indexOf('--mcp-config') + 2])
+      .toBe('--strict-mcp-config');
+    expect(call.args.at(-1)).toContain('SCENARIO-mcp');
+    expect(mcpDocument(call, [])).toEqual({ mcpServers: {} });
+  });
+
+  it('grants exactly the configured servers, verbatim', () => {
+    const servers = {
+      'jinn-notes': { command: 'npx', args: ['-y', 'jinn-notes-mcp'] },
+    };
+    const call = launch({ mcpServers: servers });
+
+    expect(mcpDocument(call, [])).toEqual({ mcpServers: servers });
+  });
+
+  it('writes the document beside the session log and names the file', () => {
+    const writes: Written[] = [];
+    const call = launch({
+      logPath: '/tmp/attempts/implement-182-abc/session.log',
+      writes,
+    });
+
+    expect(call.args[call.args.indexOf('--mcp-config') + 1])
+      .toBe('/tmp/attempts/implement-182-abc/mcp-config.json');
+    expect(writes).toEqual([{
+      path: '/tmp/attempts/implement-182-abc/mcp-config.json',
+      contents: '{"mcpServers":{}}',
+    }]);
+  });
+
+  it.each(['hermes', 'cursor', 'codex'] as const)(
+    'leaves %s sessions untouched — the flags are `claude -p` knobs',
+    (runtime) => {
+      const call = launch({ runtime });
+
+      expect(call.args).not.toContain('--strict-mcp-config');
+      expect(call.args).not.toContain('--mcp-config');
+    },
+  );
+
+  it('names the ambient servers it dropped, once per cycle', () => {
+    const logs: string[] = [];
+    const log = (message: string) => logs.push(message);
+    const ambient = {
+      '/home/operator/.claude.json': JSON.stringify({
+        mcpServers: {
+          'chrome-devtools': { command: 'npx' },
+          'personal-os': { command: 'python' },
+        },
+      }),
+    };
+
+    launch({ env: { HOME: '/home/operator' }, ambient, log });
+    launch({ env: { HOME: '/home/operator' }, ambient, log });
+
+    expect(logs.filter((line) => line.includes('worker mcp:'))).toEqual([
+      '[autopilot] worker mcp: ignoring 2 ambient server(s) '
+        + '(chrome-devtools, personal-os)',
+    ]);
+  });
+
+  it('counts only the ambient servers the grant does not already name', () => {
+    const logs: string[] = [];
+    launch({
+      env: { HOME: '/home/operator' },
+      mcpServers: { 'personal-os': { command: 'python' } },
+      ambient: {
+        '/home/operator/.claude.json': JSON.stringify({
+          mcpServers: {
+            'chrome-devtools': { command: 'npx' },
+            'personal-os': { command: 'python' },
+          },
+        }),
+      },
+      log: (message) => logs.push(message),
+    });
+
+    expect(logs.filter((line) => line.includes('worker mcp:'))).toEqual([
+      '[autopilot] worker mcp: ignoring 1 ambient server(s) (chrome-devtools)',
+    ]);
+  });
+
+  it.each([
+    ['no HOME', {}, {}],
+    ['an absent file', { HOME: '/home/operator' }, {}],
+    ['unreadable JSON', { HOME: '/home/operator' }, {
+      '/home/operator/.claude.json': '{ not json',
+    }],
+    ['a file declaring no servers', { HOME: '/home/operator' }, {
+      '/home/operator/.claude.json': '{"projects":{}}',
+    }],
+  ])('says nothing about %s, and still isolates the worker', (
+    _name,
+    env,
+    ambient,
+  ) => {
+    const logs: string[] = [];
+    const call = launch({ env, ambient, log: (message) => logs.push(message) });
+
+    expect(logs.some((line) => line.includes('worker mcp:'))).toBe(false);
+    expect(call.args).toContain('--strict-mcp-config');
+  });
+});

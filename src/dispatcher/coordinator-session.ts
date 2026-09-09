@@ -1,3 +1,5 @@
+import { readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import {
   buildCodexHeadlessPrompt,
   buildCursorHeadlessPrompt,
@@ -96,6 +98,14 @@ export interface CoordinatorSessionDeps {
    * fixture PID; production tears the real group down (#167).
    */
   terminateProcessGroup?: (pid: number) => Promise<number>;
+  /**
+   * Reads the operator's ambient `~/.claude.json`, or nothing when it cannot
+   * be read. Injectable so a test can declare an ambient server set without
+   * touching the operator's real home (#182).
+   */
+  readTextFile?: (path: string) => string | undefined;
+  /** Writes the engine-owned MCP document beside the session log (#182). */
+  writeWorkerMcpConfig?: (path: string, contents: string) => void;
 }
 
 /**
@@ -148,6 +158,130 @@ function printBackgroundWaitCeiling(
 /** Map board Effort to Claude's CLI flag; null keeps the runtime default. */
 export function effortFlag(effort: Effort | null): string[] {
   return effort == null ? [] : ['--effort', effort.toLowerCase()];
+}
+
+/** The engine-owned MCP document, written beside the attempt's session log. */
+export const WORKER_MCP_CONFIG_FILENAME = 'mcp-config.json';
+
+/** The operator's user-level Claude config, relative to `HOME`. */
+const AMBIENT_CLAUDE_CONFIG_FILENAME = '.claude.json';
+
+/**
+ * `claude -p`'s MCP flags for one worker: the engine's own server grant, and
+ * a refusal of every other MCP configuration (#182).
+ *
+ * Without them a worker loads the operator's user-level `~/.claude.json` and
+ * starts whatever it declares, so its toolset is decided by whoever last ran
+ * `claude` on the host rather than by the engine — a live browser bridge and
+ * a personal data store under sessions acting on third-party repositories, and
+ * two extra processes per worker across the whole concurrency width.
+ *
+ * ORDER IS LOAD-BEARING: `--mcp-config <configs...>` is variadic and consumes
+ * operands greedily until the next flag, so the document is followed by
+ * `--strict-mcp-config` and the prompt stays the last operand. Put the prompt
+ * between them and the CLI reads it as a second MCP document.
+ *
+ * The document is a file beside the session log when the caller named one —
+ * every production attempt does — so the argv (and the process listing that
+ * shows it) stays readable and the grant is inspectable after the fact. A
+ * caller with no log path gets the same document inline, which the CLI accepts
+ * as a JSON string; nothing about the isolation differs between the two.
+ */
+function workerMcpArgs(
+  spec: CoordinatorSessionSpec,
+  cfg: DispatcherConfig,
+  writeConfig: (path: string, contents: string) => void,
+): string[] {
+  const document = JSON.stringify({ mcpServers: cfg.mcpServers });
+  const logPath = spec.spawnOptions.logPath;
+  if (logPath === undefined) {
+    return ['--mcp-config', document, '--strict-mcp-config'];
+  }
+  const configPath = join(dirname(logPath), WORKER_MCP_CONFIG_FILENAME);
+  writeConfig(configPath, document);
+  return ['--mcp-config', configPath, '--strict-mcp-config'];
+}
+
+/**
+ * The MCP server names the operator's ambient config declares, or none.
+ *
+ * Fail-safe by construction: an unset `HOME`, an absent or unreadable file,
+ * malformed JSON and a config with no `mcpServers` map all read as "no ambient
+ * servers". This is read for one log line and nothing else — a worker is
+ * isolated whether or not the file can be read, so no failure here may reach
+ * the launch.
+ */
+function ambientMcpServerNames(
+  environment: NodeJS.ProcessEnv,
+  readTextFile: (path: string) => string | undefined,
+): string[] {
+  const home = environment.HOME;
+  if (home === undefined || home.length === 0) return [];
+  const raw = readTextFile(join(home, AMBIENT_CLAUDE_CONFIG_FILENAME));
+  if (raw === undefined) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const servers = (parsed as { mcpServers?: unknown } | null)?.mcpServers;
+  if (
+    typeof servers !== 'object'
+    || servers === null
+    || Array.isArray(servers)
+  ) return [];
+  return Object.keys(servers as Record<string, unknown>);
+}
+
+/**
+ * Cycles that have already reported the ambient servers they drop, keyed on
+ * the sink the line would be written to (#182).
+ *
+ * The daemon runs one `internal engine --mode active --once` child per cycle,
+ * so a `WeakSet` on the log sink — `console.log` in production, one object for
+ * the life of that process — is once per cycle, and every worker after the
+ * first in the same cycle would only repeat it. It is deliberately not
+ * persisted: a cycle that starts after the operator adds a server says so
+ * again, which is the point of the line. Two engines in one process, and two
+ * tests in one file, keep their own sinks and never pool.
+ */
+const reportedAmbientMcpSinks = new WeakSet<object>();
+
+/**
+ * One line naming the ambient MCP servers this engine is refusing to pass on,
+ * so the difference between "the engine grants nothing" and "the operator
+ * configured nothing" is visible rather than inferred.
+ */
+function reportDroppedAmbientMcpServers(
+  spec: CoordinatorSessionSpec,
+  cfg: DispatcherConfig,
+  readTextFile: (path: string) => string | undefined,
+  log: (message: string) => void,
+): void {
+  if (reportedAmbientMcpSinks.has(log)) return;
+  reportedAmbientMcpSinks.add(log);
+  const dropped = ambientMcpServerNames(spec.env, readTextFile)
+    .filter((name) => !Object.hasOwn(cfg.mcpServers, name));
+  if (dropped.length === 0) return;
+  log(
+    `[autopilot] worker mcp: ignoring ${dropped.length} ambient server(s) `
+      + `(${dropped.join(', ')})`,
+  );
+}
+
+/** Absent, unreadable or unparseable all read the same: no ambient servers. */
+function readTextFileOrNothing(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+/** Owner-only: the grant is the engine's, and no worker may rewrite it. */
+function writeWorkerMcpConfigFile(path: string, contents: string): void {
+  writeFileSync(path, contents, { mode: 0o600 });
 }
 
 function resolveCursorSessionModel(
@@ -321,9 +455,24 @@ export function spawnCoordinatorSession(
       },
     );
   } else {
+    reportDroppedAmbientMcpServers(
+      spec,
+      cfg,
+      deps.readTextFile ?? readTextFileOrNothing,
+      log,
+    );
     result = deps.spawn(
       'claude',
-      ['-p', ...effortFlag(spec.effort), prompt],
+      [
+        '-p',
+        ...effortFlag(spec.effort),
+        ...workerMcpArgs(
+          spec,
+          cfg,
+          deps.writeWorkerMcpConfig ?? writeWorkerMcpConfigFile,
+        ),
+        prompt,
+      ],
       {
         ...spawnOptions,
         onExit: composedOnExit,

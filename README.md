@@ -215,7 +215,8 @@ claimable number, not the open-issue number.
 
 ```json
 "worker": {
-  "backgroundWaitCeilingMs": 3600000
+  "backgroundWaitCeilingMs": 3600000,
+  "mcpServers": {}
 }
 ```
 
@@ -232,6 +233,36 @@ the hour. An operator who exports `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`
 themselves outranks the config — the exported value is passed through
 untouched. The ceiling is a `claude -p` knob only; hermes, cursor and codex
 workers never see it.
+
+`worker.mcpServers` is the whole set of MCP servers a worker may reach. Every
+`claude -p` worker is launched with `--strict-mcp-config` and an engine-owned
+document naming exactly these servers, so the operator's user-level
+`~/.claude.json` and any repository `.mcp.json` no longer reach a worker at
+all. The default is empty — no MCP servers — which is what the lifecycle
+needs: no packaged engine skill uses one. Before this, a worker's toolset was
+decided by whoever had last run `claude` on the host, which on the machine
+that motivated it meant a live Chrome DevTools bridge and the operator's
+personal data store under every session, plus two extra processes per worker
+across the whole concurrency width. An operator who wants a server grants it
+here by name, and the entry is passed to the CLI verbatim:
+
+```json
+"worker": {
+  "mcpServers": {
+    "jinn-notes": { "command": "npx", "args": ["-y", "jinn-notes-mcp"] }
+  }
+}
+```
+
+The document is written to `mcp-config.json` in the attempt directory, beside
+`session.log`, so what a worker was granted is inspectable after the run. The
+key is optional: a config written before it existed keeps loading and grants
+nothing. The first `claude -p` worker of a cycle whose ambient
+`~/.claude.json` declares servers the engine is dropping logs one
+`[autopilot] worker mcp: ignoring 2 ambient server(s) (chrome-devtools, personal-os)`
+line; a `~/.claude.json` that cannot be read is not an error and logs nothing.
+Like the wait ceiling, this is a `claude -p` knob only — hermes, cursor and
+codex workers are launched exactly as before.
 
 When a worker exits, its process group is torn down — `SIGTERM`, a ten-second
 grace, then `SIGKILL` — so background jobs it started (test runners, servers)
