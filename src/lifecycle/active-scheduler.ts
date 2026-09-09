@@ -104,6 +104,17 @@ export type ActiveCandidate =
     }
   | {
       /**
+       * Close an umbrella whose declared children are all closed (#160).
+       * Spends no concurrency lane — it spawns no session, only closes one
+       * issue — and is bounded at derivation by
+       * `MAX_UMBRELLA_CLOSURES_PER_CYCLE`.
+       */
+      readonly phase: 'close-umbrella';
+      readonly issueNumber: number;
+      readonly childIssueNumbers: readonly number[];
+    }
+  | {
+      /**
        * Batch residue — follow-ups left on several merged parents, each below
        * the per-parent floor — into one sweep issue keyed by area (#168).
        * Spends no concurrency lane, exactly like `file-debt-sweep`, and is
@@ -233,7 +244,9 @@ export function applyMergePolicy(
 }
 
 function subject(candidate: ActiveCandidate): string {
-  return candidate.phase === 'implementation' || candidate.phase === 'triage-defaults'
+  return candidate.phase === 'implementation'
+    || candidate.phase === 'triage-defaults'
+    || candidate.phase === 'close-umbrella'
     ? `issue:${candidate.issueNumber}`
     : candidate.phase === 'repair-machine-child'
       ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
@@ -541,6 +554,14 @@ export function scheduleActiveActions(
         ...(candidate.issueType === undefined ? {} : { issueType: candidate.issueType }),
         ...(candidate.priority === undefined ? {} : { priority: candidate.priority }),
         ...(candidate.blockedOn === undefined ? {} : { blockedOn: candidate.blockedOn }),
+      });
+      continue;
+    }
+    if (candidate.phase === 'close-umbrella') {
+      actions.push({
+        kind: 'close-umbrella',
+        issueNumber: candidate.issueNumber,
+        childIssueNumbers: candidate.childIssueNumbers,
       });
       continue;
     }

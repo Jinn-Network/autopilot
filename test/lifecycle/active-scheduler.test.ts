@@ -163,6 +163,27 @@ describe('active local scheduler', () => {
     }]);
   });
 
+  // #160: an umbrella closure spawns no session either, and is bounded where
+  // it is derived by MAX_UMBRELLA_CLOSURES_PER_CYCLE.
+  it('schedules an umbrella closure with every lane already full', () => {
+    const plan = scheduleActiveActions(input({
+      candidates: [
+        { phase: 'close-umbrella', issueNumber: 2448, childIssueNumbers: [2449, 2450] },
+        { phase: 'implementation', intent: 'fresh', issueNumber: 45 },
+      ],
+      remaining: { implementation: 0, child: 0, review: 0 },
+    }));
+
+    expect(plan.actions).toEqual([
+      { kind: 'close-umbrella', issueNumber: 2448, childIssueNumbers: [2449, 2450] },
+    ]);
+    expect(plan.skips).toContainEqual({
+      phase: 'implementation',
+      subject: 'issue:45',
+      reason: 'capacity',
+    });
+  });
+
   it('names a triage-defaults candidate by its own issue', () => {
     const plan = scheduleActiveActions(input({
       candidates: [{
