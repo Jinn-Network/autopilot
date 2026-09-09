@@ -31,6 +31,11 @@ import {
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { beginCycleStep, withCycleStep } from '../cycle-heartbeat.js';
 import { AUTOPILOT_RUNTIME_SET, type AutopilotRuntime } from '../autopilot-runtime.js';
+import {
+  isProcessStartTimeReading,
+  readProcessStartTime,
+  type ProcessStartTimeReader,
+} from '../process-start-time.js';
 import { CHILD_KINDS, type ChildKind } from './child-issues.js';
 import { gitOid, gitRefName, isoTimestamp, type GitOid } from './types.js';
 import {
@@ -194,6 +199,25 @@ export interface AttemptManifest {
   readonly repository: AttemptRepositoryIdentity;
   readonly processState: AttemptProcessState;
   readonly pid: number | null;
+  /**
+   * The kernel's start time for `pid`, read at the moment the PID was recorded
+   * (#161) and compared verbatim afterwards — an opaque token, never a
+   * timestamp to parse (see `readProcessStartTime`).
+   *
+   * `pid` alone is not identity: after a reboot or a long sleep the kernel
+   * hands the number to something unrelated, `kill -0` answers yes, and the
+   * attempt holds a lane seat and its worktree until someone notices. A reused
+   * PID cannot carry the start time the original process had, so a reading
+   * that disagrees with this one proves the worker is gone.
+   *
+   * Additive and optional on exactly the `childKind` pattern, and fail-safe in
+   * the same direction: absent means "this attempt's identity was never
+   * recorded" — every manifest written before the field existed, and every
+   * host where `ps` could not be read — and those keep the plain `kill -0`
+   * verdict rather than have a possibly-live worker declared dead. Valid only
+   * alongside a PID.
+   */
+  readonly processStartedAt?: string;
   readonly terminalHead?: string;
   /**
    * The coordinator runtime this attempt was dispatched on (#152). Recorded so
@@ -828,6 +852,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'repository',
     'processState',
     'pid',
+    'processStartedAt',
     'terminalHead',
     'worktreeBytes',
     'worktreePeakBytes',
@@ -843,6 +868,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'sweep',
     'worktreePeakBytes',
     'worktreeSampledAt',
+    'processStartedAt',
   ]);
   if (manifest.version !== 2) throw new Error('Unsupported attempt manifest version');
   const phase = manifest.phase;
@@ -932,6 +958,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   }
   const decodedProcessState = processState(manifest.processState);
   const pid = nullablePid(manifest.pid);
+  const processStartedAt = decodeProcessStartedAt(manifest.processStartedAt, pid);
   const terminalHead = manifest.terminalHead === undefined
     ? undefined
     : gitOid(stringField(manifest.terminalHead, 'terminal head'));
@@ -1037,6 +1064,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     repository: decodeRepositoryIdentity(manifest.repository),
     processState: decodedProcessState,
     pid,
+    ...(processStartedAt === undefined ? {} : { processStartedAt }),
     ...(terminalHead === undefined ? {} : { terminalHead }),
     ...(worktreeBytes === undefined ? {} : { worktreeBytes }),
     ...(worktreePeakBytes === undefined ? {} : { worktreePeakBytes }),
@@ -1046,6 +1074,17 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     paths,
     timestamps,
   };
+}
+
+function decodeProcessStartedAt(value: unknown, pid: number | null): string | undefined {
+  if (value === undefined) return undefined;
+  if (!isProcessStartTimeReading(value)) {
+    throw new Error('Invalid attempt process start time');
+  }
+  if (pid === null) {
+    throw new Error('Attempt process start time requires a recorded PID');
+  }
+  return value;
 }
 
 function decodeAttemptRuntime(value: unknown): AutopilotRuntime {
@@ -1337,6 +1376,8 @@ export function updateAttemptManifest(
   const progressiveManifestFields = new Set([
     'processState',
     'pid',
+    // Learned with the PID it identifies, at the running transition (#161).
+    'processStartedAt',
     'terminalHead',
     // Learned at the exit transition, not at creation (#144), and never
     // rewritten once present — see `recordedFootprint`.
@@ -2052,13 +2093,37 @@ function transitionTimestamp(now: () => Date): string {
   return isoTimestamp(timestamp);
 }
 
+/**
+ * The PID's start time when it is worth recording, and `undefined` when it is
+ * not (#161). A reader that throws, or answers with something no comparison
+ * could use, must cost nothing beyond the identity this attempt then lacks.
+ */
+function recordableProcessStartTime(
+  pid: number,
+  readStartTime: ProcessStartTimeReader,
+): string | undefined {
+  let reading: string | null;
+  try {
+    reading = readStartTime(pid);
+  } catch {
+    return undefined;
+  }
+  return isProcessStartTimeReading(reading) ? reading : undefined;
+}
+
 export function markAttemptRunning(
   manifestPath: string,
   pid: number,
   now: () => Date = () => new Date(),
+  readStartTime: ProcessStartTimeReader = readProcessStartTime,
 ): AttemptManifest {
   const validPid = positiveInteger(pid, 'PID');
   const timestamp = transitionTimestamp(now);
+  // Read here, while the child is certainly the process behind the PID: this
+  // is the only moment the engine can prove what it is recording (#161). A
+  // failed reading records nothing and leaves the attempt on the plain
+  // `kill -0` verdict — never a reason to fail the transition.
+  const processStartedAt = recordableProcessStartTime(validPid, readStartTime);
   return updateAttemptManifest(manifestPath, (current) => {
     if (current.processState !== 'preparing') {
       throw new Error('Only a preparing attempt may transition to running');
@@ -2067,6 +2132,7 @@ export function markAttemptRunning(
       ...current,
       processState: 'running',
       pid: validPid,
+      ...(processStartedAt === undefined ? {} : { processStartedAt }),
       timestamps: {
         ...current.timestamps,
         updatedAt: timestamp,

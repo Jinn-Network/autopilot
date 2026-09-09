@@ -4867,3 +4867,63 @@ describe('worktrees that still host live processes (#167)', () => {
       .resolves.toEqual([]);
   }, 20_000);
 });
+
+describe('attempt process identity beyond the bare PID (#161)', () => {
+  const START_TIME = 'Mon Jul 20 00:00:59 2026';
+
+  it('records the child process start time at the running transition', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+
+    const running = markAttemptRunning(
+      manifest.paths.manifest,
+      4242,
+      () => new Date('2026-07-20T00:01:00.000Z'),
+      () => START_TIME,
+    );
+    expect(running.processStartedAt).toBe(START_TIME);
+    expect(readAttemptManifest(manifest.paths.manifest).processStartedAt).toBe(START_TIME);
+  });
+
+  it('records no start time when the reading fails, keeping the legacy manifest shape', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+
+    const running = markAttemptRunning(
+      manifest.paths.manifest,
+      4242,
+      () => new Date('2026-07-20T00:01:00.000Z'),
+      () => null,
+    );
+    expect(running.processStartedAt).toBeUndefined();
+    expect(
+      Object.hasOwn(
+        JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')),
+        'processStartedAt',
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects a recorded start time that no PID owns, or that is not a readable line', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+    const raw = JSON.parse(readFileSync(manifest.paths.manifest, 'utf8')) as Record<string, unknown>;
+
+    expect(() => decodeAttemptManifest({ ...raw, processStartedAt: START_TIME }))
+      .toThrow(/process start time/i);
+    const running = {
+      ...raw,
+      processState: 'running',
+      pid: 4242,
+      timestamps: { ...raw.timestamps, childStartedAt: NOW },
+    };
+    expect(decodeAttemptManifest({ ...running, processStartedAt: START_TIME }).processStartedAt)
+      .toBe(START_TIME);
+    expect(() => decodeAttemptManifest({ ...running, processStartedAt: '' }))
+      .toThrow(/process start time/i);
+    expect(() => decodeAttemptManifest({ ...running, processStartedAt: `${START_TIME}\n` }))
+      .toThrow(/process start time/i);
+    expect(() => decodeAttemptManifest({ ...running, processStartedAt: 42 }))
+      .toThrow(/process start time/i);
+  });
+});
