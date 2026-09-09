@@ -42,6 +42,7 @@ import {
   pendingTrashReclaims,
   readAttemptManifest,
   recoverMarketplaceAttemptInitializations,
+  processesNamingPath,
   sweepDeadAttempts,
   trackAttemptChild,
   transitionMarketplaceExecution,
@@ -4732,4 +4733,107 @@ describe('attempt runtime and exit code (#152)', () => {
     });
     expect(tracked).toMatchObject({ processState: 'exited', exitCode: 2 });
   });
+});
+
+describe('worktrees that still host live processes (#167)', () => {
+  const started: number[] = [];
+
+  afterEach(() => {
+    for (const pid of started.splice(0)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    }
+  });
+
+  it('retains a dead attempt whose worktree still hosts a live process', async () => {
+    const fixture = repositoryFixture();
+    const manifest = terminalAttempt(
+      await createAttemptWorkspace(options(fixture), defaultRunner),
+    );
+    const asked: string[] = [];
+    let hosted: readonly number[] = [7001, 7002];
+
+    await expect(cleanupAttempt(manifest.paths.manifest, defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      isPidAlive: () => false,
+      listProcessesUnder: async (path) => {
+        asked.push(path);
+        return hosted;
+      },
+    })).resolves.toMatchObject({
+      status: 'retained',
+      attemptId: UUID_A,
+      reason: { code: 'live' },
+    });
+    expect(asked).toEqual([manifest.paths.worktree]);
+    expect(existsSync(manifest.paths.worktree)).toBe(true);
+
+    // A later cycle, once the processes are gone, removes it as before.
+    hosted = [];
+    await expect(cleanupAttempt(manifest.paths.manifest, defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      isPidAlive: () => false,
+      listProcessesUnder: async () => hosted,
+    })).resolves.toEqual({ status: 'removed', attemptId: UUID_A });
+  });
+
+  it('names the hosting processes in the retained reason', async () => {
+    const fixture = repositoryFixture();
+    const manifest = terminalAttempt(
+      await createAttemptWorkspace(options(fixture), defaultRunner),
+    );
+
+    const result = await cleanupAttempt(manifest.paths.manifest, defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      isPidAlive: () => false,
+      listProcessesUnder: async () => [7001],
+    });
+    expect(result.reason.detail).toContain('7001');
+  });
+
+  it('refuses the same worktree under an emergency below-floor sweep', async () => {
+    const fixture = repositoryFixture();
+    const manifest = terminalAttempt(
+      await createAttemptWorkspace(options(fixture), defaultRunner),
+    );
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      isPidAlive: () => false,
+      host: manifest.host,
+      diskFloorBytes: 1,
+      readFreeDiskBytes: () => 0,
+      listProcessesUnder: async () => [7003],
+    });
+    expect(results).toContainEqual(expect.objectContaining({
+      status: 'retained',
+      attemptId: UUID_A,
+      reason: expect.objectContaining({ code: 'live' }),
+    }));
+    expect(existsSync(manifest.paths.worktree)).toBe(true);
+  });
+
+  it('finds a real process whose command line names the worktree', async () => {
+    const fixture = repositoryFixture();
+    const manifest = await createAttemptWorkspace(options(fixture), defaultRunner);
+    // `$0` carries the worktree path into the command line, which is what a
+    // background job launched from inside the checkout looks like to `pgrep`.
+    // The loop keeps the shell itself resident: a single-command script would
+    // exec over it and take the argument with it.
+    const child = spawn(
+      '/bin/sh',
+      ['-c', 'while :; do sleep 1; done', manifest.paths.worktree],
+      { detached: true, stdio: 'ignore' },
+    );
+    started.push(child.pid);
+    await new Promise((resolve) => { setTimeout(resolve, 300); });
+
+    await expect(processesNamingPath(manifest.paths.worktree, defaultRunner))
+      .resolves.toContain(child.pid);
+    await expect(processesNamingPath(`${manifest.paths.worktree}-absent`, defaultRunner))
+      .resolves.toEqual([]);
+  }, 20_000);
 });

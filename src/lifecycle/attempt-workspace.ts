@@ -3512,6 +3512,49 @@ export interface CleanupAttemptOptions {
    * emergency below-floor sweep needs this to stop at the floor.
    */
   readonly awaitReclaim?: boolean;
+  /**
+   * PIDs of processes whose command line names a path. A test seam; production
+   * uses `pgrep -f` through the same runner (#167).
+   */
+  readonly listProcessesUnder?: (path: string) => Promise<readonly number[]>;
+}
+
+/** Escapes a path so `pgrep -f`'s extended regex matches it literally. */
+function regexLiteral(value: string): string {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+}
+
+/**
+ * PIDs whose command line names `path`, via `pgrep -f`.
+ *
+ * A first-order guard, not a proof of occupancy: it matches argv, not cwd, so
+ * a background job that never names its checkout is invisible to it. That is
+ * still enough for the incident it exists for (#167) — orphaned `vitest` trees
+ * from a finished attempt, whose argv carries the worktree path, running an
+ * hour after the attempt had been moved to trash and was being deleted
+ * underneath them.
+ */
+export async function processesNamingPath(
+  path: string,
+  runner: CommandRunner,
+): Promise<readonly number[]> {
+  let output: string;
+  try {
+    output = await runner('pgrep', ['-f', regexLiteral(path)]);
+  } catch {
+    // `pgrep` exits non-zero with no output when nothing matches — the
+    // overwhelmingly common case — and that is not distinguishable here from a
+    // host without `pgrep` at all. Answering "none" leaves such a host exactly
+    // as safe as it was before this guard existed; answering "some" would
+    // strand every attempt on disk forever.
+    return [];
+  }
+  return output
+    .split('\n')
+    .map((line) => Number.parseInt(line.trim(), 10))
+    // This process would match whenever its own argv names the worktree, and
+    // the sweep is never the reason to retain the thing it is sweeping.
+    .filter((value) => Number.isInteger(value) && value > 0 && value !== process.pid);
 }
 
 export function freeDiskBytes(path: string): number {
@@ -4178,6 +4221,24 @@ export async function cleanupAttempt(
     }
     markAttemptExited(manifestPath);
     manifest = readAttemptManifest(manifestPath);
+  }
+  // The manifest PID being dead does not mean the worktree is idle: a session
+  // that ended while its background jobs were still running leaves them behind
+  // as orphans, and #167 is what removing a checkout out from under them costs.
+  // Deferring is the whole remedy — a later cycle finds the processes gone and
+  // removes the attempt exactly as it would have.
+  if (existsSync(manifest.paths.worktree)) {
+    const listProcessesUnder = options.listProcessesUnder
+      ?? ((path: string) => processesNamingPath(path, runner));
+    const hosting = await listProcessesUnder(manifest.paths.worktree);
+    if (hosting.length > 0) {
+      return retained(
+        'live',
+        `Attempt worktree still hosts ${hosting.length} live process(es) `
+        + `(PID ${hosting.slice(0, 8).join(', ')}).`,
+        manifest.attemptId,
+      );
+    }
   }
   let actualRepository: AttemptRepositoryIdentity;
   try {
