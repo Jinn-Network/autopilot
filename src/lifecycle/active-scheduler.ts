@@ -16,6 +16,12 @@ export type ActiveCandidate =
        * them or the loop deadlocks.
        */
       readonly isChild?: boolean;
+      /**
+       * This issue is a debt sweep, by its own marker (#168). Read only when
+       * the debt lane is configured on; otherwise a sweep is an ordinary
+       * implementation claim exactly as it has always been.
+       */
+      readonly isSweep?: boolean;
     }
   | {
       readonly phase: 'implementation';
@@ -78,6 +84,8 @@ export type ActiveCandidate =
       readonly members: readonly {
         readonly number: number;
         readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+        /** Project Effort; absent is not Low (#168). Widens the member cap when every member is Low. */
+        readonly effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       }[];
     }
   | {
@@ -92,6 +100,24 @@ export type ActiveCandidate =
       readonly projectItemId: string;
       readonly issueType?: TriageDefaultsAction['issueType'];
       readonly priority?: TriageDefaultsAction['priority'];
+    }
+  | {
+      /**
+       * Batch residue — follow-ups left on several merged parents, each below
+       * the per-parent floor — into one sweep issue keyed by area (#168).
+       * Spends no concurrency lane, exactly like `file-debt-sweep`, and is
+       * bounded at derivation by `DEBT_SWEEP_MAX_PER_CYCLE`; its dedup is
+       * member-level and re-checked live at execution.
+       */
+      readonly phase: 'file-residue-sweep';
+      readonly area: string;
+      readonly parentPrs: readonly number[];
+      readonly members: readonly {
+        readonly number: number;
+        readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+        /** Project Effort; absent is not Low (#168). Widens the member cap when every member is Low. */
+        readonly effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+      }[];
     }
   | {
       /**
@@ -118,6 +144,18 @@ export interface ActiveSchedulingInput {
      */
     readonly child: number;
     readonly review: number;
+    /**
+     * Debt sweeps get their own lane when the operator opts in (#168).
+     * ABSENT means the lane is off — sweeps compete in the implementation
+     * lane exactly as before, and nothing here reads `isSweep` at all. A
+     * present `0` is a configured-on lane with no free slot.
+     *
+     * The lane exists because sweeps and ordinary work are not substitutes:
+     * a sweep is capped at P2 by design, so in one implementation lane it
+     * loses to every P0/P1 claim, and 13 of 14 open sweeps were skipped for
+     * capacity in the cycle that motivated this.
+     */
+    readonly debt?: number;
   };
   readonly availableLogins: readonly string[];
   readonly implementationPreferredLogin: string;
@@ -178,6 +216,9 @@ export interface ActiveSchedulingPlan {
     readonly child:
       readonly Extract<NewWorkAction, { kind: 'claim-implementation' }>[];
     readonly review: readonly Extract<NewWorkAction, { kind: 'claim-review' }>[];
+    /** Present only when the debt lane is on (#168). */
+    readonly debt?:
+      readonly Extract<NewWorkAction, { kind: 'claim-implementation' }>[];
   };
 }
 
@@ -197,6 +238,8 @@ function subject(candidate: ActiveCandidate): string {
       ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
       : candidate.phase === 'file-debt-sweep'
         ? `pr:${candidate.parentPr}`
+        : candidate.phase === 'file-residue-sweep'
+          ? `area:${candidate.area}`
     : `pr:${candidate.prNumber}`;
 }
 
@@ -210,6 +253,7 @@ export function gatingIssueNumbers(
   candidate: ActiveCandidate,
 ): readonly number[] {
   return candidate.phase === 'file-debt-sweep'
+    || candidate.phase === 'file-residue-sweep'
     ? candidate.members.map((member) => member.number)
     : [candidate.issueNumber];
 }
@@ -230,6 +274,7 @@ function capacitySkipCause(input: ActiveSchedulingInput): {
 function implementationAction(
   candidate: Extract<ActiveCandidate, { phase: 'implementation' }>,
   runtime?: AutopilotRuntime,
+  lane?: 'implementation' | 'child' | 'debt',
 ): Extract<NewWorkAction, { kind: 'claim-implementation' }> {
   return {
     kind: 'claim-implementation',
@@ -237,6 +282,10 @@ function implementationAction(
       ? {
           intent: 'fresh',
           issueNumber: candidate.issueNumber,
+          // Tagged by the lane that admitted it, never by the candidate's own
+          // `isSweep`: with the debt lane off no lane pass is a debt pass, so
+          // no action carries the tag and nothing downstream changes (#168).
+          ...(lane === 'debt' ? { sweep: true as const } : {}),
           // Advisory lane tag, not execution authority: it records which lane
           // admitted the claim so the runtime charges the right slot and the
           // controller the right fall-through budget. What the claim then
@@ -288,6 +337,8 @@ export function scheduleActiveActions(
     Extract<NewWorkAction, { kind: 'claim-implementation' }>[] = [];
   const childBackups:
     Extract<NewWorkAction, { kind: 'claim-implementation' }>[] = [];
+  const debtBackups:
+    Extract<NewWorkAction, { kind: 'claim-implementation' }>[] = [];
   const reviewBackups: Extract<NewWorkAction, { kind: 'claim-review' }>[] = [];
   const configuredLogins = new Set(
     input.availableLogins.map((login) => login.toLowerCase()),
@@ -327,6 +378,7 @@ export function scheduleActiveActions(
     laneCandidates: readonly Extract<ActiveCandidate, { phase: 'implementation' }>[],
     remaining: number,
     backups: Extract<NewWorkAction, { kind: 'claim-implementation' }>[],
+    lane: 'implementation' | 'child' | 'debt' = 'implementation',
   ): void => {
     let scheduled = 0;
     for (const candidate of laneCandidates) {
@@ -340,7 +392,7 @@ export function scheduleActiveActions(
         && codexRemaining > 0
         && (preferCodex || scheduled >= remaining)
       ) {
-        actions.push(implementationAction(candidate, 'codex'));
+        actions.push(implementationAction(candidate, 'codex', lane));
         codexRemaining -= 1;
         continue;
       }
@@ -354,7 +406,7 @@ export function scheduleActiveActions(
         // backup: promoting one would spend the very capacity the disk floor
         // withheld.
         if (gate === null && input.newWorkPaused !== true) {
-          backups.push(implementationAction(candidate));
+          backups.push(implementationAction(candidate, undefined, lane));
         }
         continue;
       }
@@ -362,20 +414,46 @@ export function scheduleActiveActions(
         skips.push({ phase: candidate.phase, subject: subject(candidate), reason: gate });
         continue;
       }
-      actions.push(implementationAction(candidate));
+      actions.push(implementationAction(candidate, undefined, lane));
       scheduled += 1;
     }
   };
+  // A sweep is only a debt-lane candidate while that lane is configured on;
+  // with it off `debtLane` is undefined, the filter below is never true, and
+  // the implementation pass sees exactly the queue it saw before (#168).
+  const debtLane = input.remaining.debt;
+  const isSweepCandidate = (
+    candidate: Extract<ActiveCandidate, { phase: 'implementation' }>,
+  ): boolean => (
+    debtLane !== undefined
+    && candidate.intent === 'fresh'
+    && candidate.isSweep === true
+    && !isChildCandidate(candidate)
+  );
   scheduleLane(
     implementation.filter(isChildCandidate),
     input.remaining.child,
     childBackups,
+    'child',
   );
   scheduleLane(
-    implementation.filter((candidate) => !isChildCandidate(candidate)),
+    implementation.filter((candidate) => (
+      !isChildCandidate(candidate) && !isSweepCandidate(candidate)
+    )),
     input.remaining.implementation,
     implementationBackups,
   );
+  // Last of the three implementation-shaped passes, so the shared Codex
+  // overflow pool is offered to ordinary and child work first: a sweep is
+  // deliberately the least urgent thing this engine runs.
+  if (debtLane !== undefined) {
+    scheduleLane(
+      implementation.filter(isSweepCandidate),
+      debtLane,
+      debtBackups,
+      'debt',
+    );
+  }
 
   let scheduledReview = 0;
   for (const candidate of input.candidates) {
@@ -462,6 +540,15 @@ export function scheduleActiveActions(
         ...(candidate.issueType === undefined ? {} : { issueType: candidate.issueType }),
         ...(candidate.priority === undefined ? {} : { priority: candidate.priority }),
       });
+      continue;
+    }
+    if (candidate.phase === 'file-residue-sweep') {
+      actions.push({
+        kind: 'file-residue-sweep',
+        area: candidate.area,
+        parentPrs: candidate.parentPrs,
+        members: candidate.members,
+      });
     }
   }
 
@@ -487,6 +574,7 @@ export function scheduleActiveActions(
       implementation: implementationBackups,
       child: childBackups,
       review: reviewBackups,
+      ...(debtLane === undefined ? {} : { debt: debtBackups }),
     },
   };
 }

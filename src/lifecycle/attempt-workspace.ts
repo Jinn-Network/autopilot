@@ -164,6 +164,20 @@ export interface AttemptManifest {
    * lane. Valid only when `phase === 'implement'`.
    */
   readonly childKind?: ChildKind;
+  /**
+   * This implementation attempt was admitted under the `debt` concurrency
+   * lane (#168), so the scheduler must count it there rather than against the
+   * implementation lane.
+   *
+   * Records the SCHEDULING fact, not a property of the issue — the `runtime`
+   * pattern, not the `childKind` one — because that is what lane accounting
+   * has to reconcile: a manifest that said "this issue is a sweep" while the
+   * lane was off would be charged to a lane that never admitted it. Absent
+   * therefore means "not admitted under the debt lane", which is every
+   * manifest written before this field existed and every manifest written
+   * while the lane is off. Valid only when `phase === 'implement'`.
+   */
+  readonly sweep?: true;
   readonly execution: AttemptExecution;
   readonly subject: string;
   readonly issueNumber: number;
@@ -221,6 +235,8 @@ export interface CreateAttemptOptions {
   readonly phase: AttemptPhase;
   /** See `AttemptManifest.childKind`: implementation attempts only. */
   readonly childKind?: ChildKind;
+  /** See `AttemptManifest.sweep`: implementation attempts only. */
+  readonly sweep?: true;
   readonly execution?: AttemptExecution;
   readonly subject: string;
   readonly issueNumber: number;
@@ -776,6 +792,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'host',
     'phase',
     'childKind',
+    'sweep',
     'execution',
     'subject',
     'issueNumber',
@@ -798,7 +815,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'timestamps',
     'runtime',
     'exitCode',
-  ], 'attempt manifest', ['execution', 'runtime', 'exitCode']);
+  ], 'attempt manifest', ['execution', 'runtime', 'exitCode', 'sweep']);
   if (manifest.version !== 2) throw new Error('Unsupported attempt manifest version');
   const phase = manifest.phase;
   if (phase !== 'implement' && phase !== 'review') {
@@ -809,6 +826,13 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     : attemptChildKind(manifest.childKind);
   if (childKind !== undefined && phase !== 'implement') {
     throw new Error('Attempt child kind is valid only for implementation attempts');
+  }
+  const sweep = manifest.sweep === undefined ? undefined : true as const;
+  if (manifest.sweep !== undefined && manifest.sweep !== true) {
+    throw new Error('Attempt sweep flag must be true when present');
+  }
+  if (sweep !== undefined && phase !== 'implement') {
+    throw new Error('Attempt sweep flag is valid only for implementation attempts');
   }
   const paths = decodePaths(manifest.paths);
   const execution = Object.hasOwn(manifest, 'execution')
@@ -958,6 +982,7 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     host,
     phase,
     ...(childKind === undefined ? {} : { childKind }),
+    ...(sweep === undefined ? {} : { sweep }),
     execution,
     subject,
     issueNumber,
@@ -3108,6 +3133,7 @@ export async function createAttemptWorkspace(
       host,
       phase: options.phase,
       ...(options.childKind === undefined ? {} : { childKind: options.childKind }),
+      ...(options.sweep === undefined ? {} : { sweep: options.sweep }),
       execution,
       subject,
       issueNumber: options.issueNumber,

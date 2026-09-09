@@ -94,6 +94,7 @@ function validConfig(): unknown {
       fullReconcileSeconds: 3600,
       implementationConcurrency: 1,
       childConcurrency: 1,
+      debtConcurrency: 0,
       codexOverflowSlots: 0,
       reviewConcurrency: 1,
       openPrBackpressure: 30,
@@ -362,6 +363,33 @@ describe('Autopilot product configuration', () => {
     await expect(loadAutopilotConfig(repositoryRoot)).rejects.toThrow(
       new RegExp(configPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
     );
+  });
+});
+
+describe('debt lane config (#168)', () => {
+  // Additive on the `childConcurrency` contract: every deployed config
+  // predates the key, and the default of 0 keeps the lane — and every sweep
+  // tag downstream of it — off until an operator asks for it.
+  it('defaults the debt lane to zero (off) when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      scheduler: { debtConcurrency?: number };
+    };
+    delete input.scheduler.debtConcurrency;
+
+    expect(decodeAutopilotConfig(input).scheduler.debtConcurrency).toBe(0);
+  });
+
+  it('honours an explicit debt lane and refuses a negative one', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      scheduler: { debtConcurrency?: number };
+    };
+    input.scheduler.debtConcurrency = 2;
+    expect(decodeAutopilotConfig(input).scheduler.debtConcurrency).toBe(2);
+    // Unlike the child lane, zero is meaningful here: it is the off state.
+    input.scheduler.debtConcurrency = 0;
+    expect(decodeAutopilotConfig(input).scheduler.debtConcurrency).toBe(0);
+    input.scheduler.debtConcurrency = -1;
+    expect(() => decodeAutopilotConfig(input)).toThrow();
   });
 });
 

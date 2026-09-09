@@ -645,6 +645,7 @@ export function makeProductionImplementationActionPort(
         runnerId: options.runnerId,
         phase: 'implement',
         ...(input.childKind === undefined ? {} : { childKind: input.childKind }),
+        ...(input.sweep === undefined ? {} : { sweep: input.sweep }),
         subject: `issue-${input.issueNumber}`,
         issueNumber: input.issueNumber,
         prNumber: input.prNumber,

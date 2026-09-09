@@ -124,6 +124,7 @@
         "fullReconcileSeconds": { "type": "integer", "minimum": 1 },
         "implementationConcurrency": { "type": "integer", "minimum": 1 },
         "childConcurrency": { "type": "integer", "minimum": 1, "default": 1 },
+        "debtConcurrency": { "type": "integer", "minimum": 0, "default": 0 },
         "codexOverflowSlots": { "type": "integer", "minimum": 0, "default": 0 },
         "reviewConcurrency": { "type": "integer", "minimum": 1 },
         "openPrBackpressure": { "type": "integer", "minimum": 1 }

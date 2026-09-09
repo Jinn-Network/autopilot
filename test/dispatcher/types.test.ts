@@ -24,6 +24,8 @@ describe('review-loop types', () => {
 
   it('DEFAULT_CONFIG gives machine-child work its own lane', () => {
     expect(DEFAULT_CONFIG.childCap).toBe(1);
+    // The debt lane is off by default (#168): sweeps draw from concurrencyCap.
+    expect(DEFAULT_CONFIG.debtCap).toBe(0);
   });
 
   it('ReviewablePr narrows PolledPr', () => {

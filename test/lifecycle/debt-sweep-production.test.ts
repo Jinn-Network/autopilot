@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { resetFieldCache } from '../../src/dispatcher/field-cache.js';
 import {
   executeProductionFileDebtSweep,
+  executeProductionFileResidueSweep,
   makeProductionDebtSweepPort,
 } from '../../src/lifecycle/debt-sweep-production.js';
 import {
   formatDebtSweepMarker,
   formatDebtSweepMarkerKey,
+  formatResidueSweepMarker,
 } from '../../src/lifecycle/debt-sweep.js';
 import { formatReviewFollowUpMarker } from '../../src/lifecycle/review-follow-ups.js';
 import { CHORE_ISSUE_TYPE_ID } from '../../src/lifecycle/review-follow-ups-production.js';
@@ -221,5 +223,143 @@ describe('production closed-sweep resolution (#154)', () => {
       detail: 'closed=- declined=101,102,103',
     });
     expect(calls.some((args) => args[1] === 'close' || args[1] === 'create')).toBe(false);
+  });
+});
+
+describe('production residue sweep filing (#168)', () => {
+  beforeEach(() => {
+    resetFieldCache();
+  });
+
+  const RESIDUE_ACTION = {
+    kind: 'file-residue-sweep' as const,
+    area: 'packages/core',
+    parentPrs: [84, 85, 86],
+    members: [
+      { number: 101, priority: 'p4' as const },
+      { number: 102, priority: 'p4' as const },
+      { number: 103, priority: 'p4' as const },
+    ],
+  };
+
+  const residueOpenRows = (extra: readonly unknown[] = []): string => JSON.stringify([
+    ...extra,
+    ...[[101, 84], [102, 85], [103, 86]].map(([number, parent]) => ({
+      number,
+      title: `Follow-up ${number}`,
+      body: `${formatReviewFollowUpMarker(parent!, HEAD, number!)}\n\nbody`,
+    })),
+  ]);
+
+  it('files a triage-complete chore residue sweep whose marker carries no pr=', async () => {
+    const calls: string[][] = [];
+    const result = await executeProductionFileResidueSweep(RESIDUE_ACTION, {
+      runner: async (_command, args) => {
+        calls.push([...args]);
+        if (args[0] === 'issue' && args[1] === 'list' && args.includes('closed')) return '[]';
+        if (args[0] === 'issue' && args[1] === 'list') return residueOpenRows();
+        if (args[0] === 'issue' && args[1] === 'create') {
+          return 'https://github.com/Jinn-Network/mono/issues/900\n';
+        }
+        if (args[0] === 'issue' && args[1] === 'view') return 'I_kwIssue900\n';
+        if (args[0] === 'api' && args[1] === 'graphql') return '{"data":{}}';
+        if (args[0] === 'project' && args[1] === 'field-list') return FIELD_LIST_JSON;
+        if (args[0] === 'project' && args[1] === 'item-add') {
+          return JSON.stringify({ id: 'PVTI_sweep900' });
+        }
+        if (args[0] === 'project' && args[1] === 'item-edit') return '';
+        throw new Error(`Unexpected gh args: ${args.join(' ')}`);
+      },
+      repo: 'Jinn-Network/mono',
+    });
+
+    expect(result).toEqual({
+      status: 'filed',
+      detail: 'residue-sweep:900 area=packages/core',
+    });
+    const create = calls.find((args) => args[0] === 'issue' && args[1] === 'create');
+    expect(create!.join(' ')).toContain(formatResidueSweepMarker([101, 102, 103]));
+    expect(create!.join(' ')).toContain('jinn-autopilot:debt-sweep residue=1');
+    expect(create!.join(' ')).not.toContain('jinn-autopilot:debt-sweep pr=');
+    expect(create!.join(' ')).not.toContain('jinn-autopilot:review-follow-up');
+    expect(create!.join(' ')).not.toContain('Closes #101');
+  });
+
+  it('drops a member an open sweep of either kind already carries', async () => {
+    let creates = 0;
+    const result = await executeProductionFileResidueSweep(RESIDUE_ACTION, {
+      runner: async (_command, args) => {
+        if (args[0] === 'issue' && args[1] === 'list' && args.includes('closed')) return '[]';
+        if (args[0] === 'issue' && args[1] === 'list') {
+          return residueOpenRows([
+            { number: 500, title: 'open residue sweep', body: formatResidueSweepMarker([101]) },
+            { number: 501, title: 'open parent sweep', body: formatDebtSweepMarker(85, [102]) },
+          ]);
+        }
+        if (args[0] === 'issue' && args[1] === 'create') {
+          creates += 1;
+          return 'https://github.com/Jinn-Network/mono/issues/999\n';
+        }
+        throw new Error(`Unexpected gh args: ${args.join(' ')}`);
+      },
+      repo: 'Jinn-Network/mono',
+    });
+    expect(result).toEqual({
+      status: 'skipped',
+      reason: 'residue-sweep-below-minimum:1',
+    });
+    expect(creates).toBe(0);
+  });
+
+  it('settles members against a merged residue sweep instead of re-filing them', async () => {
+    const calls: string[][] = [];
+    const result = await executeProductionFileResidueSweep(RESIDUE_ACTION, {
+      runner: async (_command, args) => {
+        calls.push([...args]);
+        if (args[0] === 'issue' && args[1] === 'list' && args.includes('closed')) {
+          return JSON.stringify([{
+            number: 500,
+            title: 'Sweep residual review follow-ups in packages/core (3 items)',
+            body: formatResidueSweepMarker([101, 102, 103]),
+          }]);
+        }
+        if (args[0] === 'issue' && args[1] === 'list') return residueOpenRows();
+        if (args[0] === 'issue' && args[1] === 'view' && args.includes('closedByPullRequestsReferences')) {
+          return JSON.stringify({ closedByPullRequestsReferences: [{ number: 610 }] });
+        }
+        if (args[0] === 'pr' && args[1] === 'view') {
+          return JSON.stringify({ number: 610, mergedAt: '2026-09-03T11:58:18Z', body: 'Closes #500' });
+        }
+        if (args[0] === 'issue' && args[1] === 'close') return '';
+        throw new Error(`Unexpected gh args: ${args.join(' ')}`);
+      },
+      repo: 'Jinn-Network/mono',
+    });
+    expect(result).toEqual({
+      status: 'skipped',
+      reason: 'residue-sweep-already-swept:500',
+      detail: 'closed=101,102,103 declined=-',
+    });
+    const closes = calls.filter((args) => args[0] === 'issue' && args[1] === 'close');
+    expect(closes.map((args) => args[2])).toEqual(['101', '102', '103']);
+    expect(calls.some((args) => args[0] === 'issue' && args[1] === 'create')).toBe(false);
+  });
+
+  it('refuses a truncated open-issue listing rather than duplicating residue', async () => {
+    const port = makeProductionDebtSweepPort({
+      runner: async (_command, args) => {
+        if (args[0] === 'issue' && args[1] === 'list') {
+          return JSON.stringify(Array.from({ length: 1000 }, (_unused, index) => ({
+            number: index + 1,
+            title: 'noise',
+            body: '',
+          })));
+        }
+        throw new Error(`Unexpected gh args: ${args.join(' ')}`);
+      },
+      repo: 'Jinn-Network/mono',
+    });
+    await expect(port.searchOpenBodiesByMarker('<!-- jinn-autopilot:debt-sweep '))
+      .rejects.toThrow(/truncated/i);
   });
 });

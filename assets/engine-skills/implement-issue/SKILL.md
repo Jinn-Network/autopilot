@@ -240,9 +240,17 @@ An issue whose body carries
 ```
 
 is a **debt sweep**: the engine batched several open review follow-ups from one
-merged or closed parent PR so they can be worked in one session. It is ordinary
-implementation work — every stage above still applies, at the effort the board
-records — with four extra rules.
+merged or closed parent PR so they can be worked in one session. Its **residue**
+variant, whose body carries
+
+```
+<!-- jinn-autopilot:debt-sweep residue=1 members=<a>,<b>,… -->
+```
+
+batches follow-ups left behind on *several* merged parents, none of which had
+enough left to be worth a session on its own. Both are ordinary implementation
+work — every stage above still applies, at the effort the board records — with
+four extra rules.
 
 **Work the members, and be honest about which.** Read each member issue. For
 each one, either fix it in this PR or record it as deferred with the reason.
@@ -250,9 +258,16 @@ Deferring is a legitimate outcome: a member that turns out to be obsolete,
 already fixed, or too large to belong in this change set should be deferred, not
 forced in.
 
-**Keep the PR to a single coherent change set.** The members are findings about
-the same code, which is why they were batched. If the fixes stop cohering, fix
-the subset that does and defer the rest.
+**Keep the PR to a single coherent change set.** On a per-parent sweep the
+members are findings about the same code, which is why they were batched. On a
+residue sweep the members share an **area** — a package or a top-level
+directory, named in the issue title — and nothing else; they came from
+different parent PRs, so read each one against the code as it stands today
+rather than against the PR it was filed on. Either way: one change set. If the
+fixes stop cohering, fix the subset that does and defer the rest. A residue
+batch can be larger than a per-parent one when every member is Low effort, and
+that is exactly the batch most likely to contain a member that no longer
+applies — defer it and say so.
 
 **The PR body closes only the sweep issue.** Never write `Closes #<member>` — or
 `Fixes`/`Resolves` — for a member. A PR carrying several closing references

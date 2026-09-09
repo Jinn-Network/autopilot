@@ -65,6 +65,12 @@ export interface ActiveRuntimeHandlers {
     credentials: CredentialPool,
     snapshot: GitHubLifecycleSnapshot,
   ): Promise<ActiveRuntimeResult>;
+  /** File one residue sweep across several merged parents, by area (#168). */
+  fileResidueSweep?(
+    action: Extract<NewWorkAction, { kind: 'file-residue-sweep' }>,
+    credentials: CredentialPool,
+    snapshot: GitHubLifecycleSnapshot,
+  ): Promise<ActiveRuntimeResult>;
   /**
    * Hand the exact head to GitHub's merge queue. Nothing this handler returns
    * may claim the change landed: the queue merges on its own schedule, and Done
@@ -84,6 +90,12 @@ export interface ActiveRuntimeOptions {
     /** Machine-child work, capped separately from fresh claims (#122). */
     readonly child: number;
     readonly review: number;
+    /**
+     * Debt sweeps, capped separately from ordinary claims (#168). `0` — the
+     * default — means no debt lane: sweeps compete in the implementation lane
+     * exactly as before, and no live attempt is counted anywhere but there.
+     */
+    readonly debt?: number;
     /** Codex overflow pool shared by the implementation and child lanes (#152). */
     readonly codexOverflow?: number;
   };
@@ -216,6 +228,9 @@ async function routeAction(
     case 'triage-defaults':
       return handlers.triageDefaults?.(action, credentials, snapshot)
         ?? unwired('triage-defaults');
+    case 'file-residue-sweep':
+      return handlers.fileResidueSweep?.(action, credentials, snapshot)
+        ?? unwired('file-residue-sweep');
     default:
       // Unreachable for the declared union; reached only by a retired or
       // not-yet-declared kind arriving from a stale plan. Skipping names it
@@ -234,8 +249,12 @@ export function makeActiveRuntime(
     implementation: nonNegative(options.caps.implementation, 'implementation cap'),
     child: nonNegative(options.caps.child, 'child cap'),
     review: nonNegative(options.caps.review, 'review cap'),
+    debt: nonNegative(options.caps.debt ?? 0, 'debt cap'),
     codexOverflow: nonNegative(options.caps.codexOverflow ?? 0, 'codex overflow cap'),
   };
+  // Configured on, once, at construction: the lane's existence must not change
+  // between the scheduling decision and the capacity guard within one cycle.
+  const debtLaneOn = caps.debt > 0;
   /**
    * Phases this cycle has already spawned (#144).
    *
@@ -258,12 +277,22 @@ export function makeActiveRuntime(
     // manifest's own `childKind`. An attempt written before that field existed
     // has none and counts as fresh: over-booking the implementation lane is
     // recoverable, over-running the child lane is not visible at all.
+    // A sweep attempt is only its own lane's while that lane is on; with it
+    // off the manifest's `sweep` flag is never written and the filter is a
+    // no-op, so the implementation count is byte-identical to before (#168).
     const activeByLane = {
       implementation: attempts.filter((attempt) => (
-        attempt.phase === 'implement' && attempt.childKind === undefined
+        attempt.phase === 'implement'
+        && attempt.childKind === undefined
+        && !(debtLaneOn && attempt.sweep === true)
       )).length,
       child: attempts.filter((attempt) => (
         attempt.phase === 'implement' && attempt.childKind !== undefined
+      )).length,
+      debt: attempts.filter((attempt) => (
+        attempt.phase === 'implement'
+        && attempt.childKind === undefined
+        && attempt.sweep === true
       )).length,
       review: attempts.filter((attempt) => attempt.phase === 'review').length,
       // Overflow attempts are counted by the runtime their manifest records
@@ -274,12 +303,21 @@ export function makeActiveRuntime(
       // The disk floor pauses every lane: a floor that only stopped fresh
       // claims would keep filling the same disk with child and review work.
       remaining: newWorkPaused
-        ? { implementation: 0, child: 0, review: 0, codexOverflow: 0 }
+        ? {
+            implementation: 0,
+            child: 0,
+            review: 0,
+            codexOverflow: 0,
+            ...(debtLaneOn ? { debt: 0 } : {}),
+          }
         : {
             implementation: Math.max(0, caps.implementation - activeByLane.implementation),
             child: Math.max(0, caps.child - activeByLane.child),
             review: Math.max(0, caps.review - activeByLane.review),
             codexOverflow: Math.max(0, caps.codexOverflow - activeByLane.codex),
+            ...(debtLaneOn
+              ? { debt: Math.max(0, caps.debt - activeByLane.debt) }
+              : {}),
           },
       preferCodex: newWorkPaused
         ? false
@@ -421,7 +459,11 @@ export function makeActiveRuntime(
       if (overflow && local.remaining.codexOverflow === 0) {
         return { outcome: 'skipped', reason: laneFullReason(local) };
       }
-      if (lane !== null && local.remaining[lane] === 0) {
+      // A `debt` lane can only be named by an action the scheduler tagged,
+      // which it only does when the lane is on, so the lookup is never
+      // undefined in practice; `?? 1` keeps a stale plan from reading an
+      // absent lane as full and refusing work it was admitted for.
+      if (lane !== null && (local.remaining[lane] ?? 1) === 0) {
         return { outcome: 'skipped', reason: laneFullReason(local) };
       }
       const credentials = options.credentials;

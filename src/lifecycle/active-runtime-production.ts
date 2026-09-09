@@ -68,7 +68,10 @@ import {
   executeProductionRerunFailedChecks,
 } from './ci-rerun-production.js';
 import { repairProductionMachineChild } from './child-issues-production.js';
-import { executeProductionFileDebtSweep } from './debt-sweep-production.js';
+import {
+  executeProductionFileDebtSweep,
+  executeProductionFileResidueSweep,
+} from './debt-sweep-production.js';
 import { executeProductionTriageDefaults } from './triage-defaults-production.js';
 import { withSelectedCredential } from './production-auth.js';
 import {
@@ -213,6 +216,8 @@ export interface ProductionActiveRuntimeOptions {
     /** Machine-child work, capped separately from fresh claims (#122). */
     readonly child: number;
     readonly review: number;
+    /** Debt sweeps, capped separately when the lane is opted in (#168); 0 = off. */
+    readonly debt?: number;
     /** Codex overflow pool shared by the implementation and child lanes (#152). */
     readonly codexOverflow?: number;
   };
@@ -1295,6 +1300,34 @@ export function makeProductionActiveRuntime(
           selection.credential,
           ambient,
           ({ run }) => executeProductionTriageDefaults(action, {
+            runner: run,
+            ...(options.repositorySlug === undefined
+              ? {}
+              : { repo: options.repositorySlug }),
+            ...(options.projectMapping === undefined
+              ? {}
+              : {
+                  projectOwner: options.projectMapping.owner,
+                  projectNumber: options.projectMapping.number,
+                  projectMapping: options.projectMapping,
+                }),
+          }),
+          runner,
+        );
+      },
+
+      // Same surface as `fileDebtSweep`, and the same reasoning: ordinary
+      // issue filing on the repository, with member-level dedup read live off
+      // the one open-issue listing the port makes.
+      fileResidueSweep: async (action, credentials) => {
+        const selection = selectCredential(credentials, { phase: 'implement' });
+        if (selection.status !== 'selected') {
+          return { status: 'skipped', reason: 'credential-unavailable' };
+        }
+        return withSelectedCredential(
+          selection.credential,
+          ambient,
+          ({ run }) => executeProductionFileResidueSweep(action, {
             runner: run,
             ...(options.repositorySlug === undefined
               ? {}

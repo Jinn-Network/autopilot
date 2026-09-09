@@ -42,7 +42,14 @@ import {
   diskHeadroomSummaryLine,
   type DiskHeadroom,
 } from './disk-headroom.js';
-import { planDebtSweeps, rankDebtSweeps } from './debt-sweep.js';
+import {
+  countResidueFollowUps,
+  planDebtSweeps,
+  planResidueSweeps,
+  rankDebtSweeps,
+  rankResidueSweeps,
+  type PlanDebtSweepsInput,
+} from './debt-sweep.js';
 import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import { hasReviewFollowUpMarkerTag } from './review-follow-ups.js';
@@ -147,6 +154,12 @@ export interface LifecycleControllerDeps {
         /** Machine-child work, capped separately from fresh claims (#122). */
         readonly child: number;
         readonly review: number;
+        /**
+         * Debt sweeps, when the operator opted the lane in (#168). ABSENT
+         * means the lane is off and sweeps compete in the implementation
+         * lane, which is the default.
+         */
+        readonly debt?: number;
         /** Free Codex overflow slots shared by the implementation and child lanes (#152). */
         readonly codexOverflow?: number;
       };
@@ -307,6 +320,15 @@ export interface LifecycleBacklogSummary {
     readonly noType: number;
     readonly noPriority: number;
   };
+  /**
+   * Open review follow-ups on merged parents that no per-parent sweep can
+   * ever reach — the residue (#168). A subset of `followUps`, reported beside
+   * it because it is the part the per-parent mechanism is structurally blind
+   * to: on mono it was 171 of 260. `0` on any view that cannot prove a parent
+   * is merged (an incomplete or scoped snapshot), exactly as sweep derivation
+   * itself is refused there.
+   */
+  readonly residue: number;
 }
 
 export interface LifecycleLogEvent {
@@ -850,7 +872,8 @@ function backlogPriorityKey(priority: string | null | undefined): LifecycleBackl
  * other part of the snapshot, so a closed issue that still lingers on the
  * Project board pre-archive can never be counted.
  */
-function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBacklogSummary {
+function backlogSummary(snapshot: GitHubLifecycleSnapshot): LifecycleBacklogSummary {
+  const issues = snapshot.issues;
   const ordinaryByPriority: Record<LifecycleBacklogPriorityKey, number> = {
     p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, unset: 0,
   };
@@ -879,6 +902,7 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
       ordinaryByPriority[backlogPriorityKey(issue.priority)] += 1;
     }
   }
+  const residueInput = globalDebtSweepInput(snapshot);
   return {
     ordinary,
     followUps,
@@ -887,6 +911,7 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
     actionable: ordinary + sweeps,
     ordinaryByPriority,
     untriaged: { noType, noPriority },
+    residue: residueInput === null ? 0 : countResidueFollowUps(residueInput),
   };
 }
 
@@ -1038,11 +1063,16 @@ function activeCandidates(
         body: issueSource?.body,
         labels: item.labels,
       });
+      // A sweep issue by its own marker (#168). Advisory: read only by the
+      // scheduler, and only while the debt lane is configured on.
+      const isSweep = !isChild
+        && hasDebtSweepMarkerTag(issueSource?.body ?? '');
       const freshCandidate: ActiveCandidate = {
         phase: 'implementation',
         intent: 'fresh',
         issueNumber: item.issueNumber,
         ...(isChild ? { isChild: true } : {}),
+        ...(isSweep ? { isSweep: true } : {}),
       };
       // Both lanes rank the same way (#102): the child lane has its own cap
       // now, so the order it walks its own queue in decides which child runs.
@@ -1246,6 +1276,7 @@ function activeCandidates(
     ...other,
     ...debtSweepCandidates(snapshot),
     ...triageDefaultsCandidates(snapshot, triagePolicy, repairingIssues),
+    ...residueSweepCandidates(snapshot),
   ];
 }
 
@@ -1295,13 +1326,53 @@ function triageDefaultsCandidates(
 function debtSweepCandidates(
   snapshot: GitHubLifecycleSnapshot,
 ): ActiveCandidate[] {
-  if (snapshot.snapshotComplete !== true) return [];
-  if (snapshot.snapshotAuthority === 'scoped') return [];
-  return rankDebtSweeps(planDebtSweeps({
+  const input = globalDebtSweepInput(snapshot);
+  if (input === null) return [];
+  return rankDebtSweeps(planDebtSweeps(input)).map((cluster) => ({
+    phase: 'file-debt-sweep',
+    parentPr: cluster.parentPr,
+    members: cluster.members,
+  }));
+}
+
+/**
+ * Residue sweeps (#168), derived from the same input and refused on the same
+ * evidence as {@link debtSweepCandidates}: "this parent is merged" is what
+ * qualifies a member, and absence only proves that on a proven-global view.
+ *
+ * Their own cycle budget rather than a share of the per-parent one — see
+ * `rankResidueSweeps`.
+ */
+function residueSweepCandidates(
+  snapshot: GitHubLifecycleSnapshot,
+): ActiveCandidate[] {
+  const input = globalDebtSweepInput(snapshot);
+  if (input === null) return [];
+  return rankResidueSweeps(planResidueSweeps(input)).map((cluster) => ({
+    phase: 'file-residue-sweep',
+    area: cluster.area,
+    parentPrs: cluster.parentPrs,
+    members: cluster.members,
+  }));
+}
+
+/**
+ * The sweep derivation's input, or `null` when this snapshot may not drive one.
+ * One place, so the two sweep kinds and the `backlog: … residue=N` count can
+ * never read a different set of open issues or a different parent state.
+ */
+function globalDebtSweepInput(
+  snapshot: GitHubLifecycleSnapshot,
+): PlanDebtSweepsInput | null {
+  if (snapshot.snapshotComplete !== true) return null;
+  if (snapshot.snapshotAuthority === 'scoped') return null;
+  return {
     issues: snapshot.issues.map((issue) => ({
       number: issue.number,
       body: issue.body,
       priority: issue.priority,
+      // Member Effort, for the widened all-Low member cap (#168).
+      effort: issue.effort,
     })),
     openPullRequestNumbers: new Set(
       snapshot.pullRequests
@@ -1309,11 +1380,7 @@ function debtSweepCandidates(
         .map((pr) => pr.number),
     ),
     closedUnmergedParentPrs: new Set(snapshot.closedUnmergedParentPrs ?? []),
-  })).map((cluster) => ({
-    phase: 'file-debt-sweep',
-    parentPr: cluster.parentPr,
-    members: cluster.members,
-  }));
+  };
 }
 
 /**
@@ -1378,7 +1445,9 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
   }
   // A debt sweep's subject is a parent whose pull request is merged or closed;
   // `merged` is the phase that names where that parent actually is.
-  if (action.kind === 'file-debt-sweep') return 'merged';
+  if (action.kind === 'file-debt-sweep' || action.kind === 'file-residue-sweep') {
+    return 'merged';
+  }
   return 'merge-ready';
 }
 
@@ -1389,6 +1458,8 @@ function subjectForAction(action: NewWorkAction): string {
       ? `issue:${action.issueNumber}/pr:${action.parentPr}`
       : action.kind === 'file-debt-sweep'
         ? `pr:${action.parentPr}`
+        : action.kind === 'file-residue-sweep'
+          ? `area:${action.area}`
     : `issue:${action.issueNumber}/pr:${action.prNumber}`;
 }
 
@@ -1408,7 +1479,9 @@ function phaseForSchedulingSkip(
   ) {
     return 'ci-blocked';
   }
-  if (skip.phase === 'file-debt-sweep') return 'merged';
+  if (skip.phase === 'file-debt-sweep' || skip.phase === 'file-residue-sweep') {
+    return 'merged';
+  }
   return 'merge-ready';
 }
 
@@ -1653,6 +1726,8 @@ async function executeActivePass(
           ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
           : candidate.phase === 'file-debt-sweep'
             ? `pr:${candidate.parentPr}`
+            : candidate.phase === 'file-residue-sweep'
+              ? `area:${candidate.area}`
         : `issue:${candidate.issueNumber}/pr:${candidate.prNumber}`,
       action: 'schedule',
       outcome: 'skipped',
@@ -1738,26 +1813,41 @@ async function executeActivePass(
   // candidate that refuses is not remembered, so it is claimable again the
   // moment GitHub state changes (the stack collapses, the base is retargeted)
   // with no manual step and no cache to invalidate.
+  // The debt lane's queues exist only while that lane does (#168), so with it
+  // off every structure below has exactly the three entries it had before and
+  // the lane loop walks exactly the three lanes it walked before.
+  const debtLaneOn = local.remaining.debt !== undefined;
+  const activeLanes: readonly NewWorkLane[] = debtLaneOn
+    ? ['implementation', 'child', 'review', 'debt']
+    : ['implementation', 'child', 'review'];
   const remainingBackups = {
     implementation: [...scheduling.backups.implementation],
     child: [...scheduling.backups.child],
     review: [...scheduling.backups.review],
+    debt: [...(scheduling.backups.debt ?? [])],
   };
   const scheduledInLane = (lane: NewWorkLane): number => scheduling.actions.filter(
     (action) => laneForNewWorkAction(action) === lane,
   ).length;
-  const laneCandidates = {
+  const laneCandidates: Record<NewWorkLane, number> = {
     implementation: scheduledInLane('implementation')
       + scheduling.backups.implementation.length,
     child: scheduledInLane('child') + scheduling.backups.child.length,
     review: scheduledInLane('review') + scheduling.backups.review.length,
+    debt: scheduledInLane('debt') + (scheduling.backups.debt?.length ?? 0),
   };
-  const spawnedByLane = { implementation: 0, child: 0, review: 0 };
+  const spawnedByLane: Record<NewWorkLane, number> = {
+    implementation: 0, child: 0, review: 0, debt: 0,
+  };
   // One budget per lane, not one shared between them: a child queue that
   // spends five refusals must not leave fresh work with none, or either lane
   // can silently consume the other's release valve.
-  const fallThroughAttempts = { implementation: 0, child: 0, review: 0 };
-  const fallThroughExhausted = { implementation: false, child: false, review: false };
+  const fallThroughAttempts: Record<NewWorkLane, number> = {
+    implementation: 0, child: 0, review: 0, debt: 0,
+  };
+  const fallThroughExhausted: Record<NewWorkLane, boolean> = {
+    implementation: false, child: false, review: false, debt: false,
+  };
   const promoteBackup = <T extends NewWorkAction>(
     lane: NewWorkLane,
     queue: T[],
@@ -1887,9 +1977,10 @@ async function executeActivePass(
     actionEvents.push(actionEvent(action, result));
     index += 1;
   }
-  for (const lane of ['implementation', 'child', 'review'] as const) {
-    // Both implementation lanes claim eligible issues; only their capacity
-    // differs, so they share the phase and are told apart by the subject.
+  for (const lane of activeLanes) {
+    // Every implementation-shaped lane claims eligible issues; only their
+    // capacity differs, so they share the phase and are told apart by the
+    // subject — `lane:implementation`, `lane:child`, `lane:debt`.
     const phase: LifecyclePhase = lane === 'review' ? 'awaiting-review' : 'eligible';
     if (fallThroughExhausted[lane]) {
       actionEvents.push({
@@ -1910,7 +2001,7 @@ async function executeActivePass(
     // does. One line per cycle per lane, derived and never counted across
     // cycles, so nothing has to be persisted or reset.
     if (
-      local.remaining[lane] > 0
+      (local.remaining[lane] ?? 0) > 0
       && laneCandidates[lane] > 0
       && spawnedByLane[lane] === 0
     ) {
@@ -1922,7 +2013,7 @@ async function executeActivePass(
         subject: `lane:${lane}`,
         action: 'schedule',
         outcome: 'starved',
-        reason: `${local.remaining[lane]} slot(s) free and ${laneCandidates[lane]} eligible `
+        reason: `${local.remaining[lane]!} slot(s) free and ${laneCandidates[lane]} eligible `
           + 'candidate(s), but nothing spawned this cycle',
       });
     }
@@ -2152,7 +2243,7 @@ export async function runLifecycleCycle(
       orphanBranchClaims: [],
       diagnostics: [],
       events: [],
-      backlog: backlogSummary(snapshot.issues),
+      backlog: backlogSummary(snapshot),
     };
   }
   const graphqlRemaining = snapshot.githubUsage?.graphqlRemaining ?? null;
@@ -2231,7 +2322,7 @@ export async function runLifecycleCycle(
         ...(scopedPass?.events ?? []),
         ...activePass.events,
       ],
-      backlog: backlogSummary(snapshot.issues),
+      backlog: backlogSummary(snapshot),
       ...(activePass.disk === undefined ? {} : { disk: activePass.disk }),
       reconciliation: combinedReconciliation,
     });
@@ -2275,7 +2366,7 @@ export async function runLifecycleCycle(
       orphanBranchClaims,
       diagnostics,
       events: [],
-      backlog: backlogSummary(snapshot.issues),
+      backlog: backlogSummary(snapshot),
     });
   }
   const writer = deps.writerForSnapshot?.(snapshot) ?? deps.writer!;
@@ -2303,7 +2394,7 @@ export async function runLifecycleCycle(
     orphanBranchClaims,
     diagnostics,
     events: reconciliationEvents,
-    backlog: backlogSummary(snapshot.issues),
+    backlog: backlogSummary(snapshot),
     reconciliation,
   });
 }
@@ -2534,7 +2625,7 @@ function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[
   return [
     `backlog: ordinary=${backlog.ordinary} follow-ups=${backlog.followUps} `
       + `children=${backlog.children} sweeps=${backlog.sweeps} `
-      + `(actionable=${backlog.actionable})`,
+      + `(actionable=${backlog.actionable}) residue=${backlog.residue}`,
     `backlog ordinary priority: ${
       [...BACKLOG_PRIORITY_KEYS, 'unset' as const]
         .map((key) => `${key}=${backlog.ordinaryByPriority[key]}`)

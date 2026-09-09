@@ -154,6 +154,41 @@ export function makeProductionOpenReviewFollowUpReader(
   };
 }
 
+/**
+ * Open issues matching a marker, WITH their bodies (#168).
+ *
+ * Residue-sweep dedup is member-level, so it has to read what the open sweeps
+ * name rather than only that one exists — which `ReviewFollowUpPort`'s
+ * `searchOpenByMarker` cannot answer, because it returns titles. Same listing,
+ * same cap, and the same refusal of a truncated page for the same reason: a
+ * listing cut short cannot prove a member is unswept, and filing a second
+ * sweep for it is not a recoverable mistake.
+ *
+ * Its own cache rather than the filing port's, so this stays purely additive:
+ * the reader is created alongside a port and pays one extra `gh issue list`
+ * per residue filing.
+ */
+export function makeProductionOpenIssueBodyReader(
+  options: Pick<ProductionReviewFollowUpPortOptions, 'runner' | 'repo'> = {},
+): (marker: string) => Promise<readonly OpenIssueRow[]> {
+  const runner = options.runner ?? defaultRunner;
+  const repo = options.repo ?? REPO;
+  let cache: readonly OpenIssueRow[] | undefined;
+  return async (marker) => {
+    if (cache === undefined) {
+      const rows = await listOpenIssues(runner, repo);
+      if (rows.length >= FOLLOW_UP_LIST_LIMIT) {
+        throw new Error(
+          `Open follow-up issue listing reached its ${FOLLOW_UP_LIST_LIMIT}-item `
+          + 'limit; refusing a potentially truncated set',
+        );
+      }
+      cache = rows;
+    }
+    return cache.filter((issue) => issue.body.includes(marker));
+  };
+}
+
 export function makeProductionReviewFollowUpPort(
   options: ProductionReviewFollowUpPortOptions = {},
 ): ReviewFollowUpPort {

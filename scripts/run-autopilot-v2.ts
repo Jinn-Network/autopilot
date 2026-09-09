@@ -512,6 +512,7 @@ function dispatcherConfig(
     authorAllowlist: [...allowlist],
     concurrencyCap: product.scheduler.implementationConcurrency,
     childCap: product.scheduler.childConcurrency,
+    debtCap: product.scheduler.debtConcurrency,
     reviewCap: product.scheduler.reviewConcurrency,
     openPrBackpressure: product.scheduler.openPrBackpressure,
     reviewBotLogin: environment.JINN_REVIEW_BOT_LOGIN ?? '',
@@ -1068,6 +1069,11 @@ export async function runAutopilotV2(
             env.JINN_AUTOPILOT_REVIEW_CAP,
             config.reviewCap,
             'JINN_AUTOPILOT_REVIEW_CAP',
+          ),
+          debt: nonNegativeEnvironmentInteger(
+            env.JINN_AUTOPILOT_DEBT_CAP,
+            config.debtCap,
+            'JINN_AUTOPILOT_DEBT_CAP',
           ),
           codexOverflow: nonNegativeEnvironmentInteger(
             env.JINN_AUTOPILOT_CODEX_OVERFLOW_CAP,

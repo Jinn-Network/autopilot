@@ -431,6 +431,19 @@ export type ImplementationClaimAction =
        * attempt manifest's `childKind`.
        */
       readonly child?: true;
+      /**
+       * Schedule-time lane tag: this claim was admitted under the `debt`
+       * concurrency lane rather than the implementation one (#168). Set only
+       * when that lane is configured on (`scheduler.debtConcurrency > 0`), so
+       * with the lane off no action ever carries it and every downstream
+       * accounting reads exactly as it did before.
+       *
+       * Advisory in the same sense as `child`: it decides which lane's slot
+       * and fall-through budget the claim spends, and it is what the attempt
+       * manifest records so a live sweep session is counted against the lane
+       * that admitted it.
+       */
+      readonly sweep?: true;
     }
   | {
       readonly kind: 'claim-implementation';
@@ -498,6 +511,8 @@ export type NewWorkAction =
       readonly members: readonly {
         readonly number: number;
         readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+        /** Project Effort; absent is not Low (#168). Widens the member cap when every member is Low. */
+        readonly effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       }[];
     }
   | {
@@ -525,6 +540,26 @@ export type NewWorkAction =
     }
   | {
       /**
+       * File one residue sweep (#168): review follow-ups left behind on
+       * SEVERAL merged parents, each below the per-parent floor, batched by
+       * area. Its own kind rather than a widened `file-debt-sweep` because it
+       * names no parent at all — the subject is the area — and the per-parent
+       * path must stay byte-identical.
+       */
+      readonly kind: 'file-residue-sweep';
+      /** `packages/<name>`, a first path segment, or `unknown` (`debt-sweep.ts`). */
+      readonly area: string;
+      /** The merged parents the members came from, ascending. */
+      readonly parentPrs: readonly number[];
+      readonly members: readonly {
+        readonly number: number;
+        readonly priority: 'p0' | 'p1' | 'p2' | 'p3' | 'p4';
+        /** Project Effort; absent is not Low (#168). Widens the member cap when every member is Low. */
+        readonly effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+      }[];
+    }
+  | {
+      /**
        * Hand the exact head to GitHub's merge queue. The queue, not this
        * engine, constructs and lands the merge commit, so nothing downstream of
        * a successful enqueue may claim the change is merged.
@@ -536,8 +571,14 @@ export type NewWorkAction =
       readonly expectedBaseRefName: GitRefName;
     };
 
-/** The three capped concurrency lanes new work draws its slots from. */
-export type NewWorkLane = 'implementation' | 'child' | 'review';
+/**
+ * The capped concurrency lanes new work draws its slots from.
+ *
+ * `debt` is opt-in (#168): with `scheduler.debtConcurrency` at its default 0
+ * no action is ever tagged for it, so it exists in the type and nowhere in a
+ * default deployment's behaviour.
+ */
+export type NewWorkLane = 'implementation' | 'child' | 'review' | 'debt';
 
 /**
  * Which lane an action spends a slot from, or `null` for the actions that
@@ -553,9 +594,11 @@ export type NewWorkLane = 'implementation' | 'child' | 'review';
 export function laneForNewWorkAction(action: NewWorkAction): NewWorkLane | null {
   if (action.kind === 'claim-review') return 'review';
   if (action.kind !== 'claim-implementation') return null;
-  return action.intent === 'fresh' && action.child === true
-    ? 'child'
-    : 'implementation';
+  if (action.intent !== 'fresh') return 'implementation';
+  // A claim cannot be both: the scheduler walks the child lane first, and a
+  // machine child is never a sweep issue.
+  if (action.child === true) return 'child';
+  return action.sweep === true ? 'debt' : 'implementation';
 }
 
 export type RecoveryAction =

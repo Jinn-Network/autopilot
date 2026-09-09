@@ -1065,6 +1065,112 @@ describe('active lifecycle controller', () => {
         })]);
     });
 
+    it('schedules a sweep and an ordinary claim under separate lanes (#168)', async () => {
+      const issues = [
+        {
+          ...priorityIssue(9500, 'P2'),
+          body: '<!-- jinn-autopilot:debt-sweep pr=3000 members=1,2,3 -->',
+        },
+        priorityIssue(100, 'P0'),
+      ];
+      const controller = deps({
+        readSnapshot: async () => ({
+          ...snapshot(),
+          issues,
+          lifecycle: { items: issues.map((issue) => priorityItem(issue.number)) },
+        }),
+      });
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 1, child: 1, review: 1, debt: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      const spawned: unknown[] = [];
+      controller.active!.executeAction = async (action) => {
+        spawned.push(action);
+        return { outcome: 'spawned' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      // One implementation slot and one debt slot: both claims run this cycle,
+      // where a single shared lane would have dropped the P2 sweep.
+      expect(spawned).toEqual([
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 100 },
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 9500, sweep: true },
+      ]);
+      expect(report.events.filter((event) => event.outcome === 'skipped'
+        && event.action === 'schedule')).toEqual([]);
+    });
+
+    it('logs a starved debt lane on its own subject (#168)', async () => {
+      const issues = [
+        {
+          ...priorityIssue(9500, 'P2'),
+          body: '<!-- jinn-autopilot:debt-sweep pr=3000 members=1,2,3 -->',
+        },
+        priorityIssue(100, 'P0'),
+      ];
+      const controller = deps({
+        readSnapshot: async () => ({
+          ...snapshot(),
+          issues,
+          lifecycle: { items: issues.map((issue) => priorityItem(issue.number)) },
+        }),
+      });
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 1, child: 1, review: 1, debt: 1 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      controller.active!.executeAction = async (action) => (
+        action.sweep === true
+          ? { outcome: 'ineligible', reason: 'sweep issue is no longer open' }
+          : { outcome: 'spawned' }
+      );
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.events.filter((event) => event.outcome === 'starved'))
+        .toEqual([expect.objectContaining({
+          phase: 'eligible',
+          action: 'schedule',
+          subject: 'lane:debt',
+          outcome: 'starved',
+        })]);
+    });
+
+    it('never names a debt lane while the lane is off (#168)', async () => {
+      const issues = [
+        {
+          ...priorityIssue(9500, 'P2'),
+          body: '<!-- jinn-autopilot:debt-sweep pr=3000 members=1,2,3 -->',
+        },
+      ];
+      const controller = deps({
+        readSnapshot: async () => ({
+          ...snapshot(),
+          issues,
+          lifecycle: { items: issues.map((issue) => priorityItem(issue.number)) },
+        }),
+      });
+      const spawned: unknown[] = [];
+      controller.active!.executeAction = async (action) => {
+        spawned.push(action);
+        return { outcome: 'ineligible' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      // Untagged, so it spends an implementation slot exactly as today, and
+      // the starvation line names the implementation lane.
+      expect(spawned).toEqual([
+        { kind: 'claim-implementation', intent: 'fresh', issueNumber: 9500 },
+      ]);
+      expect(report.events.filter((event) => event.outcome === 'starved'))
+        .toEqual([expect.objectContaining({ subject: 'lane:implementation' })]);
+    });
+
     it('gives each implementation lane its own fall-through budget', async () => {
       const attempted: number[] = [];
       const controller = deps({
@@ -1793,9 +1899,67 @@ describe('active lifecycle controller — JINN_AUTOPILOT_ONLY_ISSUES allowlist (
       kind: 'file-debt-sweep',
       parentPr: 84,
       members: [
-        { number: 101, priority: 'p4' },
-        { number: 102, priority: 'p3' },
-        { number: 103, priority: 'p4' },
+        { number: 101, priority: 'p4', effort: 'low' },
+        { number: 102, priority: 'p3', effort: 'low' },
+        { number: 103, priority: 'p4', effort: 'low' },
+      ],
+    }]);
+  });
+
+  function residueSweepSnapshot(): GitHubLifecycleSnapshot {
+    const head = 'a'.repeat(40);
+    const followUp = (number: number, parentPr: number, area: string) => ({
+      number,
+      title: `Follow-up ${number}`,
+      body: `${formatReviewFollowUpMarker(parentPr, head, number)}\n\n`
+        + `See \`${area}/thing.ts\`.`,
+      labels: [],
+      shape: 'chore',
+      blockedOn: 'Nothing',
+      blockedByIssues: [],
+      effort: 'Low',
+      priority: 'P4',
+      status: 'Todo',
+      onBoard: true,
+      author: 'implementation-bot',
+      projectItemId: `PVTI_${number}`,
+      inCurrentSprint: false,
+    });
+    return {
+      ...snapshot(),
+      issues: [
+        // Two merged parents, 2 + 1 members, one area: one residue sweep of 3.
+        followUp(101, 84, 'packages/core'),
+        followUp(102, 84, 'packages/core'),
+        followUp(103, 85, 'packages/core'),
+        // A lone residue in another area waits for company.
+        followUp(104, 86, 'packages/edge'),
+      ],
+      pullRequests: [],
+      lifecycle: { items: [] },
+    };
+  }
+
+  it('emits one residue-sweep filing action across parents, by area (#168)', async () => {
+    const actions: unknown[] = [];
+    const controller = deps({ readSnapshot: async () => residueSweepSnapshot() });
+    controller.active!.executeAction = async (action) => {
+      actions.push(action);
+      return { outcome: 'filed' };
+    };
+
+    await runLifecycleCycle('active', controller);
+
+    expect(actions).toEqual([{
+      kind: 'file-residue-sweep',
+      area: 'packages/core',
+      parentPrs: [84, 85],
+      // Effort rides along so the filing can widen the member cap for an
+      // all-Low batch (#168).
+      members: [
+        { number: 101, priority: 'p4', effort: 'low' },
+        { number: 102, priority: 'p4', effort: 'low' },
+        { number: 103, priority: 'p4', effort: 'low' },
       ],
     }]);
   });
