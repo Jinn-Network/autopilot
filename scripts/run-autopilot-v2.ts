@@ -1130,6 +1130,12 @@ export async function runAutopilotV2(
         runnerId,
         cycleId: randomUUID,
         mergePolicy: loaded.config.mergePolicy,
+        // Board triage defaults (#166). Both keys are defaulted in the schema,
+        // so every deployed config supplies a policy without being edited.
+        triageDefaults: {
+          defaultPriority: loaded.config.triage.defaultPriority,
+          inferIssueType: loaded.config.triage.inferIssueType,
+        },
         snapshotFailureMode: options.once ? 'throw' : 'report',
       });
     } catch (error) {

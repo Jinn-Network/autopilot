@@ -46,6 +46,11 @@ import { planDebtSweeps, rankDebtSweeps } from './debt-sweep.js';
 import { enqueuePathEnabled } from './enqueue-record.js';
 import { chooseIntegrationLadderAction } from './integration-ladder.js';
 import { hasReviewFollowUpMarkerTag } from './review-follow-ups.js';
+import {
+  planTriageDefaults,
+  triageGaps,
+  type TriageDefaultsPolicy,
+} from './triage-defaults.js';
 import type {
   AutopilotMode,
   GitOid,
@@ -127,6 +132,13 @@ export interface LifecycleControllerDeps {
    * and initialization writes manual.
    */
   readonly mergePolicy?: MergePolicy;
+  /**
+   * Board triage policy (#166). Absent means no `triage-defaults` action is
+   * ever planned: a build that wires no policy must not start writing Project
+   * fields on its own, and every deployment that does wire one gets it from
+   * config, where both keys are defaulted.
+   */
+  readonly triageDefaults?: TriageDefaultsPolicy;
   readonly active?: {
     preflight(): Promise<{ readonly ok: boolean; readonly detail?: string }>;
     readLocalState(): {
@@ -271,6 +283,12 @@ type LifecycleBacklogPriorityKey = 'p0' | 'p1' | 'p2' | 'p3' | 'p4' | 'unset';
  * actually reach. Follow-ups and children are real open issues but neither
  * competes for an ordinary claim the way a sweep does, so they are reported
  * separately rather than folded into `actionable`.
+ *
+ * `ordinary` counts only issues that pass the triage cascade (#166). An issue
+ * with no Issue Type or no Priority is refused an ordinary claim, so counting
+ * it here reported unclaimable work as claimable — on the mono board that was
+ * twenty issues, some twelve days old, while both lanes reported starvation.
+ * Those issues are named by `untriaged` instead, so nothing disappears.
  */
 export interface LifecycleBacklogSummary {
   readonly ordinary: number;
@@ -280,6 +298,15 @@ export interface LifecycleBacklogSummary {
   readonly actionable: number;
   /** Per-priority counts for the ORDINARY set only — follow-ups, children, and sweeps are excluded. */
   readonly ordinaryByPriority: Readonly<Record<LifecycleBacklogPriorityKey, number>>;
+  /**
+   * Ordinary open issues the triage cascade refuses, counted per missing
+   * field (#166). The two counts are independent, not a partition: an issue
+   * missing both fields is named by both.
+   */
+  readonly untriaged: {
+    readonly noType: number;
+    readonly noPriority: number;
+  };
 }
 
 export interface LifecycleLogEvent {
@@ -803,8 +830,10 @@ function classifyBacklogIssue(issue: { readonly body?: string }): LifecycleBackl
 const BACKLOG_PRIORITY_KEYS = ['p0', 'p1', 'p2', 'p3', 'p4'] as const;
 
 /**
- * Unset or unrecognized Priority buckets under `unset` — unset-priority
- * issues are triage gaps, not exclusions, and still count as ordinary (#127).
+ * Unrecognized Priority buckets under `unset`. An ABSENT Priority no longer
+ * reaches this function: since #166 an unset-priority issue is untriaged and
+ * never counted as ordinary, so the bucket now catches only a board value the
+ * five known options do not name.
  */
 function backlogPriorityKey(priority: string | null | undefined): LifecycleBacklogPriorityKey {
   if (priority === null || priority === undefined) return 'unset';
@@ -829,6 +858,8 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
   let followUps = 0;
   let children = 0;
   let sweeps = 0;
+  let noType = 0;
+  let noPriority = 0;
   for (const issue of issues) {
     const backlogClass = classifyBacklogIssue(issue);
     if (backlogClass === 'sweep') {
@@ -838,6 +869,12 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
     } else if (backlogClass === 'follow-up') {
       followUps += 1;
     } else {
+      // Ordinary issues only: machine children have their own repair, and
+      // follow-ups and sweeps are machine-filed with triage already applied.
+      const gaps = triageGaps(issue);
+      if (gaps.noType) noType += 1;
+      if (gaps.noPriority) noPriority += 1;
+      if (gaps.noType || gaps.noPriority) continue;
       ordinary += 1;
       ordinaryByPriority[backlogPriorityKey(issue.priority)] += 1;
     }
@@ -849,6 +886,7 @@ function backlogSummary(issues: GitHubLifecycleSnapshot['issues']): LifecycleBac
     sweeps,
     actionable: ordinary + sweeps,
     ordinaryByPriority,
+    untriaged: { noType, noPriority },
   };
 }
 
@@ -948,6 +986,7 @@ interface RankedImplementationCandidate {
 function activeCandidates(
   snapshot: GitHubLifecycleSnapshot,
   view: ReturnType<typeof deriveLifecycle>,
+  triagePolicy: TriageDefaultsPolicy | undefined,
 ): ActiveCandidate[] {
   const byPr = new Map(snapshot.pullRequests.map((pr) => [pr.number, pr]));
   const repair: ActiveCandidate[] = [];
@@ -1206,7 +1245,36 @@ function activeCandidates(
     ...orderImplementationClaims(freshImplementation),
     ...other,
     ...debtSweepCandidates(snapshot),
+    ...triageDefaultsCandidates(snapshot, triagePolicy, repairingIssues),
   ];
+}
+
+/**
+ * Board triage defaults (#166), derived from the snapshot's issues rather than
+ * from the lifecycle view: an untriaged issue is precisely one the view has
+ * already ruled ineligible, so the view carries no candidate to hang this on.
+ *
+ * Withheld entirely when no policy is wired — a build that was never told what
+ * Priority to write must not invent one — and issues already queued for
+ * machine-child repair are excluded a second time here, so the two writers can
+ * never both be planned for the same field in the same cycle.
+ */
+function triageDefaultsCandidates(
+  snapshot: GitHubLifecycleSnapshot,
+  policy: TriageDefaultsPolicy | undefined,
+  repairingIssues: ReadonlySet<number>,
+): ActiveCandidate[] {
+  if (policy === undefined) return [];
+  return planTriageDefaults(
+    snapshot.issues.filter((issue) => !repairingIssues.has(issue.number)),
+    policy,
+  ).map((planned) => ({
+    phase: 'triage-defaults',
+    issueNumber: planned.issueNumber,
+    projectItemId: planned.projectItemId,
+    ...(planned.issueType === undefined ? {} : { issueType: planned.issueType }),
+    ...(planned.priority === undefined ? {} : { priority: planned.priority }),
+  }));
 }
 
 /**
@@ -1300,6 +1368,8 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
   if (
     action.kind === 'claim-implementation'
     || action.kind === 'repair-machine-child'
+    // The gap it closes is exactly what keeps the issue out of `eligible`.
+    || action.kind === 'triage-defaults'
   ) return 'eligible';
   if (action.kind === 'claim-review') return 'awaiting-review';
   if (action.kind === 'file-reconcile-child') return 'awaiting-review';
@@ -1313,7 +1383,7 @@ function phaseForAction(action: NewWorkAction): LifecyclePhase {
 }
 
 function subjectForAction(action: NewWorkAction): string {
-  return action.kind === 'claim-implementation'
+  return action.kind === 'claim-implementation' || action.kind === 'triage-defaults'
     ? `issue:${action.issueNumber}`
     : action.kind === 'repair-machine-child'
       ? `issue:${action.issueNumber}/pr:${action.parentPr}`
@@ -1328,6 +1398,7 @@ function phaseForSchedulingSkip(
   if (
     skip.phase === 'implementation'
     || skip.phase === 'repair-machine-child'
+    || skip.phase === 'triage-defaults'
   ) return 'eligible';
   if (skip.phase === 'review') return 'awaiting-review';
   if (skip.phase === 'file-reconcile-child') return 'awaiting-review';
@@ -1560,7 +1631,7 @@ async function executeActivePass(
         pr.state === 'OPEN' && pr.labels.includes('engine:review')
       )).length;
   const candidates = applyMergePolicy(
-    activeCandidates(snapshot, view),
+    activeCandidates(snapshot, view, deps.triageDefaults),
     deps.mergePolicy ?? 'manual',
   ).filter((candidate) => gatingIssueNumbers(candidate).every((issueNumber) => (
     !blockedIssues.has(issueNumber)
@@ -1576,7 +1647,7 @@ async function executeActivePass(
       runnerId: deps.runnerId,
       mode: 'active',
       phase: phaseForSchedulingSkip(candidate),
-      subject: candidate.phase === 'implementation'
+      subject: candidate.phase === 'implementation' || candidate.phase === 'triage-defaults'
         ? `issue:${candidate.issueNumber}`
         : candidate.phase === 'repair-machine-child'
           ? `issue:${candidate.issueNumber}/pr:${candidate.parentPr}`
@@ -2446,13 +2517,18 @@ function paritySummary(
 }
 
 /**
- * Renders the open-issue composition (#127) as two lines: the exact
+ * Renders the open-issue composition (#127) as three lines: the exact
  * `backlog: ordinary=N follow-ups=M children=K sweeps=S (actionable=A)`
- * summary, and a per-priority breakdown of the ordinary set only. Both flow
- * through the one renderer, so both the per-cycle log (the continuous
- * cadence's own stdout) and `autopilot status` (the same renderer run
- * on-demand) show the composition — never derived, persisted, or scheduled
- * on; purely a read of the summary the controller already computed.
+ * summary, a per-priority breakdown of the ordinary set only, and the
+ * untriaged gap counts (#166). All three flow through the one renderer, so
+ * both the per-cycle log (the continuous cadence's own stdout) and
+ * `autopilot status` (the same renderer run on-demand) show the composition —
+ * never derived, persisted, or scheduled on; purely a read of the summary the
+ * controller already computed.
+ *
+ * The untriaged line is emitted unconditionally, zeros included: a line that
+ * appears only when it has something to say cannot be told from a build where
+ * the count is not derived at all.
  */
 function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[] {
   return [
@@ -2464,6 +2540,8 @@ function backlogSummaryLines(backlog: LifecycleBacklogSummary): readonly string[
         .map((key) => `${key}=${backlog.ordinaryByPriority[key]}`)
         .join(' ')
     }`,
+    `untriaged: no-type=${backlog.untriaged.noType} `
+      + `no-priority=${backlog.untriaged.noPriority}`,
   ];
 }
 

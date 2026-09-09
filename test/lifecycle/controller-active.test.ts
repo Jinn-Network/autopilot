@@ -299,6 +299,140 @@ describe('active lifecycle controller', () => {
     ]);
   });
 
+  // #166: nothing in the engine used to resolve an untriaged board issue, so
+  // it sat unclaimable and invisible. The cascade's refusal is unchanged; this
+  // is the mechanism that stops producing it.
+  describe('board triage defaults', () => {
+    function untriagedSnapshot(
+      issues: readonly Record<string, unknown>[],
+    ): GitHubLifecycleSnapshot {
+      return {
+        ...snapshot(),
+        issues: issues.map((overrides) => ({
+          number: 3983,
+          title: 'fix: the poller drops events',
+          body: '',
+          labels: [],
+          shape: null,
+          blockedOn: 'Nothing',
+          blockedByIssues: [],
+          effort: 'Low',
+          priority: null,
+          status: 'Todo',
+          onBoard: true,
+          author: 'implementation-bot',
+          projectItemId: 'PVTI_3983',
+          inCurrentSprint: false,
+          ...overrides,
+        })),
+        lifecycle: { items: [] },
+      };
+    }
+
+    function triageDeps(
+      snapshotValue: GitHubLifecycleSnapshot,
+    ): LifecycleControllerDeps {
+      return deps({
+        readSnapshot: async () => snapshotValue,
+        triageDefaults: { defaultPriority: 'P3', inferIssueType: true },
+      });
+    }
+
+    it('plans one action closing both gaps on an untriaged board issue', async () => {
+      const actions: unknown[] = [];
+      const controller = triageDeps(untriagedSnapshot([{}]));
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'applied', reason: 'type fix, priority P3' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([{
+        kind: 'triage-defaults',
+        issueNumber: 3983,
+        projectItemId: 'PVTI_3983',
+        issueType: 'fix',
+        priority: 'P3',
+      }]);
+    });
+
+    it('logs the applied line an operator can grep for', async () => {
+      const controller = triageDeps(untriagedSnapshot([{
+        number: 3192,
+        title: 'Make the poller faster',
+        shape: 'feat',
+        projectItemId: 'PVTI_3192',
+      }]));
+      controller.active!.executeAction = async () => ({
+        outcome: 'applied',
+        reason: 'priority P3',
+      });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(renderLifecycleHuman(report).split('\n'))
+        .toContain('triage-defaults issue:3192: applied (priority P3).');
+    });
+
+    it('leaves a machine child to its own repair', async () => {
+      const actions: unknown[] = [];
+      const controller = triageDeps(untriagedSnapshot([{
+        number: 2141,
+        title: 'fix: reconcile PR #2140',
+        body: formatChildMarker(2140, 'reconcile'),
+        projectItemId: 'PVTI_2141',
+      }]));
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'completed' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(actions.every((action) => (
+        (action as { kind: string }).kind !== 'triage-defaults'
+      ))).toBe(true);
+    });
+
+    it('plans nothing at all when no triage policy is wired', async () => {
+      const actions: unknown[] = [];
+      const controller = deps({ readSnapshot: async () => untriagedSnapshot([{}]) });
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'applied' };
+      };
+
+      await runLifecycleCycle('active', controller);
+
+      expect(actions).toEqual([]);
+    });
+
+    it('applies ten of twenty-five neglected issues and leaves the rest on the line', async () => {
+      const actions: unknown[] = [];
+      const controller = triageDeps(untriagedSnapshot(
+        Array.from({ length: 25 }, (_, index) => ({
+          number: 1000 + index,
+          projectItemId: `PVTI_${1000 + index}`,
+          title: 'Untitled work',
+          shape: 'feat',
+        })),
+      ));
+      controller.active!.executeAction = async (action) => {
+        actions.push(action);
+        return { outcome: 'applied', reason: 'priority P3' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(actions).toHaveLength(10);
+      // The remainder is not lost: the line still names every gap, and the
+      // next cycle re-derives the fifteen this one did not reach.
+      expect(renderLifecycleHuman(report).split('\n'))
+        .toContain('untriaged: no-type=0 no-priority=25');
+    });
+  });
+
   it('threads the same immutable cycle snapshot into reconciliation and active execution', async () => {
     let writerSnapshot: GitHubLifecycleSnapshot | undefined;
     let actionSnapshot: GitHubLifecycleSnapshot | undefined;

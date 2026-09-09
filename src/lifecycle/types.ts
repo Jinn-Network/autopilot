@@ -502,6 +502,29 @@ export type NewWorkAction =
     }
   | {
       /**
+       * Fill the triage gaps that make an ordinary board issue unclaimable
+       * (#166): a missing Project Priority, and a missing native Issue Type
+       * that an explicit conventional title prefix names. At least one of the
+       * two is always present — an action with neither writes nothing and is
+       * never planned.
+       *
+       * Never planned for a machine child: that issue's expected triage lives
+       * on its own marker and `repair-machine-child` owns it.
+       *
+       * `issueType` and `priority` are structurally the dispatcher's
+       * `IssueShape` and `Priority`, spelled out here so this module stays the
+       * leaf it is.
+       */
+      readonly kind: 'triage-defaults';
+      readonly issueNumber: number;
+      readonly projectItemId: string;
+      readonly issueType?:
+        | 'feat' | 'fix' | 'refactor' | 'spike' | 'chore'
+        | 'docs' | 'test' | 'incident' | 'design';
+      readonly priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4';
+    }
+  | {
+      /**
        * Hand the exact head to GitHub's merge queue. The queue, not this
        * engine, constructs and lands the merge commit, so nothing downstream of
        * a successful enqueue may claim the change is merged.
@@ -518,8 +541,9 @@ export type NewWorkLane = 'implementation' | 'child' | 'review';
 
 /**
  * Which lane an action spends a slot from, or `null` for the actions that
- * spend none (machine-child repair, child filing, debt sweeps, rerun,
- * enqueue). Those are bounded where they are derived, not by a lane.
+ * spend none (machine-child repair, child filing, debt sweeps, triage
+ * defaults, rerun, enqueue). Those are bounded where they are derived, not by
+ * a lane.
  *
  * One definition for the two places that must agree — the runtime's
  * per-action capacity guard and the controller's fall-through bookkeeping.

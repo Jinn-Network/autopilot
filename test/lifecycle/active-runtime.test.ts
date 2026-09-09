@@ -434,6 +434,70 @@ describe('active runtime boundary', () => {
       reason: 'action update-branch is not wired',
     });
   });
+
+  // #166: triage defaults reach their own handler, spend no lane slot, and a
+  // build that wires no handler degrades to "did not run" rather than failing
+  // the cycle.
+  it('routes a triage-defaults action to its handler with every lane full', async () => {
+    const seen: unknown[] = [];
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 0, child: 0, review: 0 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+        triageDefaults: async (action) => {
+          seen.push(action);
+          return { status: 'applied', detail: 'type fix, priority P3' };
+        },
+      },
+    });
+    const action = {
+      kind: 'triage-defaults' as const,
+      issueNumber: 3983,
+      projectItemId: 'PVTI_3983',
+      issueType: 'fix' as const,
+      priority: 'P3' as const,
+    };
+
+    await expect(runtime.executeAction(action, {} as never)).resolves.toEqual({
+      outcome: 'applied',
+      reason: 'type fix, priority P3',
+    });
+    expect(seen).toEqual([action]);
+  });
+
+  it('degrades to a skip when no triage-defaults handler is wired', async () => {
+    const runtime = makeActiveRuntime({
+      credentials: pool(),
+      caps: { implementation: 1, child: 1, review: 1 },
+      implementationPreferredLogin: 'implementation-bot',
+      implementationBackpressureThreshold: 30,
+      readLocalAttempts: () => [],
+      preflight: async () => ({ ok: true }),
+      handlers: {
+        implementation: async () => ({ status: 'spawned' }),
+        review: async () => ({ status: 'spawned' }),
+        enqueue: async () => ({ status: 'enqueued' }),
+      },
+    });
+
+    await expect(runtime.executeAction({
+      kind: 'triage-defaults',
+      issueNumber: 3983,
+      projectItemId: 'PVTI_3983',
+      priority: 'P3',
+    }, {} as never)).resolves.toEqual({
+      outcome: 'skipped',
+      reason: 'triage-defaults handler unavailable',
+    });
+  });
+
   it('reserves each spawn against the same cycle\u2019s later spawns', async () => {
     const seen: (readonly string[])[] = [];
     const runtime = makeActiveRuntime({

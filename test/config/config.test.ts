@@ -99,6 +99,8 @@ function validConfig(): unknown {
     },
     triage: {
       allowedAuthors: ['octocat'],
+      defaultPriority: 'P3',
+      inferIssueType: true,
     },
     safety: {
       staleAfterSeconds: 7200,
@@ -204,6 +206,42 @@ describe('Autopilot product configuration', () => {
     // A zero-width child lane cannot drain the child backlog, and children are
     // exactly the work that unblocks everything downstream: unrepresentable.
     input.scheduler.childConcurrency = 0;
+    expect(() => decodeAutopilotConfig(input)).toThrow();
+  });
+
+  // Same additive contract every earlier defaulted key established (#166):
+  // every deployed `.autopilot/config.json` carries a `triage` block with
+  // `allowedAuthors` alone, so both board-triage keys must decode from their
+  // own defaults rather than rejecting the file.
+  it('defaults the board-triage knobs when their keys are absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      triage: { defaultPriority?: unknown; inferIssueType?: unknown };
+    };
+    delete input.triage.defaultPriority;
+    delete input.triage.inferIssueType;
+
+    expect(decodeAutopilotConfig(input).triage).toEqual({
+      allowedAuthors: ['octocat'],
+      defaultPriority: 'P3',
+      inferIssueType: true,
+    });
+  });
+
+  it('round-trips configured board-triage knobs and refuses an unknown priority', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      triage: { defaultPriority: unknown; inferIssueType: unknown };
+    };
+    input.triage.defaultPriority = 'P2';
+    input.triage.inferIssueType = false;
+    expect(decodeAutopilotConfig(input).triage).toEqual({
+      allowedAuthors: ['octocat'],
+      defaultPriority: 'P2',
+      inferIssueType: false,
+    });
+
+    // The Project Priority field has exactly five options; anything else names
+    // no option id the board write could use.
+    input.triage.defaultPriority = 'P5';
     expect(() => decodeAutopilotConfig(input)).toThrow();
   });
 

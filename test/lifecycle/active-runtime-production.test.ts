@@ -436,6 +436,80 @@ describe('production active runtime preflight', () => {
     expect(trackAttemptChild).not.toHaveBeenCalled();
   });
 
+  // #166: the production runtime must actually reach the board writer, under
+  // the implement credential, without preparing an attempt workspace.
+  it('wires triage defaults to the production board writer', async () => {
+    const spawn = vi.fn(() => {
+      throw new Error('local spawn must remain untouched');
+    });
+    const live = { issueType: null, priority: null };
+    const seen = [];
+    const runner = vi.fn(async (_command, args) => {
+      if (args[0] === 'api' && args.some((arg) => arg.includes('TriageDefaultsState'))) {
+        return JSON.stringify({
+          data: {
+            repository: {
+              issue: {
+                id: 'I_3983',
+                state: 'OPEN',
+                issueType: live.issueType === null ? null : { name: live.issueType },
+              },
+            },
+            node: {
+              __typename: 'ProjectV2Item',
+              id: 'PVTI_3983',
+              project: { id: 'PVT_project' },
+              content: {
+                __typename: 'Issue',
+                number: 3983,
+                repository: { nameWithOwner: 'Jinn-Network/mono' },
+              },
+              priority: live.priority === null ? null : { name: live.priority },
+            },
+          },
+        });
+      }
+      if (args[0] === 'project' && args[1] === 'field-list') {
+        return JSON.stringify({
+          fields: [
+            { id: 'F_blocked', name: 'Blocked on', options: [{ id: 'b_nothing', name: 'Nothing' }] },
+            {
+              id: 'F_effort',
+              name: 'Effort',
+              options: ['Low', 'Medium', 'High', 'XHigh', 'Max']
+                .map((name) => ({ id: `e_${name}`, name })),
+            },
+            {
+              id: 'F_priority',
+              name: 'Priority',
+              options: ['P0', 'P1', 'P2', 'P3', 'P4']
+                .map((name) => ({ id: `opt_${name}`, name })),
+            },
+          ],
+        });
+      }
+      if (args[0] === 'project' && args[1] === 'item-edit') {
+        seen.push(String(args[args.indexOf('--single-select-option-id') + 1]));
+        live.priority = 'P3';
+        return '';
+      }
+      throw new Error(`unexpected command: ${args.join(' ')}`);
+    });
+    const active = marketplaceRuntime({ spawn, runner });
+
+    await expect(active.executeAction({
+      kind: 'triage-defaults',
+      issueNumber: 3983,
+      projectItemId: 'PVTI_3983',
+      priority: 'P3',
+    }, {} as never)).resolves.toEqual({
+      outcome: 'applied',
+      reason: 'priority P3',
+    });
+    expect(seen).toEqual(['opt_P3']);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it('exposes a marketplace adoption factory bound to runtime authority inputs', () => {
     const readSnapshot = vi.fn(async () => ({ snapshotComplete: true }));
     const factory = vi.fn(() => ({
