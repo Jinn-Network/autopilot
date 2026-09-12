@@ -107,6 +107,15 @@
           "type": "object",
           "propertyNames": { "minLength": 1 }
         },
+        "wallClockMs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["implement", "review"],
+          "properties": {
+            "implement": { "type": "integer", "minimum": 1 },
+            "review": { "type": "integer", "minimum": 1 }
+          }
+        },
         "repositorySkillDirectories": {
           "type": "array",
           "items": { "$ref": "#/$defs/repositoryRelativePath" }

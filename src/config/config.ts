@@ -157,6 +157,31 @@ export const autopilotConfigSchema = z.object({
      * and must keep parsing, onto the empty grant.
      */
     mcpServers: z.record(nonEmpty, z.unknown()).default({}),
+    /**
+     * How long one worker session may run, per phase, before the engine tears
+     * it down (#184). Recorded on the attempt manifest as `deadlineAt` at the
+     * running transition and enforced by every cycle's attempt sweep, which
+     * signals the whole process tree and marks the attempt exited with a
+     * `wall-clock` reason, so the normal stale recovery re-claims the issue
+     * on a fresh session.
+     *
+     * The incident is three implement sessions at 42 hours, holding every
+     * implementation seat while re-running one hung test and re-installing
+     * in a loop. `claude -p`'s own background-wait ceiling never applied: it
+     * runs after the final turn, and these sessions never reached one. Four
+     * hours is a long implementation with verification to spare; a review is
+     * one read of one diff, and two hours is generous. Machine children are
+     * implementation attempts and share that ceiling.
+     *
+     * Per phase on the `attemptFootprintGb` pattern, and `positiveInteger`
+     * because zero would be exactly the unbounded session being removed.
+     * Defaulted, not required: every `.autopilot/config.json` written before
+     * this key existed omits it and must keep parsing.
+     */
+    wallClockMs: z.object({
+      implement: positiveInteger,
+      review: positiveInteger,
+    }).strict().default({ implement: 14_400_000, review: 7_200_000 }),
     repositorySkillDirectories: z.array(repositoryRelativePath),
   }).strict(),
   scheduler: z.object({

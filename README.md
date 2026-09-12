@@ -216,7 +216,8 @@ claimable number, not the open-issue number.
 ```json
 "worker": {
   "backgroundWaitCeilingMs": 3600000,
-  "mcpServers": {}
+  "mcpServers": {},
+  "wallClockMs": { "implement": 14400000, "review": 7200000 }
 }
 ```
 
@@ -275,6 +276,27 @@ A teardown that found something alive logs one
 Independently, the attempt sweep refuses to remove a worktree that still hosts
 a live process, retaining it with a `live` reason until a later cycle finds
 the process gone.
+
+`worker.wallClockMs` bounds how long one session may run at all, per phase:
+four hours for an implementation (machine children included) and two for a
+review by default. The background-wait ceiling above only applies after a
+session's final turn; a session that never reaches one — three implement
+sessions once ran 42 hours re-running the same hung test and re-installing in
+a loop, holding every implementation seat — is bounded by nothing else. The
+deadline is recorded on the attempt manifest as `deadlineAt` when the worker
+starts, and every cycle's attempt sweep tears down a live session past it:
+the process group is signalled, then every descendant by PID (`pgrep -P`),
+`SIGTERM` then `SIGKILL` after the grace — the group signal alone did not take
+effect on the host that motivated this. The manifest is marked `exited` with
+`exitReason: "wall-clock"`, one
+`[autopilot] session expired: implement-4188 after 4h 7m (wall clock 4h)`
+line is logged, and the lifecycle's normal stale recovery re-claims the issue
+on a fresh session, resuming the branch. The key is optional: a config written
+before it existed keeps loading with the defaults. When present it names both
+phases, and zero is refused, because an unbounded session is exactly what
+this removes. A manifest that
+recorded no `deadlineAt` — one written before this existed — is never
+expired. Expiry runs with the sweep, so it needs `safety.cleanup` on.
 
 ## Read-only smoke
 

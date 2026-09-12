@@ -5368,3 +5368,230 @@ describe('attempt process identity beyond the bare PID (#161)', () => {
     expect(retaken).toMatchObject({ pid: 4242, processStartedAt: START_TIME });
   });
 });
+
+describe('session wall clock (#184)', () => {
+  const START_TIME = 'Thu Sep 10 18:49:00 2026';
+  const STARTED_AT = '2026-09-10T18:49:00.000Z';
+  const WALL_CLOCK = { implement: 4 * 60 * 60 * 1000, review: 2 * 60 * 60 * 1000 };
+
+  async function runningAttempt(
+    fixture: ReturnType<typeof repositoryFixture>,
+    wallClock?: typeof WALL_CLOCK,
+    overrides: Partial<CreateAttemptOptions> = {},
+  ): Promise<AttemptManifest> {
+    const created = await createAttemptWorkspace(
+      options(fixture, { host: 'same-host', ...overrides }),
+      defaultRunner,
+    );
+    return markAttemptRunning(
+      created.paths.manifest,
+      4242,
+      () => new Date(STARTED_AT),
+      () => START_TIME,
+      wallClock,
+    );
+  }
+
+  it('records the deadline at the running transition, from the phase’s own wall clock', async () => {
+    const fixture = repositoryFixture();
+    const running = await runningAttempt(fixture, WALL_CLOCK);
+
+    expect(running.deadlineAt).toBe('2026-09-10T22:49:00.000Z');
+    expect(readAttemptManifest(running.paths.manifest).deadlineAt)
+      .toBe('2026-09-10T22:49:00.000Z');
+  });
+
+  it('records no deadline when no wall clock is supplied, keeping the legacy shape', async () => {
+    const fixture = repositoryFixture();
+    const running = await runningAttempt(fixture);
+
+    expect(running.deadlineAt).toBeUndefined();
+    expect(Object.hasOwn(
+      JSON.parse(readFileSync(running.paths.manifest, 'utf8')),
+      'deadlineAt',
+    )).toBe(false);
+  });
+
+  it('rejects a deadline no PID owns and an exit reason on a running attempt', async () => {
+    const fixture = repositoryFixture();
+    const running = await runningAttempt(fixture, WALL_CLOCK);
+    const raw = JSON.parse(readFileSync(running.paths.manifest, 'utf8')) as Record<string, unknown>;
+    const { processStartedAt: _identity, ...withoutIdentity } = raw;
+
+    expect(() => decodeAttemptManifest({
+      ...withoutIdentity,
+      processState: 'preparing',
+      pid: null,
+      timestamps: { createdAt: NOW, updatedAt: NOW },
+    })).toThrow(/deadline/i);
+    expect(() => decodeAttemptManifest({ ...raw, deadlineAt: 'yesterday' }))
+      .toThrow(/deadline/i);
+    expect(() => decodeAttemptManifest({ ...raw, exitReason: 'wall-clock' }))
+      .toThrow(/exit reason/i);
+    expect(() => decodeAttemptManifest({ ...raw, exitReason: 'boredom' }))
+      .toThrow(/exit reason/i);
+  });
+
+  it('tears down and expires a live attempt past its deadline, then reaps it as exited', async () => {
+    const fixture = repositoryFixture();
+    const running = await runningAttempt(fixture, WALL_CLOCK);
+    const terminated: number[] = [];
+    const logs: string[] = [];
+    let alive = true;
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => alive,
+      readProcessStartTime: () => START_TIME,
+      now: () => new Date('2026-09-10T22:56:00.000Z'),
+      terminateAttemptProcess: async (pid) => {
+        terminated.push(pid);
+        alive = false;
+        return 2;
+      },
+      log: (line) => logs.push(line),
+      listProcessesUnder: async () => [],
+    });
+
+    expect(terminated).toEqual([4242]);
+    expect(logs).toContain(
+      '[autopilot] session expired: implement-42 after 4h 7m (wall clock 4h)',
+    );
+    // Removed on the same sweep: once expired it is a dead attempt like any
+    // other, and its clean worktree has nothing to retain.
+    expect(results).toContainEqual({ status: 'removed', attemptId: UUID_A });
+  });
+
+  it('marks an expired attempt exited with the wall-clock reason before cleanup reads it', async () => {
+    const fixture = repositoryFixture();
+    const running = await runningAttempt(fixture, WALL_CLOCK);
+    let expired: AttemptManifest | undefined;
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => true,
+      readProcessStartTime: () => START_TIME,
+      now: () => new Date('2026-09-10T22:56:00.000Z'),
+      terminateAttemptProcess: async () => 2,
+      log: () => {},
+      // Retain it so the manifest can be read back after the sweep.
+      listProcessesUnder: async () => {
+        expired = readAttemptManifest(running.paths.manifest);
+        return [9999];
+      },
+    });
+
+    expect(expired).toMatchObject({
+      processState: 'exited',
+      pid: 4242,
+      exitReason: 'wall-clock',
+      exitCode: null,
+      deadlineAt: '2026-09-10T22:49:00.000Z',
+    });
+    expect(expired!.timestamps.childExitedAt).toBe('2026-09-10T22:56:00.000Z');
+  });
+
+  it('leaves a live attempt alone before its deadline', async () => {
+    const fixture = repositoryFixture();
+    const running = await runningAttempt(fixture, WALL_CLOCK);
+    const terminated: number[] = [];
+
+    const results = await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => true,
+      readProcessStartTime: () => START_TIME,
+      now: () => new Date('2026-09-10T22:48:59.000Z'),
+      terminateAttemptProcess: async (pid) => { terminated.push(pid); return 2; },
+      log: () => {},
+    });
+
+    expect(terminated).toEqual([]);
+    expect(readAttemptManifest(running.paths.manifest).processState).toBe('running');
+    expect(results).toContainEqual(expect.objectContaining({
+      status: 'retained',
+      attemptId: UUID_A,
+      reason: { code: 'live', detail: 'Attempt child PID is still live.' },
+    }));
+  });
+
+  it('never expires a manifest that recorded no deadline, however old it is', async () => {
+    const fixture = repositoryFixture();
+    const legacy = await runningAttempt(fixture);
+    const terminated: number[] = [];
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => true,
+      readProcessStartTime: () => START_TIME,
+      // Forty-two hours on: the incident's own age.
+      now: () => new Date('2026-09-12T12:49:00.000Z'),
+      terminateAttemptProcess: async (pid) => { terminated.push(pid); return 2; },
+      log: () => {},
+    });
+
+    expect(terminated).toEqual([]);
+    expect(readAttemptManifest(legacy.paths.manifest).processState).toBe('running');
+  });
+
+  it('does not expire an attempt whose PID is no longer the worker’s', async () => {
+    const fixture = repositoryFixture();
+    const running = await runningAttempt(fixture, WALL_CLOCK);
+    const terminated: number[] = [];
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => true,
+      // A reused PID is a dead attempt (#161), and signalling it would hit a
+      // stranger; the existing dead path handles it.
+      readProcessStartTime: () => 'Sat Sep 12 09:00:00 2026',
+      now: () => new Date('2026-09-10T22:56:00.000Z'),
+      terminateAttemptProcess: async (pid) => { terminated.push(pid); return 2; },
+      log: () => {},
+      listProcessesUnder: async () => [9999],
+    });
+
+    expect(terminated).toEqual([]);
+    expect(readAttemptManifest(running.paths.manifest)).toMatchObject({
+      processState: 'exited',
+    });
+    expect(readAttemptManifest(running.paths.manifest).exitReason).toBeUndefined();
+  });
+
+  it('lets the parent’s exit listener observe an exit the sweep already recorded', async () => {
+    const fixture = repositoryFixture();
+    const created = await createAttemptWorkspace(
+      options(fixture, { host: 'same-host' }),
+      defaultRunner,
+    );
+    const child = Object.assign(new EventEmitter(), { pid: 4242 });
+    trackAttemptChild(created.paths.manifest, child, {
+      now: () => new Date(STARTED_AT),
+      wallClock: WALL_CLOCK,
+    });
+    expect(readAttemptManifest(created.paths.manifest).deadlineAt)
+      .toBe('2026-09-10T22:49:00.000Z');
+
+    await sweepDeadAttempts(defaultRunner, {
+      v2Base: join(fixture.base, 'v2'),
+      host: 'same-host',
+      isPidAlive: () => true,
+      now: () => new Date('2026-09-10T22:56:00.000Z'),
+      terminateAttemptProcess: async () => 2,
+      log: () => {},
+      listProcessesUnder: async () => [9999],
+    });
+
+    // The teardown's SIGKILL reaches a continuous-mode engine as this event;
+    // re-recording the exit would throw inside an event listener.
+    expect(() => child.emit('exit', null)).not.toThrow();
+    expect(readAttemptManifest(created.paths.manifest)).toMatchObject({
+      processState: 'exited',
+      exitReason: 'wall-clock',
+    });
+  });
+});

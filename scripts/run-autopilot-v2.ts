@@ -547,6 +547,7 @@ function dispatcherConfig(
     codexOverflowSlots: product.scheduler.codexOverflowSlots,
     backgroundWaitCeilingMs: product.worker.backgroundWaitCeilingMs,
     mcpServers: product.worker.mcpServers,
+    wallClockMs: product.worker.wallClockMs,
     ...(environment[CODEX_BIN_ENV] === undefined
       ? {}
       : { codexBin: environment[CODEX_BIN_ENV] }),
