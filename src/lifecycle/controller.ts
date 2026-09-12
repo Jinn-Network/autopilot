@@ -81,6 +81,12 @@ import {
 } from './github-usage.js';
 import { exactUtcTimestampMs } from './exact-utc-time.js';
 import {
+  LONG_HELD_SEAT_MS,
+  formatWallClock,
+  wallClockSummaryLine,
+  type HeldSeat,
+} from './wall-clock.js';
+import {
   NEEDS_HUMAN_LABEL,
   externalHumanLabel,
   hasExternalHumanLabel,
@@ -101,6 +107,14 @@ export interface LifecycleCliOptions {
 
 export interface LifecycleControllerDeps {
   readSnapshot(rateLimitFloor?: number): Promise<GitHubLifecycleSnapshot>;
+  /**
+   * The lane seats this runner's live attempts hold (#184), read once per
+   * cycle in every mode: the cycle summary and `autopilot status` list the
+   * sessions near or past their wall clock, and the active pass names the
+   * seats a full lane is losing to sessions older than a day. Absent means
+   * no seat is derived and neither line is ever rendered.
+   */
+  readHeldSeats?: () => readonly HeldSeat[];
   /**
    * Optional allowlist fast path. A null result means no recent global cache
    * authority exists and the controller must keep its unrestricted behavior.
@@ -436,6 +450,8 @@ export type LifecycleCycleReport =
        * observe/recover, and in any active build that wired no projection.
        */
       readonly disk?: DiskHeadroom;
+      /** The seats this runner's live attempts hold (#184), when wired. */
+      readonly seats?: readonly HeldSeat[];
       readonly reconciliation?: ReconciliationReport;
       /** Stage 4: GraphQL points spent this cycle (start remaining − end). */
       readonly budget?: {
@@ -1718,6 +1734,15 @@ interface ActivePassResult {
   readonly reconciliation: ReconciliationReport;
   /** Projected disk headroom this pass scheduled against (#144), when computed. */
   readonly disk?: DiskHeadroom;
+  readonly seats?: readonly HeldSeat[];
+}
+
+/** `{ seats }` for the report, or nothing when no build wired the read. */
+function heldSeatsField(
+  deps: LifecycleControllerDeps,
+): { readonly seats?: readonly HeldSeat[] } {
+  const seats = deps.readHeldSeats?.();
+  return seats === undefined ? {} : { seats };
 }
 
 async function executeActivePass(
@@ -1895,6 +1920,12 @@ async function executeActivePass(
   const activeLanes: readonly NewWorkLane[] = debtLaneOn
     ? ['implementation', 'child', 'review', 'debt']
     : ['implementation', 'child', 'review'];
+  const seats = deps.readHeldSeats?.();
+  // A sweep's seat is the implementation lane's while the debt lane is off,
+  // exactly as lane accounting charges it (#168).
+  const seatsIn = (lane: NewWorkLane): readonly HeldSeat[] => (seats ?? []).filter(
+    (seat) => seat.lane === lane || (!debtLaneOn && lane === 'implementation' && seat.lane === 'debt'),
+  );
   const remainingBackups = {
     implementation: [...scheduling.backups.implementation],
     child: [...scheduling.backups.child],
@@ -2092,6 +2123,29 @@ async function executeActivePass(
           + 'candidate(s), but nothing spawned this cycle',
       });
     }
+    // The other way a lane starves (#184): full, with candidates waiting, and
+    // its seats held by sessions that have outlived every wall clock by a
+    // day. Every candidate reads `skipped (capacity)` — true, and the cause
+    // invisible — so the cause gets its own line, additive to the one above.
+    const longHeld = seatsIn(lane)
+      .filter((seat) => seat.ageMs >= LONG_HELD_SEAT_MS).length;
+    if (
+      (local.remaining[lane] ?? 0) === 0
+      && laneCandidates[lane] > 0
+      && longHeld > 0
+    ) {
+      actionEvents.push({
+        cycleId,
+        runnerId: deps.runnerId,
+        mode: 'active',
+        phase,
+        subject: `lane:${lane}`,
+        action: 'schedule',
+        outcome: 'seats-held',
+        reason: `${longHeld} seat(s) held by sessions older than `
+          + formatWallClock(LONG_HELD_SEAT_MS),
+      });
+    }
   }
   return {
     items,
@@ -2103,6 +2157,7 @@ async function executeActivePass(
     // only visible when it refuses cannot be told from one that is not
     // running at all.
     ...(local.diskHeadroom === undefined ? {} : { disk: local.diskHeadroom }),
+    ...(seats === undefined ? {} : { seats }),
   };
 }
 
@@ -2319,6 +2374,7 @@ export async function runLifecycleCycle(
       diagnostics: [],
       events: [],
       backlog: backlogSummary(snapshot),
+      ...heldSeatsField(deps),
     };
   }
   const graphqlRemaining = snapshot.githubUsage?.graphqlRemaining ?? null;
@@ -2399,6 +2455,7 @@ export async function runLifecycleCycle(
       ],
       backlog: backlogSummary(snapshot),
       ...(activePass.disk === undefined ? {} : { disk: activePass.disk }),
+      ...(activePass.seats === undefined ? {} : { seats: activePass.seats }),
       reconciliation: combinedReconciliation,
     });
   }
@@ -2442,6 +2499,7 @@ export async function runLifecycleCycle(
       diagnostics,
       events: [],
       backlog: backlogSummary(snapshot),
+      ...heldSeatsField(deps),
     });
   }
   const writer = deps.writerForSnapshot?.(snapshot) ?? deps.writer!;
@@ -2470,6 +2528,7 @@ export async function runLifecycleCycle(
     diagnostics,
     events: reconciliationEvents,
     backlog: backlogSummary(snapshot),
+    ...heldSeatsField(deps),
     reconciliation,
   });
 }
@@ -2823,6 +2882,8 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
   const diskLines = report.disk === undefined
     ? []
     : [diskHeadroomSummaryLine(report.disk)];
+  const wallClockLine = wallClockSummaryLine(report.seats ?? []);
+  const wallClockLines = wallClockLine === undefined ? [] : [wallClockLine];
   if (
     report.items.length === 0
     && report.orphanBranchClaims.length === 0
@@ -2838,6 +2899,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
       ...accountingLines,
       ...backlogLines,
       ...diskLines,
+      ...wallClockLines,
       ...parityLines,
       'No lifecycle items.',
     ].join('\n');
@@ -2850,6 +2912,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     ...accountingLines,
     ...backlogLines,
     ...diskLines,
+    ...wallClockLines,
     ...parityLines,
     ...report.items.map(explanation),
     ...report.orphanBranchClaims.map(orphanExplanation),

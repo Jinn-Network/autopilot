@@ -123,8 +123,14 @@ export interface DispatcherConfig {
   concurrencyCap: number;
   /** Stop pulling new issues when open ready PRs exceed this. */
   openPrBackpressure: number;
-  /** Per-session wall-clock ceiling, ms. Generous — hours. */
-  wallClockMs: number;
+  /**
+   * Per-session wall-clock ceiling, ms, by attempt phase (#184). Recorded on
+   * the manifest as `deadlineAt` when the worker starts and enforced by the
+   * attempt sweep, which tears an overdue session's process tree down. Machine
+   * children are `implement` attempts and share that ceiling. Source:
+   * `worker.wallClockMs`.
+   */
+  wallClockMs: { implement: number; review: number };
   /**
    * GitHub logins whose issues the dispatcher may pick up (#497). Compared
    * case-insensitively against `PolledIssue.author`. Empty (the default) =
@@ -265,7 +271,7 @@ export const DEFAULT_CONFIG: DispatcherConfig = {
   // without the dispatcher idling on a healthy queue. Override per run with
   // `--backpressure N` on scripts/run-autopilot.ts.
   openPrBackpressure: 30,
-  wallClockMs: 4 * 60 * 60 * 1000,
+  wallClockMs: { implement: 4 * 60 * 60 * 1000, review: 2 * 60 * 60 * 1000 },
   authorAllowlist: [],
   reviewCap: 3,
   childCap: 1,

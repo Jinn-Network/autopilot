@@ -12,7 +12,13 @@ import {
 import {
   isGitHubSecretEnvironmentKey,
 } from '../lifecycle/credentials.js';
-import { loadCanon } from './coordinator-session.js';
+import {
+  claudeWorkerLaunch,
+  EMPTY_WORKER_MCP_DOCUMENT,
+  loadCanon,
+  WORKER_MCP_CONFIG_ENV,
+} from './coordinator-session.js';
+import { DEFAULT_CONFIG } from './types.js';
 import {
   assertHermesBillingRoute,
   hermesChatArgs,
@@ -220,6 +226,9 @@ export function runStageHeadless(
   const prompt = buildStagePrompt(opts, runtime);
   let cmd: string;
   let args: string[];
+  // The worker contract a `claude -p` stage carries beyond the reduced
+  // environment (#184); the other runtimes have none.
+  let contract: NodeJS.ProcessEnv = {};
   if (runtime === 'hermes') {
     const pythonPath = requireHermesValue(
       opts.hermesPythonPath ?? ambient.JINN_DISPATCHER_HERMES_PYTHON,
@@ -258,15 +267,30 @@ export function runStageHeadless(
       workspace: opts.worktreePath,
     });
   } else {
+    // The same builder as the coordinator's claude branch, so a nested stage
+    // session gets `--strict-mcp-config` on the grant its worker was launched
+    // on and the same background-wait ceiling (#184). A worker launched by an
+    // engine that carried no grant gets the empty one, never the operator's
+    // ambient servers. The stage never sees the attempt manifest, so it has
+    // no deadline of its own and no way to extend its parent's.
+    const launch = claudeWorkerLaunch({
+      prompt,
+      effort: null,
+      ...(opts.model === undefined ? {} : { model: opts.model }),
+      mcpConfig: ambient[WORKER_MCP_CONFIG_ENV] ?? EMPTY_WORKER_MCP_DOCUMENT,
+      backgroundWaitCeilingMs: DEFAULT_CONFIG.backgroundWaitCeilingMs,
+      ambient,
+    });
     cmd = 'claude';
-    args = ['-p', ...(opts.model ? ['--model', opts.model] : []), prompt];
+    args = launch.args;
+    contract = launch.env;
   }
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   return new Promise((resolve) => {
     const proc = spawn(cmd, args, {
       cwd: opts.worktreePath,
-      env: buildUnprivilegedStageEnvironment(ambient),
+      env: { ...buildUnprivilegedStageEnvironment(ambient), ...contract },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';

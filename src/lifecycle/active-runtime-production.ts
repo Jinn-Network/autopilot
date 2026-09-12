@@ -599,7 +599,12 @@ export function makeProductionActiveRuntime(
   };
   const track = (manifestPath: string, child: SpawnResult): void => {
     const trackable = requireTrackable(child);
-    const tracked = trackAttempt(manifestPath, trackable, { now });
+    // The running transition is the single write point for the attempt's
+    // deadline (#184); the sweep reads it back from the manifest alone.
+    const tracked = trackAttempt(manifestPath, trackable, {
+      now,
+      wallClock: options.config.wallClockMs,
+    });
     const circuitPath = options.runtimeCircuitPath;
     if (circuitPath === undefined) return;
     // Folds this child's exit into the session-limit circuit (#152). Registered

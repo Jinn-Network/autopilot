@@ -30,6 +30,8 @@ import {
 } from '@jinn-network/sdk/autopilot';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
 import { beginCycleStep, withCycleStep } from '../cycle-heartbeat.js';
+import { childProcessesOf, terminateProcessTree } from '../process-group.js';
+import { attemptSessionName, formatElapsed, formatWallClock } from './wall-clock.js';
 import { AUTOPILOT_RUNTIME_SET, type AutopilotRuntime } from '../autopilot-runtime.js';
 import {
   isProcessStartTimeReading,
@@ -67,6 +69,13 @@ import {
 
 export type AttemptPhase = 'implement' | 'review';
 export type AttemptProcessState = 'preparing' | 'running' | 'exited';
+/**
+ * Why an attempt was moved to `exited` by something other than its own child
+ * exiting (#184). `wall-clock`: the sweep tore it down past `deadlineAt`.
+ */
+export type AttemptExitReason = 'wall-clock';
+/** How long a worker of each phase may run, ms (`worker.wallClockMs`). */
+export type AttemptWallClock = Readonly<Record<AttemptPhase, number>>;
 export type ReviewApprovalPolicy = 'approve-eligible' | 'human-codeowner';
 export const MARKETPLACE_EXECUTION_SCHEMA_VERSION = 'marketplace-execution-v1';
 export const MARKETPLACE_EXECUTION_V2_SCHEMA_VERSION = 'marketplace-execution-v2';
@@ -218,6 +227,24 @@ export interface AttemptManifest {
    * alongside a PID.
    */
   readonly processStartedAt?: string;
+  /**
+   * When this attempt's worker must be gone by (#184): the running transition
+   * plus the phase's configured wall clock. The sweep tears down a live
+   * attempt past it and marks the attempt exited with `exitReason:
+   * 'wall-clock'`, so the lifecycle's stale recovery re-claims the issue.
+   *
+   * Additive and optional on exactly the `childKind` pattern, and fail-safe
+   * in the same direction: absent means "no deadline was recorded" — every
+   * manifest written before the field existed — and such an attempt is never
+   * expired, however old it is. Valid only alongside a PID.
+   */
+  readonly deadlineAt?: string;
+  /**
+   * Why the exit transition was recorded by the engine rather than observed
+   * from the child (#184). Absent on every attempt whose child exited on its
+   * own. Valid only when `processState` is `exited`.
+   */
+  readonly exitReason?: AttemptExitReason;
   readonly terminalHead?: string;
   /**
    * The coordinator runtime this attempt was dispatched on (#152). Recorded so
@@ -853,6 +880,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'processState',
     'pid',
     'processStartedAt',
+    'deadlineAt',
+    'exitReason',
     'terminalHead',
     'worktreeBytes',
     'worktreePeakBytes',
@@ -869,6 +898,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     'worktreePeakBytes',
     'worktreeSampledAt',
     'processStartedAt',
+    'deadlineAt',
+    'exitReason',
   ]);
   if (manifest.version !== 2) throw new Error('Unsupported attempt manifest version');
   const phase = manifest.phase;
@@ -959,6 +990,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
   const decodedProcessState = processState(manifest.processState);
   const pid = nullablePid(manifest.pid);
   const processStartedAt = decodeProcessStartedAt(manifest.processStartedAt, pid);
+  const deadlineAt = decodeDeadlineAt(manifest.deadlineAt, pid);
+  const exitReason = decodeExitReason(manifest.exitReason, decodedProcessState);
   const terminalHead = manifest.terminalHead === undefined
     ? undefined
     : gitOid(stringField(manifest.terminalHead, 'terminal head'));
@@ -1065,6 +1098,8 @@ export function decodeAttemptManifest(value: unknown): AttemptManifest {
     processState: decodedProcessState,
     pid,
     ...(processStartedAt === undefined ? {} : { processStartedAt }),
+    ...(deadlineAt === undefined ? {} : { deadlineAt }),
+    ...(exitReason === undefined ? {} : { exitReason }),
     ...(terminalHead === undefined ? {} : { terminalHead }),
     ...(worktreeBytes === undefined ? {} : { worktreeBytes }),
     ...(worktreePeakBytes === undefined ? {} : { worktreePeakBytes }),
@@ -1083,6 +1118,31 @@ function decodeProcessStartedAt(value: unknown, pid: number | null): string | un
   }
   if (pid === null) {
     throw new Error('Attempt process start time requires a recorded PID');
+  }
+  return value;
+}
+
+function decodeDeadlineAt(value: unknown, pid: number | null): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error('Invalid attempt deadline');
+  let deadlineAt: string;
+  try {
+    deadlineAt = isoTimestamp(value);
+  } catch {
+    throw new Error('Invalid attempt deadline');
+  }
+  if (pid === null) throw new Error('Attempt deadline requires a recorded PID');
+  return deadlineAt;
+}
+
+function decodeExitReason(
+  value: unknown,
+  state: AttemptProcessState,
+): AttemptExitReason | undefined {
+  if (value === undefined) return undefined;
+  if (value !== 'wall-clock') throw new Error('Invalid attempt exit reason');
+  if (state !== 'exited') {
+    throw new Error('Attempt exit reason is valid only for an exited attempt');
   }
   return value;
 }
@@ -1393,6 +1453,10 @@ export function updateAttemptManifest(
     'pid',
     // Learned with the PID it identifies, at the running transition (#161).
     'processStartedAt',
+    // Learned at the running transition (#184) and read by the sweep; the
+    // reason is written by the sweep at the exit it forces.
+    'deadlineAt',
+    'exitReason',
     'terminalHead',
     // Learned at the exit transition, not at creation (#144), and never
     // rewritten once present — see `recordedFootprint`.
@@ -2126,11 +2190,29 @@ function recordableProcessStartTime(
   return isProcessStartTimeReading(reading) ? reading : undefined;
 }
 
+/**
+ * `deadlineAt` for an attempt of `phase` starting at `startedAt` (#184), or
+ * nothing when no wall clock was configured — the legacy shape, which the
+ * sweep never expires.
+ */
+function attemptDeadline(
+  phase: AttemptPhase,
+  startedAt: string,
+  wallClock: AttemptWallClock | undefined,
+): { readonly deadlineAt?: string } {
+  if (wallClock === undefined) return {};
+  const limit = positiveInteger(wallClock[phase], `${phase} wall clock`);
+  return {
+    deadlineAt: isoTimestamp(new Date(Date.parse(startedAt) + limit).toISOString()),
+  };
+}
+
 export function markAttemptRunning(
   manifestPath: string,
   pid: number,
   now: () => Date = () => new Date(),
   readStartTime: ProcessStartTimeReader = readProcessStartTime,
+  wallClock?: AttemptWallClock,
 ): AttemptManifest {
   const validPid = positiveInteger(pid, 'PID');
   const timestamp = transitionTimestamp(now);
@@ -2148,6 +2230,7 @@ export function markAttemptRunning(
       processState: 'running',
       pid: validPid,
       ...(processStartedAt === undefined ? {} : { processStartedAt }),
+      ...attemptDeadline(current.phase, timestamp, wallClock),
       timestamps: {
         ...current.timestamps,
         updatedAt: timestamp,
@@ -2221,6 +2304,39 @@ export function markAttemptExited(
   measure: (path: string) => number | null = measureWorktreeBytes,
   exitCode?: number | null,
 ): AttemptManifest {
+  return transitionAttemptExited(manifestPath, now, { terminalHead, measure, exitCode });
+}
+
+/**
+ * The exit transition the sweep records when it tears a session down past its
+ * wall clock (#184): `exited`, `exitCode: null` — it died to a signal — and
+ * the reason, so the session-limit circuit and the operator can tell an
+ * expiry from a crash. Local attempts only; a marketplace attempt has no
+ * worker process of this engine's to expire.
+ */
+export function markAttemptExpired(
+  manifestPath: string,
+  now: () => Date = () => new Date(),
+  measure: (path: string) => number | null = measureWorktreeBytes,
+): AttemptManifest {
+  return transitionAttemptExited(manifestPath, now, {
+    measure,
+    exitCode: null,
+    exitReason: 'wall-clock',
+  });
+}
+
+function transitionAttemptExited(
+  manifestPath: string,
+  now: () => Date,
+  exit: {
+    readonly terminalHead?: string;
+    readonly measure: (path: string) => number | null;
+    readonly exitCode?: number | null;
+    readonly exitReason?: AttemptExitReason;
+  },
+): AttemptManifest {
+  const { terminalHead, measure, exitCode, exitReason } = exit;
   const current = readAttemptManifest(manifestPath);
   if (
     current.execution.backend === 'marketplace'
@@ -2242,6 +2358,7 @@ export function markAttemptExited(
       processState: 'exited',
       ...(validTerminalHead === undefined ? {} : { terminalHead: validTerminalHead }),
       ...(exitCode === undefined ? {} : { exitCode }),
+      ...(exitReason === undefined ? {} : { exitReason }),
       ...recordedFootprint(manifest, measure),
       timestamps: {
         ...manifest.timestamps,
@@ -2292,6 +2409,8 @@ export interface TrackAttemptChildOptions {
   readonly alreadyRunning?: boolean;
   readonly now?: () => Date;
   readonly terminalHead?: string;
+  /** Records `deadlineAt` at the running transition (#184); absent records none. */
+  readonly wallClock?: AttemptWallClock;
 }
 
 /**
@@ -2313,6 +2432,14 @@ export function trackAttemptChild(
   const recordExit = (code?: unknown): void => {
     exitObserved = true;
     if (runningRecorded && !exitedRecorded) {
+      // The sweep may already have recorded this exit: it tears an attempt
+      // down past its wall clock and marks it exited itself (#184), and the
+      // SIGKILL then reaches a continuous-mode engine as this very event.
+      // Re-recording it would throw inside an event listener.
+      if (readAttemptManifest(manifestPath).processState === 'exited') {
+        exitedRecorded = true;
+        return;
+      }
       markAttemptExited(
         manifestPath,
         options.now,
@@ -2326,7 +2453,7 @@ export function trackAttemptChild(
   child.once('exit', recordExit);
   const running = options.alreadyRunning === true
     ? readAttemptManifest(manifestPath)
-    : markAttemptRunning(manifestPath, pid, options.now);
+    : markAttemptRunning(manifestPath, pid, options.now, undefined, options.wallClock);
   if (running.processState !== 'running' || running.pid !== pid) {
     throw new Error('Tracked child does not match the running attempt');
   }
@@ -5007,6 +5134,14 @@ const DEFERRED_CLEANUP_DETAIL =
 
 export interface SweepDeadAttemptsOptions extends CleanupAttemptOptions {
   readonly host?: string;
+  /**
+   * Tears down one overdue worker's whole process tree (#184), returning how
+   * many signals were delivered. A test seam; production is
+   * `terminateProcessTree` over `pgrep -P` through the runner.
+   */
+  readonly terminateAttemptProcess?: (pid: number) => Promise<number>;
+  /** Where the `session expired` line goes; `console.log` in production. */
+  readonly log?: (line: string) => void;
   readonly diskFloorBytes?: number;
   readonly diskPath?: string;
   readonly readFreeDiskBytes?: (path: string) => number;
@@ -5102,6 +5237,67 @@ function sweepOrphanAttemptDirs(
   return results;
 }
 
+/**
+ * Expire every live attempt past its wall clock (#184): tear its process tree
+ * down and record the exit, so the rest of the sweep — and the lifecycle's
+ * stale recovery — see one more dead attempt and handle it exactly as today.
+ *
+ * Only a manifest that recorded a `deadlineAt` can expire: the field is the
+ * operator's configured ceiling applied to this attempt, and an attempt with
+ * none has no ceiling to be past. A dead or reused PID is not expired either
+ * — signalling it would reach a stranger — and is left to the dead path.
+ * Each attempt is isolated: one teardown that throws costs that attempt its
+ * expiry for a cycle, never the sweep.
+ */
+async function expireOverdueAttempts(
+  runner: CommandRunner,
+  options: SweepDeadAttemptsOptions,
+  host: string,
+): Promise<void> {
+  const now = options.now ?? (() => new Date());
+  const readStartTime = options.readProcessStartTime ?? readProcessStartTime;
+  const log = options.log ?? console.log;
+  const terminate = options.terminateAttemptProcess
+    ?? ((pid: number) => terminateProcessTree({
+      pid,
+      listChildren: (parent) => childProcessesOf(parent, runner),
+    }));
+  for (const { manifestPath, manifest } of collectHostedAttempts(options.v2Base, host)) {
+    const deadlineAt = manifest.deadlineAt;
+    const startedAt = manifest.timestamps.childStartedAt;
+    if (
+      deadlineAt === undefined
+      || startedAt === undefined
+      || manifest.pid === null
+      || manifest.execution.backend !== 'local'
+      || !isAttemptChildLive(manifest, options.isPidAlive, readStartTime)
+    ) continue;
+    const nowMs = now().getTime();
+    const deadlineMs = Date.parse(deadlineAt);
+    if (nowMs < deadlineMs) continue;
+    const session = attemptSessionName(manifest);
+    const endStep = beginCycleStep(`attempt expire ${manifest.subject}`);
+    try {
+      await terminate(manifest.pid);
+      markAttemptExpired(manifestPath, now);
+      const startedMs = Date.parse(startedAt);
+      log(
+        `[autopilot] session expired: ${session} `
+        + `after ${formatElapsed(nowMs - startedMs)} `
+        + `(wall clock ${formatWallClock(deadlineMs - startedMs)})`,
+      );
+    } catch (error) {
+      log(
+        `[autopilot] session expiry failed: ${session}: ${
+          error instanceof Error ? error.message : String(error)
+        }; the next sweep retries it`,
+      );
+    } finally {
+      endStep();
+    }
+  }
+}
+
 export async function sweepDeadAttempts(
   runner: CommandRunner,
   options: SweepDeadAttemptsOptions,
@@ -5119,6 +5315,9 @@ export async function sweepDeadAttempts(
   const budgetSpent = (): boolean => monotonicNow() - sweepStartedAt >= budgetMs;
 
   startQueuedTrashReclaims(options);
+  // First, so an attempt expired here is a dead attempt to everything below —
+  // the below-floor eviction included.
+  await expireOverdueAttempts(runner, options, host);
 
   if (
     diskFloorBytes !== undefined

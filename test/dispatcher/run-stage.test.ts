@@ -5,6 +5,10 @@ import {
   type StageSpawnFn,
 } from '../../src/dispatcher/run-stage.js';
 import { HERMES_STATELESS_LAUNCHER } from '../../src/dispatcher/hermes-runtime.js';
+import {
+  PRINT_BACKGROUND_WAIT_CEILING_ENV,
+  WORKER_MCP_CONFIG_ENV,
+} from '../../src/dispatcher/coordinator-session.js';
 
 // ---------------------------------------------------------------------------
 // Fake stage-spawn. Mirrors the fake-SpawnFn style in dispatch.test.ts, but
@@ -173,8 +177,8 @@ describe('runStageHeadless', () => {
     const { spawn, calls } = makeSpawn('close-0', 'ok');
     await runStageHeadless(BASE_OPTS, spawn);
 
-    const pIdx = calls[0].args.indexOf('-p');
-    const prompt = calls[0].args[pIdx + 1];
+    // The prompt is the last operand, past the worker-contract flags (#184).
+    const prompt = calls[0].args.at(-1)!;
     // Distinctive phrase from headless-override.md (same token dispatch.test.ts uses).
     expect(prompt).toContain('non-interactive');
   });
@@ -183,8 +187,8 @@ describe('runStageHeadless', () => {
     const { spawn, calls } = makeSpawn('close-0', 'ok');
     await runStageHeadless(BASE_OPTS, spawn);
 
-    const pIdx = calls[0].args.indexOf('-p');
-    const prompt = calls[0].args[pIdx + 1];
+    // The prompt is the last operand, past the worker-contract flags (#184).
+    const prompt = calls[0].args.at(-1)!;
     expect(prompt).toContain('Autopilot active-active lifecycle');
     expect(prompt).toContain('Single-Surface Autopilot Lifecycle');
     expect(prompt).not.toContain('Jinn Network monorepo');
@@ -194,8 +198,8 @@ describe('runStageHeadless', () => {
     const { spawn, calls } = makeSpawn('close-0', 'ok');
     await runStageHeadless(BASE_OPTS, spawn);
 
-    const pIdx = calls[0].args.indexOf('-p');
-    const prompt = calls[0].args[pIdx + 1];
+    // The prompt is the last operand, past the worker-contract flags (#184).
+    const prompt = calls[0].args.at(-1)!;
     expect(prompt).toContain('STAGE-3 IMPLEMENT MARKER');
     expect(prompt).toContain('ISSUE-BODY-MARKER');
     expect(prompt).toContain('PLAN-MARKER');
@@ -429,5 +433,83 @@ describe('codex stage root (#152)', () => {
     await runStageHeadless({ ...BASE_OPTS, codexBin: '/opt/bin/codex' }, spawn);
 
     expect(calls[0].cmd).toBe('/opt/bin/codex');
+  });
+});
+
+/**
+ * A nested stage session is a `claude -p` of the engine's own, launched from
+ * inside a worker, and #184 found it launched on none of the worker contract:
+ * no `--strict-mcp-config` (#182) and no ceiling (#167). Both come from the
+ * one builder the coordinator's claude branch uses.
+ */
+describe('nested stage sessions inherit the worker contract (#184)', () => {
+  const WORKER_ENV = {
+    PATH: '/bin',
+    HOME: '/home/runner',
+    JINN_AUTOPILOT_RUNTIME: 'claude',
+    [WORKER_MCP_CONFIG_ENV]: '/attempts/implement-184/mcp-config.json',
+    [PRINT_BACKGROUND_WAIT_CEILING_ENV]: '3600000',
+  };
+
+  it('refuses every MCP configuration but the grant the worker was launched on', async () => {
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+    await runStageHeadless({ ...BASE_OPTS, environment: WORKER_ENV }, spawn);
+
+    const [call] = calls;
+    expect(call.cmd).toBe('claude');
+    expect(call.args).toContain('--strict-mcp-config');
+    expect(call.args[call.args.indexOf('--mcp-config') + 1])
+      .toBe('/attempts/implement-184/mcp-config.json');
+    // Variadic flag: the document is followed by a flag and the prompt stays
+    // the last operand, exactly as the coordinator orders it.
+    expect(call.args[call.args.indexOf('--mcp-config') + 2])
+      .toBe('--strict-mcp-config');
+    expect(call.args.at(-1)).toContain('STAGE-3 IMPLEMENT MARKER');
+  });
+
+  it('falls back to the empty grant when the worker carried none', async () => {
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+    await runStageHeadless({
+      ...BASE_OPTS,
+      environment: { PATH: '/bin', HOME: '/home/runner', JINN_AUTOPILOT_RUNTIME: 'claude' },
+    }, spawn);
+
+    const [call] = calls;
+    expect(call.args).toContain('--strict-mcp-config');
+    expect(JSON.parse(call.args[call.args.indexOf('--mcp-config') + 1]))
+      .toEqual({ mcpServers: {} });
+  });
+
+  it('passes the worker’s own ceiling and grant on to the stage', async () => {
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+    await runStageHeadless({ ...BASE_OPTS, environment: WORKER_ENV }, spawn);
+
+    const environment = calls[0].opts.env as NodeJS.ProcessEnv;
+    expect(environment[PRINT_BACKGROUND_WAIT_CEILING_ENV]).toBe('3600000');
+    expect(environment[WORKER_MCP_CONFIG_ENV])
+      .toBe('/attempts/implement-184/mcp-config.json');
+    // The deadline lives on the manifest, which the stage cannot reach, so a
+    // nested session has no way to extend its parent's.
+    expect(environment.JINN_AUTOPILOT_SESSION_MANIFEST).toBeUndefined();
+  });
+
+  it('sets the default ceiling when the worker carried none', async () => {
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+    await runStageHeadless({
+      ...BASE_OPTS,
+      environment: { PATH: '/bin', HOME: '/home/runner', JINN_AUTOPILOT_RUNTIME: 'claude' },
+    }, spawn);
+
+    expect((calls[0].opts.env as NodeJS.ProcessEnv)[PRINT_BACKGROUND_WAIT_CEILING_ENV])
+      .toBe('3600000');
+  });
+
+  it('keeps the stage model flag alongside the contract', async () => {
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+    await runStageHeadless({ ...BASE_OPTS, environment: WORKER_ENV, model: 'opus' }, spawn);
+
+    const [call] = calls;
+    expect(call.args[call.args.indexOf('--model') + 1]).toBe('opus');
+    expect(call.args).toContain('--strict-mcp-config');
   });
 });

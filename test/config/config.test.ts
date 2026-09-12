@@ -88,6 +88,7 @@ function validConfig(): unknown {
       provider: 'openai-codex',
       backgroundWaitCeilingMs: 3_600_000,
       mcpServers: {},
+      wallClockMs: { implement: 14_400_000, review: 7_200_000 },
       repositorySkillDirectories: ['.agents/skills'],
     },
     scheduler: {
@@ -299,6 +300,42 @@ describe('Autopilot product configuration', () => {
     input.worker.mcpServers = ['jinn-notes'];
 
     expect(() => decodeAutopilotConfig(input)).toThrow();
+  });
+
+  // #184: three implement sessions ran 42 hours holding every implementation
+  // seat because nothing bounded a session's lifetime. Every deployed
+  // `.autopilot/config.json` predates the key, so an absent one must keep
+  // parsing and land on the per-phase ceilings the incident asked for: four
+  // hours for an implementation (children included), two for a review.
+  it('defaults the worker wall clock per phase when the key is absent', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { wallClockMs?: unknown };
+    };
+    delete input.worker.wallClockMs;
+
+    expect(decodeAutopilotConfig(input).worker.wallClockMs)
+      .toEqual({ implement: 14_400_000, review: 7_200_000 });
+  });
+
+  it('round-trips a configured wall clock and refuses a partial, zero or unknown one', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { wallClockMs?: unknown };
+    };
+    input.worker.wallClockMs = { implement: 21_600_000, review: 3_600_000 };
+    expect(decodeAutopilotConfig(input).worker.wallClockMs)
+      .toEqual({ implement: 21_600_000, review: 3_600_000 });
+
+    // A session with no ceiling is the incident, so zero is unrepresentable,
+    // and a phase left out would silently keep it.
+    for (const invalid of [
+      { implement: 21_600_000 },
+      { implement: 0, review: 3_600_000 },
+      { implement: 21_600_000, review: 3_600_000, enqueue: 1 },
+      14_400_000,
+    ]) {
+      input.worker.wallClockMs = invalid;
+      expect(() => decodeAutopilotConfig(input)).toThrow();
+    }
   });
 
   // Same additive contract `codeOwnerLogins` established: every deployed

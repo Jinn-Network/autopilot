@@ -655,10 +655,13 @@ describe('production active runtime preflight', () => {
       expect(args.join('\n')).toContain('Use the implement-issue skill on issue #42.');
       return child;
     });
-    const trackAttemptChild = vi.fn((manifestPath, trackedChild) => {
+    const trackAttemptChild = vi.fn((manifestPath, trackedChild, tracking) => {
       events.push('track');
       expect(manifestPath).toBe('/attempt/implementation-manifest.json');
       expect(trackedChild).toBe(child);
+      // The running transition is the one write point for the deadline
+      // (#184), so the configured wall clock has to arrive with it.
+      expect(tracking).toMatchObject({ wallClock: DEFAULT_CONFIG.wallClockMs });
     });
     const makeImplementationActionPort = vi.fn(() => ({
       readIssue: async () => ({

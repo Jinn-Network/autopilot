@@ -46,6 +46,14 @@ describe('review-loop types', () => {
     expect(DEFAULT_CONFIG.runtime).toBe('claude');
   });
 
+  // #184: the ceiling was declared here for months with no reader. Now that
+  // it is enforced, the default must be the per-phase pair the config decodes
+  // to, and never a session-wide "forever".
+  it('DEFAULT_CONFIG bounds a worker session per phase', () => {
+    expect(DEFAULT_CONFIG.wallClockMs)
+      .toEqual({ implement: 4 * 60 * 60 * 1000, review: 2 * 60 * 60 * 1000 });
+  });
+
   // #182: the fallback a worker is launched under when nothing configured one
   // must be the empty MCP grant, never the operator's ambient server set.
   it('DEFAULT_CONFIG grants workers no MCP servers', () => {

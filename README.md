@@ -216,7 +216,8 @@ claimable number, not the open-issue number.
 ```json
 "worker": {
   "backgroundWaitCeilingMs": 3600000,
-  "mcpServers": {}
+  "mcpServers": {},
+  "wallClockMs": { "implement": 14400000, "review": 7200000 }
 }
 ```
 
@@ -265,7 +266,13 @@ nothing. The first `claude -p` worker of a cycle whose ambient
 `[autopilot] worker mcp: ignoring 2 ambient server(s) (chrome-devtools, personal-os)`
 line; a `~/.claude.json` that cannot be read is not an error and logs nothing.
 Like the wait ceiling, this is a `claude -p` knob only — hermes, cursor and
-codex workers are launched exactly as before.
+codex workers are launched exactly as before. The nested stage sessions a
+worker launches through `internal run-stage` are put on the same grant and
+the same ceiling: the worker carries its `--mcp-config` operand as
+`JINN_AUTOPILOT_WORKER_MCP_CONFIG`, and the stage is launched with it and
+`--strict-mcp-config` through the same builder as the worker itself. A stage
+whose worker carried no grant gets the empty one, never the operator's
+ambient servers.
 
 When a worker exits, its process group is torn down — `SIGTERM`, a ten-second
 grace, then `SIGKILL` — so background jobs it started (test runners, servers)
@@ -275,6 +282,36 @@ A teardown that found something alive logs one
 Independently, the attempt sweep refuses to remove a worktree that still hosts
 a live process, retaining it with a `live` reason until a later cycle finds
 the process gone.
+
+`worker.wallClockMs` bounds how long one session may run at all, per phase:
+four hours for an implementation (machine children included) and two for a
+review by default. The background-wait ceiling above only applies after a
+session's final turn; a session that never reaches one — three implement
+sessions once ran 42 hours re-running the same hung test and re-installing in
+a loop, holding every implementation seat — is bounded by nothing else. The
+deadline is recorded on the attempt manifest as `deadlineAt` when the worker
+starts, and every cycle's attempt sweep tears down a live session past it:
+the process group is signalled, then every descendant by PID (`pgrep -P`),
+`SIGTERM` then `SIGKILL` after the grace — the group signal alone did not take
+effect on the host that motivated this. The manifest is marked `exited` with
+`exitReason: "wall-clock"`, one
+`[autopilot] session expired: implement-4188 after 4h 7m (wall clock 4h)`
+line is logged, and the lifecycle's normal stale recovery re-claims the issue
+on a fresh session, resuming the branch. The key is optional: a config written
+before it existed keeps loading with the defaults. When present it names both
+phases, and zero is refused, because an unbounded session is exactly what
+this removes. A manifest that
+recorded no `deadlineAt` — one written before this existed — is never
+expired. Expiry runs with the sweep, so it needs `safety.cleanup` on.
+
+Two lines make the effect legible before the sweep acts. The cycle summary —
+and `autopilot status`, which runs the same renderer — lists every session
+within thirty minutes of its wall clock or past it:
+`wall clock: implement-4188 expires in 12m; review-4190 expired 7m ago`
+(a session still listed as expired is one the sweep has not torn down). And
+a lane that is full while candidates wait, with seats held by sessions older
+than a day, names the cause beside its `skipped (capacity)` lines:
+`schedule lane:implementation: seats-held (3 seat(s) held by sessions older than 24h).`
 
 ## Read-only smoke
 
