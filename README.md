@@ -304,6 +304,15 @@ this removes. A manifest that
 recorded no `deadlineAt` — one written before this existed — is never
 expired. Expiry runs with the sweep, so it needs `safety.cleanup` on.
 
+Two lines make the effect legible before the sweep acts. The cycle summary —
+and `autopilot status`, which runs the same renderer — lists every session
+within thirty minutes of its wall clock or past it:
+`wall clock: implement-4188 expires in 12m; review-4190 expired 7m ago`
+(a session still listed as expired is one the sweep has not torn down). And
+a lane that is full while candidates wait, with seats held by sessions older
+than a day, names the cause beside its `skipped (capacity)` lines:
+`schedule lane:implementation: seats-held (3 seat(s) held by sessions older than 24h).`
+
 ## Read-only smoke
 
 ```text

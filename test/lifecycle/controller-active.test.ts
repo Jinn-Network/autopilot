@@ -1059,6 +1059,93 @@ describe('active lifecycle controller', () => {
   });
 
   /**
+   * #184: three 42-hour sessions held every implementation seat for two days
+   * and the log said only `skipped (capacity)` — true, and useless. The cause
+   * gets its own line, additive to the starved-lane line above, and the cycle
+   * summary lists the sessions that are about to expire or already should have.
+   */
+  describe('seats held by long-running sessions', () => {
+    const HOUR = 3_600_000;
+    const held = (report: Awaited<ReturnType<typeof runLifecycleCycle>>) => (
+      report.events.filter((event) => event.outcome === 'seats-held')
+    );
+    const fullLane = (seats: readonly unknown[]) => {
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 0, child: 0, review: 0 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      controller.active!.executeAction = async () => ({ outcome: 'spawned' });
+      controller.readHeldSeats = () => seats as never;
+      return controller;
+    };
+
+    it('names the sessions holding a full lane when they are older than a day', async () => {
+      const report = await runLifecycleCycle('active', fullLane([
+        { lane: 'implementation', session: 'implement-4188', ageMs: 42 * HOUR },
+        { lane: 'implementation', session: 'implement-4189', ageMs: 41 * HOUR },
+        { lane: 'implementation', session: 'implement-4190', ageMs: 25 * HOUR, untilDeadlineMs: -21 * HOUR },
+        { lane: 'review', session: 'review-4191', ageMs: 30 * HOUR },
+      ]));
+
+      expect(held(report)).toEqual([expect.objectContaining({
+        mode: 'active',
+        phase: 'eligible',
+        action: 'schedule',
+        subject: 'lane:implementation',
+        outcome: 'seats-held',
+        reason: '3 seat(s) held by sessions older than 24h',
+      })]);
+      // Still reported as capacity skips: the line names the cause, it does
+      // not replace the effect.
+      expect(report.events).toContainEqual(expect.objectContaining({
+        subject: 'issue:100',
+        outcome: 'skipped',
+        reason: 'capacity',
+      }));
+    });
+
+    it('says nothing about a full lane held by sessions within their day', async () => {
+      const report = await runLifecycleCycle('active', fullLane([
+        { lane: 'implementation', session: 'implement-4188', ageMs: 3 * HOUR, untilDeadlineMs: HOUR },
+        { lane: 'implementation', session: 'implement-4189', ageMs: 23 * HOUR },
+      ]));
+
+      expect(held(report)).toEqual([]);
+    });
+
+    it('says nothing when no seat is wired', async () => {
+      const controller = fullLane([]);
+      delete controller.readHeldSeats;
+
+      expect(held(await runLifecycleCycle('active', controller))).toEqual([]);
+    });
+
+    it('lists sessions within half an hour of their wall clock, or past it, in the summary', async () => {
+      const report = await runLifecycleCycle('active', fullLane([
+        { lane: 'implementation', session: 'implement-4188', ageMs: 4 * HOUR - 12 * 60_000, untilDeadlineMs: 12 * 60_000 },
+        { lane: 'review', session: 'review-4190', ageMs: 2 * HOUR + 7 * 60_000, untilDeadlineMs: -7 * 60_000 },
+        { lane: 'child', session: 'implement-4191', ageMs: HOUR, untilDeadlineMs: 3 * HOUR },
+        { lane: 'implementation', session: 'implement-4192', ageMs: 40 * HOUR },
+      ]));
+
+      expect(report.seats).toHaveLength(4);
+      expect(renderLifecycleHuman(report).split('\n')).toContain(
+        'wall clock: implement-4188 expires in 12m; review-4190 expired 7m ago',
+      );
+    });
+
+    it('renders no wall-clock line when nothing is near its deadline', async () => {
+      const report = await runLifecycleCycle('active', fullLane([
+        { lane: 'implementation', session: 'implement-4188', ageMs: HOUR, untilDeadlineMs: 3 * HOUR },
+      ]));
+
+      expect(renderLifecycleHuman(report)).not.toContain('wall clock:');
+    });
+  });
+
+  /**
    * A run of cycles whose every candidate is refused by the freshness gate is a
    * total claim stop, and #130 saw ~10 of them pass unremarked because the only
    * evidence was one `skipped (full-reconciliation-stale)` line per candidate —

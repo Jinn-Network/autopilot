@@ -116,6 +116,7 @@ import {
   runLifecycleCycle,
   sanitizedGitHubCommandOverlay,
   selectCredential,
+  listRunnerLiveAttempts,
   sweepDeadAttempts,
   freeDiskBytes,
   attemptFootprintDefaultsFromGb,
@@ -131,6 +132,7 @@ import {
   type CredentialPool,
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
+import { heldSeats } from '../src/lifecycle/wall-clock.js';
 
 export function lifecycleExitCodeForReport(
   report: Pick<LifecycleCycleReport, 'status'>,
@@ -1145,6 +1147,12 @@ export async function runAutopilotV2(
           ),
         resetGitHubUsage: () => reader.resetGitHubUsage(),
         readGitHubUsage: () => reader.githubUsage(),
+        // Every mode, so `autopilot status` (an observe cycle) lists the
+        // sessions near or past their wall clock too (#184).
+        readHeldSeats: () => heldSeats(
+          listRunnerLiveAttempts(v2AttemptsBase, runnerId, childIsAlive),
+          new Date(),
+        ),
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
         ...(active === undefined ? {} : { active }),
         ...(recoverPreparedMarketplaceSubmissions === undefined
