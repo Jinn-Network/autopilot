@@ -590,6 +590,23 @@ describe('worker MCP isolation (#182)', () => {
     },
   );
 
+  // #184: the nested stage sessions a worker launches through
+  // `internal run-stage` read the grant back from the worker's environment.
+  it('hands the worker its grant in the environment, for the stages it launches', () => {
+    const writes: Written[] = [];
+    const call = launch({
+      logPath: '/tmp/attempts/implement-182-abc/session.log',
+      writes,
+    });
+
+    expect(call.opts.env).toMatchObject({
+      JINN_AUTOPILOT_WORKER_MCP_CONFIG: '/tmp/attempts/implement-182-abc/mcp-config.json',
+    });
+    expect(launch({ writes }).opts.env).toMatchObject({
+      JINN_AUTOPILOT_WORKER_MCP_CONFIG: '{"mcpServers":{}}',
+    });
+  });
+
   it('names the ambient servers it dropped, once per cycle', () => {
     const logs: string[] = [];
     const log = (message: string) => logs.push(message);

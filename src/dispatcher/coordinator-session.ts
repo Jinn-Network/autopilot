@@ -142,16 +142,18 @@ export const PRINT_BACKGROUND_WAIT_CEILING_ENV =
 /**
  * The ceiling overlay for one `claude -p` session, or nothing when the
  * operator has already exported the variable: an explicit export is a
- * deliberate override of the configured value and outranks it.
+ * deliberate override of the configured value and outranks it. Inside a
+ * worker the "export" is the engine's own value, which is how a nested stage
+ * session (#184) ends up on the same ceiling as its parent.
  */
 function printBackgroundWaitCeiling(
   ambient: NodeJS.ProcessEnv,
-  cfg: DispatcherConfig,
+  backgroundWaitCeilingMs: number,
 ): NodeJS.ProcessEnv {
   const exported = ambient[PRINT_BACKGROUND_WAIT_CEILING_ENV];
   if (exported !== undefined && exported.length > 0) return {};
   return {
-    [PRINT_BACKGROUND_WAIT_CEILING_ENV]: String(cfg.backgroundWaitCeilingMs),
+    [PRINT_BACKGROUND_WAIT_CEILING_ENV]: String(backgroundWaitCeilingMs),
   };
 }
 
@@ -163,23 +165,76 @@ export function effortFlag(effort: Effort | null): string[] {
 /** The engine-owned MCP document, written beside the attempt's session log. */
 export const WORKER_MCP_CONFIG_FILENAME = 'mcp-config.json';
 
+/**
+ * Carries a worker's MCP grant — the `--mcp-config` operand it was launched
+ * on, a file path or the inline document — into its environment, so the
+ * nested stage sessions it launches through `internal run-stage` are put on
+ * the same grant (#184). Nothing else reads it.
+ */
+export const WORKER_MCP_CONFIG_ENV = 'JINN_AUTOPILOT_WORKER_MCP_CONFIG';
+
+/** The grant a stage falls back to when its worker carried none: no servers. */
+export const EMPTY_WORKER_MCP_DOCUMENT = '{"mcpServers":{}}';
+
+export interface ClaudeWorkerLaunchInput {
+  readonly prompt: string;
+  readonly effort: Effort | null;
+  readonly model?: string;
+  /** The MCP document operand: a path beside the session log, or inline JSON. */
+  readonly mcpConfig: string;
+  readonly backgroundWaitCeilingMs: number;
+  /** What the child inherits; the returned `env` is an overlay on it. */
+  readonly ambient: NodeJS.ProcessEnv;
+}
+
+export interface ClaudeWorkerLaunch {
+  readonly args: string[];
+  readonly env: NodeJS.ProcessEnv;
+}
+
+/**
+ * The worker contract for one `claude -p` session: argv and environment
+ * overlay. The coordinator's claude branch and the nested stage sessions a
+ * worker launches (`run-stage.ts`) both build here, so a session of the
+ * engine's cannot be launched without `--strict-mcp-config` (#182) or the
+ * background-wait ceiling (#167) — #184 found stage sessions launched with
+ * neither, running the operator's ambient servers under a third-party
+ * repository.
+ *
+ * ORDER IS LOAD-BEARING: `--mcp-config <configs...>` is variadic and consumes
+ * operands greedily until the next flag, so the document is followed by
+ * `--strict-mcp-config` and the prompt stays the last operand. Put the prompt
+ * between them and the CLI reads it as a second MCP document.
+ */
+export function claudeWorkerLaunch(input: ClaudeWorkerLaunchInput): ClaudeWorkerLaunch {
+  return {
+    args: [
+      '-p',
+      ...effortFlag(input.effort),
+      ...(input.model === undefined ? [] : ['--model', input.model]),
+      '--mcp-config', input.mcpConfig, '--strict-mcp-config',
+      input.prompt,
+    ],
+    env: {
+      ...printBackgroundWaitCeiling(input.ambient, input.backgroundWaitCeilingMs),
+      [WORKER_MCP_CONFIG_ENV]: input.mcpConfig,
+    },
+  };
+}
+
 /** The operator's user-level Claude config, relative to `HOME`. */
 const AMBIENT_CLAUDE_CONFIG_FILENAME = '.claude.json';
 
 /**
- * `claude -p`'s MCP flags for one worker: the engine's own server grant, and
- * a refusal of every other MCP configuration (#182).
+ * `claude -p`'s MCP document operand for one worker: the engine's own server
+ * grant, which `claudeWorkerLaunch` pairs with a refusal of every other MCP
+ * configuration (#182).
  *
  * Without them a worker loads the operator's user-level `~/.claude.json` and
  * starts whatever it declares, so its toolset is decided by whoever last ran
  * `claude` on the host rather than by the engine — a live browser bridge and
  * a personal data store under sessions acting on third-party repositories, and
  * two extra processes per worker across the whole concurrency width.
- *
- * ORDER IS LOAD-BEARING: `--mcp-config <configs...>` is variadic and consumes
- * operands greedily until the next flag, so the document is followed by
- * `--strict-mcp-config` and the prompt stays the last operand. Put the prompt
- * between them and the CLI reads it as a second MCP document.
  *
  * The document is a file beside the session log when the caller named one —
  * every production attempt does — so the argv (and the process listing that
@@ -190,17 +245,15 @@ const AMBIENT_CLAUDE_CONFIG_FILENAME = '.claude.json';
  * is allowed to fail: an unwritable file would otherwise cost a whole attempt
  * to protect a convenience, and the fallback is announced rather than hidden.
  */
-function workerMcpArgs(
+function workerMcpConfig(
   spec: CoordinatorSessionSpec,
   cfg: DispatcherConfig,
   writeConfig: (path: string, contents: string) => void,
   log: (message: string) => void,
-): string[] {
+): string {
   const document = JSON.stringify({ mcpServers: cfg.mcpServers });
   const logPath = spec.spawnOptions.logPath;
-  if (logPath === undefined) {
-    return ['--mcp-config', document, '--strict-mcp-config'];
-  }
+  if (logPath === undefined) return document;
   const configPath = join(dirname(logPath), WORKER_MCP_CONFIG_FILENAME);
   try {
     writeConfig(configPath, document);
@@ -209,9 +262,9 @@ function workerMcpArgs(
       `[autopilot] worker mcp: could not write ${configPath}; `
         + 'passing the grant inline',
     );
-    return ['--mcp-config', document, '--strict-mcp-config'];
+    return document;
   }
-  return ['--mcp-config', configPath, '--strict-mcp-config'];
+  return configPath;
 }
 
 /**
@@ -473,24 +526,26 @@ export function spawnCoordinatorSession(
       deps.readTextFile ?? readTextFileOrNothing,
       log,
     );
+    const launch = claudeWorkerLaunch({
+      prompt,
+      effort: spec.effort,
+      mcpConfig: workerMcpConfig(
+        spec,
+        cfg,
+        deps.writeWorkerMcpConfig ?? writeWorkerMcpConfigFile,
+        log,
+      ),
+      backgroundWaitCeilingMs: cfg.backgroundWaitCeilingMs,
+      ambient: spec.env,
+    });
     result = deps.spawn(
       'claude',
-      [
-        '-p',
-        ...effortFlag(spec.effort),
-        ...workerMcpArgs(
-          spec,
-          cfg,
-          deps.writeWorkerMcpConfig ?? writeWorkerMcpConfigFile,
-          log,
-        ),
-        prompt,
-      ],
+      launch.args,
       {
         ...spawnOptions,
         onExit: composedOnExit,
         cwd: spec.worktreePath,
-        env: { ...env, ...printBackgroundWaitCeiling(spec.env, cfg) },
+        env: { ...env, ...launch.env },
       },
     );
   }

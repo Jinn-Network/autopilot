@@ -266,7 +266,13 @@ nothing. The first `claude -p` worker of a cycle whose ambient
 `[autopilot] worker mcp: ignoring 2 ambient server(s) (chrome-devtools, personal-os)`
 line; a `~/.claude.json` that cannot be read is not an error and logs nothing.
 Like the wait ceiling, this is a `claude -p` knob only — hermes, cursor and
-codex workers are launched exactly as before.
+codex workers are launched exactly as before. The nested stage sessions a
+worker launches through `internal run-stage` are put on the same grant and
+the same ceiling: the worker carries its `--mcp-config` operand as
+`JINN_AUTOPILOT_WORKER_MCP_CONFIG`, and the stage is launched with it and
+`--strict-mcp-config` through the same builder as the worker itself. A stage
+whose worker carried no grant gets the empty one, never the operator's
+ambient servers.
 
 When a worker exits, its process group is torn down — `SIGTERM`, a ten-second
 grace, then `SIGKILL` — so background jobs it started (test runners, servers)
