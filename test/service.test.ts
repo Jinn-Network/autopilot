@@ -1,11 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { LoadedAutopilotConfig } from '../src/config/config.js';
 import { cycleHeartbeatPath } from '../src/cycle-heartbeat.js';
+import { WORKER_INFANCY_FILE } from '../src/lifecycle/worker-infancy.js';
 import {
   classifyDaemonRecord,
   completeDaemonCycle,
@@ -887,6 +888,34 @@ describe('the start-time fallback is transient, not permanent', () => {
     expect(calls).toBe(2);
     expect(record.startedAt).toBe(metadata.startedAt);
   });
+
+  it('starts with no infant-death streak: a fresh daemon has dispatched nothing (#186)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-infancy-reset-'));
+    const fixture = fallbackDaemonFixture(dir, 0);
+    const streakPath = join(fixture.loaded.paths.state, WORKER_INFANCY_FILE);
+    mkdirSync(fixture.loaded.paths.state, { recursive: true });
+    writeFileSync(streakPath, '{"version":1,"consecutiveAllInfantCycles":3}\n');
+    const previousPath = process.env.PATH;
+    process.env.PATH = fixture.binDirectory;
+    let daemon: Promise<void> | null = null;
+
+    try {
+      daemon = runDaemon({
+        loaded: fixture.loaded,
+        entryPath: fixture.entryPath,
+        environment: { PATH: fixture.binDirectory },
+      });
+      await waitForRecord(fixture.loaded, (record) => record.state === 'running');
+      expect(existsSync(streakPath)).toBe(false);
+    } finally {
+      process.env.PATH = previousPath;
+      if (daemon !== null) {
+        const record = readDaemonMetadata(fixture.loaded);
+        if (record !== null) await sendControl(record.socketPath, 'stop');
+        await daemon;
+      }
+    }
+  }, 30_000);
 
   it('never touches a record that already carries a pinned start time', async () => {
     let calls = 0;

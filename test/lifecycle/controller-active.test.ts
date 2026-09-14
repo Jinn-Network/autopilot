@@ -1146,6 +1146,139 @@ describe('active lifecycle controller', () => {
   });
 
   /**
+   * #186: for 48 hours every worker died within a second of dispatch and the
+   * cycle summary read as healthy — snapshots, `backlog:`, `disk:`, claims,
+   * dispatch. The pass now settles its dispatches, renders what became of
+   * them, and after three cycles in a row of nothing surviving stops spending
+   * claims on a launcher that cannot keep a worker alive.
+   */
+  describe('worker infant deaths (#186)', () => {
+    type Summary = { dispatched: number; infantDeaths: number; lastStderr?: string };
+    const infantDeaths = (report: Awaited<ReturnType<typeof runLifecycleCycle>>) => (
+      report.events.filter((event) => event.outcome === 'infant-deaths')
+    );
+    const withInfancy = (
+      consecutiveAllInfantCycles: number,
+      settled: Summary,
+    ) => {
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      const recorded: Summary[] = [];
+      const executed: string[] = [];
+      controller.active!.executeAction = async (action) => {
+        executed.push(action.kind);
+        return { outcome: 'spawned' };
+      };
+      controller.workerInfancy = {
+        read: () => ({ version: 1, consecutiveAllInfantCycles }),
+        settle: async () => settled,
+        record: (summary) => {
+          recorded.push(summary);
+          return { version: 1, consecutiveAllInfantCycles: consecutiveAllInfantCycles + 1 };
+        },
+      };
+      return { controller, recorded, executed };
+    };
+
+    it('renders the settled dispatches on the summary and feeds the streak', async () => {
+      const { controller, recorded } = withInfancy(0, { dispatched: 2, infantDeaths: 0 });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.workers).toEqual({ dispatched: 2, infantDeaths: 0 });
+      expect(renderLifecycleHuman(report).split('\n'))
+        .toContain('workers: dispatched=2 infant-deaths=0');
+      expect(renderLifecycleHuman(report)).not.toContain('every worker this cycle');
+      expect(recorded).toEqual([{ dispatched: 2, infantDeaths: 0 }]);
+    });
+
+    it('says so, with the stderr, when every worker this cycle died within 30s', async () => {
+      const { controller } = withInfancy(1, {
+        dispatched: 2,
+        infantDeaths: 2,
+        lastStderr: 'Error: connect ENOENT /tmp/cc-socks/51448.sock',
+      });
+
+      const lines = renderLifecycleHuman(await runLifecycleCycle('active', controller)).split('\n');
+
+      expect(lines).toContain('workers: dispatched=2 infant-deaths=2');
+      expect(lines).toContain(
+        '[autopilot] every worker this cycle died within 30s; '
+          + 'last stderr: Error: connect ENOENT /tmp/cc-socks/51448.sock',
+      );
+    });
+
+    it('withholds every claim after three all-infant cycles, naming the lane reason', async () => {
+      const { controller, executed } = withInfancy(3, { dispatched: 0, infantDeaths: 0 });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(executed.filter((kind) => kind.startsWith('claim-'))).toEqual([]);
+      expect(infantDeaths(report)).toEqual([expect.objectContaining({
+        mode: 'active',
+        phase: 'eligible',
+        action: 'schedule',
+        subject: 'lane:implementation',
+        outcome: 'infant-deaths',
+        // One scheduled claim and two backups: every candidate, not just the
+        // ones that had a seat.
+        reason: '3 consecutive cycle(s) of every worker dying within 30s; '
+          + '3 candidate(s) withheld until the daemon is restarted',
+      })]);
+      // The withheld claim is named, and not as a starved lane: the cause is.
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'claim-implementation',
+        subject: 'issue:100',
+        outcome: 'skipped',
+        reason: 'infant-deaths',
+      }));
+      expect(report.events.filter((event) => event.outcome === 'starved')).toEqual([]);
+      expect(renderLifecycleHuman(report).split('\n'))
+        .toContain('workers: dispatched=0 infant-deaths=0');
+    });
+
+    it('withholds review claims on their own lane too', async () => {
+      const controller = deps({ readSnapshot: async () => awaitingReviewSnapshot([101, 102]) });
+      let reviewed = 0;
+      controller.active!.executeReviewActions = async (actions) => {
+        reviewed += actions.length;
+        return actions.map(() => ({ outcome: 'spawned' }));
+      };
+      controller.workerInfancy = {
+        read: () => ({ version: 1, consecutiveAllInfantCycles: 4 }),
+        settle: async () => ({ dispatched: 0, infantDeaths: 0 }),
+        record: (summary) => ({ version: 1, consecutiveAllInfantCycles: 4 }),
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(reviewed).toBe(0);
+      expect(infantDeaths(report)).toEqual([expect.objectContaining({
+        phase: 'awaiting-review',
+        subject: 'lane:review',
+        outcome: 'infant-deaths',
+      })]);
+    });
+
+    it('keeps dispatching below three cycles', async () => {
+      const { controller, executed } = withInfancy(2, { dispatched: 1, infantDeaths: 1 });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(executed).toContain('claim-implementation');
+      expect(infantDeaths(report)).toEqual([]);
+    });
+
+    it('renders nothing about workers when no watch is wired', async () => {
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.workers).toBeUndefined();
+      expect(renderLifecycleHuman(report)).not.toContain('workers:');
+    });
+  });
+
+  /**
    * A run of cycles whose every candidate is refused by the freshness gate is a
    * total claim stop, and #130 saw ~10 of them pass unremarked because the only
    * evidence was one `skipped (full-reconciliation-stale)` line per candidate —

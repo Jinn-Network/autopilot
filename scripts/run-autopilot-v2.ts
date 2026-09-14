@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import {
+  appendFileSync,
   closeSync,
   mkdirSync,
   openSync,
@@ -133,6 +134,12 @@ import {
   type SelectedCredential,
 } from '../src/lifecycle/index.js';
 import { heldSeats } from '../src/lifecycle/wall-clock.js';
+import {
+  readWorkerInfancy,
+  recordWorkerCycle,
+  WORKER_INFANCY_FILE,
+  WorkerInfancyWatch,
+} from '../src/lifecycle/worker-infancy.js';
 
 export function lifecycleExitCodeForReport(
   report: Pick<LifecycleCycleReport, 'status'>,
@@ -572,7 +579,16 @@ function selectedReadRunner(
   });
 }
 
-export function makeLoggingSpawn(): SpawnFn {
+/**
+ * The production worker spawn: stdout and stderr go straight to the
+ * attempt's `session.log` through a descriptor the child inherits, so even a
+ * worker that dies before the skill prints anything leaves its first stderr
+ * there (#186). A launch that could not spawn at all — no binary, no
+ * permission — writes the reason itself, since no child was ever there to.
+ * Every dispatch and its exit are reported to the watch, when one is given,
+ * which is how the cycle summary learns what became of them.
+ */
+export function makeLoggingSpawn(watch?: WorkerInfancyWatch): SpawnFn {
   return (command, args, options) => {
     const { onExit, logPath, ...spawnOptions } = options;
     let descriptor: number | undefined;
@@ -592,19 +608,30 @@ export function makeLoggingSpawn(): SpawnFn {
         detached: true,
         stdio,
       } as SpawnOptions) as ChildProcess;
-      if (onExit !== undefined) {
-        let completed = false;
-        const finish = (
-          code: number | null,
-          signal: NodeJS.Signals | null,
-        ) => {
-          if (completed) return;
-          completed = true;
-          onExit(code, signal);
-        };
-        child.once('error', () => finish(null, null));
-        child.once('exit', finish);
-      }
+      const recordExit = watch?.dispatched(logPath);
+      let completed = false;
+      const finish = (
+        code: number | null,
+        signal: NodeJS.Signals | null,
+      ) => {
+        if (completed) return;
+        completed = true;
+        // Before the caller's own handler, which may mark the attempt exited
+        // and so let the sweep remove the log the watch reads.
+        recordExit?.(code, signal);
+        onExit?.(code, signal);
+      };
+      child.once('error', (error) => {
+        if (logPath !== undefined) {
+          try {
+            appendFileSync(logPath, `[autopilot] spawn failed: ${error.message}\n`);
+          } catch {
+            // The log is diagnostic; the exit below is the record.
+          }
+        }
+        finish(null, null);
+      });
+      child.once('exit', finish);
       child.unref();
       const result = {
         pid: child.pid,
@@ -1042,6 +1069,10 @@ export async function runAutopilotV2(
             defaultBranch: loaded.config.repository.defaultBranch,
           });
       })();
+  // One watch per engine process, drained by each cycle's settle (#186); the
+  // streak it feeds lives beside the session-limit circuit.
+  const workerInfancyWatch = new WorkerInfancyWatch();
+  const workerInfancyPath = join(loaded.paths.state, WORKER_INFANCY_FILE);
   const active = options.mode !== 'active'
     ? undefined
     : makeProductionActiveRuntime({
@@ -1082,7 +1113,7 @@ export async function runAutopilotV2(
         },
         ...reconciliationTargets,
         config,
-        spawn: makeLoggingSpawn(),
+        spawn: makeLoggingSpawn(workerInfancyWatch),
         caps: {
           implementation: positiveEnvironmentInteger(
             env.JINN_AUTOPILOT_IMPLEMENTATION_CAP,
@@ -1159,6 +1190,17 @@ export async function runAutopilotV2(
           listRunnerLiveAttempts(v2AttemptsBase, runnerId, childIsAlive),
           new Date(),
         ),
+        // What became of this cycle's dispatches, and the streak of cycles in
+        // which none survived (#186). Active only: nothing else dispatches.
+        ...(options.mode === 'active'
+          ? {
+              workerInfancy: {
+                read: () => readWorkerInfancy(workerInfancyPath),
+                settle: () => workerInfancyWatch.settle(),
+                record: (summary) => recordWorkerCycle(workerInfancyPath, summary),
+              },
+            }
+          : {}),
         ...(writerForSnapshot === undefined ? {} : { writerForSnapshot }),
         ...(active === undefined ? {} : { active }),
         ...(recoverPreparedMarketplaceSubmissions === undefined
