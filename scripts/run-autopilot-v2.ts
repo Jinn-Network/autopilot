@@ -722,7 +722,13 @@ export async function runAutopilotV2(
       JINN_IMPL_GH_TOKEN: runtimeEnvironment.JINN_IMPL_GH_TOKEN,
       JINN_REVIEW_GH_TOKEN: runtimeEnvironment.JINN_REVIEW_GH_TOKEN,
       JINN_REVIEW_BOT_LOGIN: runtimeEnvironment.JINN_REVIEW_BOT_LOGIN,
-    }, defaultRunner);
+    }, defaultRunner, {
+      // A retried probe is a cycle that nearly did nothing (#186); say so.
+      onRetry: (event) => console.warn(
+        `[autopilot:v2] credential probe: ${event.preference} attempt `
+          + `${event.attempt} failed (${event.fault}); retrying`,
+      ),
+    });
     const selected = selectCredential(credentials, { phase: 'implement' });
     if (selected.status !== 'selected') throw new Error(selected.detail);
     maintenanceCredential = selected.credential;

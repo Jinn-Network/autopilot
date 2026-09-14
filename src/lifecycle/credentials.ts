@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import type { CommandRunner } from '../dispatcher/issue-source.js';
+import { retryIdempotentProbe, type ProbeRetryEvent } from './transient-retry.js';
 
 export type CredentialPhase = 'implement' | 'review' | 'merge';
 export type CredentialPreference = 'implementation' | 'review';
@@ -178,9 +179,49 @@ function isolatedLoginEnvironment(token: string): Record<string, string> {
   return env;
 }
 
+/** The probe: one REST GET, on the engine's own read allowlist. */
+const LOGIN_PROBE_ARGS: readonly string[] = ['api', 'user', '--jq', '.login'];
+
+/** How much of a probe failure's stderr the thrown error quotes. */
+const PROBE_FAILURE_DETAIL_CHARS = 300;
+
+/**
+ * What a failed probe actually said: its stderr when it has one — Node's
+ * `execFile` rejection carries it, and gh writes `HTTP 502 …` there — else
+ * its message, whitespace collapsed and bounded, with every configured token
+ * redacted in case the text echoes one.
+ */
+function probeFailureDetail(error: unknown, secrets: readonly string[]): string {
+  const fields = (typeof error === 'object' && error !== null
+    ? error
+    : {}) as { readonly stderr?: unknown; readonly message?: unknown };
+  const stderr = typeof fields.stderr === 'string' ? fields.stderr.trim() : '';
+  const raw = stderr.length > 0
+    ? stderr
+    : typeof fields.message === 'string' && fields.message.length > 0
+      ? fields.message
+      : String(error);
+  let detail = raw.replace(/\s+/g, ' ').trim();
+  if (detail.length > PROBE_FAILURE_DETAIL_CHARS) {
+    detail = `${detail.slice(0, PROBE_FAILURE_DETAIL_CHARS)}…`;
+  }
+  for (const secret of secrets) detail = detail.split(secret).join('[redacted]');
+  return detail;
+}
+
+export interface ResolveCredentialPoolOptions {
+  /** One retried probe attempt (#186), so a retry is never invisible. */
+  readonly onRetry?: (
+    event: ProbeRetryEvent & { readonly preference: CredentialPreference },
+  ) => void;
+  /** Test seam for the ladder's backoff; production always waits for real. */
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
 export async function resolveCredentialPool(
   env: CredentialEnvironment,
   runner: CommandRunner,
+  options: ResolveCredentialPoolOptions = {},
 ): Promise<CredentialPool> {
   const configured = [
     ...(env.JINN_IMPL_GH_TOKEN
@@ -190,16 +231,29 @@ export async function resolveCredentialPool(
       ? [{ token: env.JINN_REVIEW_GH_TOKEN, preference: 'review' as const }]
       : []),
   ];
+  const secrets = configured.map(({ token }) => token);
   const loginByToken = new Map<string, string>();
   for (const { token, preference } of configured) {
     if (loginByToken.has(token)) continue;
     try {
-      const raw = await runner('gh', ['api', 'user', '--jq', '.login'], {
-        env: isolatedLoginEnvironment(token),
-      });
+      // Through the transient-retry ladder like every other GitHub read, plus
+      // the served gateway statuses a GET of `/user` can safely be re-sent
+      // after (#186); the failure it finally throws quotes what gh said.
+      const raw = await retryIdempotentProbe(
+        () => runner('gh', [...LOGIN_PROBE_ARGS], {
+          env: isolatedLoginEnvironment(token),
+        }),
+        {
+          ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+          onRetry: (event) => options.onRetry?.({ ...event, preference }),
+        },
+      );
       loginByToken.set(token, validatedLogin(raw));
-    } catch {
-      throw new Error(`${preference} credential GitHub login resolution failed`);
+    } catch (error) {
+      throw new Error(
+        `${preference} credential GitHub login resolution failed: `
+          + probeFailureDetail(error, secrets),
+      );
     }
   }
 

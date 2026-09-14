@@ -225,13 +225,16 @@ const SERVED_STATUS: ReadonlyArray<RegExp> = [
  * and its served-response veto govern every command this engine runs, mutations
  * included, where a served 5xx may name a request that was applied and must
  * never be re-sent. This function proves something narrower and is consulted by
- * exactly one caller: the paged full-reconciliation read in
- * `github-reader.ts`, which is idempotent, and for which a 502/503/504 is the
- * canonical "this page exceeded the server's execution budget" signal — the
- * same fault as the HTTP/2 stream cancel of #130, reported by a proxy that got
- * to answer before the connection died (issue #134, live on Jinn-Network/mono).
- * Nothing here makes any command retryable; the reader re-reads a *smaller*
- * page, which is a different request.
+ * exactly two callers, each on one read that is idempotent by construction:
+ * the paged full-reconciliation read in `github-reader.ts`, for which a
+ * 502/503/504 is the canonical "this page exceeded the server's execution
+ * budget" signal — the same fault as the HTTP/2 stream cancel of #130, reported
+ * by a proxy that got to answer before the connection died (issue #134, live on
+ * Jinn-Network/mono) — and the credential probe's `gh api user` through
+ * {@link retryIdempotentProbe} (#186). Nothing here makes any command
+ * retryable through the general runner; the reader re-reads a *smaller* page,
+ * which is a different request, and the probe is a GET of `/user` that no
+ * re-send can duplicate.
  *
  * The evidence discipline is the veto's, unchanged. `stdout` is never read as
  * evidence — it carries the response payload, so a pull-request body quoting a
@@ -522,4 +525,57 @@ export function withTransientReadRetry(
   };
   alreadyRetrying.add(retrying);
   return retrying;
+}
+
+// ---------------------------------------------------------------------------
+// The credential probe's ladder (one caller: `resolveCredentialPool`, #186)
+// ---------------------------------------------------------------------------
+
+export interface ProbeRetryEvent {
+  /** The 1-based attempt that failed; the next attempt is `attempt + 1`. */
+  readonly attempt: number;
+  /** The classified reason: a transport fault, or `HTTP 502`/`503`/`504`. */
+  readonly fault: string;
+}
+
+export interface ProbeRetryOptions {
+  readonly onRetry?: (event: ProbeRetryEvent) => void;
+  /** Test seam for the fixed backoff; production always waits for real. */
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * The same ladder as {@link withTransientReadRetry} — the same attempt cap,
+ * the same backoff, the same transport-fault classification — for a read that
+ * is not only allowlist-shaped but idempotent by construction, and so may
+ * also be re-sent after a served gateway status.
+ *
+ * Its one caller is the credential probe, `gh api user` (#186): a GET whose
+ * only effect is the answer, issued once per cycle before anything else can
+ * run. A 502 blip made it fail eight cycles in a row, each one an engine that
+ * did nothing, because the general runner's served-response veto — correct
+ * for every command that might have been applied — refused to re-send it.
+ * The veto is untouched: this is a separate loop over the same primitives,
+ * not an option on the general wrapper, so nothing routed through the metered
+ * boundary can acquire gateway tolerance by mistake. Every other failure —
+ * a 4xx, a throttle, a bad login — is thrown on the first attempt, original
+ * error intact, so the caller can quote it.
+ */
+export async function retryIdempotentProbe<T>(
+  probe: () => Promise<T>,
+  options: ProbeRetryOptions = {},
+): Promise<T> {
+  const sleep = options.sleep ?? defaultSleep;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await probe();
+    } catch (error) {
+      const gateway = gatewayStatusFromFailure(error);
+      const fault = classifyTransportFault(error)
+        ?? (gateway === null ? null : `HTTP ${gateway}`);
+      if (fault === null || attempt >= MAX_READ_ATTEMPTS) throw error;
+      options.onRetry?.({ attempt, fault });
+      await sleep(BACKOFF_MS[attempt - 1]!);
+    }
+  }
 }
