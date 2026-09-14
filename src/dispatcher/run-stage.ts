@@ -19,6 +19,7 @@ import {
   WORKER_MCP_CONFIG_ENV,
 } from './coordinator-session.js';
 import { DEFAULT_CONFIG } from './types.js';
+import { withoutAmbientClaudeEnvironment } from '../worker-environment.js';
 import {
   assertHermesBillingRoute,
   hermesChatArgs,
@@ -224,11 +225,17 @@ export function runStageHeadless(
   const ambient = opts.environment ?? process.env;
   const runtime = parseAutopilotRuntime(ambient[AUTOPILOT_RUNTIME_ENV]);
   const prompt = buildStagePrompt(opts, runtime);
+  // Stage roots need model/runtime configuration, but never the coordinator's
+  // GitHub identity or manifest-bound lifecycle authority — nor, on any
+  // runtime, the ambient `CLAUDE_*` of the worker's own session (#186).
+  const environment = withoutAmbientClaudeEnvironment(
+    buildUnprivilegedStageEnvironment(ambient),
+  ).env;
   let cmd: string;
   let args: string[];
-  // The worker contract a `claude -p` stage carries beyond the reduced
-  // environment (#184); the other runtimes have none.
-  let contract: NodeJS.ProcessEnv = {};
+  // The environment a `claude -p` stage is launched on carries the worker
+  // contract on top of the reduced one (#184); the other runtimes carry none.
+  let stageEnvironment: NodeJS.ProcessEnv = environment;
   if (runtime === 'hermes') {
     const pythonPath = requireHermesValue(
       opts.hermesPythonPath ?? ambient.JINN_DISPATCHER_HERMES_PYTHON,
@@ -279,18 +286,18 @@ export function runStageHeadless(
       ...(opts.model === undefined ? {} : { model: opts.model }),
       mcpConfig: ambient[WORKER_MCP_CONFIG_ENV] ?? EMPTY_WORKER_MCP_DOCUMENT,
       backgroundWaitCeilingMs: DEFAULT_CONFIG.backgroundWaitCeilingMs,
-      ambient,
+      ambient: environment,
     });
     cmd = 'claude';
     args = launch.args;
-    contract = launch.env;
+    stageEnvironment = launch.env;
   }
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   return new Promise((resolve) => {
     const proc = spawn(cmd, args, {
       cwd: opts.worktreePath,
-      env: { ...buildUnprivilegedStageEnvironment(ambient), ...contract },
+      env: stageEnvironment,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';

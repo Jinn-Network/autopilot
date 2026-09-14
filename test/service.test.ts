@@ -28,6 +28,7 @@ import {
   readDaemonMetadata,
   renderDaemonStatus,
   runDaemon,
+  serviceCredentialEnvironment,
   serviceSocketPath,
   serviceStatus,
   START_TIME_HEAL_ATTEMPTS,
@@ -130,6 +131,53 @@ describe('repository-scoped daemon safety', () => {
     expect(parent.JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE).toBe('stale');
     expect(INTERNAL_DAEMON_ACTIVE_ONCE_ENV)
       .toBe('JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE');
+  });
+
+  /**
+   * #186: the daemon was started from inside a Claude Code session, and every
+   * worker inherited that session's `CLAUDE_*` variables through the daemon
+   * and the engine child. Both spawn environments drop them, so the operator
+   * recipe (`env -u CLAUDE_… autopilot start`) is no longer the only defence.
+   */
+  describe('ambient CLAUDE_* variables never reach the daemon or engine child (#186)', () => {
+    const LEAKED = {
+      CLAUDE_CODE_CHILD_SESSION: '1',
+      CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/cc-socks/51448.sock',
+      CLAUDE_CODE_MESSAGING_TOKEN: 'host-session-token',
+      CLAUDE_PID: '51448',
+    };
+
+    it('scrubs the engine child environment, keeping the engine-owned ceiling', () => {
+      const child = daemonActiveOnceEnvironment({
+        PATH: '/opt/homebrew/bin',
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '3600000',
+        ...LEAKED,
+      });
+
+      expect(child).toEqual({
+        PATH: '/opt/homebrew/bin',
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '3600000',
+        JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE: '1',
+      });
+    });
+
+    it('scrubs the daemon environment `start` builds, idempotently', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'autopilot-service-env-'));
+      const loaded = loadedFixture(dir, dir);
+
+      const once = serviceCredentialEnvironment(loaded, {
+        PATH: '/opt/homebrew/bin',
+        ANTHROPIC_MODEL: 'opus',
+        ...LEAKED,
+      });
+      const twice = serviceCredentialEnvironment(loaded, once);
+
+      for (const name of Object.keys(LEAKED)) {
+        expect(once).not.toHaveProperty(name);
+      }
+      expect(once).toMatchObject({ PATH: '/opt/homebrew/bin', ANTHROPIC_MODEL: 'opus' });
+      expect(twice).toEqual(once);
+    });
   });
 
   it('measures the next poll delay from child completion', async () => {

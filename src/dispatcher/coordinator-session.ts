@@ -26,6 +26,12 @@ import {
 } from '../config/runtime-assets.js';
 import { packageRoot } from '../package-paths.js';
 import { terminateProcessGroup } from '../process-group.js';
+import {
+  PRINT_BACKGROUND_WAIT_CEILING_ENV,
+  withoutAmbientClaudeEnvironment,
+} from '../worker-environment.js';
+
+export { PRINT_BACKGROUND_WAIT_CEILING_ENV } from '../worker-environment.js';
 
 export interface SpawnResult {
   pid: number | undefined;
@@ -127,19 +133,6 @@ export function loadCanon(
 }
 
 /**
- * `claude -p`'s print-mode background-task ceiling.
- *
- * After the final turn the runtime waits at most this long for background
- * tasks the session started, then terminates the session. Its own default is
- * 600 s, and engine sessions routinely end their last turn with verification
- * still running, so the default kills them at the finish line after hours of
- * work (#167: one attempt ran 9 h 41 m, checkpointed, and died here — the
- * sweep was then re-claimed five more times).
- */
-export const PRINT_BACKGROUND_WAIT_CEILING_ENV =
-  'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS';
-
-/**
  * The ceiling overlay for one `claude -p` session, or nothing when the
  * operator has already exported the variable: an explicit export is a
  * deliberate override of the configured value and outranks it. Inside a
@@ -183,23 +176,30 @@ export interface ClaudeWorkerLaunchInput {
   /** The MCP document operand: a path beside the session log, or inline JSON. */
   readonly mcpConfig: string;
   readonly backgroundWaitCeilingMs: number;
-  /** What the child inherits; the returned `env` is an overlay on it. */
+  /** What the child would inherit; the returned `env` is built from it. */
   readonly ambient: NodeJS.ProcessEnv;
 }
 
 export interface ClaudeWorkerLaunch {
   readonly args: string[];
+  /** The child's whole environment: `ambient` scrubbed, plus the contract. */
   readonly env: NodeJS.ProcessEnv;
 }
 
 /**
- * The worker contract for one `claude -p` session: argv and environment
- * overlay. The coordinator's claude branch and the nested stage sessions a
- * worker launches (`run-stage.ts`) both build here, so a session of the
- * engine's cannot be launched without `--strict-mcp-config` (#182) or the
- * background-wait ceiling (#167) — #184 found stage sessions launched with
- * neither, running the operator's ambient servers under a third-party
- * repository.
+ * The worker contract for one `claude -p` session: argv and environment.
+ * The coordinator's claude branch and the nested stage sessions a worker
+ * launches (`run-stage.ts`) both build here, so a session of the engine's
+ * cannot be launched without `--strict-mcp-config` (#182), the
+ * background-wait ceiling (#167), or the `CLAUDE_*` scrub (#186) — #184
+ * found stage sessions launched with neither of the first two, running the
+ * operator's ambient servers under a third-party repository.
+ *
+ * The environment is the whole child environment rather than an overlay
+ * because a scrub cannot be expressed as one: the ambient `CLAUDE_*`
+ * variables (a parent session's id, socket and pid) are removed, then the
+ * engine's own are set. The ceiling is read from the ambient environment
+ * before the scrub, so an exported one still outranks the configured value.
  *
  * ORDER IS LOAD-BEARING: `--mcp-config <configs...>` is variadic and consumes
  * operands greedily until the next flag, so the document is followed by
@@ -216,6 +216,7 @@ export function claudeWorkerLaunch(input: ClaudeWorkerLaunchInput): ClaudeWorker
       input.prompt,
     ],
     env: {
+      ...withoutAmbientClaudeEnvironment(input.ambient).env,
       ...printBackgroundWaitCeiling(input.ambient, input.backgroundWaitCeilingMs),
       [WORKER_MCP_CONFIG_ENV]: input.mcpConfig,
     },
@@ -335,6 +336,32 @@ function reportDroppedAmbientMcpServers(
   );
 }
 
+/**
+ * Cycles that have already reported the ambient `CLAUDE_*` variables they
+ * drop (#186), keyed the same way as {@link reportedAmbientMcpSinks} and for
+ * the same reasons: once per engine process is once per cycle, and a fresh
+ * cycle under a fresh environment says so again.
+ */
+const reportedAmbientClaudeEnvSinks = new WeakSet<object>();
+
+/**
+ * One line naming the ambient `CLAUDE_*` variables this engine is refusing
+ * to pass on, so a daemon started from inside a Claude Code session is
+ * visible in the log as such rather than only as a fleet of instant deaths.
+ */
+function reportDroppedAmbientClaudeEnv(
+  dropped: readonly string[],
+  log: (message: string) => void,
+): void {
+  if (reportedAmbientClaudeEnvSinks.has(log)) return;
+  reportedAmbientClaudeEnvSinks.add(log);
+  if (dropped.length === 0) return;
+  log(
+    `[autopilot] worker env: dropping ${dropped.length} ambient CLAUDE_* var(s) `
+      + `(${dropped.join(', ')})`,
+  );
+}
+
 /** Absent, unreadable or unparseable all read the same: no ambient servers. */
 function readTextFileOrNothing(path: string): string | undefined {
   try {
@@ -432,8 +459,12 @@ export function spawnCoordinatorSession(
     '',
     runtimePrompt,
   ].join('\n');
+  // Every runtime, not only claude: the scrub is about what the environment
+  // carries, not which binary reads it (#186). Reported once per cycle.
+  const scrubbed = withoutAmbientClaudeEnvironment(spec.env);
+  reportDroppedAmbientClaudeEnv(scrubbed.dropped, log);
   const env: NodeJS.ProcessEnv = {
-    ...spec.env,
+    ...scrubbed.env,
     JINN_AUTOPILOT_RUNTIME: runtime,
     // Overrides any ambient JINN_AUTOPILOT_PACKAGE_DIR the operator may have
     // exported: pinned to this package's real root (works from `src/` and
@@ -536,7 +567,7 @@ export function spawnCoordinatorSession(
         log,
       ),
       backgroundWaitCeilingMs: cfg.backgroundWaitCeilingMs,
-      ambient: spec.env,
+      ambient: env,
     });
     result = deps.spawn(
       'claude',
@@ -545,7 +576,7 @@ export function spawnCoordinatorSession(
         ...spawnOptions,
         onExit: composedOnExit,
         cwd: spec.worktreePath,
-        env: { ...env, ...launch.env },
+        env: launch.env,
       },
     );
   }

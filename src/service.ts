@@ -27,15 +27,22 @@ import {
 } from './cycle-heartbeat.js';
 import type { DoctorReport } from './doctor.js';
 import { readProcessStartTime } from './process-start-time.js';
+import { withoutAmbientClaudeEnvironment } from './worker-environment.js';
 
 export const INTERNAL_DAEMON_ACTIVE_ONCE_ENV =
   'JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE';
 
+/**
+ * The engine child's environment: the daemon's own, marked as a daemon-spawned
+ * cycle, with every ambient `CLAUDE_*` variable removed (#186). The scrub is
+ * idempotent, so a daemon that was itself started scrubbed loses nothing here,
+ * and one that was not still hands its cycles a clean environment.
+ */
 export function daemonActiveOnceEnvironment(
   environment: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   return {
-    ...environment,
+    ...withoutAmbientClaudeEnvironment(environment).env,
     [INTERNAL_DAEMON_ACTIVE_ONCE_ENV]: '1',
   };
 }
@@ -796,11 +803,20 @@ export async function inspectDaemon(input: {
   };
 }
 
+/**
+ * The daemon's environment as `start` builds it: the operator's, with the
+ * repository identity and credentials on top and every ambient `CLAUDE_*`
+ * variable removed (#186). A daemon started from inside a Claude Code session
+ * would otherwise carry that session's id, socket and pid into every engine
+ * child and every worker, which is how the 2026-09-12 fleet died on startup
+ * for 48 hours once the session was gone.
+ */
 export function serviceCredentialEnvironment(
   loaded: LoadedAutopilotConfig,
-  environment: NodeJS.ProcessEnv = process.env,
+  ambient: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  if (!existsSync(loaded.paths.credentials)) return { ...environment };
+  const environment = withoutAmbientClaudeEnvironment(ambient).env;
+  if (!existsSync(loaded.paths.credentials)) return environment;
   const stat = lstatSync(loaded.paths.credentials);
   if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
     throw new Error('credentials.json must be a regular owner-only file');

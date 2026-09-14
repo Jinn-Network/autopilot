@@ -504,6 +504,29 @@ describe('nested stage sessions inherit the worker contract (#184)', () => {
       .toBe('3600000');
   });
 
+  it('drops the ambient CLAUDE_* a worker carries, keeping its ceiling and grant (#186)', async () => {
+    const { spawn, calls } = makeSpawn('close-0', 'ok');
+    await runStageHeadless({
+      ...BASE_OPTS,
+      environment: {
+        ...WORKER_ENV,
+        // What a worker's own Bash tool exports to the stage launcher, plus
+        // what a leaked daemon start would have handed the worker itself.
+        CLAUDE_CODE_ENTRYPOINT: 'cli',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/cc-socks/51448.sock',
+      },
+    }, spawn);
+
+    const environment = calls[0].opts.env as NodeJS.ProcessEnv;
+    expect(environment.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
+    expect(environment.CLAUDE_CODE_CHILD_SESSION).toBeUndefined();
+    expect(environment.CLAUDE_CODE_MESSAGING_SOCKET).toBeUndefined();
+    expect(environment[PRINT_BACKGROUND_WAIT_CEILING_ENV]).toBe('3600000');
+    expect(environment[WORKER_MCP_CONFIG_ENV])
+      .toBe('/attempts/implement-184/mcp-config.json');
+  });
+
   it('keeps the stage model flag alongside the contract', async () => {
     const { spawn, calls } = makeSpawn('close-0', 'ok');
     await runStageHeadless({ ...BASE_OPTS, environment: WORKER_ENV, model: 'opus' }, spawn);
