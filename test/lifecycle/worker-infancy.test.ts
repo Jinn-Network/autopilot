@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   allInfantLine,
+  canaryLine,
   dispatchHalted,
   INFANT_CYCLES_TO_HALT,
   INFANT_STDERR_CHARS,
@@ -65,6 +66,26 @@ describe('worker infancy (#186)', () => {
 
       expect(reset).toEqual({ version: 1, consecutiveAllInfantCycles: 0 });
       expect(dispatchHalted(reset)).toBe(false);
+    });
+
+    /**
+     * #188: while halted the controller dispatches one canary per cycle. It
+     * is an ordinary dispatch to the streak — one survivor ends it, one
+     * infant extends it — so the halt clears exactly when a worker lives.
+     */
+    it('clears the halt on a surviving canary and keeps it on a dying one', () => {
+      const path = statePath();
+      recordWorkerCycle(path, allInfant);
+      recordWorkerCycle(path, allInfant);
+      recordWorkerCycle(path, allInfant);
+
+      const died = recordWorkerCycle(path, { dispatched: 1, infantDeaths: 1, lastStderr: 'session limit' });
+      expect(died).toEqual({ version: 1, consecutiveAllInfantCycles: 4, lastStderr: 'session limit' });
+      expect(dispatchHalted(died)).toBe(true);
+
+      const survived = recordWorkerCycle(path, { dispatched: 1, infantDeaths: 0 });
+      expect(survived).toEqual({ version: 1, consecutiveAllInfantCycles: 0 });
+      expect(dispatchHalted(survived)).toBe(false);
     });
 
     it('leaves the streak alone on a cycle that dispatched nothing', () => {
@@ -174,14 +195,35 @@ describe('worker infancy (#186)', () => {
   describe('the lines', () => {
     it('renders the summary, the all-infant line, and the lane reason', () => {
       expect(workersSummaryLine({ dispatched: 3, infantDeaths: 3 }))
-        .toBe('workers: dispatched=3 infant-deaths=3');
+        .toBe('workers: dispatched=3 infant-deaths=3 canary=none');
       expect(allInfantLine({ dispatched: 3, infantDeaths: 3, lastStderr: 'connect ENOENT' }))
         .toBe('[autopilot] every worker this cycle died within 30s; last stderr: connect ENOENT');
       expect(allInfantLine({ dispatched: 1, infantDeaths: 1 }))
         .toBe('[autopilot] every worker this cycle died within 30s; last stderr: none captured');
       expect(infantDeathsLaneReason({ version: 1, consecutiveAllInfantCycles: 3 }, 5))
         .toBe('3 consecutive cycle(s) of every worker dying within 30s; '
-          + '5 candidate(s) withheld until the daemon is restarted');
+          + '5 candidate(s) withheld until a canary survives or the daemon is restarted');
+    });
+
+    it('names the canary on the summary and on its own line (#188)', () => {
+      const survived = { session: 'implement-4188', survived: true } as const;
+      const died = { session: 'review-4190', survived: false } as const;
+      expect(workersSummaryLine({ dispatched: 1, infantDeaths: 0 }, survived))
+        .toBe('workers: dispatched=1 infant-deaths=0 canary=survived');
+      expect(workersSummaryLine({ dispatched: 1, infantDeaths: 1 }, died))
+        .toBe('workers: dispatched=1 infant-deaths=1 canary=died');
+      expect(canaryLine(survived, { dispatched: 1, infantDeaths: 0 }))
+        .toBe('[autopilot] infant-death halt: canary implement-4188 survived; resuming dispatch');
+      expect(canaryLine(died, {
+        dispatched: 1,
+        infantDeaths: 1,
+        lastStderr: "You've hit your session limit",
+      })).toBe(
+        "[autopilot] infant-death halt: canary review-4190 died (You've hit your session limit); "
+          + 'halt continues',
+      );
+      expect(canaryLine(died, { dispatched: 1, infantDeaths: 1 }))
+        .toBe('[autopilot] infant-death halt: canary review-4190 died (no stderr captured); halt continues');
     });
   });
 });
