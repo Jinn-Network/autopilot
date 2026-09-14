@@ -82,16 +82,19 @@ import {
 import { exactUtcTimestampMs } from './exact-utc-time.js';
 import {
   LONG_HELD_SEAT_MS,
+  attemptSessionName,
   formatWallClock,
   wallClockSummaryLine,
   type HeldSeat,
 } from './wall-clock.js';
 import {
   allInfantLine,
+  canaryLine,
   dispatchHalted,
   infantDeathsLaneReason,
   isAllInfant,
   workersSummaryLine,
+  type InfantCanary,
   type WorkerCycleSummary,
   type WorkerInfancyState,
 } from './worker-infancy.js';
@@ -127,9 +130,10 @@ export interface LifecycleControllerDeps {
   /**
    * What became of this cycle's worker dispatches (#186), and the streak of
    * cycles in which none survived. `read` is consulted before scheduling —
-   * three all-infant cycles in a row withhold every claim — `settle` waits
-   * for the cycle's dispatches to exit or outlive infancy, and `record` folds
-   * the result into the streak. Absent means no `workers:` line and no gate.
+   * three all-infant cycles in a row withhold every claim but one, the
+   * canary (#188) — `settle` waits for the cycle's dispatches to exit or
+   * outlive infancy, and `record` folds the result into the streak. Absent
+   * means no `workers:` line and no gate.
    */
   readonly workerInfancy?: {
     read(): WorkerInfancyState;
@@ -475,6 +479,8 @@ export type LifecycleCycleReport =
       readonly seats?: readonly HeldSeat[];
       /** What became of this cycle's worker dispatches (#186), when wired. */
       readonly workers?: WorkerCycleSummary;
+      /** The one claim a halted cycle dispatched (#188), and whether it lived. */
+      readonly canary?: InfantCanary;
       readonly reconciliation?: ReconciliationReport;
       /** Stage 4: GraphQL points spent this cycle (start remaining − end). */
       readonly budget?: {
@@ -1574,6 +1580,15 @@ function subjectForAction(action: NewWorkAction): string {
     : `issue:${action.issueNumber}/pr:${action.prNumber}`;
 }
 
+/** The session a claim spawns, as the coordinator logs it: `implement-4188`, `review-4190`. */
+function claimSessionName(
+  action: Extract<NewWorkAction, { kind: 'claim-implementation' | 'claim-review' }>,
+): string {
+  return action.kind === 'claim-review'
+    ? attemptSessionName({ phase: 'review', issueNumber: action.issueNumber, prNumber: action.prNumber })
+    : attemptSessionName({ phase: 'implement', issueNumber: action.issueNumber });
+}
+
 function phaseForSchedulingSkip(
   skip: Pick<ActiveSchedulingSkip, 'phase'>,
 ): LifecyclePhase {
@@ -1759,6 +1774,7 @@ interface ActivePassResult {
   readonly disk?: DiskHeadroom;
   readonly seats?: readonly HeldSeat[];
   readonly workers?: WorkerCycleSummary;
+  readonly canary?: InfantCanary;
 }
 
 /** `{ seats }` for the report, or nothing when no build wired the read. */
@@ -1910,6 +1926,16 @@ async function executeActivePass(
     outcome: 'skipped',
     reason: skip.detail === undefined ? skip.reason : `${skip.reason} (${skip.detail})`,
   })));
+  // Except one (#188): the halt's canary, the first implementation claim in
+  // the plan's own order — or the first review when it has none — is the one
+  // claim a halted cycle spends, so a launcher that has recovered is found
+  // out by the next cycle and not by an operator. Its session is recorded at
+  // the spawn, and only a canary spawns while halted.
+  const canary: NewWorkAction | undefined = !halted
+    ? undefined
+    : scheduling.actions.find((action) => action.kind === 'claim-implementation')
+      ?? scheduling.actions.find((action) => action.kind === 'claim-review');
+  let canarySession: string | undefined;
   const actionEvent = (
     action: NewWorkAction,
     result: { readonly outcome: string; readonly reason?: string },
@@ -1924,6 +1950,9 @@ async function executeActivePass(
     outcome: result.outcome,
     ...(result.reason !== undefined
       ? { reason: logSafeReason(result.reason) }
+      // The one spawn of a halted cycle is the canary (#188), and says so.
+      : halted && result.outcome === 'spawned'
+        ? { reason: 'infant-death canary' }
       // A claim the scheduler seated in the Codex pool says so at the moment
       // it spawns (#152), so the routing is visible without a manifest read.
       : action.kind === 'claim-implementation'
@@ -2038,17 +2067,20 @@ async function executeActivePass(
         >);
         index += 1;
       }
+      // While halted the cohort is the canary alone, when the canary is a
+      // review; every other member is withheld (#188).
       if (halted) {
-        actionEvents.push(...cohort.map((candidate) => actionEvent(candidate, {
-          outcome: 'skipped',
-          reason: 'infant-deaths',
-        })));
-        continue;
+        actionEvents.push(...cohort
+          .filter((candidate) => candidate !== canary)
+          .map((candidate) => actionEvent(candidate, {
+            outcome: 'skipped',
+            reason: 'infant-deaths',
+          })));
       }
       // Each round replaces exactly the claims that refused late with the next
       // backups, so the cohort never grows past the capacity the first one was
       // admitted under: a refusal spawns nothing.
-      let batch = cohort;
+      let batch = halted ? cohort.filter((candidate) => candidate === canary) : cohort;
       while (batch.length > 0) {
         let results: readonly { readonly outcome: string; readonly reason?: string }[];
         try {
@@ -2069,6 +2101,10 @@ async function executeActivePass(
         spawnedByLane.review += results.filter((result) => (
           result.outcome === 'spawned'
         )).length;
+        if (halted) {
+          const spawned = batch.find((_, offset) => results[offset]!.outcome === 'spawned');
+          if (spawned !== undefined) canarySession = claimSessionName(spawned);
+        }
         const refused = results.filter((result) => result.outcome === 'ineligible').length;
         const next: Extract<NewWorkAction, { kind: 'claim-review' }>[] = [];
         for (let slot = 0; slot < refused; slot += 1) {
@@ -2093,6 +2129,7 @@ async function executeActivePass(
     }
     if (
       halted
+      && action !== canary
       && (action.kind === 'claim-implementation' || action.kind === 'claim-review')
     ) {
       actionEvents.push(actionEvent(action, { outcome: 'skipped', reason: 'infant-deaths' }));
@@ -2111,6 +2148,7 @@ async function executeActivePass(
         actionEvents.push(actionEvent(attempt, result));
         if (result.outcome === 'spawned') {
           spawnedByLane[lane] += 1;
+          if (halted) canarySession = claimSessionName(attempt);
           break;
         }
         if (result.outcome !== 'ineligible') break;
@@ -2151,9 +2189,12 @@ async function executeActivePass(
     // queued candidate reads `skipped (capacity)` exactly like a busy lane's
     // does. One line per cycle per lane, derived and never counted across
     // cycles, so nothing has to be persisted or reset.
-    // The halt names itself per lane with candidates (#186), in place of the
-    // starved line below: nothing spawned because nothing was allowed to.
-    if (halted && laneCandidates[lane] > 0) {
+    // The halt names itself per lane with withheld candidates (#186), in
+    // place of the starved line below: nothing spawned because nothing was
+    // allowed to — except the canary, which is not withheld (#188).
+    const withheld = laneCandidates[lane]
+      - (canary !== undefined && laneForNewWorkAction(canary) === lane ? 1 : 0);
+    if (halted && withheld > 0) {
       actionEvents.push({
         cycleId,
         runnerId: deps.runnerId,
@@ -2162,7 +2203,7 @@ async function executeActivePass(
         subject: `lane:${lane}`,
         action: 'schedule',
         outcome: 'infant-deaths',
-        reason: infantDeathsLaneReason(infancy!, laneCandidates[lane]),
+        reason: infantDeathsLaneReason(infancy!, withheld),
       });
     }
     if (
@@ -2211,6 +2252,13 @@ async function executeActivePass(
   // outlived infancy, so the summary can say what became of them (#186).
   const workers = await deps.workerInfancy?.settle();
   if (workers !== undefined) deps.workerInfancy!.record(workers);
+  // The canary's fate is the settled cycle's (#188): the only dispatch of a
+  // halted cycle, it survived exactly when the cycle was not all-infant —
+  // the same test `record` just applied to the streak.
+  const canaryOutcome: InfantCanary | undefined =
+    canarySession === undefined || workers === undefined || workers.dispatched === 0
+      ? undefined
+      : { session: canarySession, survived: !isAllInfant(workers) };
   return {
     items,
     orphanBranchClaims,
@@ -2223,6 +2271,7 @@ async function executeActivePass(
     ...(local.diskHeadroom === undefined ? {} : { disk: local.diskHeadroom }),
     ...(seats === undefined ? {} : { seats }),
     ...(workers === undefined ? {} : { workers }),
+    ...(canaryOutcome === undefined ? {} : { canary: canaryOutcome }),
   };
 }
 
@@ -2522,6 +2571,7 @@ export async function runLifecycleCycle(
       ...(activePass.disk === undefined ? {} : { disk: activePass.disk }),
       ...(activePass.seats === undefined ? {} : { seats: activePass.seats }),
       ...(activePass.workers === undefined ? {} : { workers: activePass.workers }),
+      ...(activePass.canary === undefined ? {} : { canary: activePass.canary }),
       reconciliation: combinedReconciliation,
     });
   }
@@ -2951,12 +3001,16 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
   const wallClockLine = wallClockSummaryLine(report.seats ?? []);
   const wallClockLines = wallClockLine === undefined ? [] : [wallClockLine];
   // Every active cycle, dispatches or none: a fleet that dispatched nothing
-  // and one whose every dispatch died must read differently (#186).
+  // and one whose every dispatch died must read differently (#186). A halted
+  // cycle's loud line is its canary's (#188); the all-infant line would only
+  // repeat it.
   const workerLines = report.workers === undefined
     ? []
     : [
-        workersSummaryLine(report.workers),
-        ...(isAllInfant(report.workers) ? [allInfantLine(report.workers)] : []),
+        workersSummaryLine(report.workers, report.canary),
+        ...(report.canary !== undefined
+          ? [canaryLine(report.canary, report.workers)]
+          : isAllInfant(report.workers) ? [allInfantLine(report.workers)] : []),
       ];
   if (
     report.items.length === 0

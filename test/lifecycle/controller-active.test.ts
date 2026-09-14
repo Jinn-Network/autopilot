@@ -1186,7 +1186,7 @@ describe('active lifecycle controller', () => {
 
       expect(report.workers).toEqual({ dispatched: 2, infantDeaths: 0 });
       expect(renderLifecycleHuman(report).split('\n'))
-        .toContain('workers: dispatched=2 infant-deaths=0');
+        .toContain('workers: dispatched=2 infant-deaths=0 canary=none');
       expect(renderLifecycleHuman(report)).not.toContain('every worker this cycle');
       expect(recorded).toEqual([{ dispatched: 2, infantDeaths: 0 }]);
     });
@@ -1200,63 +1200,157 @@ describe('active lifecycle controller', () => {
 
       const lines = renderLifecycleHuman(await runLifecycleCycle('active', controller)).split('\n');
 
-      expect(lines).toContain('workers: dispatched=2 infant-deaths=2');
+      expect(lines).toContain('workers: dispatched=2 infant-deaths=2 canary=none');
       expect(lines).toContain(
         '[autopilot] every worker this cycle died within 30s; '
           + 'last stderr: Error: connect ENOENT /tmp/cc-socks/51448.sock',
       );
     });
 
-    it('withholds every claim after three all-infant cycles, naming the lane reason', async () => {
-      const { controller, executed } = withInfancy(3, { dispatched: 0, infantDeaths: 0 });
+    /**
+     * #188: a halt with no way out but a restart regressed the one case that
+     * used to self-heal, a usage-limit outage. While halted, the head of the
+     * implementation lane is dispatched as a canary — one claim per cycle —
+     * and everything else is withheld as before. A canary that outlives
+     * infancy is the survivor that resets the streak; one that dies extends
+     * it, and the next cycle sends another.
+     */
+    it('dispatches the head-of-lane claim as the canary after three all-infant cycles, withholding the rest', async () => {
+      const { controller, executed } = withInfancy(3, { dispatched: 1, infantDeaths: 1 });
+      const attempted: number[] = [];
+      controller.active!.executeAction = async (action) => {
+        executed.push(action.kind);
+        if (action.kind === 'claim-implementation') attempted.push(action.issueNumber);
+        return { outcome: 'spawned' };
+      };
 
       const report = await runLifecycleCycle('active', controller);
 
-      expect(executed.filter((kind) => kind.startsWith('claim-'))).toEqual([]);
+      // Exactly one claim, the P0 head of the lane; the two backups stay withheld.
+      expect(attempted).toEqual([100]);
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'claim-implementation',
+        subject: 'issue:100',
+        outcome: 'spawned',
+        reason: 'infant-death canary',
+      }));
       expect(infantDeaths(report)).toEqual([expect.objectContaining({
         mode: 'active',
         phase: 'eligible',
         action: 'schedule',
         subject: 'lane:implementation',
         outcome: 'infant-deaths',
-        // One scheduled claim and two backups: every candidate, not just the
-        // ones that had a seat.
         reason: '3 consecutive cycle(s) of every worker dying within 30s; '
-          + '3 candidate(s) withheld until the daemon is restarted',
+          + '2 candidate(s) withheld until a canary survives or the daemon is restarted',
       })]);
-      // The withheld claim is named, and not as a starved lane: the cause is.
-      expect(report.events).toContainEqual(expect.objectContaining({
-        action: 'claim-implementation',
-        subject: 'issue:100',
-        outcome: 'skipped',
-        reason: 'infant-deaths',
-      }));
       expect(report.events.filter((event) => event.outcome === 'starved')).toEqual([]);
-      expect(renderLifecycleHuman(report).split('\n'))
-        .toContain('workers: dispatched=0 infant-deaths=0');
     });
 
-    it('withholds review claims on their own lane too', async () => {
+    it('clears the halt on a canary that survived, saying so', async () => {
+      const { controller, recorded } = withInfancy(3, { dispatched: 1, infantDeaths: 0 });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.canary).toEqual({ session: 'implement-100', survived: true });
+      expect(recorded).toEqual([{ dispatched: 1, infantDeaths: 0 }]);
+      const lines = renderLifecycleHuman(report).split('\n');
+      expect(lines).toContain('workers: dispatched=1 infant-deaths=0 canary=survived');
+      expect(lines).toContain(
+        '[autopilot] infant-death halt: canary implement-100 survived; resuming dispatch',
+      );
+    });
+
+    it('keeps the halt on a canary that died, quoting its stderr', async () => {
+      const { controller, recorded } = withInfancy(4, {
+        dispatched: 1,
+        infantDeaths: 1,
+        lastStderr: "You've hit your session limit. Resets at 3pm.",
+      });
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(report.canary).toEqual({ session: 'implement-100', survived: false });
+      expect(recorded).toEqual([{
+        dispatched: 1,
+        infantDeaths: 1,
+        lastStderr: "You've hit your session limit. Resets at 3pm.",
+      }]);
+      const lines = renderLifecycleHuman(report).split('\n');
+      expect(lines).toContain('workers: dispatched=1 infant-deaths=1 canary=died');
+      expect(lines).toContain(
+        "[autopilot] infant-death halt: canary implement-100 died (You've hit your session limit. "
+          + 'Resets at 3pm.); halt continues',
+      );
+      // The canary line is this cycle's loud line; the all-infant one would
+      // only repeat it.
+      expect(renderLifecycleHuman(report)).not.toContain('every worker this cycle');
+      // The withheld count is what it was: the canary is not one of them.
+      expect(infantDeaths(report)).toEqual([expect.objectContaining({
+        subject: 'lane:implementation',
+        reason: '4 consecutive cycle(s) of every worker dying within 30s; '
+          + '2 candidate(s) withheld until a canary survives or the daemon is restarted',
+      })]);
+    });
+
+    it('sends a review as the canary when the implementation lane has none, withholding the other reviews', async () => {
       const controller = deps({ readSnapshot: async () => awaitingReviewSnapshot([101, 102]) });
-      let reviewed = 0;
+      // Two review seats, so both are scheduled as one cohort: the canary is
+      // cut out of it, not merely the head of a queue of one.
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 1, child: 1, review: 2 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
+      const reviewed: number[][] = [];
       controller.active!.executeReviewActions = async (actions) => {
-        reviewed += actions.length;
+        reviewed.push(actions.map((action) => action.prNumber));
         return actions.map(() => ({ outcome: 'spawned' }));
       };
       controller.workerInfancy = {
         read: () => ({ version: 1, consecutiveAllInfantCycles: 4 }),
-        settle: async () => ({ dispatched: 0, infantDeaths: 0 }),
-        record: (summary) => ({ version: 1, consecutiveAllInfantCycles: 4 }),
+        settle: async () => ({ dispatched: 1, infantDeaths: 0 }),
+        record: () => ({ version: 1, consecutiveAllInfantCycles: 0 }),
       };
 
       const report = await runLifecycleCycle('active', controller);
 
-      expect(reviewed).toBe(0);
+      expect(reviewed).toEqual([[101]]);
+      expect(report.canary).toEqual({ session: 'review-101', survived: true });
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'claim-review',
+        subject: 'issue:42/pr:102',
+        outcome: 'skipped',
+        reason: 'infant-deaths',
+      }));
       expect(infantDeaths(report)).toEqual([expect.objectContaining({
         phase: 'awaiting-review',
         subject: 'lane:review',
         outcome: 'infant-deaths',
+        reason: '4 consecutive cycle(s) of every worker dying within 30s; '
+          + '1 candidate(s) withheld until a canary survives or the daemon is restarted',
       })]);
+    });
+
+    it('sends no canary, and says so, when there is nothing to claim while halted', async () => {
+      const controller = deps({ readSnapshot: async () => awaitingReviewSnapshot([]) });
+      let executed = 0;
+      controller.active!.executeAction = async () => {
+        executed += 1;
+        return { outcome: 'spawned' };
+      };
+      controller.workerInfancy = {
+        read: () => ({ version: 1, consecutiveAllInfantCycles: 3 }),
+        settle: async () => ({ dispatched: 0, infantDeaths: 0 }),
+        record: () => ({ version: 1, consecutiveAllInfantCycles: 3 }),
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      expect(executed).toBe(0);
+      expect(report.canary).toBeUndefined();
+      expect(infantDeaths(report)).toEqual([]);
+      expect(renderLifecycleHuman(report).split('\n'))
+        .toContain('workers: dispatched=0 infant-deaths=0 canary=none');
     });
 
     it('keeps dispatching below three cycles', async () => {
