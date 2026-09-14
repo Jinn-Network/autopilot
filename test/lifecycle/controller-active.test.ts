@@ -1294,6 +1294,13 @@ describe('active lifecycle controller', () => {
 
     it('sends a review as the canary when the implementation lane has none, withholding the other reviews', async () => {
       const controller = deps({ readSnapshot: async () => awaitingReviewSnapshot([101, 102]) });
+      // Two review seats, so both are scheduled as one cohort: the canary is
+      // cut out of it, not merely the head of a queue of one.
+      controller.active!.readLocalState = () => ({
+        remaining: { implementation: 1, child: 1, review: 2 },
+        availableLogins: ['implementation-bot'],
+        implementationPreferredLogin: 'implementation-bot',
+      });
       const reviewed: number[][] = [];
       controller.active!.executeReviewActions = async (actions) => {
         reviewed.push(actions.map((action) => action.prNumber));

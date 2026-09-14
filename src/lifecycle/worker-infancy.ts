@@ -21,6 +21,15 @@ import { dirname } from 'node:path';
  * daemon removes the file at start — so a restart, which is how a leaked
  * environment is fixed anyway, is the operator-visible reset. The daemon's own
  * `consecutiveFailedCycles` (#139) resets the same way.
+ *
+ * A restart is not the only way out (#188). A usage-limit outage kills every
+ * worker the same way a leaked environment does, and used to heal itself when
+ * the limit lifted; a halt that waits for an operator turned that into hours
+ * of idle. So while halted the controller dispatches one canary claim per
+ * cycle — the head of the implementation lane, or a review when that lane has
+ * none — and withholds the rest. To the streak it is an ordinary dispatch:
+ * a canary that outlives infancy is the survivor that resets it, and one that
+ * dies extends it, at the cost of one claim per cycle.
  */
 
 /**
@@ -56,6 +65,17 @@ export interface WorkerInfancyState {
   readonly version: 1;
   readonly consecutiveAllInfantCycles: number;
   readonly lastStderr?: string;
+}
+
+/**
+ * The one claim a halted cycle dispatched (#188), named as the coordinator
+ * logs its session — `implement-4188`, `review-4190` — and whether it
+ * outlived infancy. Survival is the cycle's summary not being all-infant,
+ * which is exactly the condition under which `recordWorkerCycle` resets.
+ */
+export interface InfantCanary {
+  readonly session: string;
+  readonly survived: boolean;
 }
 
 const NO_STREAK: WorkerInfancyState = { version: 1, consecutiveAllInfantCycles: 0 };
@@ -121,8 +141,21 @@ export function dispatchHalted(state: WorkerInfancyState): boolean {
   return state.consecutiveAllInfantCycles >= INFANT_CYCLES_TO_HALT;
 }
 
-export function workersSummaryLine(summary: WorkerCycleSummary): string {
-  return `workers: dispatched=${summary.dispatched} infant-deaths=${summary.infantDeaths}`;
+export function workersSummaryLine(
+  summary: WorkerCycleSummary,
+  canary?: InfantCanary,
+): string {
+  const outcome = canary === undefined ? 'none' : canary.survived ? 'survived' : 'died';
+  return `workers: dispatched=${summary.dispatched} infant-deaths=${summary.infantDeaths} `
+    + `canary=${outcome}`;
+}
+
+/** The halted cycle's loud line: what became of its canary (#188). */
+export function canaryLine(canary: InfantCanary, summary: WorkerCycleSummary): string {
+  return canary.survived
+    ? `[autopilot] infant-death halt: canary ${canary.session} survived; resuming dispatch`
+    : `[autopilot] infant-death halt: canary ${canary.session} died `
+      + `(${summary.lastStderr ?? 'no stderr captured'}); halt continues`;
 }
 
 export function allInfantLine(summary: WorkerCycleSummary): string {
@@ -134,7 +167,7 @@ export function allInfantLine(summary: WorkerCycleSummary): string {
 export function infantDeathsLaneReason(state: WorkerInfancyState, withheld: number): string {
   return `${state.consecutiveAllInfantCycles} consecutive cycle(s) of every worker dying `
     + `within ${WORKER_INFANT_DEATH_MS / 1_000}s; ${withheld} candidate(s) withheld `
-    + 'until the daemon is restarted';
+    + 'until a canary survives or the daemon is restarted';
 }
 
 /**
