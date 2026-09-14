@@ -670,3 +670,87 @@ describe('worker MCP isolation (#182)', () => {
     expect(call.args).toContain('--strict-mcp-config');
   });
 });
+
+/**
+ * #186: a daemon started from inside a Claude Code session carried that
+ * session's `CLAUDE_*` variables into every worker, and every worker died on
+ * startup once the session was gone. The engine owns the scrub now — on every
+ * runtime, because it is about the environment a session inherits, not which
+ * binary reads it — and keeps only the `CLAUDE_*` variables it sets itself.
+ */
+describe('ambient CLAUDE_* scrub (#186)', () => {
+  const LEAKED = {
+    CLAUDE_CODE_CHILD_SESSION: '1',
+    CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/cc-socks/51448.sock',
+    CLAUDE_PID: '51448',
+  };
+
+  function launch(
+    runtime: AutopilotRuntime,
+    env: NodeJS.ProcessEnv,
+    log: (message: string) => void = () => {},
+  ): SpawnCall {
+    const calls: SpawnCall[] = [];
+    spawnCoordinatorSession(
+      {
+        kind: 'implement',
+        number: 186,
+        skill: 'implement-issue',
+        scenario: 'SCENARIO-env',
+        worktreePath: '/tmp/worktrees/implement-186',
+        effort: 'High',
+        env,
+        spawnOptions: { detached: true, stdio: 'ignore' },
+      },
+      { ...DEFAULT_CONFIG, runtime },
+      {
+        spawn: (cmd, args, opts) => {
+          calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+          return { pid: 1860 };
+        },
+        prepareHermesHome: () => ({ hermesHome: '/tmp/hermes-homes/implement-186' }),
+        log,
+        readTextFile: () => undefined,
+      },
+    );
+    return calls[0];
+  }
+
+  it.each(['claude', 'hermes', 'cursor', 'codex'] as const)(
+    'drops every ambient CLAUDE_* variable from a %s session',
+    (runtime) => {
+      const env = launch(runtime, { GH_TOKEN: 'token', ...LEAKED }).opts.env as NodeJS.ProcessEnv;
+
+      for (const name of Object.keys(LEAKED)) expect(env).not.toHaveProperty(name);
+      expect(env.GH_TOKEN).toBe('token');
+    },
+  );
+
+  it('keeps the ceiling the engine sets, and one the operator exported', () => {
+    expect(launch('claude', LEAKED).opts.env).toMatchObject({
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '3600000',
+    });
+    expect(launch('claude', { ...LEAKED, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '900000' })
+      .opts.env).toMatchObject({ CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '900000' });
+  });
+
+  it('reports the drop once per cycle, naming the variables', () => {
+    const logs: string[] = [];
+    const log = (message: string) => logs.push(message);
+
+    launch('claude', LEAKED, log);
+    launch('codex', LEAKED, log);
+
+    expect(logs.filter((line) => line.includes('worker env:'))).toEqual([
+      '[autopilot] worker env: dropping 3 ambient CLAUDE_* var(s) '
+        + '(CLAUDE_CODE_CHILD_SESSION, CLAUDE_CODE_MESSAGING_SOCKET, CLAUDE_PID)',
+    ]);
+  });
+
+  it('says nothing when the environment carried no ambient CLAUDE_* variable', () => {
+    const logs: string[] = [];
+    launch('claude', { CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '900000' }, (m) => logs.push(m));
+
+    expect(logs.some((line) => line.includes('worker env:'))).toBe(false);
+  });
+});

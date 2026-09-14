@@ -31,11 +31,11 @@ afterAll(() => {
 });
 
 /**
- * A `claude` on `PATH` that records the argv it was handed and exits. The
- * shebang is this test runner's own node by absolute path, so `PATH` can hold
- * nothing but the stub and the real CLI is unreachable.
+ * A `claude` on `PATH` that records the argv and environment it was handed
+ * and exits. The shebang is this test runner's own node by absolute path, so
+ * `PATH` can hold nothing but the stub and the real CLI is unreachable.
  */
-function stubClaude(root: string, argvPath: string): string {
+function stubClaude(root: string, recordPath: string): string {
   const binDir = join(root, 'bin');
   mkdirSync(binDir, { recursive: true });
   const stub = join(binDir, 'claude');
@@ -43,8 +43,8 @@ function stubClaude(root: string, argvPath: string): string {
     stub,
     `#!${process.execPath}\n`
       + 'require("node:fs").writeFileSync('
-      + `${JSON.stringify(argvPath)}, `
-      + 'JSON.stringify(process.argv.slice(2)));\n',
+      + `${JSON.stringify(recordPath)}, `
+      + 'JSON.stringify({ argv: process.argv.slice(2), env: process.env }));\n',
   );
   chmodSync(stub, 0o755);
   return binDir;
@@ -52,15 +52,20 @@ function stubClaude(root: string, argvPath: string): string {
 
 interface StubbedWorker {
   argv: string[];
+  /** The environment the child actually ran under. */
+  env: Record<string, string>;
   document: string;
   configPath: string;
   logs: string[];
   status: number | null;
 }
 
-function launchStubbedWorker(
-  mcpServers?: Record<string, unknown>,
-): StubbedWorker {
+function launchStubbedWorker(options: {
+  readonly mcpServers?: Record<string, unknown>;
+  /** Ambient variables on top of the minimal `HOME`/`PATH` a worker needs. */
+  readonly ambient?: Record<string, string>;
+} = {}): StubbedWorker {
+  const { mcpServers } = options;
   const root = mkdtempSync(join(tmpdir(), 'worker-mcp-'));
   roots.push(root);
   const home = join(root, 'home');
@@ -71,8 +76,8 @@ function launchStubbedWorker(
     join(home, '.claude.json'),
     JSON.stringify({ mcpServers: AMBIENT_SERVERS }),
   );
-  const argvPath = join(root, 'argv.json');
-  const binDir = stubClaude(root, argvPath);
+  const recordPath = join(root, 'record.json');
+  const binDir = stubClaude(root, recordPath);
   const logs: string[] = [];
   let status: number | null = null;
 
@@ -84,7 +89,7 @@ function launchStubbedWorker(
       scenario: 'SCENARIO-stub',
       worktreePath: worktree,
       effort: 'High',
-      env: { HOME: home, PATH: binDir },
+      env: { HOME: home, PATH: binDir, ...options.ambient },
       spawnOptions: {
         detached: false,
         stdio: 'ignore',
@@ -116,8 +121,13 @@ function launchStubbedWorker(
   // The filename is the contract the operator inspects after a run, so it is
   // spelled out here rather than re-derived from the launcher.
   const configPath = join(attemptDir, 'mcp-config.json');
+  const record = JSON.parse(readFileSync(recordPath, 'utf8')) as {
+    argv: string[];
+    env: Record<string, string>;
+  };
   return {
-    argv: JSON.parse(readFileSync(argvPath, 'utf8')) as string[],
+    argv: record.argv,
+    env: record.env,
     document: readFileSync(configPath, 'utf8'),
     configPath,
     logs,
@@ -154,7 +164,9 @@ describe('worker MCP isolation, real child (#182)', () => {
 
   it('hands the child a granted server and still no ambient one', () => {
     const { argv, document, configPath } = launchStubbedWorker({
-      'jinn-notes': { command: 'npx', args: ['-y', 'jinn-notes-mcp'] },
+      mcpServers: {
+        'jinn-notes': { command: 'npx', args: ['-y', 'jinn-notes-mcp'] },
+      },
     });
 
     expect(argv[argv.indexOf('--mcp-config') + 1]).toBe(configPath);
@@ -172,5 +184,52 @@ describe('worker MCP isolation, real child (#182)', () => {
     expect(argv[0]).toBe('-p');
     expect(argv.at(-1)).toContain('SCENARIO-stub');
     expect(argv.indexOf('--mcp-config')).toBeLessThan(argv.length - 1);
+  });
+});
+
+/**
+ * The environment the 2026-09-12 start leaked into every worker (#186). The
+ * daemon was started from inside a Claude Code session; each `claude -p`
+ * inherited that session's child-session marker and messaging socket, and
+ * died on startup for 48 hours once the session was gone.
+ */
+const LEAKED_HOST_SESSION_ENV = {
+  CLAUDE_CODE_CHILD_SESSION: '1',
+  CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/cc-socks/51448.sock',
+  CLAUDE_CODE_MESSAGING_TOKEN: 'host-session-token',
+  CLAUDE_PID: '51448',
+  CLAUDE_CODE_HOST_SESSION_ID: 'host-session',
+  CLAUDE_CODE_SESSION_ID: 'session',
+  CLAUDE_EFFORT: 'high',
+};
+
+describe('worker env hygiene, real child (#186)', () => {
+  it('hands the child no ambient CLAUDE_* variable, and still the ceiling', () => {
+    const { env, status } = launchStubbedWorker({ ambient: LEAKED_HOST_SESSION_ENV });
+
+    expect(status).toBe(0);
+    for (const name of Object.keys(LEAKED_HOST_SESSION_ENV)) {
+      expect(env).not.toHaveProperty(name);
+    }
+    expect(env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS).toBe('3600000');
+    // The scrub is by prefix, so nothing else the worker needs is touched.
+    expect(env.JINN_AUTOPILOT_RUNTIME).toBe('claude');
+  });
+
+  it('says how many ambient CLAUDE_* variables it dropped, and which', () => {
+    const { logs } = launchStubbedWorker({ ambient: LEAKED_HOST_SESSION_ENV });
+
+    expect(logs).toContain(
+      '[autopilot] worker env: dropping 7 ambient CLAUDE_* var(s) '
+        + '(CLAUDE_CODE_CHILD_SESSION, CLAUDE_CODE_HOST_SESSION_ID, '
+        + 'CLAUDE_CODE_MESSAGING_SOCKET, CLAUDE_CODE_MESSAGING_TOKEN, '
+        + 'CLAUDE_CODE_SESSION_ID, CLAUDE_EFFORT, CLAUDE_PID)',
+    );
+  });
+
+  it('says nothing about the env when nothing ambient was there to drop', () => {
+    const { logs } = launchStubbedWorker();
+
+    expect(logs.some((line) => line.includes('worker env:'))).toBe(false);
   });
 });

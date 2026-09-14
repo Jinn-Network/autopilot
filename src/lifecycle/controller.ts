@@ -87,6 +87,15 @@ import {
   type HeldSeat,
 } from './wall-clock.js';
 import {
+  allInfantLine,
+  dispatchHalted,
+  infantDeathsLaneReason,
+  isAllInfant,
+  workersSummaryLine,
+  type WorkerCycleSummary,
+  type WorkerInfancyState,
+} from './worker-infancy.js';
+import {
   NEEDS_HUMAN_LABEL,
   externalHumanLabel,
   hasExternalHumanLabel,
@@ -115,6 +124,18 @@ export interface LifecycleControllerDeps {
    * no seat is derived and neither line is ever rendered.
    */
   readHeldSeats?: () => readonly HeldSeat[];
+  /**
+   * What became of this cycle's worker dispatches (#186), and the streak of
+   * cycles in which none survived. `read` is consulted before scheduling —
+   * three all-infant cycles in a row withhold every claim — `settle` waits
+   * for the cycle's dispatches to exit or outlive infancy, and `record` folds
+   * the result into the streak. Absent means no `workers:` line and no gate.
+   */
+  readonly workerInfancy?: {
+    read(): WorkerInfancyState;
+    settle(): Promise<WorkerCycleSummary>;
+    record(summary: WorkerCycleSummary): WorkerInfancyState;
+  };
   /**
    * Optional allowlist fast path. A null result means no recent global cache
    * authority exists and the controller must keep its unrestricted behavior.
@@ -452,6 +473,8 @@ export type LifecycleCycleReport =
       readonly disk?: DiskHeadroom;
       /** The seats this runner's live attempts hold (#184), when wired. */
       readonly seats?: readonly HeldSeat[];
+      /** What became of this cycle's worker dispatches (#186), when wired. */
+      readonly workers?: WorkerCycleSummary;
       readonly reconciliation?: ReconciliationReport;
       /** Stage 4: GraphQL points spent this cycle (start remaining − end). */
       readonly budget?: {
@@ -1735,6 +1758,7 @@ interface ActivePassResult {
   /** Projected disk headroom this pass scheduled against (#144), when computed. */
   readonly disk?: DiskHeadroom;
   readonly seats?: readonly HeldSeat[];
+  readonly workers?: WorkerCycleSummary;
 }
 
 /** `{ seats }` for the report, or nothing when no build wired the read. */
@@ -1855,6 +1879,12 @@ async function executeActivePass(
       reason: `for ${staleCycles} cycle(s), ${candidates.length} candidate(s) withheld`,
     });
   }
+  // Three cycles in a row of every worker dying in infancy (#186): the plan
+  // is still computed, so every candidate is still named, but no claim is
+  // executed — a claim opens a branch, a draft PR and a worktree for a
+  // session that will not start. A fresh daemon starts with no streak.
+  const infancy = deps.workerInfancy?.read();
+  const halted = infancy !== undefined && dispatchHalted(infancy);
   const scheduling = scheduleActiveActions({
     candidates: reconciliationFresh ? candidates : [],
     remaining: local.remaining,
@@ -2008,6 +2038,13 @@ async function executeActivePass(
         >);
         index += 1;
       }
+      if (halted) {
+        actionEvents.push(...cohort.map((candidate) => actionEvent(candidate, {
+          outcome: 'skipped',
+          reason: 'infant-deaths',
+        })));
+        continue;
+      }
       // Each round replaces exactly the claims that refused late with the next
       // backups, so the cohort never grows past the capacity the first one was
       // admitted under: a refusal spawns nothing.
@@ -2051,6 +2088,14 @@ async function executeActivePass(
         outcome: 'skipped',
         reason: 'enqueue-repository-refused',
       }));
+      index += 1;
+      continue;
+    }
+    if (
+      halted
+      && (action.kind === 'claim-implementation' || action.kind === 'claim-review')
+    ) {
+      actionEvents.push(actionEvent(action, { outcome: 'skipped', reason: 'infant-deaths' }));
       index += 1;
       continue;
     }
@@ -2106,8 +2151,23 @@ async function executeActivePass(
     // queued candidate reads `skipped (capacity)` exactly like a busy lane's
     // does. One line per cycle per lane, derived and never counted across
     // cycles, so nothing has to be persisted or reset.
+    // The halt names itself per lane with candidates (#186), in place of the
+    // starved line below: nothing spawned because nothing was allowed to.
+    if (halted && laneCandidates[lane] > 0) {
+      actionEvents.push({
+        cycleId,
+        runnerId: deps.runnerId,
+        mode: 'active',
+        phase,
+        subject: `lane:${lane}`,
+        action: 'schedule',
+        outcome: 'infant-deaths',
+        reason: infantDeathsLaneReason(infancy!, laneCandidates[lane]),
+      });
+    }
     if (
-      (local.remaining[lane] ?? 0) > 0
+      !halted
+      && (local.remaining[lane] ?? 0) > 0
       && laneCandidates[lane] > 0
       && spawnedByLane[lane] === 0
     ) {
@@ -2147,6 +2207,10 @@ async function executeActivePass(
       });
     }
   }
+  // Last, after every dispatch of the pass: waits until each has exited or
+  // outlived infancy, so the summary can say what became of them (#186).
+  const workers = await deps.workerInfancy?.settle();
+  if (workers !== undefined) deps.workerInfancy!.record(workers);
   return {
     items,
     orphanBranchClaims,
@@ -2158,6 +2222,7 @@ async function executeActivePass(
     // running at all.
     ...(local.diskHeadroom === undefined ? {} : { disk: local.diskHeadroom }),
     ...(seats === undefined ? {} : { seats }),
+    ...(workers === undefined ? {} : { workers }),
   };
 }
 
@@ -2456,6 +2521,7 @@ export async function runLifecycleCycle(
       backlog: backlogSummary(snapshot),
       ...(activePass.disk === undefined ? {} : { disk: activePass.disk }),
       ...(activePass.seats === undefined ? {} : { seats: activePass.seats }),
+      ...(activePass.workers === undefined ? {} : { workers: activePass.workers }),
       reconciliation: combinedReconciliation,
     });
   }
@@ -2884,6 +2950,14 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     : [diskHeadroomSummaryLine(report.disk)];
   const wallClockLine = wallClockSummaryLine(report.seats ?? []);
   const wallClockLines = wallClockLine === undefined ? [] : [wallClockLine];
+  // Every active cycle, dispatches or none: a fleet that dispatched nothing
+  // and one whose every dispatch died must read differently (#186).
+  const workerLines = report.workers === undefined
+    ? []
+    : [
+        workersSummaryLine(report.workers),
+        ...(isAllInfant(report.workers) ? [allInfantLine(report.workers)] : []),
+      ];
   if (
     report.items.length === 0
     && report.orphanBranchClaims.length === 0
@@ -2900,6 +2974,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
       ...backlogLines,
       ...diskLines,
       ...wallClockLines,
+      ...workerLines,
       ...parityLines,
       'No lifecycle items.',
     ].join('\n');
@@ -2913,6 +2988,7 @@ export function renderLifecycleHuman(report: LifecycleCycleReport): string {
     ...backlogLines,
     ...diskLines,
     ...wallClockLines,
+    ...workerLines,
     ...parityLines,
     ...report.items.map(explanation),
     ...report.orphanBranchClaims.map(orphanExplanation),

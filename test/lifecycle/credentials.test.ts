@@ -7,6 +7,7 @@ import {
   resolveCredentialPool,
   selectCredential,
 } from '../../src/lifecycle/credentials.js';
+import { isRetryableReadCommand } from '../../src/lifecycle/transient-retry.js';
 
 function loginRunner(byToken: Readonly<Record<string, string>>): CommandRunner {
   return vi.fn(async (cmd, args, opts) => {
@@ -166,6 +167,128 @@ describe('credential pool', () => {
       throw new Error('expected credential resolution to fail');
     } catch (error) {
       expect(String(error)).toContain('implementation credential');
+      expect(String(error)).not.toContain(secret);
+    }
+  });
+});
+
+/**
+ * #186: a GitHub 502 blip made the unretried `gh api user` fail eight cycles
+ * in a row, with the underlying error swallowed behind `login resolution
+ * failed`. The probe is a REST GET the engine's own read allowlist admits, so
+ * it goes through the same bounded ladder as every other GitHub read, plus the
+ * served gateway statuses a proxy answers with when GitHub gave up — nothing a
+ * re-sent GET can duplicate — and the failure it finally throws quotes the
+ * stderr it saw.
+ */
+describe('credential probe retry (#186)', () => {
+  const noSleep = async (): Promise<void> => {};
+
+  function subprocessFault(stderr: string): Error & { stderr: string } {
+    return Object.assign(
+      new Error(`Command failed: gh api user --jq .login\n${stderr}`),
+      { stderr, code: 1 },
+    );
+  }
+
+  function flakyRunner(
+    failures: readonly Error[],
+    login = 'Jinn-Bot',
+  ): { runner: CommandRunner; calls: () => number } {
+    let calls = 0;
+    const runner: CommandRunner = async (cmd, args) => {
+      expect([cmd, ...args]).toEqual(['gh', 'api', 'user', '--jq', '.login']);
+      const failure = failures[calls];
+      calls += 1;
+      if (failure !== undefined) throw failure;
+      return `${login}\n`;
+    };
+    return { runner, calls: () => calls };
+  }
+
+  it('is a read the engine can prove idempotent', () => {
+    expect(isRetryableReadCommand('gh', ['api', 'user', '--jq', '.login'])).toBe(true);
+  });
+
+  it('resolves the credential when a 502 is served twice and then the login', async () => {
+    const gateway = subprocessFault('gh: Bad Gateway (HTTP 502)');
+    const { runner, calls } = flakyRunner([gateway, gateway]);
+    const retries: Array<{ attempt: number; fault: string }> = [];
+
+    const pool = await resolveCredentialPool(
+      { JINN_IMPL_GH_TOKEN: 'impl' },
+      runner,
+      { sleep: noSleep, onRetry: (event) => retries.push(event) },
+    );
+
+    expect(pool.logins()).toEqual(['Jinn-Bot']);
+    expect(calls()).toBe(3);
+    expect(retries).toEqual([
+      { preference: 'implementation', attempt: 1, fault: 'HTTP 502' },
+      { preference: 'implementation', attempt: 2, fault: 'HTTP 502' },
+    ]);
+  });
+
+  it('retries a transport fault through the same ladder', async () => {
+    const { runner, calls } = flakyRunner([
+      subprocessFault('Post "https://api.github.com/user": net/http: TLS handshake timeout'),
+    ]);
+
+    await resolveCredentialPool({ JINN_REVIEW_GH_TOKEN: 'rev' }, runner, { sleep: noSleep });
+
+    expect(calls()).toBe(2);
+  });
+
+  it('throws after three 502s, quoting the stderr it saw', async () => {
+    const gateway = subprocessFault('gh: Bad Gateway (HTTP 502)');
+    const { runner, calls } = flakyRunner([gateway, gateway, gateway]);
+
+    await expect(resolveCredentialPool(
+      { JINN_IMPL_GH_TOKEN: 'impl' },
+      runner,
+      { sleep: noSleep },
+    )).rejects.toThrow(
+      'implementation credential GitHub login resolution failed: gh: Bad Gateway (HTTP 502)',
+    );
+    expect(calls()).toBe(3);
+  });
+
+  it('never retries a failure that is not transport or gateway shaped', async () => {
+    const { runner, calls } = flakyRunner([
+      subprocessFault('gh: Bad credentials (HTTP 401)'),
+    ]);
+
+    await expect(resolveCredentialPool(
+      { JINN_REVIEW_GH_TOKEN: 'rev' },
+      runner,
+      { sleep: noSleep },
+    )).rejects.toThrow(
+      'review credential GitHub login resolution failed: gh: Bad credentials (HTTP 401)',
+    );
+    expect(calls()).toBe(1);
+  });
+
+  it('waits the pinned backoff between attempts', async () => {
+    const gateway = subprocessFault('gh: Service Unavailable (HTTP 503)');
+    const { runner } = flakyRunner([gateway, gateway]);
+    const waits: number[] = [];
+
+    await resolveCredentialPool({ JINN_IMPL_GH_TOKEN: 'impl' }, runner, {
+      sleep: async (ms) => { waits.push(ms); },
+    });
+
+    expect(waits).toEqual([250, 1_000]);
+  });
+
+  it('redacts a secret the quoted stderr happens to echo', async () => {
+    const secret = 'echoed-secret';
+    const { runner } = flakyRunner([subprocessFault(`gh: token ${secret} rejected (HTTP 401)`)]);
+
+    try {
+      await resolveCredentialPool({ JINN_IMPL_GH_TOKEN: secret }, runner, { sleep: noSleep });
+      throw new Error('expected credential resolution to fail');
+    } catch (error) {
+      expect(String(error)).toContain('HTTP 401');
       expect(String(error)).not.toContain(secret);
     }
   });

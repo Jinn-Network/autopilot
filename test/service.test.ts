@@ -1,11 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { LoadedAutopilotConfig } from '../src/config/config.js';
 import { cycleHeartbeatPath } from '../src/cycle-heartbeat.js';
+import { WORKER_INFANCY_FILE } from '../src/lifecycle/worker-infancy.js';
 import {
   classifyDaemonRecord,
   completeDaemonCycle,
@@ -28,6 +29,7 @@ import {
   readDaemonMetadata,
   renderDaemonStatus,
   runDaemon,
+  serviceCredentialEnvironment,
   serviceSocketPath,
   serviceStatus,
   START_TIME_HEAL_ATTEMPTS,
@@ -130,6 +132,53 @@ describe('repository-scoped daemon safety', () => {
     expect(parent.JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE).toBe('stale');
     expect(INTERNAL_DAEMON_ACTIVE_ONCE_ENV)
       .toBe('JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE');
+  });
+
+  /**
+   * #186: the daemon was started from inside a Claude Code session, and every
+   * worker inherited that session's `CLAUDE_*` variables through the daemon
+   * and the engine child. Both spawn environments drop them, so the operator
+   * recipe (`env -u CLAUDE_… autopilot start`) is no longer the only defence.
+   */
+  describe('ambient CLAUDE_* variables never reach the daemon or engine child (#186)', () => {
+    const LEAKED = {
+      CLAUDE_CODE_CHILD_SESSION: '1',
+      CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/cc-socks/51448.sock',
+      CLAUDE_CODE_MESSAGING_TOKEN: 'host-session-token',
+      CLAUDE_PID: '51448',
+    };
+
+    it('scrubs the engine child environment, keeping the engine-owned ceiling', () => {
+      const child = daemonActiveOnceEnvironment({
+        PATH: '/opt/homebrew/bin',
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '3600000',
+        ...LEAKED,
+      });
+
+      expect(child).toEqual({
+        PATH: '/opt/homebrew/bin',
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '3600000',
+        JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE: '1',
+      });
+    });
+
+    it('scrubs the daemon environment `start` builds, idempotently', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'autopilot-service-env-'));
+      const loaded = loadedFixture(dir, dir);
+
+      const once = serviceCredentialEnvironment(loaded, {
+        PATH: '/opt/homebrew/bin',
+        ANTHROPIC_MODEL: 'opus',
+        ...LEAKED,
+      });
+      const twice = serviceCredentialEnvironment(loaded, once);
+
+      for (const name of Object.keys(LEAKED)) {
+        expect(once).not.toHaveProperty(name);
+      }
+      expect(once).toMatchObject({ PATH: '/opt/homebrew/bin', ANTHROPIC_MODEL: 'opus' });
+      expect(twice).toEqual(once);
+    });
   });
 
   it('measures the next poll delay from child completion', async () => {
@@ -839,6 +888,34 @@ describe('the start-time fallback is transient, not permanent', () => {
     expect(calls).toBe(2);
     expect(record.startedAt).toBe(metadata.startedAt);
   });
+
+  it('starts with no infant-death streak: a fresh daemon has dispatched nothing (#186)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-infancy-reset-'));
+    const fixture = fallbackDaemonFixture(dir, 0);
+    const streakPath = join(fixture.loaded.paths.state, WORKER_INFANCY_FILE);
+    mkdirSync(fixture.loaded.paths.state, { recursive: true });
+    writeFileSync(streakPath, '{"version":1,"consecutiveAllInfantCycles":3}\n');
+    const previousPath = process.env.PATH;
+    process.env.PATH = fixture.binDirectory;
+    let daemon: Promise<void> | null = null;
+
+    try {
+      daemon = runDaemon({
+        loaded: fixture.loaded,
+        entryPath: fixture.entryPath,
+        environment: { PATH: fixture.binDirectory },
+      });
+      await waitForRecord(fixture.loaded, (record) => record.state === 'running');
+      expect(existsSync(streakPath)).toBe(false);
+    } finally {
+      process.env.PATH = previousPath;
+      if (daemon !== null) {
+        const record = readDaemonMetadata(fixture.loaded);
+        if (record !== null) await sendControl(record.socketPath, 'stop');
+        await daemon;
+      }
+    }
+  }, 30_000);
 
   it('never touches a record that already carries a pinned start time', async () => {
     let calls = 0;

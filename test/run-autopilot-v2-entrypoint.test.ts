@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import * as lifecycleEntrypoint from '../scripts/run-autopilot-v2.js';
 import { CredentialPool } from '../src/lifecycle/credentials.js';
+import { WorkerInfancyWatch } from '../src/lifecycle/worker-infancy.js';
 
 const {
   isDirectLifecycleEntrypoint,
@@ -64,6 +65,61 @@ describe('lifecycle script entrypoint', () => {
     });
     expect(result.pid).toBeTypeOf('number');
     expect(readFileSync(logPath, 'utf8')).toContain('active dispatch');
+  });
+
+  /**
+   * #186: the dead sessions of 2026-09-12 left no attempt directory or log at
+   * all, because the sweep removed them before anyone read them. A worker's
+   * stderr lands in its `session.log` the moment it is written — even one
+   * line before an immediate exit — and the watch reads it back at exit, so
+   * the cycle summary can quote it after the directory is gone.
+   */
+  it('captures an infant worker\'s first stderr into session.log and the watch (#186)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-infant-spawn-'));
+    const logPath = join(dir, 'attempt', 'session.log');
+    const watch = new WorkerInfancyWatch();
+    const spawn = makeLoggingSpawn(watch);
+    let exited = false;
+    spawn(process.execPath, [
+      '-e',
+      'console.error("Error: connect ENOENT /tmp/cc-socks/51448.sock"); process.exit(1)',
+    ], {
+      cwd: dir,
+      detached: true,
+      stdio: ['ignore', 'inherit', 'inherit'],
+      logPath,
+      onExit: () => { exited = true; },
+    });
+
+    await vi.waitFor(() => { expect(exited).toBe(true); });
+    expect(readFileSync(logPath, 'utf8')).toContain('connect ENOENT /tmp/cc-socks/51448.sock');
+    expect(await watch.settle()).toEqual({
+      dispatched: 1,
+      infantDeaths: 1,
+      lastStderr: 'Error: connect ENOENT /tmp/cc-socks/51448.sock',
+    });
+  });
+
+  it('writes a launch that could not even spawn into session.log, as an infant death (#186)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'autopilot-nospawn-'));
+    const logPath = join(dir, 'session.log');
+    const watch = new WorkerInfancyWatch();
+    const exits: Array<{ code: number | null; signal: NodeJS.Signals | null }> = [];
+    makeLoggingSpawn(watch)(join(dir, 'no-such-claude'), ['-p'], {
+      cwd: dir,
+      detached: true,
+      stdio: 'ignore',
+      logPath,
+      onExit: (code, signal) => { exits.push({ code, signal }); },
+    });
+
+    await vi.waitFor(() => { expect(exits).toEqual([{ code: null, signal: null }]); });
+    expect(readFileSync(logPath, 'utf8')).toMatch(/\[autopilot\] spawn failed: .*ENOENT/);
+    expect(await watch.settle()).toMatchObject({
+      dispatched: 1,
+      infantDeaths: 1,
+      lastStderr: expect.stringContaining('spawn failed'),
+    });
   });
 
   it('selects the production backend only from the dedicated configured runtime variable', () => {

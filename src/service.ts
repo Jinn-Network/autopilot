@@ -27,15 +27,23 @@ import {
 } from './cycle-heartbeat.js';
 import type { DoctorReport } from './doctor.js';
 import { readProcessStartTime } from './process-start-time.js';
+import { withoutAmbientClaudeEnvironment } from './worker-environment.js';
+import { WORKER_INFANCY_FILE } from './lifecycle/worker-infancy.js';
 
 export const INTERNAL_DAEMON_ACTIVE_ONCE_ENV =
   'JINN_AUTOPILOT_INTERNAL_DAEMON_ACTIVE_ONCE';
 
+/**
+ * The engine child's environment: the daemon's own, marked as a daemon-spawned
+ * cycle, with every ambient `CLAUDE_*` variable removed (#186). The scrub is
+ * idempotent, so a daemon that was itself started scrubbed loses nothing here,
+ * and one that was not still hands its cycles a clean environment.
+ */
 export function daemonActiveOnceEnvironment(
   environment: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   return {
-    ...environment,
+    ...withoutAmbientClaudeEnvironment(environment).env,
     [INTERNAL_DAEMON_ACTIVE_ONCE_ENV]: '1',
   };
 }
@@ -796,11 +804,20 @@ export async function inspectDaemon(input: {
   };
 }
 
+/**
+ * The daemon's environment as `start` builds it: the operator's, with the
+ * repository identity and credentials on top and every ambient `CLAUDE_*`
+ * variable removed (#186). A daemon started from inside a Claude Code session
+ * would otherwise carry that session's id, socket and pid into every engine
+ * child and every worker, which is how the 2026-09-12 fleet died on startup
+ * for 48 hours once the session was gone.
+ */
 export function serviceCredentialEnvironment(
   loaded: LoadedAutopilotConfig,
-  environment: NodeJS.ProcessEnv = process.env,
+  ambient: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  if (!existsSync(loaded.paths.credentials)) return { ...environment };
+  const environment = withoutAmbientClaudeEnvironment(ambient).env;
+  if (!existsSync(loaded.paths.credentials)) return environment;
   const stat = lstatSync(loaded.paths.credentials);
   if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
     throw new Error('credentials.json must be a regular owner-only file');
@@ -960,6 +977,11 @@ export async function runDaemon(input: {
   const controlPath = serviceSocketPath(input.loaded);
   ensureSocketDirectory(controlPath);
   rmSync(controlPath, { force: true });
+  // A daemon that has just started has dispatched nothing, so the streak of
+  // all-infant cycles that halts dispatch (#186) starts over — the restart is
+  // the operator-visible reset, as it is for `consecutiveFailedCycles` (#139),
+  // and it is how a leaked environment gets fixed in the first place.
+  rmSync(join(input.loaded.paths.state, WORKER_INFANCY_FILE), { force: true });
   const startupConfigHash = configurationHash(input.loaded.configPath);
   const heartbeatPath = cycleHeartbeatPath(input.loaded.paths.service);
   const watchdogThresholdMs = cycleWatchdogThresholdMs(
