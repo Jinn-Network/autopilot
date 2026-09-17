@@ -243,6 +243,71 @@ describe.each(['claude', 'hermes', 'cursor', 'codex'] as const)(
   },
 );
 
+describe('pinned Cursor implement model', () => {
+  it.each(['Low', 'Medium', 'High'] as const)(
+    'overrides the Effort map for an implement session at %s',
+    (effort) => {
+      const calls: SpawnCall[] = [];
+      const spawn: SpawnFn = (cmd, args, opts) => {
+        calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+        return { pid: 7778 };
+      };
+
+      spawnCoordinatorSession(
+        {
+          kind: 'implement',
+          number: 85,
+          skill: 'implement-issue',
+          scenario: 'SCENARIO-pinned',
+          worktreePath: '/tmp/worktrees/implement-85',
+          effort,
+          env: { GH_TOKEN: 'implement-token' },
+          spawnOptions: { detached: true, stdio: ['ignore', 'inherit', 'inherit'] },
+        },
+        { ...DEFAULT_CONFIG, runtime: 'cursor', cursorImplementModel: 'cursor-grok-4.6-high' },
+        { spawn, log: () => undefined },
+      );
+
+      const [call] = calls;
+      expect(call.args[call.args.indexOf('--model') + 1]).toBe('cursor-grok-4.6-high');
+      // Stage children read the model from the environment (run-stage.ts).
+      expect(call.opts.env).toMatchObject({
+        JINN_DISPATCHER_CURSOR_MODEL: 'cursor-grok-4.6-high',
+      });
+    },
+  );
+
+  it('leaves a review session on the review model', () => {
+    const calls: SpawnCall[] = [];
+    const spawn: SpawnFn = (cmd, args, opts) => {
+      calls.push({ cmd, args, opts: opts as Record<string, unknown> });
+      return { pid: 7779 };
+    };
+
+    spawnCoordinatorSession(
+      {
+        kind: 'review',
+        number: 86,
+        skill: 'review-pr',
+        scenario: 'SCENARIO-review',
+        worktreePath: '/tmp/worktrees/review-86',
+        effort: null,
+        env: { GH_TOKEN: 'review-token' },
+        spawnOptions: { detached: true, stdio: ['ignore', 'inherit', 'inherit'] },
+      },
+      {
+        ...DEFAULT_CONFIG,
+        runtime: 'cursor',
+        cursorModel: 'review-model',
+        cursorImplementModel: 'implement-model',
+      },
+      { spawn, log: () => undefined },
+    );
+
+    expect(calls[0]!.args[calls[0]!.args.indexOf('--model') + 1]).toBe('review-model');
+  });
+});
+
 describe('per-session runtime override (#152)', () => {
   it('launches one session on Codex under a claude process-wide runtime', () => {
     const calls: SpawnCall[] = [];

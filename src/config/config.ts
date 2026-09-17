@@ -118,6 +118,13 @@ export const autopilotConfigSchema = z.object({
     /** Passed as `-m` to Codex overflow sessions (#152); absent, Codex's own default. */
     codexModel: nonEmpty.optional(),
     /**
+     * Pins every Cursor session — implement and review alike — to one catalog
+     * model (`agent --model`). Absent, implement sessions follow the built-in
+     * Effort map and reviews use the default review model. The catalog moves
+     * faster than this engine ships, so the id belongs to the repository.
+     */
+    cursorModel: nonEmpty.optional(),
+    /**
      * How long a `claude -p` worker waits for its own background tasks after
      * the final turn before the runtime terminates the session
      * (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`).

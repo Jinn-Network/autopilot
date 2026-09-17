@@ -210,6 +210,11 @@ export interface DispatcherConfig {
    * `JINN_DISPATCHER_CURSOR_MODEL`.
    */
   cursorModel: string;
+  /**
+   * Fixed Cursor model for implement sessions; absent, `cursorModelForEffort`.
+   * Source: `worker.cursorModel`, which pins reviews to the same model.
+   */
+  cursorImplementModel?: string;
   /** Cursor Agent CLI binary. Source: `JINN_DISPATCHER_CURSOR_BIN`. */
   cursorBin: string;
   /**
