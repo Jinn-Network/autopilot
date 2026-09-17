@@ -2016,6 +2016,8 @@ async function executeActivePass(
   const promoteBackup = <T extends NewWorkAction>(
     lane: NewWorkLane,
     queue: T[],
+    /** The outcome that freed the slot: `ineligible` or `partial` (#192). */
+    afterOutcome: string,
   ): T | undefined => {
     if (queue.length === 0) return undefined;
     if (fallThroughAttempts[lane] >= LANE_FALLTHROUGH_ATTEMPT_LIMIT) {
@@ -2035,7 +2037,7 @@ async function executeActivePass(
       subject: subjectForAction(promoted),
       action: 'schedule',
       outcome: 'promoted',
-      reason: 'ineligible-fall-through',
+      reason: `${afterOutcome}-fall-through`,
     });
     return promoted;
   };
@@ -2108,7 +2110,7 @@ async function executeActivePass(
         const refused = results.filter((result) => result.outcome === 'ineligible').length;
         const next: Extract<NewWorkAction, { kind: 'claim-review' }>[] = [];
         for (let slot = 0; slot < refused; slot += 1) {
-          const promoted = promoteBackup('review', remainingBackups.review);
+          const promoted = promoteBackup('review', remainingBackups.review, 'ineligible');
           if (promoted === undefined) break;
           next.push(promoted);
         }
@@ -2139,8 +2141,13 @@ async function executeActivePass(
     if (action.kind === 'claim-implementation' || action.kind === 'claim-review') {
       // An `ineligible` claim is a fact about the candidate, not evidence the
       // slot was used, so the lane keeps reaching down its own priority order
-      // until something spawns or the bounded budget is spent. Every other
-      // outcome — spawned, failed, human, lost — did consume the attempt.
+      // until something spawns or the bounded budget is spent. A `partial`
+      // claim is the same kind of fact (#192): it returns before
+      // `createAttempt`, so no workspace exists and no session was started —
+      // charging the lane for it let one lagging candidate hold a slot every
+      // cycle, and mono ran 3-slot lanes at one session while 200 candidates
+      // waited. Every other outcome — spawned, failed, human, lost — did
+      // consume the attempt.
       const lane = laneForNewWorkAction(action)!;
       let attempt: NewWorkAction | undefined = action;
       while (attempt !== undefined) {
@@ -2151,10 +2158,10 @@ async function executeActivePass(
           if (halted) canarySession = claimSessionName(attempt);
           break;
         }
-        if (result.outcome !== 'ineligible') break;
+        if (result.outcome !== 'ineligible' && result.outcome !== 'partial') break;
         attempt = lane === 'review'
-          ? promoteBackup('review', remainingBackups.review)
-          : promoteBackup(lane, remainingBackups[lane]);
+          ? promoteBackup('review', remainingBackups.review, result.outcome)
+          : promoteBackup(lane, remainingBackups[lane], result.outcome);
       }
       index += 1;
       continue;

@@ -203,6 +203,19 @@ export interface ImplementationExecutorDeps {
     issueNumber: number,
     selfClaim?: SelfClaimHeadTransition,
   ): Promise<ImplementationIssue | null>;
+  /**
+   * The same read as {@link readIssue}, keeping the refusal the projection
+   * already composes ("issue #N is absent from the snapshot issue index").
+   * Optional so existing builds keep working; absent, a refused re-read can
+   * only be reported as "returned nothing".
+   */
+  readIssueProjection?(
+    issueNumber: number,
+    selfClaim?: SelfClaimHeadTransition,
+  ): Promise<{
+    readonly issue: ImplementationIssue | null;
+    readonly refusal?: string;
+  }>;
   readStaleRecovery(
     issueNumber: number,
     prNumber: number,
@@ -280,6 +293,12 @@ export type ImplementationExecutionResult =
       readonly issueNumber: number;
       readonly code: 'pr-not-converged' | 'target-base-changed';
       readonly claimOid: GitOid;
+      /**
+       * Why this claim stopped, in the operator's words (#192). Without it the
+       * cycle log reads `claim-implementation issue:N: partial.` — no code, no
+       * cause — while the same candidate repeats the claim every cycle.
+       */
+      readonly detail?: string;
     };
 
 function positiveIssueNumber(issueNumber: number): number {
@@ -427,6 +446,55 @@ function humanBranchAmbiguity(
         `PR #${pullRequest.number} (${pullRequest.headRefName} → ${pullRequest.baseRefName})`,
       ).join(', '),
   };
+}
+
+/** Names every convergence condition the draft PR fails, for the log (#192). */
+function prConvergenceGaps(
+  pullRequest: ImplementationPullRequest,
+  input: DraftPullRequestInput,
+): readonly string[] {
+  const gaps: string[] = [];
+  if (pullRequest.headRefName !== input.branch) {
+    gaps.push(`head branch is ${pullRequest.headRefName}, not ${input.branch}`);
+  }
+  if (pullRequest.head !== input.claimOid) {
+    gaps.push(`head is ${pullRequest.head}, not the published claim ${input.claimOid}`);
+  }
+  if (pullRequest.baseRefName !== input.targetBase) {
+    gaps.push(`base is ${pullRequest.baseRefName}, not ${input.targetBase}`);
+  }
+  if (!pullRequest.draft) gaps.push('pull request is not a draft');
+  if (!pullRequest.labels.includes(input.label)) {
+    gaps.push(`label ${input.label} is absent`);
+  }
+  if (!pullRequest.body.includes(`Closes #${input.issueNumber}`)) {
+    gaps.push(`body has no "Closes #${input.issueNumber}"`);
+  }
+  if (!pullRequest.body.includes(
+    `<!-- jinn-autopilot:v2 issue=${input.issueNumber} branch=${input.branch} -->`,
+  )) {
+    gaps.push('body has no v2 claim marker');
+  }
+  return gaps;
+}
+
+/** Why an issue re-read after the claim no longer authorizes the work (#192). */
+function issueRereadDetail(
+  issueNumber: number,
+  issue: ImplementationIssue | null,
+  refusal: string | undefined,
+  expectedTargetBase: GitRefName,
+): string {
+  if (issue === null) {
+    return `issue #${issueNumber} re-read after the claim returned nothing`
+      + (refusal === undefined ? '' : `: ${refusal}`);
+  }
+  if (issue.number !== issueNumber) {
+    return `issue re-read returned #${issue.number}, not #${issueNumber}`;
+  }
+  if (!issue.open) return `issue #${issueNumber} is closed`;
+  return `issue #${issueNumber} target base is now ${issue.targetBase}, `
+    + `not ${expectedTargetBase}`;
 }
 
 function prConverged(
@@ -792,7 +860,10 @@ export async function executeImplementationAction(
         claimedHead: claimOid,
       });
 
-  const currentIssue = await deps.readIssue(issueNumber, selfClaim);
+  const reread = deps.readIssueProjection === undefined
+    ? { issue: await deps.readIssue(issueNumber, selfClaim), refusal: undefined }
+    : await deps.readIssueProjection(issueNumber, selfClaim);
+  const currentIssue = reread.issue;
   if (
     currentIssue === null
     || currentIssue.number !== issueNumber
@@ -804,6 +875,12 @@ export async function executeImplementationAction(
       issueNumber,
       code: 'target-base-changed',
       claimOid,
+      detail: issueRereadDetail(
+        issueNumber,
+        currentIssue,
+        reread.refusal,
+        issue.targetBase,
+      ),
     };
   }
 
@@ -825,6 +902,8 @@ export async function executeImplementationAction(
       issueNumber,
       code: 'pr-not-converged',
       claimOid,
+      detail: `pull request #${pullRequest.number} has not converged on the claim: `
+        + prConvergenceGaps(pullRequest, draftInput).join('; '),
     };
   }
   if (selfClaim === undefined) {

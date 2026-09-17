@@ -879,6 +879,43 @@ describe('active lifecycle controller', () => {
       }));
     });
 
+    it('attempts the next candidate when a claim stops as partial (#192)', async () => {
+      const attempted: number[] = [];
+      const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
+      controller.active!.executeAction = async (action) => {
+        attempted.push(action.issueNumber);
+        return action.issueNumber === 100
+          ? {
+              outcome: 'partial',
+              reason: 'issue #100 re-read after the claim returned nothing',
+            }
+          : { outcome: 'spawned' };
+      };
+
+      const report = await runLifecycleCycle('active', controller);
+
+      // The partial published a claim commit but opened no workspace and
+      // started no session, so the slot is still there for the next candidate.
+      expect(attempted).toEqual([100, 200]);
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'claim-implementation',
+        subject: 'issue:100',
+        outcome: 'partial',
+        reason: 'issue #100 re-read after the claim returned nothing',
+      }));
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'claim-implementation',
+        subject: 'issue:200',
+        outcome: 'spawned',
+      }));
+      expect(report.events).toContainEqual(expect.objectContaining({
+        action: 'schedule',
+        subject: 'issue:200',
+        outcome: 'promoted',
+        reason: 'partial-fall-through',
+      }));
+    });
+
     it('consumes fall-through backups in priority order', async () => {
       const attempted: number[] = [];
       const controller = deps({ readSnapshot: async () => mixedPrioritySnapshot() });
