@@ -547,9 +547,14 @@ function dispatcherConfig(
     ...(environment.JINN_DISPATCHER_HERMES_PYTHON === undefined
       ? {}
       : { hermesPythonPath: environment.JINN_DISPATCHER_HERMES_PYTHON }),
-    ...(environment[CURSOR_MODEL_ENV] === undefined
+    // `worker.cursorModel` pins both kinds of session; the environment keeps
+    // its historical meaning, the review model alone.
+    ...((environment[CURSOR_MODEL_ENV] ?? product.worker.cursorModel) === undefined
       ? {}
-      : { cursorModel: environment[CURSOR_MODEL_ENV] }),
+      : { cursorModel: environment[CURSOR_MODEL_ENV] ?? product.worker.cursorModel }),
+    ...(product.worker.cursorModel === undefined
+      ? {}
+      : { cursorImplementModel: product.worker.cursorModel }),
     ...(environment[CURSOR_BIN_ENV] === undefined
       ? {}
       : { cursorBin: environment[CURSOR_BIN_ENV] }),
@@ -733,7 +738,8 @@ export async function runAutopilotV2(
   console.log(`[autopilot:v2] runtime=${config.runtime}`);
   if (config.runtime === 'cursor') {
     console.log(
-      `[autopilot:v2] cursor config (bin=${config.cursorBin}, reviewModel=${config.cursorModel})`,
+      `[autopilot:v2] cursor config (bin=${config.cursorBin}, reviewModel=${config.cursorModel}, `
+        + `implementModel=${config.cursorImplementModel ?? 'by-effort'})`,
     );
   }
   const runnerId = defaultRunnerId({

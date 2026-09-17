@@ -545,6 +545,19 @@ describe('codex overflow config (#152)', () => {
     expect(() => decodeAutopilotConfig(input)).toThrow();
   });
 
+  it('accepts an optional Cursor model on the worker', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { cursorModel?: string };
+    };
+    expect(decodeAutopilotConfig(input).worker.cursorModel).toBeUndefined();
+
+    input.worker.cursorModel = 'cursor-grok-4.6-high';
+    expect(decodeAutopilotConfig(input).worker.cursorModel).toBe('cursor-grok-4.6-high');
+
+    input.worker.cursorModel = '';
+    expect(() => decodeAutopilotConfig(input)).toThrow();
+  });
+
   it('accepts an optional Codex model on the worker', () => {
     const input = validConfig() as ReturnType<typeof validConfig> & {
       worker: { codexModel?: string };

@@ -382,7 +382,7 @@ function resolveCursorSessionModel(
   cfg: DispatcherConfig,
 ): string {
   return kind === 'implement'
-    ? cursorModelForEffort(effort)
+    ? cfg.cursorImplementModel ?? cursorModelForEffort(effort)
     : cfg.cursorModel;
 }
 

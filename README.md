@@ -111,6 +111,12 @@ pool for thirty minutes, and a `claude` worker that runs normally closes the
 circuit again. The Codex CLI must be installed and logged in
 (`codex login`); `worker.codexModel` optionally pins its model.
 
+Under `JINN_AUTOPILOT_RUNTIME=cursor`, implement sessions pick a Cursor
+catalog model from the issue's Effort and reviews use one fixed review model.
+`worker.cursorModel` pins both to a single id — the catalog moves faster than
+the engine ships, so list what the account can run with `agent models` and
+set the id there rather than waiting on a release.
+
 `debtConcurrency` (default `0`, off) gives debt sweeps — the batched review
 follow-ups the engine files itself — their own lane. A sweep is capped at P2
 by design, so while it shares the implementation lane it loses every cycle to
