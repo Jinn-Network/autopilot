@@ -215,6 +215,11 @@ export interface DispatcherConfig {
    * Source: `worker.cursorModel`, which pins reviews to the same model.
    */
   cursorImplementModel?: string;
+  /**
+   * Per-Effort Cursor models for implement sessions, over the built-in map.
+   * Source: `worker.cursorModels` (its `review` entry feeds `cursorModel`).
+   */
+  cursorEffortModels?: Partial<Record<Effort, string>>;
   /** Cursor Agent CLI binary. Source: `JINN_DISPATCHER_CURSOR_BIN`. */
   cursorBin: string;
   /**

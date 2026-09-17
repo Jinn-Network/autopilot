@@ -558,6 +558,31 @@ describe('codex overflow config (#152)', () => {
     expect(() => decodeAutopilotConfig(input)).toThrow();
   });
 
+  it('accepts a per-Effort Cursor model map, and refuses it beside a pin', () => {
+    const input = validConfig() as ReturnType<typeof validConfig> & {
+      worker: { cursorModel?: string; cursorModels?: Record<string, string> };
+    };
+    input.worker.cursorModels = {
+      Low: 'cursor-grok-4.6-low',
+      Max: 'cursor-grok-4.6-xhigh',
+      review: 'cursor-grok-4.6-high',
+    };
+    expect(decodeAutopilotConfig(input).worker.cursorModels).toEqual({
+      Low: 'cursor-grok-4.6-low',
+      Max: 'cursor-grok-4.6-xhigh',
+      review: 'cursor-grok-4.6-high',
+    });
+
+    // Effort keys are the board's own spelling.
+    expect(() => decodeAutopilotConfig({
+      ...input,
+      worker: { ...input.worker, cursorModels: { low: 'cursor-grok-4.6-low' } },
+    })).toThrow();
+
+    input.worker.cursorModel = 'cursor-grok-4.6-high';
+    expect(() => decodeAutopilotConfig(input)).toThrow(/cursorModel.*not both/);
+  });
+
   it('accepts an optional Codex model on the worker', () => {
     const input = validConfig() as ReturnType<typeof validConfig> & {
       worker: { codexModel?: string };

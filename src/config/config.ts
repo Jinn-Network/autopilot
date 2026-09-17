@@ -125,6 +125,21 @@ export const autopilotConfigSchema = z.object({
      */
     cursorModel: nonEmpty.optional(),
     /**
+     * Routes Cursor sessions by the issue's Effort instead of pinning one
+     * model: an implement session uses the entry for its Effort (an issue with
+     * no Effort uses `High`), a review session uses `review`. A missing
+     * entry falls back to the built-in default for that slot. Exclusive with
+     * `cursorModel` — a pin and a map cannot both be meant.
+     */
+    cursorModels: z.object({
+      Low: nonEmpty.optional(),
+      Medium: nonEmpty.optional(),
+      High: nonEmpty.optional(),
+      XHigh: nonEmpty.optional(),
+      Max: nonEmpty.optional(),
+      review: nonEmpty.optional(),
+    }).strict().optional(),
+    /**
      * How long a `claude -p` worker waits for its own background tasks after
      * the final turn before the runtime terminates the session
      * (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`).
@@ -333,6 +348,14 @@ export const autopilotConfigSchema = z.object({
       code: 'custom',
       path: ['project', 'owner'],
       message: 'Project owner must match the repository organization',
+    });
+  }
+  if (config.worker.cursorModel !== undefined && config.worker.cursorModels !== undefined) {
+    context.addIssue({
+      code: 'custom',
+      path: ['worker', 'cursorModels'],
+      message: 'set worker.cursorModel (one model for every session) or '
+        + 'worker.cursorModels (a model per Effort), not both',
     });
   }
 });

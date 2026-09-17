@@ -113,9 +113,24 @@ circuit again. The Codex CLI must be installed and logged in
 
 Under `JINN_AUTOPILOT_RUNTIME=cursor`, implement sessions pick a Cursor
 catalog model from the issue's Effort and reviews use one fixed review model.
-`worker.cursorModel` pins both to a single id — the catalog moves faster than
-the engine ships, so list what the account can run with `agent models` and
-set the id there rather than waiting on a release.
+`worker.cursorModel` pins both to a single id. To keep routing by Effort on a
+newer model, use `worker.cursorModels` instead — one entry per Effort
+(`Low`, `Medium`, `High`, `XHigh`, `Max`; an issue with no Effort uses
+`High`) plus `review`; any entry left out keeps its built-in default. The two
+keys are exclusive. The catalog moves faster than the engine ships, so list
+what the account can run with `agent models` and set the ids there rather
+than waiting on a release:
+
+```json
+"cursorModels": {
+  "Low": "cursor-grok-4.6-low",
+  "Medium": "cursor-grok-4.6-medium",
+  "High": "cursor-grok-4.6-high",
+  "XHigh": "cursor-grok-4.6-xhigh",
+  "Max": "cursor-grok-4.6-xhigh",
+  "review": "cursor-grok-4.6-high"
+}
+```
 
 `debtConcurrency` (default `0`, off) gives debt sweeps — the batched review
 follow-ups the engine files itself — their own lane. A sweep is capped at P2
