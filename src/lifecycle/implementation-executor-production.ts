@@ -55,6 +55,7 @@ export interface ProductionImplementationActionPortOptions {
 export type ProductionImplementationActionPort = Pick<
 ImplementationExecutorDeps,
 | 'readIssue'
+| 'readIssueProjection'
 | 'readStaleRecovery'
 | 'runRealityCheck'
 | 'listOpenPullRequests'
@@ -386,6 +387,15 @@ export function makeProductionImplementationActionPort(
     async readIssue(issueNumber, selfClaim?) {
       const snapshot = await options.readSnapshot(selfClaim);
       return issueFromSnapshot(snapshot, issueNumber).issue;
+    },
+
+    async readIssueProjection(issueNumber, selfClaim?) {
+      const snapshot = await options.readSnapshot(selfClaim);
+      const projection = issueFromSnapshot(snapshot, issueNumber);
+      return {
+        issue: projection.issue,
+        ...(projection.refusal === undefined ? {} : { refusal: projection.refusal }),
+      };
     },
 
     async readStaleRecovery(issueNumber, prNumber) {

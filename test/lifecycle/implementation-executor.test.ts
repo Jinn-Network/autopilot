@@ -1188,8 +1188,71 @@ describe('implementation action executor', () => {
         status: 'partial',
         code: 'target-base-changed',
         claimOid: CLAIM_A,
+        detail: 'issue #42 target base is now release/next, not next',
       });
     expect(events).toEqual(['claim']);
+  });
+
+  it('names why a re-read refused, keeping the projection refusal (#192)', async () => {
+    let projectionReads = 0;
+    const { deps } = harness({
+      readIssue: async () => issue(),
+      // Only the post-claim re-read goes through the projection; the
+      // pre-claim read is `readIssue`.
+      readIssueProjection: async () => {
+        projectionReads += 1;
+        return {
+          issue: null,
+          refusal: 'issue #42 is absent from the snapshot issue index',
+        };
+      },
+    });
+
+    await expect(executeImplementationAction(freshAction(), deps))
+      .resolves.toMatchObject({
+        status: 'partial',
+        code: 'target-base-changed',
+        detail: 'issue #42 re-read after the claim returned nothing: '
+          + 'issue #42 is absent from the snapshot issue index',
+      });
+    expect(projectionReads).toBe(1);
+  });
+
+  it('reports a re-read with no refusal as returning nothing', async () => {
+    let reads = 0;
+    const { deps } = harness({
+      readIssue: async () => reads++ === 0 ? issue() : null,
+    });
+
+    await expect(executeImplementationAction(freshAction(), deps))
+      .resolves.toMatchObject({
+        status: 'partial',
+        code: 'target-base-changed',
+        detail: 'issue #42 re-read after the claim returned nothing',
+      });
+  });
+
+  it('names every condition a lagging draft PR fails (#192)', async () => {
+    const { deps } = harness({
+      ensureDraftPullRequest: async (input) => pr({
+        number: 84,
+        headRefName: input.branch,
+        head: BASE,
+        baseRefName: input.targetBase,
+        draft: false,
+        labels: [],
+        body: input.body,
+      }),
+    });
+
+    const result = await executeImplementationAction(freshAction(), deps);
+
+    expect(result).toMatchObject({ status: 'partial', code: 'pr-not-converged' });
+    const detail = (result as { readonly detail?: string }).detail ?? '';
+    expect(detail).toContain('pull request #84 has not converged on the claim');
+    expect(detail).toContain(`head is ${BASE}, not the published claim ${CLAIM_A}`);
+    expect(detail).toContain('pull request is not a draft');
+    expect(detail).toContain('label engine:review is absent');
   });
 
   it('continues after claim when eligibility flips off the ready queue', async () => {
