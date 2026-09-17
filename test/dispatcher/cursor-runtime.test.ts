@@ -17,6 +17,20 @@ describe('cursorModelForEffort', () => {
     expect(cursorModelForEffort(effort)).toBe(model);
   });
 
+  it('prefers a configured model for the Effort and keeps the built-in for the rest', () => {
+    const configured = { Low: 'cursor-grok-4.6-low', XHigh: 'cursor-grok-4.6-xhigh' };
+    expect(cursorModelForEffort('Low', configured)).toBe('cursor-grok-4.6-low');
+    expect(cursorModelForEffort('XHigh', configured)).toBe('cursor-grok-4.6-xhigh');
+    expect(cursorModelForEffort('Medium', configured)).toBe('cursor-grok-4.5-medium');
+  });
+
+  it('reads the High entry for an issue with no Effort', () => {
+    expect(cursorModelForEffort(null, { High: 'cursor-grok-4.6-high' }))
+      .toBe('cursor-grok-4.6-high');
+    expect(cursorModelForEffort(null, { XHigh: 'cursor-grok-4.6-xhigh' }))
+      .toBe('cursor-grok-4.5-high');
+  });
+
   it('maps unset Effort to Grok high (same as XHigh)', () => {
     expect(cursorModelForEffort(null)).toBe('cursor-grok-4.5-high');
   });

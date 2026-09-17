@@ -277,6 +277,44 @@ describe('pinned Cursor implement model', () => {
     },
   );
 
+  it('routes implement sessions by Effort through the configured map', () => {
+    const models: string[] = [];
+    const spawn: SpawnFn = (_cmd, args) => {
+      models.push(args[args.indexOf('--model') + 1]!);
+      return { pid: 7780 };
+    };
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      runtime: 'cursor' as const,
+      cursorEffortModels: {
+        Low: 'cursor-grok-4.6-low',
+        Medium: 'cursor-grok-4.6-medium',
+        Max: 'cursor-grok-4.6-xhigh',
+      },
+    };
+    for (const effort of ['Low', 'Medium', 'Max'] as const) {
+      spawnCoordinatorSession(
+        {
+          kind: 'implement',
+          number: 87,
+          skill: 'implement-issue',
+          scenario: 'SCENARIO-routed',
+          worktreePath: '/tmp/worktrees/implement-87',
+          effort,
+          env: { GH_TOKEN: 'implement-token' },
+          spawnOptions: { detached: true, stdio: ['ignore', 'inherit', 'inherit'] },
+        },
+        cfg,
+        { spawn, log: () => undefined },
+      );
+    }
+    expect(models).toEqual([
+      'cursor-grok-4.6-low',
+      'cursor-grok-4.6-medium',
+      'cursor-grok-4.6-xhigh',
+    ]);
+  });
+
   it('leaves a review session on the review model', () => {
     const calls: SpawnCall[] = [];
     const spawn: SpawnFn = (cmd, args, opts) => {

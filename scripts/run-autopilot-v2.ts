@@ -57,6 +57,7 @@ import {
 import {
   CURSOR_BIN_ENV,
   CURSOR_MODEL_ENV,
+  cursorModelForEffort,
 } from '../src/dispatcher/cursor-runtime.js';
 import { CODEX_BIN_ENV, CODEX_MODEL_ENV } from '../src/dispatcher/codex-runtime.js';
 import { nonNegativeEnvironmentInteger } from '../src/lifecycle/active-config.js';
@@ -65,7 +66,7 @@ import {
   defaultRunner,
   type CommandRunner,
 } from '../src/dispatcher/issue-source.js';
-import { DEFAULT_CONFIG, type DispatcherConfig } from '../src/dispatcher/types.js';
+import { DEFAULT_CONFIG, EFFORTS, type DispatcherConfig } from '../src/dispatcher/types.js';
 import { DEFAULT_FLOOR } from '../src/dispatcher/rate-limit-guard.js';
 import { configureRepositoryConstants } from '../src/dispatcher/constants.js';
 import { configureCanonicalGitHubRemote } from '../src/lifecycle/implementation-executor.js';
@@ -521,6 +522,20 @@ export function renderCleanupWarnings(
   return lines;
 }
 
+function cursorModelSettings(
+  worker: AutopilotConfig['worker'],
+  reviewFromEnvironment: string | undefined,
+): Pick<DispatcherConfig, 'cursorImplementModel' | 'cursorEffortModels'>
+  & Partial<Pick<DispatcherConfig, 'cursorModel'>> {
+  const { review, ...byEffort } = worker.cursorModels ?? {};
+  const reviewModel = reviewFromEnvironment ?? worker.cursorModel ?? review;
+  return {
+    ...(reviewModel === undefined ? {} : { cursorModel: reviewModel }),
+    ...(worker.cursorModel === undefined ? {} : { cursorImplementModel: worker.cursorModel }),
+    ...(Object.keys(byEffort).length === 0 ? {} : { cursorEffortModels: byEffort }),
+  };
+}
+
 function dispatcherConfig(
   allowlist: ReadonlySet<string>,
   product: AutopilotConfig,
@@ -547,14 +562,10 @@ function dispatcherConfig(
     ...(environment.JINN_DISPATCHER_HERMES_PYTHON === undefined
       ? {}
       : { hermesPythonPath: environment.JINN_DISPATCHER_HERMES_PYTHON }),
-    // `worker.cursorModel` pins both kinds of session; the environment keeps
-    // its historical meaning, the review model alone.
-    ...((environment[CURSOR_MODEL_ENV] ?? product.worker.cursorModel) === undefined
-      ? {}
-      : { cursorModel: environment[CURSOR_MODEL_ENV] ?? product.worker.cursorModel }),
-    ...(product.worker.cursorModel === undefined
-      ? {}
-      : { cursorImplementModel: product.worker.cursorModel }),
+    // `worker.cursorModel` pins both kinds of session; `worker.cursorModels`
+    // routes implement sessions by Effort and names the review model. The
+    // environment keeps its historical meaning, the review model alone.
+    ...cursorModelSettings(product.worker, environment[CURSOR_MODEL_ENV]),
     ...(environment[CURSOR_BIN_ENV] === undefined
       ? {}
       : { cursorBin: environment[CURSOR_BIN_ENV] }),
@@ -739,7 +750,8 @@ export async function runAutopilotV2(
   if (config.runtime === 'cursor') {
     console.log(
       `[autopilot:v2] cursor config (bin=${config.cursorBin}, reviewModel=${config.cursorModel}, `
-        + `implementModel=${config.cursorImplementModel ?? 'by-effort'})`,
+        + `implementModel=${config.cursorImplementModel
+          ?? EFFORTS.map((effort) => `${effort}:${cursorModelForEffort(effort, config.cursorEffortModels)}`).join(',')})`,
     );
   }
   const runnerId = defaultRunnerId({

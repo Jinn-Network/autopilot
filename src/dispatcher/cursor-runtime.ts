@@ -15,8 +15,17 @@ const GROK_HIGH = 'cursor-grok-4.5-high';
 /**
  * Map board Effort to a Cursor catalog model for implement sessions.
  * Review sessions use `cfg.cursorModel` instead.
+ *
+ * `configured` is the repository's `worker.cursorModels` map; an entry there
+ * wins over the built-in one, and an issue with no Effort reads the `High`
+ * entry, exactly as it lands on the built-in high model.
  */
-export function cursorModelForEffort(effort: Effort | null): string {
+export function cursorModelForEffort(
+  effort: Effort | null,
+  configured: Partial<Record<Effort, string>> = {},
+): string {
+  const override = configured[effort ?? 'High'];
+  if (override !== undefined) return override;
   switch (effort) {
     case 'Low':
       return COMPOSER_LOW;
