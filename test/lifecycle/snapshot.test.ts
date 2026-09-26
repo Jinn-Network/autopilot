@@ -2070,6 +2070,25 @@ describe('buildGitHubLifecycleSnapshot', () => {
     expect(Object.isFrozen(snapshot.pullRequests)).toBe(true);
   });
 
+  it('keeps one copy of a PR that arrives on two pages, preferring the later page', async () => {
+    // A 504 halves the page size, so an old open PR lands on page 2 of the
+    // open connection while page 1's merged outcomes already carried it.
+    const openCopy = page('page-2').nodes[0]!;
+    const mergedOutcomeCopy = { ...openCopy };
+    const source = reader({
+      readPullRequests: async (cursor) => (cursor === null
+        ? { nodes: [mergedOutcomeCopy], pageInfo: { hasNextPage: true, endCursor: 'page-2' } }
+        : { nodes: [{ ...openCopy, enqueueHold: 'flake' as const }], pageInfo: { hasNextPage: false, endCursor: null } }),
+    });
+
+    const snapshot = await buildGitHubLifecycleSnapshot(source, {
+      authorAllowlist: new Set(['trusted']),
+    });
+
+    expect(snapshot.pullRequests.map((pr) => pr.number)).toEqual([101]);
+    expect(snapshot.pullRequests[0]?.enqueueHold).toBe('flake');
+  });
+
   it('maps MERGEABLE/CLEAN with exact compare behind to lifecycle behind', async () => {
     const raw = page('page-2').nodes[0]!;
     const source = reader({
