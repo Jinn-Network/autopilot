@@ -1542,7 +1542,12 @@ export async function buildGitHubLifecycleSnapshot(
   const nonDoneIssueNumbers = project.items
     .filter((item) => item.contentType === 'Issue' && item.status !== 'Done')
     .map((item) => item.number);
-  const rawPrs: RawPullRequest[] = [];
+  // Keyed by PR number: a PR can arrive on two pages. Merged outcomes (which
+  // include open PRs closing a non-Done issue) ride only on the first page, so
+  // once a 504 halves the page size an old open PR also appears on a later
+  // open-connection page. That later copy wins: it carries the head-exact
+  // ciRerunRecorded/enqueueHold stamps the merged-outcome copy lacks.
+  const rawPrs = new Map<number, RawPullRequest>();
   let closingIssueEvidenceIncomplete = false;
   const closedUnmergedParentPrs = new Set<number>();
   const maxPages = options.maxPages ?? 100;
@@ -1551,7 +1556,7 @@ export async function buildGitHubLifecycleSnapshot(
   for (let pageNumber = 1; ; pageNumber += 1) {
     if (pageNumber > maxPages) throw new Error('PR pagination exceeded safety limit');
     const page = await reader.readPullRequests(cursor, nonDoneIssueNumbers);
-    rawPrs.push(...page.nodes);
+    for (const pr of page.nodes) rawPrs.set(pr.number, pr);
     if (page.closingIssueEvidenceIncomplete === true) {
       closingIssueEvidenceIncomplete = true;
     }
@@ -1566,7 +1571,7 @@ export async function buildGitHubLifecycleSnapshot(
     seen.add(next);
     cursor = next;
   }
-  const pullRequests = rawPrs.map(decodePullRequestSnapshot);
+  const pullRequests = [...rawPrs.values()].map(decodePullRequestSnapshot);
   const branchClaims = await reader.readBranchClaims?.() ?? [];
   const branches: BranchClaimSnapshot[] = [];
   for (const raw of branchClaims) {
